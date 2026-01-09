@@ -1,0 +1,70 @@
+# NKIPy Monorepo
+
+[project]
+name = "nkipy-workspace"
+version = "0.1.0"
+description = "NKIPy Monorepo - A lightweight Pythonic kernel environment for AWS Neuron"
+requires-python = ">=3.10"
+dependencies = ["nkipy", "spike"]
+
+[tool.uv.workspace]
+members = ["nkipy", "spike"]
+
+[[tool.uv.index]]
+name = "neuron"
+url = "https://pip.repos.neuron.amazonaws.com"
+explicit = true
+
+[tool.uv.sources]
+spike = { workspace = true }
+nkipy = { workspace = true }
+
+[dependency-groups]
+test = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "pytest-order>=1.0",
+    "pytest-xdist>=3.0",
+    "ruff",
+    "mypy",
+]
+examples = ["torch", "ipython", "transformers", "argparse", "safetensors"]
+docs = [
+    "sphinx",
+    "sphinx-book-theme",
+    "myst-parser",
+    "myst-nb",
+    "sphinx-autodoc-typehints",
+]
+
+[tool.ruff]
+line-length = 88
+exclude = ["build", "third-party"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "spike/tests"]
+
+[tool.mypy]
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+
+[[tool.mypy.overrides]]
+module = "neuronxcc.*"
+ignore_missing_imports = true
+
+[tool.coverage.run]
+source = ["nkipy/src/nkipy", "spike/src/spike"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+
+[tool.coverage.html]
+directory = "htmlcov"

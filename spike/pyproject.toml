@@ -1,0 +1,17 @@
+[build-system]
+requires = ["scikit-build-core", "nanobind", "ruff"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "spike"
+version = "0.1.0"
+description = "Pythonic runtime for AWS Trainium, building on Neuron Runtime"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "NKIPy Team" }]
+dependencies = ["numpy>=1.20.0", "ml_dtypes>=0.2.0"]
+
+[tool.scikit-build]
+cmake.source-dir = "."
+wheel.packages = ["src/spike"]
+build-dir = "build"

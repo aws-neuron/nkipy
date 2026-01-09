@@ -1,0 +1,1 @@
+recursive-include src/nkipy/third_party *.proto
