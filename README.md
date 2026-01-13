@@ -129,6 +129,7 @@ result = softmax_kernel(x)
 Use the `@simulate_jit` decorator to trace and simulate execution:
 
 ```python
+import numpy as np
 from nkipy.runtime import simulate_jit
 
 @simulate_jit
@@ -138,6 +139,7 @@ def softmax_kernel(x):
     return exp_x / sum_x
 
 # Automatically traced and simulated
+x = np.random.rand(2, 128).astype(np.float32)
 result = softmax_kernel(x)
 ```
 
@@ -146,6 +148,7 @@ result = softmax_kernel(x)
 Use the `@baremetal_jit` decorator to compile and run on Trainium:
 
 ```python
+import numpy as np
 from nkipy.runtime import baremetal_jit
 
 @baremetal_jit
@@ -155,6 +158,7 @@ def softmax_kernel(x):
     return exp_x / sum_x
 
 # Compiled and executed on Trainium hardware
+x = np.random.rand(2, 128).astype(np.float32)
 result = softmax_kernel(x)
 ```
 
