@@ -5,7 +5,7 @@
 import numpy as np
 import pytest
 
-from nkipy.runtime.decorators import simulate_jit
+from nkipy.runtime.decorators import baremetal_jit
 
 
 class TestEinsumMatmul:
@@ -13,7 +13,7 @@ class TestEinsumMatmul:
 
     def test_matmul_basic(self):
         """Test basic matrix multiplication: ij,jk->ik"""
-        @simulate_jit
+        @baremetal_jit
         def kernel_matmul(A, B):
             import nkipy.core.ops as ops
             return ops.einsum('ij,jk->ik', A, B)
@@ -28,7 +28,7 @@ class TestEinsumMatmul:
 
     def test_matmul_implicit_output(self):
         """Test matrix multiplication with implicit output: ij,jk"""
-        @simulate_jit
+        @baremetal_jit
         def kernel_matmul_implicit(A, B):
             import nkipy.core.ops as ops
             return ops.einsum('ij,jk', A, B)
@@ -43,7 +43,7 @@ class TestEinsumMatmul:
 
     def test_batch_matmul(self):
         """Test batched matrix multiplication: bij,bjk->bik"""
-        @simulate_jit
+        @baremetal_jit
         def kernel_batch_matmul(A, B):
             import nkipy.core.ops as ops
             return ops.einsum('bij,bjk->bik', A, B)
@@ -58,7 +58,7 @@ class TestEinsumMatmul:
 
     def test_vector_dot_product(self):
         """Test vector dot product: i,i->"""
-        @simulate_jit
+        @baremetal_jit
         def kernel_dot(a, b):
             import nkipy.core.ops as ops
             return ops.einsum('i,i->', a, b)
@@ -73,7 +73,7 @@ class TestEinsumMatmul:
 
     def test_matrix_vector_multiply(self):
         """Test matrix-vector multiplication: ij,j->i"""
-        @simulate_jit
+        @baremetal_jit
         def kernel_matvec(A, b):
             import nkipy.core.ops as ops
             return ops.einsum('ij,j->i', A, b)
@@ -92,7 +92,7 @@ class TestEinsumTranspose:
 
     def test_transpose_2d(self):
         """Test 2D transpose: ij->ji"""
-        @simulate_jit
+        @baremetal_jit
         def kernel_transpose(A):
             import nkipy.core.ops as ops
             return ops.einsum('ij->ji', A)
@@ -105,7 +105,7 @@ class TestEinsumTranspose:
 
     def test_transpose_3d(self):
         """Test 3D transpose: ijk->kji"""
-        @simulate_jit
+        @baremetal_jit
         def kernel_transpose_3d(A):
             import nkipy.core.ops as ops
             return ops.einsum('ijk->kji', A)
@@ -118,7 +118,7 @@ class TestEinsumTranspose:
 
     def test_permute_dims(self):
         """Test dimension permutation: ijk->jki"""
-        @simulate_jit
+        @baremetal_jit
         def kernel_permute(A):
             import nkipy.core.ops as ops
             return ops.einsum('ijk->jki', A)
@@ -135,7 +135,7 @@ class TestEinsumReduction:
 
     def test_sum_all(self):
         """Test sum of all elements: ij->"""
-        @simulate_jit
+        @baremetal_jit
         def kernel_sum_all(A):
             import nkipy.core.ops as ops
             return ops.einsum('ij->', A)
@@ -148,7 +148,7 @@ class TestEinsumReduction:
 
     def test_sum_axis(self):
         """Test sum along axis: ij->i"""
-        @simulate_jit
+        @baremetal_jit
         def kernel_sum_axis(A):
             import nkipy.core.ops as ops
             return ops.einsum('ij->i', A)
@@ -161,7 +161,7 @@ class TestEinsumReduction:
 
     def test_trace(self):
         """Test matrix trace: ii->"""
-        @simulate_jit
+        @baremetal_jit
         def kernel_trace(A):
             import nkipy.core.ops as ops
             return ops.einsum('ii->', A)
@@ -174,7 +174,7 @@ class TestEinsumReduction:
 
     def test_diagonal(self):
         """Test extracting diagonal: ii->i"""
-        @simulate_jit
+        @baremetal_jit
         def kernel_diagonal(A):
             import nkipy.core.ops as ops
             return ops.einsum('ii->i', A)
@@ -191,7 +191,7 @@ class TestEinsumOuterProduct:
 
     def test_outer_product(self):
         """Test outer product: i,j->ij"""
-        @simulate_jit
+        @baremetal_jit
         def kernel_outer(a, b):
             import nkipy.core.ops as ops
             return ops.einsum('i,j->ij', a, b)
@@ -206,7 +206,7 @@ class TestEinsumOuterProduct:
 
     def test_outer_product_3d(self):
         """Test 3D outer product: i,j,k->ijk"""
-        @simulate_jit
+        @baremetal_jit
         def kernel_outer_3d(a, b, c):
             import nkipy.core.ops as ops
             return ops.einsum('i,j,k->ijk', a, b, c)
@@ -226,7 +226,7 @@ class TestEinsumBroadcast:
 
     def test_broadcast_multiply(self):
         """Test element-wise multiply with broadcasting: ij,j->ij"""
-        @simulate_jit
+        @baremetal_jit
         def kernel_broadcast_mul(A, b):
             import nkipy.core.ops as ops
             return ops.einsum('ij,j->ij', A, b)
@@ -241,7 +241,7 @@ class TestEinsumBroadcast:
 
     def test_batch_broadcast(self):
         """Test batched broadcasting: bij,bj->bij"""
-        @simulate_jit
+        @baremetal_jit
         def kernel_batch_broadcast(A, b):
             import nkipy.core.ops as ops
             return ops.einsum('bij,bj->bij', A, b)
@@ -260,7 +260,7 @@ class TestEinsumComplex:
 
     def test_bilinear_form(self):
         """Test bilinear form: i,ij,j->"""
-        @simulate_jit
+        @baremetal_jit
         def kernel_bilinear(x, A, y):
             import nkipy.core.ops as ops
             return ops.einsum('i,ij,j->', x, A, y)
@@ -276,7 +276,7 @@ class TestEinsumComplex:
 
     def test_tensor_contraction(self):
         """Test tensor contraction: ijk,jkl->il"""
-        @simulate_jit
+        @baremetal_jit
         def kernel_contraction(A, B):
             import nkipy.core.ops as ops
             return ops.einsum('ijk,jkl->il', A, B)
@@ -295,7 +295,7 @@ class TestEinsumEdgeCases:
 
     def test_identity(self):
         """Test identity operation: ij->ij"""
-        @simulate_jit
+        @baremetal_jit
         def kernel_identity(A):
             import nkipy.core.ops as ops
             return ops.einsum('ij->ij', A)
@@ -308,7 +308,7 @@ class TestEinsumEdgeCases:
 
     def test_scalar(self):
         """Test scalar operations."""
-        @simulate_jit
+        @baremetal_jit
         def kernel_scalar(A):
             import nkipy.core.ops as ops
             return ops.einsum('->', A)
@@ -321,7 +321,7 @@ class TestEinsumEdgeCases:
 
     def test_single_element(self):
         """Test with single element arrays."""
-        @simulate_jit
+        @baremetal_jit
         def kernel_single(a, b):
             import nkipy.core.ops as ops
             return ops.einsum('i,i->', a, b)
