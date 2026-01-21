@@ -7,6 +7,7 @@ Einstein notation, such as matrix multiplication, batch operations,
 traces, and more.
 """
 
+import numpy as np
 from typing import Dict, List, Set, Tuple
 
 from nkipy.core.ops._registry import Op
@@ -296,7 +297,7 @@ def _handle_repeated_indices(ctx, operand, spec: str):
         iota1 = ctx.build_op("iota", [], (dim_size, dim_size), "int32", {"iota_dimension": 1})
         
         # Mask = (iota0 == iota1)
-        pred = ctx.build_op("compare", [iota0, iota1], (dim_size, dim_size), "pred", {"comparison_direction": "EQ"})
+        pred = ctx.build_op("compare", [iota0, iota1], (dim_size, dim_size), np.bool_, {"comparison_direction": "EQ"})
         
         # Convert to dtype
         mask = ctx.build_op("convert", [pred], (dim_size, dim_size), current_operand.dtype, {})
