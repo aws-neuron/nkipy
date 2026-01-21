@@ -799,7 +799,6 @@ class HLOModule:
                 if isinstance(op.result_dtype, list)
                 else [op.result_dtype]
             )
-            instr.shape.Clear()
             instr.shape.CopyFrom(_make_tuple_shape_proto(list(zip(shapes, dtypes))))
 
         backend_config = op.attributes.get("backend_config", "")
