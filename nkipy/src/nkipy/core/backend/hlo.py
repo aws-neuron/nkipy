@@ -803,11 +803,6 @@ class HLOModule:
             instr.shape.Clear()
             instr.shape.CopyFrom(_make_tuple_shape_proto(list(zip(shapes, dtypes))))
 
-    def _handle_iota(self, instr, op: HLOOp, _) -> None:
-        """Handle iota operation."""
-        instr.iota_dimension = op.attributes.get("iota_dimension", 0)
-            instr.shape.CopyFrom(_make_tuple_shape_proto(list(zip(shapes, dtypes))))
-
         backend_config = op.attributes.get("backend_config", "")
         if backend_config:
             instr.backend_config = (
@@ -831,6 +826,10 @@ class HLOModule:
         # Handle has_collectives frontend attribute
         if op.attributes.get("has_collectives", False):
             instr.frontend_attributes.map["has_collectives"] = "1"
+
+    def _handle_iota(self, instr, op: HLOOp, _) -> None:
+        """Handle iota operation."""
+        instr.iota_dimension = op.attributes.get("iota_dimension", 0)
 
     def _handle_convolution(self, instr, op: HLOOp, _) -> None:
         """Handle convolution operation."""
