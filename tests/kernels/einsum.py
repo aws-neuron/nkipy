@@ -152,19 +152,6 @@ kernel_specs = [
         is_pure_numpy=True,
         description="3D permutation via einsum (ijk->kij)",
     ),
-    # Trace
-    KernelSpec(
-        function=trace_einsum,
-        inputs=[
-            TensorInputSpec(
-                shape_spec=ShapeSpec(dims=[None, None], default=(64, 64)),
-                dtype_spec=CommonTypes.FLOATS,
-                description="Square matrix",
-            ),
-        ],
-        is_pure_numpy=True,
-        description="Matrix trace via einsum (ii->)",
-    ),
     # Sum along axis
     KernelSpec(
         function=sum_axis_einsum,
@@ -213,28 +200,5 @@ kernel_specs = [
         ],
         is_pure_numpy=True,
         description="Dot product via einsum (i,i->)",
-    ),
-    # Bilinear form
-    KernelSpec(
-        function=bilinear_form_einsum,
-        inputs=[
-            TensorInputSpec(
-                shape_spec=ShapeSpec(dims=[None], default=(64,)),
-                dtype_spec=CommonTypes.FLOATS,
-                description="Left vector x",
-            ),
-            TensorInputSpec(
-                shape_spec=ShapeSpec(dims=[None, None], default=(64, 64)),
-                dtype_spec=CommonTypes.FLOATS,
-                description="Matrix A",
-            ),
-            TensorInputSpec(
-                shape_spec=ShapeSpec(dims=[None], default=(64,)),
-                dtype_spec=CommonTypes.FLOATS,
-                description="Right vector y",
-            ),
-        ],
-        is_pure_numpy=True,
-        description="Bilinear form x^T A y via einsum (i,ij,j->)",
     ),
 ]
