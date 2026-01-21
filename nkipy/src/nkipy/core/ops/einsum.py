@@ -53,11 +53,17 @@ def parse_einsum_subscripts(
                 all_indices[idx] = all_indices.get(idx, 0) + 1
 
         # Output contains indices that appear exactly once, in order of first appearance
+        # For implicit output with ..., we need to keep ... if present
         output_spec = ""
         seen: Set[str] = set()
+        
+        # Collect all indices that appear exactly once
+        unique_indices = sorted([idx for idx, count in all_indices.items() if count == 1 and idx != "."])
+        
+        # In implicit mode, we preserve order of appearance
         for spec in input_specs:
             for idx in spec:
-                if idx not in seen and all_indices[idx] == 1:
+                if idx in unique_indices and idx not in seen:
                     output_spec += idx
                     seen.add(idx)
 
@@ -165,31 +171,63 @@ def _einsum_hlo(subscripts, *operands, dtype=None):
     if not operands:
         raise ValueError("einsum requires at least one operand")
 
+    # Get shapes
+    shapes = []
+    real_operands = []
+    ctx = get_hlo_context()
+    
+    for op in operands:
+        if isinstance(op, NKIPyTensorRef):
+            real_operands.append(op)
+            shapes.append(op.backend_tensor.shape)
+        else:
+            # Assume it's an HLO tensor or similar
+            # Wrappping it might be needed if we call tensor ops? 
+            # The original code handled wrapping later. 
+            # We need shapes now for ellipsis expansion.
+            real_operands.append(op)
+            shapes.append(op.shape)
+
     # Parse subscripts
     input_specs, output_spec = parse_einsum_subscripts(subscripts, len(operands))
 
-    # Convert to HLO tensors
-    ctx = get_hlo_context()
-    hlo_operands = []
-    shapes = []
-
-    for op in operands:
-        if isinstance(op, NKIPyTensorRef):
-            hlo_operands.append(op.backend_tensor)
-            shapes.append(op.backend_tensor.shape)
+    # Handle repeated indices (Diagonal/Trace)
+    # This might modify operands (insert diagonal ops) and specs
+    cleaned_input_specs = []
+    processed_operands = []
+    
+    for i, (spec, op) in enumerate(zip(input_specs, real_operands)):
+        # Check for repeated indices
+        if len(set(spec)) != len(spec):
+             new_op, new_spec = _handle_repeated_indices(ctx, op, spec)
+             processed_operands.append(new_op)
+             cleaned_input_specs.append(new_spec)
         else:
-            hlo_operands.append(op)
-            shapes.append(op.shape)
+             processed_operands.append(op)
+             cleaned_input_specs.append(spec)
+    
+    input_specs = cleaned_input_specs
+    
+    # Refresh shapes after potential diagonal reductions
+    hlo_operands = []
+    final_shapes = []
+    for op in processed_operands:
+        if isinstance(op, NKIPyTensorRef):
+             hlo_operands.append(op.backend_tensor)
+             final_shapes.append(op.backend_tensor.shape)
+        else:
+             hlo_operands.append(op)
+             final_shapes.append(op.shape)
 
     # Analyze pattern
-    analysis = analyze_einsum_pattern(input_specs, output_spec, shapes)
+    analysis = analyze_einsum_pattern(input_specs, output_spec, final_shapes)
 
     # Handle special cases for optimization
-    if len(operands) == 1:
+    if len(hlo_operands) == 1:
         return _einsum_unary(
             ctx, hlo_operands[0], input_specs[0], output_spec, analysis
         )
-    elif len(operands) == 2:
+    elif len(hlo_operands) == 2:
         return _einsum_binary(
             ctx,
             hlo_operands[0],
@@ -202,6 +240,104 @@ def _einsum_hlo(subscripts, *operands, dtype=None):
     else:
         # General case: reduce to binary operations
         return _einsum_nary(ctx, hlo_operands, input_specs, output_spec, analysis)
+
+
+
+
+
+def _handle_repeated_indices(ctx, operand, spec: str):
+    """Handle repeated indices in a single spec (e.g., 'ii') by taking diagonal."""
+    from nkipy.core.tensor import NKIPyTensorRef
+    from nkipy.core.backend.hlo import as_hlo_tensor
+    import collections
+    
+    current_operand = operand
+    if isinstance(current_operand, NKIPyTensorRef):
+        current_operand = current_operand.backend_tensor
+    current_spec = list(spec)
+    
+    while True:
+        counts = collections.Counter(current_spec)
+        repeated = [char for char, count in counts.items() if count > 1]
+        
+        if not repeated:
+            break
+            
+        # Handle first repeated index
+        idx = repeated[0]
+        # Find first two positions
+        positions = [i for i, char in enumerate(current_spec) if char == idx]
+        pos1, pos2 = positions[0], positions[1]
+        
+        # Verify dimensions
+        shape = current_operand.shape
+        if shape[pos1] != shape[pos2]:
+             raise ValueError(f"Repeated index {idx} has incompatible dimensions {shape[pos1]} and {shape[pos2]}")
+             
+        dim_size = shape[pos1]
+        
+        # Move pos1 and pos2 to the end
+        # Permutation: All other indices + pos1 + pos2
+        other_indices = [i for i in range(len(shape)) if i != pos1 and i != pos2]
+        perm = other_indices + [pos1, pos2]
+        
+        current_operand = ctx.build_op(
+            "transpose", [current_operand], 
+            tuple(shape[i] for i in perm), 
+            current_operand.dtype, 
+            {"permutation": perm}
+        )
+        
+        # Now shape is (..., N, N)
+        # Create Identity Mask (N, N)
+        # iota dimension 0
+        iota0 = ctx.build_op("iota", [], (dim_size, dim_size), "int32", {"iota_dimension": 0})
+        # iota dimension 1
+        iota1 = ctx.build_op("iota", [], (dim_size, dim_size), "int32", {"iota_dimension": 1})
+        
+        # Mask = (iota0 == iota1)
+        pred = ctx.build_op("compare", [iota0, iota1], (dim_size, dim_size), "pred", {"comparison_direction": "EQ"})
+        
+        # Convert to dtype
+        mask = ctx.build_op("convert", [pred], (dim_size, dim_size), current_operand.dtype, {})
+        
+        # Broadcast mask to matches current_operand magnitude
+        # Mask has shape (N, N). Operand has (..., N, N).
+        # We broadcast mask to operands shape.
+        # Dimensions to broadcast are the '...' ones (0 to len-3).
+        # We map the mask dimensions [0, 1] to Result dimensions [rank-2, rank-1].
+        
+        rank = len(current_operand.shape)
+        mask_broadcast = ctx.build_op(
+            "broadcast", [mask], current_operand.shape, current_operand.dtype,
+            {"broadcast_dimensions": [rank-2, rank-1]}
+        )
+        
+        # Multiply
+        masked_op = ctx.build_op("multiply", [current_operand, mask_broadcast], current_operand.shape, current_operand.dtype)
+        
+        # Reduce sum over the last dimension (pos2) - which is now at rank-1
+        # Reduce dims: [rank-1]
+        # Init value for add: 0.0
+        init_val = as_hlo_tensor(ctx, 0.0, current_operand.dtype)
+        
+        reduced_shape = current_operand.shape[:-1]
+        current_operand = ctx.build_op(
+            "reduce", [masked_op, init_val], reduced_shape, current_operand.dtype,
+            {"dimensions": [rank-1], "computation": "add"}
+        )
+        
+        # Update spec
+        # We removed the char at pos2 (which was moved to end).
+        # The char at pos1 (which was moved to rank-2) is now at rank-1 (end).
+        # The other chars are at 0 ... rank-2.
+        # So new spec order is: [others] + [idx].
+        
+        new_spec_list = [current_spec[i] for i in other_indices] + [idx]
+        current_spec = new_spec_list
+        
+    return current_operand, "".join(current_spec)
+
 
 
 def _einsum_unary(ctx, operand, input_spec, output_spec, analysis):
