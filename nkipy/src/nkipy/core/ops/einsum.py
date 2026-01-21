@@ -243,9 +243,6 @@ def _einsum_hlo(subscripts, *operands, dtype=None):
         return _einsum_nary(ctx, hlo_operands, input_specs, output_spec, analysis)
 
 
-
-
-
 def _handle_repeated_indices(ctx, operand, spec: str):
     """Handle repeated indices in a single spec (e.g., 'ii') by taking diagonal."""
     from nkipy.core.tensor import NKIPyTensorRef
@@ -477,31 +474,19 @@ def _einsum_binary(ctx, lhs, rhs, lhs_spec, rhs_spec, output_spec, analysis):
         lhs_out_positions = [output_spec.index(idx) for idx in lhs_indices]
         rhs_out_positions = [output_spec.index(idx) for idx in rhs_indices]
 
-        # Reshape lhs: add dimensions at positions not in lhs
-        new_lhs_shape = [1] * len(output_shape)
-        for i, pos in enumerate(lhs_out_positions):
-            new_lhs_shape[pos] = lhs.shape[i]
-        lhs_reshaped = ctx.build_op("reshape", [lhs], tuple(new_lhs_shape), lhs.dtype)
-
         # Broadcast lhs to output shape
         lhs_broadcasted = ctx.build_op(
             "broadcast",
-            [lhs_reshaped],
+            [lhs],
             output_shape,
             lhs.dtype,
             {"broadcast_dimensions": lhs_out_positions},
         )
 
-        # Reshape rhs similarly
-        new_rhs_shape = [1] * len(output_shape)
-        for i, pos in enumerate(rhs_out_positions):
-            new_rhs_shape[pos] = rhs.shape[i]
-        rhs_reshaped = ctx.build_op("reshape", [rhs], tuple(new_rhs_shape), rhs.dtype)
-
         # Broadcast rhs to output shape
         rhs_broadcasted = ctx.build_op(
             "broadcast",
-            [rhs_reshaped],
+            [rhs],
             output_shape,
             rhs.dtype,
             {"broadcast_dimensions": rhs_out_positions},
