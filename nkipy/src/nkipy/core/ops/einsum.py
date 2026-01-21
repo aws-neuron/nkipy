@@ -374,11 +374,20 @@ def _einsum_unary(ctx, operand, input_spec, output_spec, analysis):
             output_dims.append((idx, i, analysis["input_dims"][idx]))
 
     # Sort output dimensions by their order in output_spec
-    output_dims.sort(key=lambda x: output_spec.index(x[0]))
-
+    # output_dims contains (idx, original_pos, size)
+    # The 'operand' tensor currently has these dimensions in the order they appeared in input_spec (minus reduced ones).
+    # XLA Reduce preserves relative order of remaining dimensions.
+    
+    current_indices = [idx for idx, _, _ in output_dims]
+    
     # If there are dimensions to reduce
     if dims_to_reduce:
+        # The shape expected by reduce op is the shape of the RESULT of reduction? 
+        # Or the shape of the operands? 
+        # Usually XLA build_op('reduce') might take output shape?
+        # If so, it should match the input-ordered result (since no transpose happens during reduce).
         reduced_shape = tuple(size for _, _, size in output_dims)
+        
         init_tensor = as_hlo_tensor(ctx, 0.0, operand.dtype)
         operand = ctx.build_op(
             "reduce",
@@ -391,11 +400,20 @@ def _einsum_unary(ctx, operand, input_spec, output_spec, analysis):
             },
         )
 
-    # If we need to transpose to match output order
-    current_order = [idx for idx, _, _ in output_dims]
-    if current_order != list(output_spec):
+    # Check if we need to transpose to match output spec
+    if current_indices != list(output_spec):
         # Build permutation
-        perm = [current_order.index(idx) for idx in output_spec]
+        # We want output to be output_spec.
+        # Current tensor has dims in `current_indices` order.
+        # We need to mapp `current_indices` -> `output_spec`.
+        # Transpose perm[i] is the index in input that maps to output[i].
+        
+        try:
+            perm = [current_indices.index(idx) for idx in output_spec]
+        except ValueError as e:
+            # Should not happen if analysis is correct
+            raise RuntimeError(f"Internal einsum error: indices mismatch {current_indices} vs {output_spec}") from e
+            
         transposed_shape = tuple(operand.shape[i] for i in perm)
         operand = ctx.build_op(
             "transpose",
