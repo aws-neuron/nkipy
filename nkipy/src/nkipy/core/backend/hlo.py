@@ -656,7 +656,6 @@ class HLOModule:
             "all-reduce": self._handle_all_reduce,
             "reduce-scatter": self._handle_reduce_scatter,
             "all-to-all": self._handle_all_to_all,
-            "iota": self._handle_iota,
         }
 
         handler = handlers.get(op.op_name)
@@ -826,10 +825,6 @@ class HLOModule:
         # Handle has_collectives frontend attribute
         if op.attributes.get("has_collectives", False):
             instr.frontend_attributes.map["has_collectives"] = "1"
-
-    def _handle_iota(self, instr, op: HLOOp, _) -> None:
-        """Handle iota operation."""
-        instr.iota_dimension = op.attributes.get("iota_dimension", 0)
 
     def _handle_convolution(self, instr, op: HLOOp, _) -> None:
         """Handle convolution operation."""
