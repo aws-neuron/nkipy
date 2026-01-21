@@ -656,6 +656,7 @@ class HLOModule:
             "all-reduce": self._handle_all_reduce,
             "reduce-scatter": self._handle_reduce_scatter,
             "all-to-all": self._handle_all_to_all,
+            "iota": self._handle_iota,
         }
 
         handler = handlers.get(op.op_name)
@@ -799,6 +800,12 @@ class HLOModule:
                 if isinstance(op.result_dtype, list)
                 else [op.result_dtype]
             )
+            instr.shape.Clear()
+            instr.shape.CopyFrom(_make_tuple_shape_proto(list(zip(shapes, dtypes))))
+
+    def _handle_iota(self, instr, op: HLOOp, _) -> None:
+        """Handle iota operation."""
+        instr.iota_dimension = op.attributes.get("iota_dimension", 0)
             instr.shape.CopyFrom(_make_tuple_shape_proto(list(zip(shapes, dtypes))))
 
         backend_config = op.attributes.get("backend_config", "")
