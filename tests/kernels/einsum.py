@@ -14,7 +14,6 @@ This module provides kernel specifications for testing various einsum patterns:
 import numpy as np
 from nkipy.core.specs import CommonTypes, KernelSpec, ShapeSpec, TensorInputSpec
 
-
 # =============================================================================
 # Matrix Operations
 # =============================================================================

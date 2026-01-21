@@ -7,8 +7,9 @@ Einstein notation, such as matrix multiplication, batch operations,
 traces, and more.
 """
 
-import numpy as np
 from typing import Dict, List, Set, Tuple
+
+import numpy as np
 
 from nkipy.core.ops._registry import Op
 
@@ -57,10 +58,12 @@ def parse_einsum_subscripts(
         # For implicit output with ..., we need to keep ... if present
         output_spec = ""
         seen: Set[str] = set()
-        
+
         # Collect all indices that appear exactly once
-        unique_indices = sorted([idx for idx, count in all_indices.items() if count == 1 and idx != "."])
-        
+        unique_indices = sorted(
+            [idx for idx, count in all_indices.items() if count == 1 and idx != "."]
+        )
+
         # In implicit mode, we preserve order of appearance
         for spec in input_specs:
             for idx in spec:
@@ -176,15 +179,15 @@ def _einsum_hlo(subscripts, *operands, dtype=None):
     shapes = []
     real_operands = []
     ctx = get_hlo_context()
-    
+
     for op in operands:
         if isinstance(op, NKIPyTensorRef):
             real_operands.append(op)
             shapes.append(op.backend_tensor.shape)
         else:
             # Assume it's an HLO tensor or similar
-            # Wrappping it might be needed if we call tensor ops? 
-            # The original code handled wrapping later. 
+            # Wrappping it might be needed if we call tensor ops?
+            # The original code handled wrapping later.
             # We need shapes now for ellipsis expansion.
             real_operands.append(op)
             shapes.append(op.shape)
@@ -196,29 +199,29 @@ def _einsum_hlo(subscripts, *operands, dtype=None):
     # This might modify operands (insert diagonal ops) and specs
     cleaned_input_specs = []
     processed_operands = []
-    
+
     for i, (spec, op) in enumerate(zip(input_specs, real_operands)):
         # Check for repeated indices
         if len(set(spec)) != len(spec):
-             new_op, new_spec = _handle_repeated_indices(ctx, op, spec)
-             processed_operands.append(new_op)
-             cleaned_input_specs.append(new_spec)
+            new_op, new_spec = _handle_repeated_indices(ctx, op, spec)
+            processed_operands.append(new_op)
+            cleaned_input_specs.append(new_spec)
         else:
-             processed_operands.append(op)
-             cleaned_input_specs.append(spec)
-    
+            processed_operands.append(op)
+            cleaned_input_specs.append(spec)
+
     input_specs = cleaned_input_specs
-    
+
     # Refresh shapes after potential diagonal reductions
     hlo_operands = []
     final_shapes = []
     for op in processed_operands:
         if isinstance(op, NKIPyTensorRef):
-             hlo_operands.append(op.backend_tensor)
-             final_shapes.append(op.backend_tensor.shape)
+            hlo_operands.append(op.backend_tensor)
+            final_shapes.append(op.backend_tensor.shape)
         else:
-             hlo_operands.append(op)
-             final_shapes.append(op.shape)
+            hlo_operands.append(op)
+            final_shapes.append(op.shape)
 
     # Analyze pattern
     analysis = analyze_einsum_pattern(input_specs, output_spec, final_shapes)
@@ -245,97 +248,123 @@ def _einsum_hlo(subscripts, *operands, dtype=None):
 
 def _handle_repeated_indices(ctx, operand, spec: str):
     """Handle repeated indices in a single spec (e.g., 'ii') by taking diagonal."""
-    from nkipy.core.tensor import NKIPyTensorRef
-    from nkipy.core.backend.hlo import as_hlo_tensor
     import collections
-    
+
+    from nkipy.core.backend.hlo import as_hlo_tensor
+    from nkipy.core.tensor import NKIPyTensorRef
+
     current_operand = operand
     if isinstance(current_operand, NKIPyTensorRef):
         current_operand = current_operand.backend_tensor
     current_spec = list(spec)
-    
+
     while True:
         counts = collections.Counter(current_spec)
         repeated = [char for char, count in counts.items() if count > 1]
-        
+
         if not repeated:
             break
-            
+
         # Handle first repeated index
         idx = repeated[0]
         # Find first two positions
         positions = [i for i, char in enumerate(current_spec) if char == idx]
         pos1, pos2 = positions[0], positions[1]
-        
+
         # Verify dimensions
         shape = current_operand.shape
         if shape[pos1] != shape[pos2]:
-             raise ValueError(f"Repeated index {idx} has incompatible dimensions {shape[pos1]} and {shape[pos2]}")
-             
+            raise ValueError(
+                f"Repeated index {idx} has incompatible dimensions {shape[pos1]} and {shape[pos2]}"
+            )
+
         dim_size = shape[pos1]
-        
+
         # Move pos1 and pos2 to the end
         # Permutation: All other indices + pos1 + pos2
         other_indices = [i for i in range(len(shape)) if i != pos1 and i != pos2]
         perm = other_indices + [pos1, pos2]
-        
+
         current_operand = ctx.build_op(
-            "transpose", [current_operand], 
-            tuple(shape[i] for i in perm), 
-            current_operand.dtype, 
-            {"permutation": perm}
+            "transpose",
+            [current_operand],
+            tuple(shape[i] for i in perm),
+            current_operand.dtype,
+            {"permutation": perm},
         )
-        
+
         # Now shape is (..., N, N)
         # Create Identity Mask (N, N)
         # iota dimension 0
-        iota0 = ctx.build_op("iota", [], (dim_size, dim_size), "int32", {"iota_dimension": 0})
+        iota0 = ctx.build_op(
+            "iota", [], (dim_size, dim_size), "int32", {"iota_dimension": 0}
+        )
         # iota dimension 1
-        iota1 = ctx.build_op("iota", [], (dim_size, dim_size), "int32", {"iota_dimension": 1})
-        
+        iota1 = ctx.build_op(
+            "iota", [], (dim_size, dim_size), "int32", {"iota_dimension": 1}
+        )
+
         # Mask = (iota0 == iota1)
-        pred = ctx.build_op("compare", [iota0, iota1], (dim_size, dim_size), np.bool_, {"comparison_direction": "EQ"})
-        
+        pred = ctx.build_op(
+            "compare",
+            [iota0, iota1],
+            (dim_size, dim_size),
+            np.bool_,
+            {"comparison_direction": "EQ"},
+        )
+
         # Convert to dtype
-        mask = ctx.build_op("convert", [pred], (dim_size, dim_size), current_operand.dtype, {})
-        
+        mask = ctx.build_op(
+            "convert", [pred], (dim_size, dim_size), current_operand.dtype, {}
+        )
+
         # Broadcast mask to matches current_operand magnitude
         # Mask has shape (N, N). Operand has (..., N, N).
         # We broadcast mask to operands shape.
         # Dimensions to broadcast are the '...' ones (0 to len-3).
         # We map the mask dimensions [0, 1] to Result dimensions [rank-2, rank-1].
-        
+
         rank = len(current_operand.shape)
         mask_broadcast = ctx.build_op(
-            "broadcast", [mask], current_operand.shape, current_operand.dtype,
-            {"broadcast_dimensions": [rank-2, rank-1]}
+            "broadcast",
+            [mask],
+            current_operand.shape,
+            current_operand.dtype,
+            {"broadcast_dimensions": [rank - 2, rank - 1]},
         )
-        
+
         # Multiply
-        masked_op = ctx.build_op("multiply", [current_operand, mask_broadcast], current_operand.shape, current_operand.dtype)
-        
+        masked_op = ctx.build_op(
+            "multiply",
+            [current_operand, mask_broadcast],
+            current_operand.shape,
+            current_operand.dtype,
+        )
+
         # Reduce sum over the last dimension (pos2) - which is now at rank-1
         # Reduce dims: [rank-1]
         # Init value for add: 0.0
         init_val = as_hlo_tensor(ctx, 0.0, current_operand.dtype)
-        
+
         reduced_shape = current_operand.shape[:-1]
         current_operand = ctx.build_op(
-            "reduce", [masked_op, init_val], reduced_shape, current_operand.dtype,
-            {"dimensions": [rank-1], "computation": "add"}
+            "reduce",
+            [masked_op, init_val],
+            reduced_shape,
+            current_operand.dtype,
+            {"dimensions": [rank - 1], "computation": "add"},
         )
-        
+
         # Update spec
         # We removed the char at pos2 (which was moved to end).
         # The char at pos1 (which was moved to rank-2) is now at rank-1 (end).
         # The other chars are at 0 ... rank-2.
         # So new spec order is: [others] + [idx].
-        
+
         new_spec_list = [current_spec[i] for i in other_indices] + [idx]
         current_spec = new_spec_list
-        
-    return current_operand, "".join(current_spec)
 
+    return current_operand, "".join(current_spec)
 
 
 def _einsum_unary(ctx, operand, input_spec, output_spec, analysis):
@@ -374,17 +403,17 @@ def _einsum_unary(ctx, operand, input_spec, output_spec, analysis):
     # output_dims contains (idx, original_pos, size)
     # The 'operand' tensor currently has these dimensions in the order they appeared in input_spec (minus reduced ones).
     # XLA Reduce preserves relative order of remaining dimensions.
-    
+
     current_indices = [idx for idx, _, _ in output_dims]
-    
+
     # If there are dimensions to reduce
     if dims_to_reduce:
-        # The shape expected by reduce op is the shape of the RESULT of reduction? 
-        # Or the shape of the operands? 
+        # The shape expected by reduce op is the shape of the RESULT of reduction?
+        # Or the shape of the operands?
         # Usually XLA build_op('reduce') might take output shape?
         # If so, it should match the input-ordered result (since no transpose happens during reduce).
         reduced_shape = tuple(size for _, _, size in output_dims)
-        
+
         init_tensor = as_hlo_tensor(ctx, 0.0, operand.dtype)
         operand = ctx.build_op(
             "reduce",
@@ -404,13 +433,15 @@ def _einsum_unary(ctx, operand, input_spec, output_spec, analysis):
         # Current tensor has dims in `current_indices` order.
         # We need to mapp `current_indices` -> `output_spec`.
         # Transpose perm[i] is the index in input that maps to output[i].
-        
+
         try:
             perm = [current_indices.index(idx) for idx in output_spec]
         except ValueError as e:
             # Should not happen if analysis is correct
-            raise RuntimeError(f"Internal einsum error: indices mismatch {current_indices} vs {output_spec}") from e
-            
+            raise RuntimeError(
+                f"Internal einsum error: indices mismatch {current_indices} vs {output_spec}"
+            ) from e
+
         transposed_shape = tuple(operand.shape[i] for i in perm)
         operand = ctx.build_op(
             "transpose",

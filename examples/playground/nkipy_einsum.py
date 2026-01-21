@@ -1,6 +1,6 @@
 import numpy as np
 from nkipy.core.trace import NKIPyKernel
-from nkipy.runtime.execute import simulate_traced_kernel, baremetal_run_traced_kernel
+from nkipy.runtime.execute import baremetal_run_traced_kernel, simulate_traced_kernel
 
 print("=" * 80)
 print("EINSUM OPERATION TESTS")
