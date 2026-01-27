@@ -96,28 +96,8 @@ def download_and_convert_qwen3_weights(
     # Save tokenizer
     tokenizer.save_pretrained(output_dir)
 
-    # Save config info
-    config_info = {
-        "model_name": model_name,
-        "hidden_size": model.config.hidden_size,
-        "num_hidden_layers": model.config.num_hidden_layers,
-        "num_attention_heads": model.config.num_attention_heads,
-        "num_key_value_heads": model.config.num_key_value_heads,
-        "intermediate_size": model.config.intermediate_size,
-        "vocab_size": model.config.vocab_size,
-        "max_position_embeddings": model.config.max_position_embeddings,
-        "rms_norm_eps": model.config.rms_norm_eps,
-        "rope_theta": model.config.rope_theta,
-    }
-
-    import json
-
-    with open(os.path.join(output_dir, "model_config.json"), "w") as f:
-        json.dump(config_info, f, indent=2)
-
     print(f"Weights saved to {output_path}")
     print(f"Tokenizer saved to {output_dir}")
-    print(f"Config saved to {os.path.join(output_dir, 'model_config.json')}")
 
     # Print weight shapes for verification
     print("Weight shapes:")
