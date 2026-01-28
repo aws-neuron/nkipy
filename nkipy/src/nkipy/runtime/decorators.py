@@ -1,9 +1,10 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 import functools
+from typing import Optional
 
 from nkipy.core import compile
-from nkipy.core.compile import trace
+from nkipy.core.compile import CompilerConfig, trace
 from nkipy.runtime.execute import baremetal_run_traced_kernel, simulate_traced_kernel
 
 
@@ -45,6 +46,7 @@ def simulate_jit(kernel_func):
 def baremetal_jit(
     kernel_func=None,
     *,
+    compiler_config: Optional[CompilerConfig] = None,
     additional_compiler_args="",
     target=compile.CompilationTarget.DEFAULT,
 ):
@@ -56,7 +58,11 @@ def baremetal_jit(
 
     Args:
         kernel_func: The kernel function to decorate (when used without parentheses)
-        additional_compiler_args: Additional arguments to pass to the compiler
+        compiler_config: Structured compiler configuration (recommended).
+            Use CompilerConfig.for_nkipy() or CompilerConfig.for_nki() for presets.
+        additional_compiler_args: Additional arguments to pass to the compiler (legacy).
+            If both compiler_config and additional_compiler_args are provided,
+            additional_compiler_args will be appended to the config's args.
         target: Compilation target (default: CompilationTarget.DEFAULT)
 
     Returns:
@@ -70,8 +76,13 @@ def baremetal_jit(
         # Compiles on first call with this signature
         result = my_kernel(input_a, input_b)
 
-        # Or with compiler args:
-        @baremetal_jit(additional_compiler_args="--lnc 1")
+        # With structured config (recommended):
+        @baremetal_jit(compiler_config=CompilerConfig.for_nkipy(model_type="transformer"))
+        def my_kernel(A, B):
+            return A @ B
+
+        # Legacy string args (still supported):
+        @baremetal_jit(additional_compiler_args="--model-type transformer")
         def my_kernel(A, B):
             return A @ B
     """
@@ -85,6 +96,7 @@ def baremetal_jit(
             return baremetal_run_traced_kernel(
                 traced_kernel,
                 *args,
+                compiler_config=compiler_config,
                 additional_compiler_args=additional_compiler_args,
                 target=target,
                 **kwargs,
