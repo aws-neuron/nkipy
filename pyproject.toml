@@ -29,7 +29,14 @@ test = [
     "ruff",
     "mypy",
 ]
-examples = ["torch", "ipython", "transformers", "argparse", "safetensors"]
+examples = [
+    "torch",
+    "ipython",
+    "transformers",
+    "argparse",
+    "safetensors",
+    "accelerate",
+]
 docs = [
     "sphinx",
     "sphinx-book-theme",

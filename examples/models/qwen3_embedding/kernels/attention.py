@@ -22,7 +22,7 @@ def qwen3_attention_kernel(
     Simplified attention for Qwen3 (no TP, no sliding window, no bias, prefill only)
 
     Args:
-        hidden_states: [batch_size * seq_len, hidden_size]
+        hidden_states: [batch_size,  seq_len, hidden_size]
         input_layernorm_weight: [hidden_size]
         qkv_weight: [hidden_size, (n_heads + 2*n_kv_heads) * head_dim]
         o_weight: [(n_heads * head_dim), hidden_size]
@@ -34,12 +34,14 @@ def qwen3_attention_kernel(
         compute_dtype: computation dtype
 
     Returns:
-        output: [batch_size * seq_len, hidden_size]
+        output: [batch_size, seq_len, hidden_size]
     """
-    # Store original dtype
     original_dtype = hidden_states.dtype
+    batch_size, seq_len, hidden_size = hidden_states.shape
+    assert hidden_size == config.hidden_size, (
+        f"Hidden size mismatch: {hidden_size} != {config.hidden_size}"
+    )
 
-    # Cast to compute dtype
     hidden_states = hidden_states.astype(compute_dtype)
     qkv_weight = qkv_weight.astype(compute_dtype)
     o_weight = o_weight.astype(compute_dtype)
@@ -47,23 +49,11 @@ def qwen3_attention_kernel(
     # Store original for residual
     residual = hidden_states
 
-    # 1. RMSNorm
     hidden_states = rmsnorm(hidden_states, input_layernorm_weight, config.rms_norm_eps)
 
-    # Infer actual batch_size and seq_len from input shape
-    # Input is [batch_size * seq_len, hidden_size]
-    total_tokens = hidden_states.shape[0]
-    # For now, assume batch_size=1 (can be extended later)
-    batch_size = 1
-    seq_len = total_tokens // batch_size
-
-    # Reshape to [batch_size, seq_len, hidden_size]
-    hidden_states = hidden_states.reshape(batch_size, seq_len, config.hidden_size)
-
-    # 2. QKV projection (no bias for Qwen3)
+    # no bias for Qwen3
     qkv = hidden_states @ qkv_weight
 
-    # 3. Split Q, K, V
     n_heads = config.num_attention_heads
     n_kv_heads = config.num_key_value_heads
     head_dim = config.head_dim
@@ -72,56 +62,44 @@ def qwen3_attention_kernel(
     split1 = split0 + n_kv_heads * head_dim
     q, k, v = np.split(qkv, [split0, split1], axis=-1)
 
-    # Reshape: [batch_size, seq_len, n_heads, head_dim]
     q = q.reshape(batch_size, seq_len, n_heads, head_dim)
     k = k.reshape(batch_size, seq_len, n_kv_heads, head_dim)
     v = v.reshape(batch_size, seq_len, n_kv_heads, head_dim)
 
-    # 4. Apply Q and K normalization before RoPE
     q = rmsnorm(q, q_norm_weight, config.rms_norm_eps)
     k = rmsnorm(k, k_norm_weight, config.rms_norm_eps)
 
-    # 5. Apply RoPE
     q, k = rope_qwen3(q, k, cos, sin)
 
-    # 5. Repeat K, V for GQA (n_heads / n_kv_heads times)
+    # Repeat K, V for GQA (n_heads / n_kv_heads times)
     n_rep = n_heads // n_kv_heads
     if n_rep > 1:
         k = np.repeat(k, n_rep, axis=2)
         v = np.repeat(v, n_rep, axis=2)
 
-    # 6. Transpose for attention: [batch_size, n_heads, seq_len, head_dim]
+    # [batch_size, n_heads, seq_len, head_dim]
     q = q.transpose(0, 2, 1, 3)
     k = k.transpose(0, 2, 1, 3)
     v = v.transpose(0, 2, 1, 3)
 
-    # 7. Compute attention scores
     scores = (q @ k.transpose(0, 1, 3, 2)) / np.sqrt(head_dim)
     scores = scores.astype(compute_dtype)
 
-    # 8. Apply causal mask
     causal_mask = np.triu(np.ones((seq_len, seq_len)) * -10000.0, k=1).astype(
         compute_dtype
     )
     scores = scores + causal_mask[None, None, :, :]
 
-    # 9. Softmax
     attn_weights = softmax(scores)
 
-    # 10. Apply attention to values
     attn_output = (attn_weights @ v).astype(compute_dtype)
 
-    # 11. Transpose back and reshape: [batch_size, seq_len, n_heads, head_dim]
     attn_output = attn_output.transpose(0, 2, 1, 3)
     attn_output = attn_output.reshape(batch_size, seq_len, n_heads * head_dim)
 
-    # 12. Output projection (no bias for Qwen3)
+    # no bias for Qwen3
     output = attn_output @ o_weight
 
-    # 13. Reshape back to [batch_size * seq_len, hidden_size]
-    output = output.reshape(batch_size * seq_len, config.hidden_size)
-
-    # 14. Add residual
     output = output + residual
 
     return output.astype(original_dtype)

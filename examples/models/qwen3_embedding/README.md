@@ -1,44 +1,64 @@
 # Qwen3-Embedding on Trainium
 
-A clean, simple implementation of Qwen3-Embedding-*B for AWS Trainium accelerators.
+A clean implementation of Qwen3-Embedding (0.6B and 8B) for AWS Trainium.
 
 ## Quick Start
 
-Directly run test script (cleans cache, checks weights, runs example)
-`bash test.sh`
+```bash
+# Run test script (cleans cache, checks weights, runs example)
+bash test.sh
 
-Or, run the two steps manually
+# Or run manually:
+python prepare_weights.py          # Download and convert weights
+python example_retrieval.py        # Run retrieval example
+```
+
+## Usage
 
 ```bash
-# 1. Download and convert weights (one-time setup)
-python prepare_weights.py
-
-# 2. Run retrieval example
+# Basic retrieval example (0.6B model)
 python example_retrieval.py
+
+# Use 8B model
+python example_retrieval.py --model-size 8b
+
+# Run performance benchmark
+python example_retrieval.py --benchmark
+
+# Compare with HuggingFace (verify correctness)
+python example_retrieval.py --compare
+
+# Custom sequence length
+python example_retrieval.py --seq-len 512
+
+# Use LNC=1 (single NeuronCore)
+python example_retrieval.py --lnc 1
+
+# Use separate kernels instead of fused (for debugging)
+python example_retrieval.py --no-fused
 ```
 
-Or to compare with huggingface example. This compares embeddings between Trainium and HuggingFace implementations. Expected cosine similarity: >0.99
+## Performance Tips
 
+Enable async execution for better throughput:
 ```bash
-python compare.py
+export NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS=16
 ```
+
+Note: LNC (Logical NeuronCore) is set at compile time via `--lnc` flag, not via `NEURON_LOGICAL_NC_CONFIG` at runtime.
 
 ## Modifying the Code
 
-**Note:** Changing code requires recompiling kernels:
+After changing code, clean the kernel cache:
 ```bash
-rm -rf /tmp/build/qwen3_*
+rm -rf build/
 ```
 
-### To change sequence length:
-1. Edit `max_model_len` in `config.py`
-2. Clean cache: `rm -rf /tmp/build/qwen3_*`
-3. Run your code (kernels will recompile)
+## Files
 
-### To add custom pooling:
-1. Add your pooling function to `embedding_utils.py`
-2. Update `model.py` to use it in the `forward()` method
-
-### To modify kernels:
-1. Edit files in `kernels/` directory
-2. Clean cache to force recompilation
+- `example_retrieval.py` - Main script with retrieval, benchmark, and compare modes
+- `config.py` - Model configurations (0.6B and 8B)
+- `model.py` - Trainium model implementation
+- `prepare_weights.py` - Weight download and conversion
+- `kernels/` - NKI kernel implementations
+- `layer.py` - Alternative implementation using separate kernels (for debugging)

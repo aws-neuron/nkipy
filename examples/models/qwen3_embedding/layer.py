@@ -1,4 +1,9 @@
-"""Qwen3 transformer layer using shared kernels"""
+"""
+Qwen3 transformer layer using separate kernels.
+
+This module provides an ALTERNATIVE implementation that uses separate kernels
+for attention, RMSNorm, and FFN operations instead of the fused transformer
+layer kernel."""
 
 import numpy as np
 from config import Qwen3Config
@@ -6,10 +11,8 @@ from nkipy.runtime import DeviceKernel, DeviceTensor
 
 
 class Qwen3Layer:
-    """
-    Single transformer layer for Qwen3.
+    """Single transformer layer using separate kernels.
 
-    Uses shared kernels (compiled once at model level) with layer-specific weights.
     Each layer performs:
     1. Attention block (with input norm and residual)
     2. FFN block (with post-attention norm and residual)
@@ -39,7 +42,7 @@ class Qwen3Layer:
         self.layer_id = layer_id
         self.config = config
 
-        # Store layer-specific weights
+        # Layer-specific weights
         self.qkv_weight = qkv_weight
         self.q_norm_weight = q_norm_weight
         self.k_norm_weight = k_norm_weight
@@ -49,16 +52,16 @@ class Qwen3Layer:
         self.gate_up_weight = gate_up_weight
         self.down_weight = down_weight
 
-        # Store RoPE tables
+        # RoPE tables
         self.cos = cos
         self.sin = sin
 
-        # Store references to shared kernels
+        # Shared kernels
         self.attention_kernel = shared_attention_kernel
         self.rmsnorm_kernel = shared_rmsnorm_kernel
         self.ffn_kernel = shared_ffn_kernel
 
-        # Create zero bias tensors (Qwen3 doesn't use bias)
+        # Zero bias tensors (Qwen3 doesn't use bias)
         self.gate_up_bias = DeviceTensor.from_numpy(
             np.zeros(2 * config.intermediate_size, dtype=config.dtype),
             f"gate_up_bias_zero_L{layer_id}",
@@ -69,18 +72,17 @@ class Qwen3Layer:
         )
 
     def forward(self, hidden_states: DeviceTensor) -> DeviceTensor:
-        """
-        Forward pass through the layer.
+        """Forward pass through the layer.
 
         Args:
-            hidden_states: [batch_size * seq_len, hidden_size]
+            hidden_states: [batch_size, seq_len, hidden_size]
 
         Returns:
-            hidden_states: [batch_size * seq_len, hidden_size]
+            hidden_states: [batch_size, seq_len, hidden_size]
         """
-        from model import OUTPUT_PREFIX
+        OUTPUT_PREFIX = "output"
 
-        # 1. Attention block (includes input norm and residual connection)
+        # 1. Attention block (includes input norm and residual)
         attn_output = DeviceTensor.from_numpy(
             np.empty_like(hidden_states.numpy()), f"attn_output_L{self.layer_id}"
         )
@@ -101,7 +103,7 @@ class Qwen3Layer:
 
         hidden_states = attn_output
 
-        # 2. FFN block with residual connection
+        # 2. FFN block with residual
         residual = hidden_states
 
         # Post-attention normalization

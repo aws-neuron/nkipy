@@ -1,7 +1,6 @@
-"""Qwen3 Embedding Model for Trainium"""
+"""Qwen3 Embedding Model for Trainium."""
 
-from .config import Qwen3Config
-from .config_8b import Qwen3Config_8B
+from .config import QWEN3_0_6B_CONFIG, QWEN3_8B_CONFIG, Qwen3Config, get_config
 from .embedding_utils import (
     get_detailed_instruct,
     last_token_pool,
@@ -11,9 +10,11 @@ from .model import Qwen3EmbeddingModel
 from .prepare_weights import download_and_convert_qwen3_weights, load_qwen3_weights
 
 __all__ = [
-    # Configs
+    # Config
     "Qwen3Config",
-    "Qwen3Config_8B",
+    "QWEN3_0_6B_CONFIG",
+    "QWEN3_8B_CONFIG",
+    "get_config",
     # Model
     "Qwen3EmbeddingModel",
     # Weight utilities
