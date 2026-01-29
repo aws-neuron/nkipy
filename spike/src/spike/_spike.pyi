@@ -70,6 +70,14 @@ class NrtTensor:
     def name(self) -> str:
         """Tensor name"""
 
+    @property
+    def ptr(self) -> int:
+        """Raw nrt_tensor_t pointer as integer"""
+
+    @staticmethod
+    def wrap(ptr: int, core_id: int, size: int, name: str = "") -> NrtTensor:
+        """Create non-owning wrapper around existing nrt_tensor_t*"""
+
 class NrtModel:
     @property
     def neff_path(self) -> str:

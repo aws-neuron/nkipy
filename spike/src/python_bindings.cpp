@@ -9,6 +9,7 @@
 #include <nanobind/stl/unordered_map.h>
 #include <nanobind/stl/vector.h>
 
+#include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <sstream>
@@ -85,7 +86,16 @@ NB_MODULE(_spike, m) {
   nb::class_<NrtTensor>(m, "NrtTensor")
       .def_prop_ro("core_id", &NrtTensor::get_core_id, "Logical NeuronCore ID")
       .def_prop_ro("size", &NrtTensor::get_size, "Tensor size in bytes")
-      .def_prop_ro("name", &NrtTensor::get_name, "Tensor name");
+      .def_prop_ro("name", &NrtTensor::get_name, "Tensor name")
+      .def_prop_ro("ptr", [](const NrtTensor &t) {
+          return reinterpret_cast<uintptr_t>(t.get_ptr());
+      }, "Raw nrt_tensor_t pointer as integer")
+      .def_static("wrap", [](uintptr_t ptr, uint32_t core_id, size_t size,
+                            const std::string &name) {
+          return NrtTensor::wrap(reinterpret_cast<nrt_tensor_t*>(ptr),
+                                 core_id, size, name);
+      }, "ptr"_a, "core_id"_a, "size"_a, "name"_a = "",
+         "Create non-owning wrapper around existing nrt_tensor_t*");
 
   // NrtModel class
   nb::class_<NrtModel>(m, "NrtModel")

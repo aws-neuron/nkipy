@@ -41,6 +41,18 @@ NrtTensor::NrtTensor(const NrtTensor &source, size_t offset, size_t size,
 
 NrtTensor::~NrtTensor() { free(); }
 
+// Private constructor for non-owning wrapper
+NrtTensor::NrtTensor(nrt_tensor_t *ptr, uint32_t core_id, size_t size,
+                     const std::string &name)
+    : ptr_(ptr), core_id_(core_id), name_(name), size_(size),
+      spike_(nullptr) {} // nullptr = non-owning, won't free in destructor
+
+// Static factory for non-owning wrapper
+NrtTensor NrtTensor::wrap(nrt_tensor_t *ptr, uint32_t core_id, size_t size,
+                          const std::string &name) {
+  return NrtTensor(ptr, core_id, size, name);
+}
+
 NrtTensor::NrtTensor(NrtTensor &&other) noexcept
     : ptr_(other.ptr_), core_id_(other.core_id_), name_(std::move(other.name_)),
       size_(other.size_), spike_(other.spike_) {
