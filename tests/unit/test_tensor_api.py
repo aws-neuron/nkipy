@@ -303,6 +303,37 @@ def test_reduction(sim_mode, np_fn, shape, dtype, axis):
         baremetal_assert_allclose(out1, out_baremetal)
 
 
+def test_multiple_sum_different_dtypes(sim_mode):
+    """Test multiple np.sum calls with different dtypes.
+
+    Regression test for: "Computation name is not unique: add_computation"
+    This bug occurred when multiple reduce operations with different dtypes
+    were used in the same kernel, causing duplicate HLO computation names.
+    """
+
+    def kernel(a):
+        sum_f32 = np.sum(a.astype(np.float32), axis=-1, keepdims=True)
+        sum_f16 = np.sum(a.astype(np.float16), axis=-1, keepdims=True)
+        return sum_f32, sum_f16
+
+    shape = (32, 64)
+    np.random.seed(0)
+    a = np.random.random_sample(shape).astype(np.float32)
+
+    out_f32, out_f16 = simulate_kernel_unified(kernel, sim_mode, a)
+
+    expected_f32 = np.sum(a.astype(np.float32), axis=-1, keepdims=True)
+    expected_f16 = np.sum(a.astype(np.float16), axis=-1, keepdims=True)
+
+    simulate_assert_allclose(out_f32, expected_f32)
+    simulate_assert_allclose(out_f16, expected_f16)
+
+    if NEURON_AVAILABLE:
+        out_baremetal = baremetal_run_kernel_unified(kernel, sim_mode, a)
+        baremetal_assert_allclose(expected_f32, out_baremetal[0])
+        baremetal_assert_allclose(expected_f16, out_baremetal[1])
+
+
 @pytest.mark.parametrize("np_fn", [np.mean, np.max, np.min, np.sum])
 @pytest.mark.parametrize(
     "shape,dtype",

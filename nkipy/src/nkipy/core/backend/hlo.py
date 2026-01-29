@@ -512,14 +512,14 @@ class HLOModule:
         """Create a binary sub-computation (for reduce/scatter operations)."""
 
         comp = module_proto.computations.add()
-        comp.name = f"{name_prefix}_computation"
+        comp.name = f"{name_prefix}_{dtype_key}_computation"
         comp.id = next_comp_id
         computation_map[(name_prefix, dtype_key)] = next_comp_id
 
         # Add lhs parameter
         lhs = comp.instructions.add()
         lhs.id = next_instr_id
-        lhs.name = f"{name_prefix}_lhs"
+        lhs.name = f"{name_prefix}_{dtype_key}_lhs"
         lhs.opcode = "parameter"
         lhs.parameter_number = 0
         lhs.shape.CopyFrom(_make_shape_proto((), result_dtype))
@@ -528,7 +528,7 @@ class HLOModule:
         # Add rhs parameter
         rhs = comp.instructions.add()
         rhs.id = next_instr_id
-        rhs.name = f"{name_prefix}_rhs"
+        rhs.name = f"{name_prefix}_{dtype_key}_rhs"
         rhs.opcode = "parameter"
         rhs.parameter_number = 1
         rhs.shape.CopyFrom(_make_shape_proto((), result_dtype))
@@ -537,7 +537,7 @@ class HLOModule:
         # Add result operation
         result = comp.instructions.add()
         result.id = next_instr_id
-        result.name = f"{name_prefix}_result"
+        result.name = f"{name_prefix}_{dtype_key}_result"
         result.opcode = result_opcode
         result.shape.CopyFrom(_make_shape_proto((), result_dtype))
 
