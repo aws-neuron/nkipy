@@ -8,7 +8,7 @@ requires-python = ">=3.10"
 dependencies = ["nkipy"]
 
 [tool.uv.workspace]
-members = ["nkipy", "spike"]
+members = ["nkipy", "spike", "spike-torch", "torch-to-nkipy"]
 
 [[tool.uv.index]]
 name = "neuron"
@@ -17,7 +17,9 @@ explicit = true
 
 [tool.uv.sources]
 spike = { workspace = true }
+spike-torch = { workspace = true }
 nkipy = { workspace = true }
+torch-to-nkipy = { workspace = true }
 
 [dependency-groups]
 dev = ["spike"]
@@ -44,6 +46,15 @@ docs = [
     "myst-nb",
     "sphinx-autodoc-typehints",
 ]
+torch-to-nkipy = [
+    "torch-to-nkipy",
+    "torch==2.8.0",
+    "torchaudio>=2.7.0",
+    "torchvision>=0.22.0",
+    "transformers==4.56.1",
+    "tabulate",
+    "sentencepiece",
+]
 
 [tool.ruff]
 line-length = 88
@@ -52,11 +63,14 @@ exclude = ["build", "third-party"]
 [tool.ruff.lint]
 select = ["E", "F", "I"]
 
+[tool.ruff.lint.isort]
+known-first-party = ["nkipy", "spike", "spike_torch", "torch_to_nkipy"]
+
 [tool.ruff.format]
 quote-style = "double"
 
 [tool.pytest.ini_options]
-testpaths = ["tests", "spike/tests"]
+testpaths = ["tests", "spike/tests", "torch-to-nkipy/tests"]
 
 [tool.mypy]
 warn_return_any = true
@@ -68,7 +82,7 @@ module = "neuronxcc.*"
 ignore_missing_imports = true
 
 [tool.coverage.run]
-source = ["nkipy/src/nkipy", "spike/src/spike"]
+source = ["nkipy/src/nkipy", "spike/src/spike", "spike-torch/src/spike_torch", "torch-to-nkipy/src/torch_to_nkipy"]
 branch = true
 
 [tool.coverage.report]

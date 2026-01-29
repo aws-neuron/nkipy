@@ -22,6 +22,11 @@ public:
             const std::string &name);
   ~NrtTensor();
 
+  // Static factory for non-owning wrapper around existing nrt_tensor_t*
+  // Used by spike-torch to create wrappers for PyTorch tensors
+  static NrtTensor wrap(nrt_tensor_t *ptr, uint32_t core_id, size_t size,
+                        const std::string &name = "");
+
   // Getters (read-only properties for Python)
   nrt_tensor_t *get_ptr() const { return ptr_; }
   uint32_t get_core_id() const { return core_id_; }
@@ -44,6 +49,10 @@ public:
   void free();
 
 private:
+  // Private constructor for wrap() - creates non-owning wrapper
+  NrtTensor(nrt_tensor_t *ptr, uint32_t core_id, size_t size,
+            const std::string &name);
+
   nrt_tensor_t *ptr_;
   uint32_t core_id_;
   uint64_t size_;

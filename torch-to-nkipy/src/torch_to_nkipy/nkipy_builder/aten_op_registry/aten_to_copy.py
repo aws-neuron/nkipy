@@ -1,0 +1,44 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import torch.fx as fx
+
+from torch_to_nkipy.nkipy_builder.aten_op_registry.base import AtenOpRegistry
+from torch_to_nkipy.nkipy_builder.nkipy_ast import ComputationNode
+from torch_to_nkipy.utils.dtype import torch_to_numpy_dtype_str
+
+
+@AtenOpRegistry.register("torch.ops.aten._to_copy.default")
+def _to_copy(node: fx.Node, computation_node: ComputationNode) -> None:
+    """
+    Handle simple type conversion operation.
+
+    Maps PyTorch's tensor.to(dtype=...) to NumPy's astype().
+    Only handles cases where dtype is the only kwarg and there are no other args.
+
+    Args:
+        node: The FX node representing the to() operation
+        computation_node: The ComputationNode to add code to
+
+    Raises:
+        NotImplementedError: If there are additional args or kwargs besides dtype
+    """
+    # Check if this is a simple dtype conversion case
+    if "dtype" not in node.kwargs:
+        raise NotImplementedError(
+            f"Unhandled Node {node} with args {node.args} and kwargs {node.kwargs}"
+        )
+
+    ast_block = computation_node.ast_code_block
+
+    # Get dtype from kwargs and convert to numpy dtype
+    torch_dtype = node.kwargs["dtype"]
+    numpy_dtype = torch_to_numpy_dtype_str(torch_dtype)
+
+    # Add the astype operation
+    ast_block.add_call_assignment(
+        target=node.name,
+        pkg_or_obj=node.args[0].name,
+        func="astype",
+        args=[numpy_dtype],
+    )

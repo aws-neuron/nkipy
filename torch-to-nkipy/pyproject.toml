@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "torch-to-nkipy"
+version = "0.1.0"
+description = "PyTorch extension for AWS Neuron devices using NKIPy"
+requires-python = ">=3.10"
+authors = [{ name = "Neuron Science Team (Mason Fu, Yuan Zhou et al.)" }]
+dependencies = [
+    "spike",
+    "spike-torch",
+    "nkipy",
+    "torch",
+]

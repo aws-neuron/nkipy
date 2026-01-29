@@ -1,0 +1,34 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[project]
+name = "spike_torch"
+version = "0.1.0"
+description = "PyTorch device integration for spike runtime on AWS Neuron"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+dependencies = [
+    # TODO: Remove version pin when torch-to-nkipy migrates to use spike-torch
+    "torch==2.8.0",
+    "spike",
+]
+
+[build-system]
+# TODO: Remove version pin when torch-to-nkipy migrates to use spike-torch
+requires = ["setuptools>=61.0", "wheel", "torch==2.8.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["spike_torch"]
+package-dir = {"" = "src"}
+
+[tool.ruff]
+line-length = 88
+exclude = ["build"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.ruff.format]
+quote-style = "double"
