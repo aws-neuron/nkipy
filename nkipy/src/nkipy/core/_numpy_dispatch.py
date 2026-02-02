@@ -90,6 +90,9 @@ def register_all_numpy_apis():
     # Linear algebra
     _register_numpy_api(np.matmul, ops.matmul)
 
+    # Einstein summation
+    _register_numpy_api(np.einsum, ops.einsum)
+
     # Transform operations
     _register_numpy_api(np.reshape, ops.reshape)
     _register_numpy_api(np.transpose, ops.transpose)
