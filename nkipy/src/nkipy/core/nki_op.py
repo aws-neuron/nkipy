@@ -199,7 +199,26 @@ def _generate_nki_custom_call(kernel, *args, **kwargs):
     """Generate HLO custom-call for an NKI kernel during NKIPy tracing."""
     _patch_nkipy_methods(kernel)
 
-    with kernel.bind_arguments(*args, **kwargs) as boundargs:
+    # Convert NKIPyTensorRef to empty numpy arrays for NKI specialization
+    # Especially important for NKI Beta2 frontend
+    # which doesn't support NKIPyTensorRef during specialize
+    numpy_args = []
+    for arg in args:
+        if isinstance(arg, NKIPyTensorRef):
+            # Create empty numpy array with same shape/dtype
+            numpy_args.append(np.empty(arg.shape, dtype=arg.dtype))
+        else:
+            # Maybe numpy or non-tensor args
+            numpy_args.append(arg)
+
+    numpy_kwargs = {}
+    for key, value in kwargs.items():
+        if isinstance(value, NKIPyTensorRef):
+            numpy_kwargs[key] = np.empty(value.shape, dtype=value.dtype)
+        else:
+            numpy_kwargs[key] = value
+
+    with kernel.bind_arguments(*numpy_args, **numpy_kwargs) as boundargs:
         config = kernel.dump_config_with_boundargs(boundargs)
 
     operands = [arg for arg in args if isinstance(arg, (NKIPyTensorRef, np.ndarray))]
