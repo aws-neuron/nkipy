@@ -17,6 +17,7 @@ from transformers import AutoTokenizer
 from utils import print_log
 
 BUILD_DIR = "./build"
+USE_NKI_RMSNORM = True
 
 
 class Qwen3Model:
@@ -213,6 +214,7 @@ class Qwen3Model:
             norm_weight=self.norm_weight,
             lm_head_weight=self.lm_head_weight,
             configs=self.config,
+            use_nki_rmsnorm=USE_NKI_RMSNORM,
             build_dir=BUILD_DIR,
         )
 
@@ -245,6 +247,7 @@ class Qwen3Model:
             norm_weight=self.norm_weight,
             lm_head_weight=self.lm_head_weight,
             configs=self.config,
+            use_nki_rmsnorm=USE_NKI_RMSNORM,
             build_dir=BUILD_DIR,
         )
 
