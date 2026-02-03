@@ -30,7 +30,7 @@ import torch
 from nkipy.core.compile import compile_to_neff, trace
 from spike import SpikeModel
 from torch_to_nkipy.backend.nkipy_backend_config import get_nkipy_backend_config
-from torch_to_nkipy.device import nkipy_execute_model, nkipy_load_model, nkipy_profile
+from torch_to_nkipy.device import load_spike_model, nkipy_profile, spike_execute
 from torch_to_nkipy.utils.dtype import meta_tensor_to_numpy, numpy_to_torch_dtype
 from torch_to_nkipy.utils.graph import load_func_from_file
 from torch_to_nkipy.utils.name import (
@@ -166,8 +166,8 @@ def compile_load_execute(
         )
 
     # Second phase: Execute the loaded model with provided inputs (with profiling)
-    with torch.profiler.record_function(f"nkipy_execute_model {kernel_hash}"):
-        output_tensors = execute_model(
+    with torch.profiler.record_function(f"run_neff_model {kernel_hash}"):
+        output_tensors = run_neff_model(
             nkipy_model=neuron_executable.nkipy_model,
             io_specs=neuron_executable.io_specs,
             neff_path=neuron_executable.neff_path,
@@ -213,7 +213,7 @@ def load_model(
         # Load the compiled model into the Neuron runtime
         config = get_nkipy_backend_config()
         logger.info(f"Rank {config.rank}: loading from {neff_path}...")
-        nkipy_model = nkipy_load_model(
+        nkipy_model = load_spike_model(
             neff_file=str(neff_path),
             # Enable collective communication for distributed execution
             cc_enabled=config.world_size > 1,
@@ -436,7 +436,7 @@ def in_parallel_compile_context():
     return _in_parallel_compile_context.get()
 
 
-def execute_model(
+def run_neff_model(
     nkipy_model: SpikeModel,
     args: Tuple[torch.Tensor, ...],
     alias_map: Dict[int, int],
@@ -446,7 +446,7 @@ def execute_model(
     ntff_meta: NtffMeta,
 ) -> List[torch.Tensor]:
     """
-    Execute a compiled model on Neuron hardware with the given inputs.
+    Execute a compiled NEFF model on Neuron hardware with the given inputs.
 
     This function handles the complex task of:
     1. Mapping input tensors to their Neuron runtime counterparts
@@ -495,7 +495,7 @@ def execute_model(
 
     with nkipy_profile(ntff_meta, neff_path) as (save_trace, ntff_name):
         # Execute the model on Neuron hardware
-        nkipy_execute_model(
+        spike_execute(
             model=nkipy_model,
             inputs=neff_input_dict,
             outputs=neff_output_dict,
@@ -508,3 +508,7 @@ def execute_model(
 
     # Return only the newly allocated output tensors
     return dynamo_output_tensors
+
+
+# Backward compatibility alias
+execute_model = run_neff_model
