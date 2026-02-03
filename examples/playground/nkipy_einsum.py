@@ -121,9 +121,9 @@ run_test(einsum_transpose, A)
 
 
 # =============================================================================
-# 8. Sum Along Axis
+# 7. Sum Along Axis
 # =============================================================================
-print("\n8. Sum Along Axis (ij->i)")
+print("\n7. Sum Along Axis (ij->i)")
 print("-" * 80)
 
 def einsum_sum_axis(A):
@@ -135,25 +135,9 @@ run_test(einsum_sum_axis, A)
 
 
 # =============================================================================
-# 9. Bilinear Form (Quadratic Form)
+# 8. Batched Dot Product
 # =============================================================================
-print("\n9. Bilinear Form (i,ij,j->)")
-print("-" * 80)
-
-def einsum_bilinear(x, A, y):
-    """Compute x^T @ A @ y"""
-    return np.einsum('i,ij,j->', x, A, y)
-
-x = np.array([1, 2], dtype=np.float32)
-A = np.array([[1, 2], [3, 4]], dtype=np.float32)
-y = np.array([5, 6], dtype=np.float32)
-run_test(einsum_bilinear, x, A, y)
-
-
-# =============================================================================
-# 10. Batched Dot Product
-# =============================================================================
-print("\n10. Batched Dot Product (bi,bi->b)")
+print("\n8. Batched Dot Product (bi,bi->b)")
 print("-" * 80)
 
 def einsum_batch_dot(A, B):
@@ -166,9 +150,9 @@ run_test(einsum_batch_dot, A, B)
 
 
 # =============================================================================
-# 11. Tensor Contraction
+# 9. Tensor Contraction
 # =============================================================================
-print("\n11. Tensor Contraction (ijk,jkl->il)")
+print("\n9. Tensor Contraction (ijk,jkl->il)")
 print("-" * 80)
 
 def einsum_tensor_contract(A, B):

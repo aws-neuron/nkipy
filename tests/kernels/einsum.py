@@ -48,12 +48,6 @@ def permute_dims_einsum(A):
 # Reductions
 # =============================================================================
 
-
-def trace_einsum(A):
-    """Matrix trace using einsum: ii->"""
-    return np.einsum('ii->', A)
-
-
 def sum_axis_einsum(A):
     """Sum along axis using einsum: ij->i"""
     return np.einsum('ij->i', A)
@@ -77,11 +71,6 @@ def outer_product_einsum(a, b):
 def dot_product_einsum(a, b):
     """Dot product using einsum: i,i->"""
     return np.einsum('i,i->', a, b)
-
-
-def bilinear_form_einsum(x, A, y):
-    """Bilinear form x^T A y using einsum: i,ij,j->"""
-    return np.einsum('i,ij,j->', x, A, y)
 
 
 # =============================================================================
