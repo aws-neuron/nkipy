@@ -1,3 +1,5 @@
+"""NKIPy Spike Runtime C++ bindings"""
+
 from collections.abc import Mapping
 
 class SpikeRuntimeError(RuntimeError):
@@ -128,7 +130,7 @@ class Spike:
         inputs: Mapping[str, NrtTensor],
         outputs: Mapping[str, NrtTensor],
         ntff_name: str | None = None,
-        save_trace: bool = False,
+        save_trace: bool | None = False,
     ) -> None:
         """Execute a model with given inputs and outputs"""
 
