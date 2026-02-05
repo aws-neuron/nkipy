@@ -4,10 +4,12 @@
 
 import os
 import shutil
+from typing import Optional
 
 import numpy as np
 
 from nkipy.core import compile
+from nkipy.core.compile import CompilerConfig
 from nkipy.core.ops._registry import set_backend
 from nkipy.core.trace import NKIPyKernel
 
@@ -59,10 +61,29 @@ def baremetal_run_traced_kernel(
     *args,
     artifacts_dir=None,
     save_trace=False,
+    compiler_config: Optional[CompilerConfig] = None,
     additional_compiler_args="",
     target=compile.CompilationTarget.DEFAULT,
     **kwargs,
 ):
+    """Execute a traced kernel on Trainium hardware.
+
+    Args:
+        kernel: The traced kernel to execute.
+        *args: Positional arguments for the kernel.
+        artifacts_dir: Directory to save compilation artifacts.
+        save_trace: Whether to save execution trace.
+        compiler_config: Structured compiler configuration (recommended).
+            If not provided, auto-detects kernel type and uses appropriate preset.
+        additional_compiler_args: Additional arguments to append (legacy).
+            If both compiler_config and additional_compiler_args are provided,
+            additional_compiler_args will be appended.
+        target: Compilation target (default: auto-detect).
+        **kwargs: Keyword arguments for the kernel.
+
+    Returns:
+        The kernel output(s).
+    """
     if not _RUNTIME_AVAILABLE:
         raise RuntimeError(
             "Runtime is not available. Please install Spike to use this function."
@@ -87,15 +108,19 @@ def baremetal_run_traced_kernel(
     name = kernel.__name__
 
     build_dir = artifacts_dir if artifacts_dir else f"{compile._get_build_dir()}/{name}"
-    if isinstance(kernel, compile.NKIPyKernel):
-        additional_compiler_args = (
-            compile.nkipy_compiler_args + " " + additional_compiler_args
-        )
+
+    # Resolve compiler args: compiler_config takes precedence, else auto-detect
+    if compiler_config is not None:
+        final_compiler_args = compiler_config.to_args()
+    elif isinstance(kernel, compile.NKIPyKernel):
+        final_compiler_args = compile.nkipy_compiler_args
     else:
         # assume is NKI
-        additional_compiler_args = (
-            compile.nki_compiler_args + " " + additional_compiler_args
-        )
+        final_compiler_args = compile.nki_compiler_args
+
+    # Append legacy additional_compiler_args if provided
+    if additional_compiler_args:
+        final_compiler_args = final_compiler_args + " " + additional_compiler_args
 
     # always clean the build dir in baremetal mode
     if os.path.exists(build_dir):
@@ -106,7 +131,7 @@ def baremetal_run_traced_kernel(
         output_dir=build_dir,
         neff_name=f"{name}.neff",
         save_artifacts=True,
-        additional_compiler_args=additional_compiler_args,
+        additional_compiler_args=final_compiler_args,
         target=target,
     )
 
