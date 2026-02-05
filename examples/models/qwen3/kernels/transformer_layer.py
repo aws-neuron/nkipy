@@ -17,16 +17,12 @@ from .softmax import softmax_kernel
 def context_encoding(
     x,
     start_pos,
-    mask,
     # weights
     qkv_weight,
     o_weight,
     input_weight,
     q_norm_weight,
     k_norm_weight,
-    # rope
-    freqs_cos,
-    freqs_sin,
     # kv cache
     cache_k: nt.mutable_tensor,
     cache_v: nt.mutable_tensor,
@@ -47,19 +43,9 @@ def context_encoding(
     norm_x = rmsnorm_kernel(x, input_weight, configs.norm_eps)
 
     L = x.shape[1]
-    if mask is not None:
-        # CTE
-        freqs_cos = freqs_cos[0:L]
-        freqs_sin = freqs_sin[0:L]
-    else:
-        # TKG
-        freqs_cos = freqs_cos[start_pos]
-        freqs_sin = freqs_sin[start_pos]
 
     h1, cache_k, cache_v = attention_kernel(
         norm_x,
-        freqs_cos,
-        freqs_sin,
         qkv_weight,
         q_norm_weight,
         k_norm_weight,
@@ -69,11 +55,9 @@ def context_encoding(
         configs.n_kv_heads,
         cache_k,
         cache_v,
-        start_pos,
-        mask,
-        o_weight,
+        start_pos=None,  # prefill: start_pos is None
+        o_weight=o_weight,
         is_nkipy=is_nkipy,
-        is_prefill=True,
     )
 
     z = x + h1
@@ -141,16 +125,12 @@ def context_encoding(
 def tokengen(
     x,
     start_pos,
-    mask,
     # weights
     qkv_weight,
     o_weight,
     input_weight,
     q_norm_weight,
     k_norm_weight,
-    # rope
-    freqs_cos,
-    freqs_sin,
     # kv cache
     cache_k: nt.mutable_tensor,
     cache_v: nt.mutable_tensor,
@@ -172,17 +152,9 @@ def tokengen(
     norm_x = rmsnorm_kernel(x, input_weight, configs.norm_eps)
 
     L = x.shape[1]
-    if mask is not None:
-        freqs_cos = freqs_cos[0:L]
-        freqs_sin = freqs_sin[0:L]
-    else:
-        freqs_cos = freqs_cos[start_pos]
-        freqs_sin = freqs_sin[start_pos]
 
     h1, cache_k, cache_v = attention_kernel(
         norm_x,
-        freqs_cos,
-        freqs_sin,
         qkv_weight,
         q_norm_weight,
         k_norm_weight,
@@ -192,11 +164,9 @@ def tokengen(
         configs.n_kv_heads,
         cache_k,
         cache_v,
-        start_pos,
-        mask,
-        o_weight,
+        start_pos=start_pos,  # decode: start_pos is the position tensor
+        o_weight=o_weight,
         is_nkipy=is_nkipy,
-        is_prefill=False,
     )
 
     z = x + h1

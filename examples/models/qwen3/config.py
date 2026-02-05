@@ -32,7 +32,7 @@ class Config:
     batch_size: int = 1
     block_size: int = 128
     dtype: np.dtype = DTYPE
-    additional_compiler_args_nkipy: str = "--lnc 2 --model-type transformer"
+    additional_compiler_args_nkipy: str = "--lnc 1"
 
 
 def get_n_blocks(T, TOPK, E, B, n_block_per_iter=1):

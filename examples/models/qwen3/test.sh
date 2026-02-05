@@ -19,10 +19,11 @@ echo ""
 echo "[2/3] Checking weights..."
 
 WEIGHTS_PATH="./tmp_qwen3-30b-a3b"
+TP_DEGREE=4 # Tensor parallelism
 
 if [ ! -d "$WEIGHTS_PATH" ]; then
     echo "Weights not found. Downloading and converting..."
-    python tensor_preparation.py --model-name Qwen/Qwen3-30B-A3B --world-size 4 --head-dim 128 --output-dir="$WEIGHTS_PATH"
+    python tensor_preparation.py --model-name Qwen/Qwen3-30B-A3B --world-size "$TP_DEGREE" --head-dim 128 --output-dir="$WEIGHTS_PATH"
     echo "✓ Weights prepared"
 else
     echo "✓ Weights found at $WEIGHTS_PATH"
@@ -35,7 +36,8 @@ echo "=========================================="
 
 # Enable async to improve performance
 export NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS=16
-torchrun --nproc-per-node 4 qwen3.py -n 500 --checkpoint "$WEIGHTS_PATH" --model Qwen/Qwen3-30B-A3B
+# export NEURON_LOGICAL_NC_CONFIG=1
+torchrun --nproc-per-node "$TP_DEGREE" qwen3.py -n 500 --checkpoint "$WEIGHTS_PATH" --model Qwen/Qwen3-30B-A3B
 
 echo ""
 echo "=========================================="

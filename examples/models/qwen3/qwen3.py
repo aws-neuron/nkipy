@@ -35,10 +35,6 @@ class Qwen3Model:
         self.block_wise_moe_layers = []
         self.tkg_layers = []
 
-        # Initialize shared tensors as separate variables
-        self.freqs_cos = None
-        self.freqs_sin = None
-        self.mask = None
         self.norm_weight = None
         self.lm_head_weight = None
 
@@ -52,14 +48,6 @@ class Qwen3Model:
 
         t = time.time()
         print_log("Preparing Tensors")
-
-        # Prepare RoPE tensors
-        freqs_cos, freqs_sin = compute_cos_sin_cache(
-            self.config.head_dim,
-            self.config.max_seq_len,
-            base=1000000,
-            dtype=self.config.dtype,
-        )
 
         n_local_kv_heads = max(1, self.config.n_kv_heads // dist.get_world_size())
 
@@ -138,18 +126,9 @@ class Qwen3Model:
             )
 
         # Create shared tensors as separate class members using DeviceTensor.from_torch for weights and from_numpy for computed arrays
-        self.freqs_cos = DeviceTensor.from_numpy(freqs_cos, "freqs_cos")
-        self.freqs_sin = DeviceTensor.from_numpy(freqs_sin, "freqs_sin")
         self.norm_weight = DeviceTensor.from_torch(norm_weight, "norm_weight")
         self.lm_head_weight = DeviceTensor.from_torch(lm_head_weight, "lm_head_weight")
 
-        # Create causal mask
-        mask = np.full(
-            (self.config.max_seq_len, self.config.max_seq_len),
-            np.float32("-100000"),
-            dtype=self.config.dtype,
-        )
-        self.mask = DeviceTensor.from_numpy(np.triu(mask, k=1), "mask")
         print_log(f"--> Finished Preparing Tensors in {time.time() - t:.2f}s")
 
     def _prepare_kernels(self):
@@ -186,14 +165,11 @@ class Qwen3Model:
                 name="cte_layer",
                 x=x_context,
                 start_pos=start_pos,
-                mask=self.mask,
                 qkv_weight=self.layer_tensors[layer_id]["qkv_weight"],
                 o_weight=self.layer_tensors[layer_id]["o_weight"],
                 input_weight=self.layer_tensors[layer_id]["input_weight"],
                 q_norm_weight=self.layer_tensors[layer_id]["q_norm_weight"],
                 k_norm_weight=self.layer_tensors[layer_id]["k_norm_weight"],
-                freqs_cos=self.freqs_cos,
-                freqs_sin=self.freqs_sin,
                 post_attention_weight=self.layer_tensors[layer_id][
                     "post_attention_weight"
                 ],
@@ -204,6 +180,7 @@ class Qwen3Model:
                 cache_v=self.layer_tensors[layer_id]["cache_v"],
                 configs=self.config,
                 build_dir=BUILD_DIR,
+                additional_compiler_args=self.config.additional_compiler_args_nkipy,
             )
             self.block_wise_moe_layers.append(cte_layer)
 
@@ -216,13 +193,13 @@ class Qwen3Model:
             configs=self.config,
             use_nki_rmsnorm=USE_NKI_RMSNORM,
             build_dir=BUILD_DIR,
+            additional_compiler_args=self.config.additional_compiler_args_nkipy,
         )
 
         self.kernel_tkg = DeviceKernel.compile_and_load(
             tokengen,
             x=x_token,
             start_pos=start_pos,
-            mask=None,
             qkv_weight=self.layer_tensors[0]["qkv_weight"],
             o_weight=self.layer_tensors[0]["o_weight"],
             input_weight=self.layer_tensors[0]["input_weight"],
@@ -234,10 +211,9 @@ class Qwen3Model:
             router_weight=self.layer_tensors[0]["router_weight"],
             gate_up_weight=self.layer_tensors[0]["gate_up_weight"],
             down_weight=self.layer_tensors[0]["down_weight"],
-            freqs_cos=self.freqs_cos,
-            freqs_sin=self.freqs_sin,
             configs=self.config,
             build_dir=BUILD_DIR,
+            additional_compiler_args=self.config.additional_compiler_args_nkipy,
         )
 
         self.kernel_tkg_greedy_sampling = DeviceKernel.compile_and_load(
@@ -249,6 +225,7 @@ class Qwen3Model:
             configs=self.config,
             use_nki_rmsnorm=USE_NKI_RMSNORM,
             build_dir=BUILD_DIR,
+            additional_compiler_args=self.config.additional_compiler_args_nkipy,
         )
 
         print_log(
@@ -259,13 +236,8 @@ class Qwen3Model:
         """Run inference and generate tokens with tensor parallelism (collectives inside kernels)"""
         context_len = self.config.context_len
 
-        # Embed input tokens
-        hidden_states = DeviceTensor.from_numpy(
-            np.asarray(
-                self.tok_embedding[input_ids].to(dtype=torch.float32),
-                dtype=self.config.dtype,
-            ),
-            "hidden_states",
+        hidden_states = DeviceTensor.from_torch(
+            self.tok_embedding[input_ids], "hidden_states"
         )
 
         # Initial position - next_id tensor for storing generated tokens
@@ -280,7 +252,6 @@ class Qwen3Model:
                 inputs={
                     "x": hidden_states,
                     "start_pos": t_start_pos,
-                    "mask": self.mask,
                     # Layer i weights
                     "qkv_weight": self.layer_tensors[i]["qkv_weight"],
                     "o_weight": self.layer_tensors[i]["o_weight"],
@@ -295,9 +266,6 @@ class Qwen3Model:
                     "router_weight": self.layer_tensors[i]["router_weight"],
                     "gate_up_weight": self.layer_tensors[i]["gate_up_weight"],
                     "down_weight": self.layer_tensors[i]["down_weight"],
-                    # Shared tensors
-                    "freqs_cos": self.freqs_cos,
-                    "freqs_sin": self.freqs_sin,
                 },
                 outputs={
                     "output0": hidden_states,
@@ -324,13 +292,9 @@ class Qwen3Model:
             # Update the start position for this iteration
             t_start_pos = DeviceTensor.from_numpy(np.array([pos], dtype=np.int32))
 
-            # Embed the new token
-            h0 = np.asarray(
-                self.tok_embedding[next_id_torch].to(dtype=torch.float32),
-                dtype=self.config.dtype,
+            hidden_states = DeviceTensor.from_torch(
+                self.tok_embedding[next_id_torch], "h0/res1"
             )
-
-            hidden_states = DeviceTensor.from_numpy(h0, "h0/res1")
             t_res1 = hidden_states  # Output becomes next layer's input
 
             for i in range(0, self.config.n_layers):
@@ -352,9 +316,6 @@ class Qwen3Model:
                         "router_weight": self.layer_tensors[i]["router_weight"],
                         "gate_up_weight": self.layer_tensors[i]["gate_up_weight"],
                         "down_weight": self.layer_tensors[i]["down_weight"],
-                        # Shared tensors
-                        "freqs_cos": self.freqs_cos,
-                        "freqs_sin": self.freqs_sin,
                     },
                     outputs={
                         "output0": t_res1,
