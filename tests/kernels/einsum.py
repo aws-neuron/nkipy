@@ -21,12 +21,12 @@ from nkipy.core.specs import CommonTypes, KernelSpec, ShapeSpec, TensorInputSpec
 
 def matmul_einsum(A, B):
     """Matrix multiplication using einsum: ij,jk->ik"""
-    return np.einsum('ij,jk->ik', A, B)
+    return np.einsum("ij,jk->ik", A, B)
 
 
 def batch_matmul_einsum(A, B):
     """Batch matrix multiplication using einsum: bij,bjk->bik"""
-    return np.einsum('bij,bjk->bik', A, B)
+    return np.einsum("bij,bjk->bik", A, B)
 
 
 # =============================================================================
@@ -36,12 +36,12 @@ def batch_matmul_einsum(A, B):
 
 def transpose_einsum(A):
     """Transpose using einsum: ij->ji"""
-    return np.einsum('ij->ji', A)
+    return np.einsum("ij->ji", A)
 
 
 def permute_dims_einsum(A):
     """Permute dimensions using einsum: ijk->kij"""
-    return np.einsum('ijk->kij', A)
+    return np.einsum("ijk->kij", A)
 
 
 # =============================================================================
@@ -49,14 +49,9 @@ def permute_dims_einsum(A):
 # =============================================================================
 
 
-def trace_einsum(A):
-    """Matrix trace using einsum: ii->"""
-    return np.einsum('ii->', A)
-
-
 def sum_axis_einsum(A):
     """Sum along axis using einsum: ij->i"""
-    return np.einsum('ij->i', A)
+    return np.einsum("ij->i", A)
 
 
 # =============================================================================
@@ -66,7 +61,7 @@ def sum_axis_einsum(A):
 
 def outer_product_einsum(a, b):
     """Outer product using einsum: i,j->ij"""
-    return np.einsum('i,j->ij', a, b)
+    return np.einsum("i,j->ij", a, b)
 
 
 # =============================================================================
@@ -76,12 +71,7 @@ def outer_product_einsum(a, b):
 
 def dot_product_einsum(a, b):
     """Dot product using einsum: i,i->"""
-    return np.einsum('i,i->', a, b)
-
-
-def bilinear_form_einsum(x, A, y):
-    """Bilinear form x^T A y using einsum: i,ij,j->"""
-    return np.einsum('i,ij,j->', x, A, y)
+    return np.einsum("i,i->", a, b)
 
 
 # =============================================================================
