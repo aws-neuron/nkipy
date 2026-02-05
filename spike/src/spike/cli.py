@@ -240,7 +240,7 @@ def run_multi_core(args):
         # User hasn't configured cores - set based on --num-cores
         configure(visible_cores=list(range(num_cores)))
         if args.verbose:
-            print(f"Set NEURON_RT_VISIBLE_CORES=0-{num_cores-1}")
+            print(f"Set NEURON_RT_VISIBLE_CORES=0-{num_cores - 1}")
     else:
         # User has configured cores - validate and respect their setting
         validate_core_config(
@@ -251,10 +251,7 @@ def run_multi_core(args):
         print(f"Multi-core mode: {num_cores} cores, collective={collective}")
 
     # Load inputs per core (expanding {rank} placeholders)
-    inputs_per_core = [
-        load_inputs_for_core(args.inputs, i)
-        for i in range(num_cores)
-    ]
+    inputs_per_core = [load_inputs_for_core(args.inputs, i) for i in range(num_cores)]
 
     # Load model on each core
     models = [
@@ -276,15 +273,19 @@ def run_multi_core(args):
 
     # Create SpikeTensors for each core
     spike_inputs_per_core = [
-        {name: SpikeTensor.from_numpy(arr, name, core_id=i)
-         for name, arr in inputs_per_core[i].items()}
+        {
+            name: SpikeTensor.from_numpy(arr, name, core_id=i)
+            for name, arr in inputs_per_core[i].items()
+        }
         for i in range(num_cores)
     ]
 
     if args.verbose:
         for i in range(num_cores):
             for name, arr in inputs_per_core[i].items():
-                print(f"Core {i}: Loaded input '{name}': shape={arr.shape}, dtype={arr.dtype}")
+                print(
+                    f"Core {i}: Loaded input '{name}': shape={arr.shape}, dtype={arr.dtype}"
+                )
 
     # Execute in parallel using threads (spike releases GIL during execute)
     results = [None] * num_cores
@@ -306,7 +307,9 @@ def run_multi_core(args):
         except Exception as e:
             errors[core_id] = e
 
-    threads = [threading.Thread(target=run_on_core, args=(i,)) for i in range(num_cores)]
+    threads = [
+        threading.Thread(target=run_on_core, args=(i,)) for i in range(num_cores)
+    ]
     for t in threads:
         t.start()
     for t in threads:
@@ -328,7 +331,7 @@ def run_multi_core(args):
                 print(f"Core {i}: Saved '{name}' to {out_path}")
 
     if args.verbose:
-        print(f"Outputs: {args.output_dir}/core_{{0..{num_cores-1}}}")
+        print(f"Outputs: {args.output_dir}/core_{{0..{num_cores - 1}}}")
 
 
 def main():
@@ -354,34 +357,65 @@ Examples:
     )
     parser.add_argument("neff_path", help="Path to .neff file")
     parser.add_argument(
-        "--input", "-i", action="append", dest="inputs", metavar="NAME=PATH",
+        "--input",
+        "-i",
+        action="append",
+        dest="inputs",
+        metavar="NAME=PATH",
         help="Input tensor as name=path.npy (repeatable). Use {rank} for per-core files.",
     )
     parser.add_argument("--output-dir", "-o", default=".", help="Output directory")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Print tensor info")
+    parser.add_argument(
+        "--verbose", "-v", action="store_true", help="Print tensor info"
+    )
 
     # Trace options
-    parser.add_argument("--save-trace", action="store_true", help="Save execution trace")
-    parser.add_argument("--ntff-name", help="Path for trace file (default: <neff>.ntff)")
+    parser.add_argument(
+        "--save-trace", action="store_true", help="Save execution trace"
+    )
+    parser.add_argument(
+        "--ntff-name", help="Path for trace file (default: <neff>.ntff)"
+    )
 
     # Benchmarking options
     parser.add_argument("--benchmark", action="store_true", help="Run benchmark")
     parser.add_argument("--warmup", type=int, default=5, help="Warmup iterations")
-    parser.add_argument("--iterations", type=int, default=10, help="Benchmark iterations")
+    parser.add_argument(
+        "--iterations", type=int, default=10, help="Benchmark iterations"
+    )
 
     # Single-core options
     parser.add_argument("--name", help="Model name (default: neff filename)")
-    parser.add_argument("--core-id", type=int, default=0, help="NeuronCore ID (default: 0)")
-    parser.add_argument("--cc-enabled", action="store_true", help="Enable collective compute (single-core)")
-    parser.add_argument("--rank-id", type=int, default=0, help="Rank ID for distributed (default: 0)")
-    parser.add_argument("--world-size", type=int, default=1, help="World size for distributed (default: 1)")
+    parser.add_argument(
+        "--core-id", type=int, default=0, help="NeuronCore ID (default: 0)"
+    )
+    parser.add_argument(
+        "--cc-enabled",
+        action="store_true",
+        help="Enable collective compute (single-core)",
+    )
+    parser.add_argument(
+        "--rank-id", type=int, default=0, help="Rank ID for distributed (default: 0)"
+    )
+    parser.add_argument(
+        "--world-size",
+        type=int,
+        default=1,
+        help="World size for distributed (default: 1)",
+    )
 
     # Multi-core options
     parser.add_argument(
-        "--num-cores", type=int, default=1,
-        help="Number of logical NeuronCores. Respects NEURON_RT_VISIBLE_CORES if set."
+        "--num-cores",
+        type=int,
+        default=1,
+        help="Number of logical NeuronCores. Respects NEURON_RT_VISIBLE_CORES if set.",
     )
-    parser.add_argument("--collective", action="store_true", help="Enable collective compute (multi-core)")
+    parser.add_argument(
+        "--collective",
+        action="store_true",
+        help="Enable collective compute (multi-core)",
+    )
 
     args = parser.parse_args()
 
