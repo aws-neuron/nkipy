@@ -7,9 +7,8 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from config import Config, get_config
-from kernels.rope import compute_cos_sin_cache
 from kernels.sampling import greedy_sampling
-from kernels.transformer_layer import context_encoding, tokengen
+from kernels.transformer_layer import transformer_layer
 from nkipy.runtime import DeviceKernel, DeviceTensor
 from parallel_state import initialize_model_parallel
 from safetensors.torch import load_file
@@ -33,7 +32,6 @@ class Qwen3Model:
         self.kernel_tkg = None
         self.kernel_tkg_greedy_sampling = None
         self.block_wise_moe_layers = []
-        self.tkg_layers = []
 
         self.norm_weight = None
         self.lm_head_weight = None
@@ -108,16 +106,16 @@ class Qwen3Model:
                         router_weight, f"router_weight_L{layer_id}"
                     ),
                     "q_norm_weight": DeviceTensor.from_torch(
-                        q_norm_weight.unsqueeze(0), f"q_norm_weight_L{layer_id}"
+                        q_norm_weight, f"q_norm_weight_L{layer_id}"
                     ),
                     "k_norm_weight": DeviceTensor.from_torch(
-                        k_norm_weight.unsqueeze(0), f"k_norm_weight_L{layer_id}"
+                        k_norm_weight, f"k_norm_weight_L{layer_id}"
                     ),
                     "input_weight": DeviceTensor.from_torch(
-                        input_weight.unsqueeze(0), f"input_weight_L{layer_id}"
+                        input_weight, f"input_weight_L{layer_id}"
                     ),
                     "post_attention_weight": DeviceTensor.from_torch(
-                        post_attention_weight.unsqueeze(0),
+                        post_attention_weight,
                         f"post_attention_weight_L{layer_id}",
                     ),
                     "cache_k": DeviceTensor.from_numpy(cache_k, f"cache_k_L{layer_id}"),
@@ -161,10 +159,10 @@ class Qwen3Model:
         )
         for layer_id in range(self.config.n_layers):
             cte_layer = DeviceKernel.compile_and_load(
-                context_encoding,
+                transformer_layer,
                 name="cte_layer",
                 x=x_context,
-                start_pos=start_pos,
+                start_pos=None,
                 qkv_weight=self.layer_tensors[layer_id]["qkv_weight"],
                 o_weight=self.layer_tensors[layer_id]["o_weight"],
                 input_weight=self.layer_tensors[layer_id]["input_weight"],
@@ -197,7 +195,7 @@ class Qwen3Model:
         )
 
         self.kernel_tkg = DeviceKernel.compile_and_load(
-            tokengen,
+            transformer_layer,
             x=x_token,
             start_pos=start_pos,
             qkv_weight=self.layer_tensors[0]["qkv_weight"],
@@ -251,7 +249,6 @@ class Qwen3Model:
             self.block_wise_moe_layers[i](
                 inputs={
                     "x": hidden_states,
-                    "start_pos": t_start_pos,
                     # Layer i weights
                     "qkv_weight": self.layer_tensors[i]["qkv_weight"],
                     "o_weight": self.layer_tensors[i]["o_weight"],
