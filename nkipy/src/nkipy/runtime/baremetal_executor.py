@@ -152,7 +152,11 @@ class BaremetalExecutor:
         )
 
         # Use SpikeModel's __call__ method
-        ntff_name = os.path.abspath("./profile.ntff") if save_trace else None
+        if save_trace:
+            base = os.path.abspath(artifacts_dir) if artifacts_dir else os.getcwd()
+            ntff_name = os.path.join(base, "profile.ntff")
+        else:
+            ntff_name = None
         device_kernel(
             inputs=inputs, outputs=outputs, save_trace=save_trace, ntff_name=ntff_name
         )
