@@ -47,7 +47,7 @@ class Qwen3Model:
         t = time.time()
         print_log("Preparing Tensors")
 
-        n_local_kv_heads = max(1, self.config.n_kv_heads // dist.get_world_size())
+        n_local_kv_heads = max(1, self.config.num_kv_heads // dist.get_world_size())
 
         cache_k = np.zeros(
             (
@@ -74,7 +74,7 @@ class Qwen3Model:
 
         # Prepare layer weights and tensors as class members
         self.layer_tensors = []
-        for layer_id in range(self.config.n_layers):
+        for layer_id in range(self.config.num_layers):
             qkv_weight = weights.get(f"layers.{layer_id}.qkv_weight")
             o_weight = weights.get(f"layers.{layer_id}.o_weight")
             gate_up_weight = weights.get(f"layers.{layer_id}.gate_up_weight")
@@ -157,7 +157,7 @@ class Qwen3Model:
         start_pos = DeviceTensor.from_numpy(
             np.empty(shape=(1), dtype=np.int32), "start_pos"
         )
-        for layer_id in range(self.config.n_layers):
+        for layer_id in range(self.config.num_layers):
             cte_layer = DeviceKernel.compile_and_load(
                 transformer_layer,
                 name="cte_layer",
@@ -245,7 +245,7 @@ class Qwen3Model:
         )
 
         # Process through all layers (context phase)
-        for i in range(self.config.n_layers):
+        for i in range(self.config.num_layers):
             self.block_wise_moe_layers[i](
                 inputs={
                     "x": hidden_states,
@@ -294,7 +294,7 @@ class Qwen3Model:
             )
             t_res1 = hidden_states  # Output becomes next layer's input
 
-            for i in range(0, self.config.n_layers):
+            for i in range(0, self.config.num_layers):
                 self.kernel_tkg(
                     inputs={
                         "x": hidden_states,

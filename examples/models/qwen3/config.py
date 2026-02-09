@@ -12,11 +12,10 @@ DTYPE = bfloat16
 @dataclass
 class Config:
     hidden_size: int
-    n_heads: int
+    num_heads: int
     head_dim: int
-    n_kv_heads: int
-    n_rep: int
-    n_layers: int
+    num_kv_heads: int
+    num_layers: int
     num_experts_per_tok: int
     num_experts: int
     context_len: int = None
@@ -25,7 +24,6 @@ class Config:
     norm_eps: float = 1e-6
     intermediate_size: int = 1536
     max_seq_len: int = 4096
-    batch_size: int = 1
     dtype: np.dtype = DTYPE
     additional_compiler_args_nkipy: str = "--lnc 1"
 
@@ -35,12 +33,11 @@ def get_config(model_name, context_len, max_new_tokens):
     config = Config(
         hidden_size=hf_config.hidden_size,
         intermediate_size=hf_config.moe_intermediate_size // dist.get_world_size(),
-        n_heads=hf_config.num_attention_heads,
+        num_heads=hf_config.num_attention_heads,
         head_dim=hf_config.head_dim,
-        n_kv_heads=hf_config.num_key_value_heads,
-        n_rep=hf_config.num_attention_heads // hf_config.num_key_value_heads,
+        num_kv_heads=hf_config.num_key_value_heads,
         norm_eps=hf_config.rms_norm_eps,
-        n_layers=hf_config.num_hidden_layers,
+        num_layers=hf_config.num_hidden_layers,
         num_experts_per_tok=hf_config.num_experts_per_tok,
         num_experts=hf_config.num_experts,
         context_len=context_len,

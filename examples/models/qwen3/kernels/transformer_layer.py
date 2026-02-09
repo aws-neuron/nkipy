@@ -31,7 +31,6 @@ def transformer_layer(
     gate_up_weight,
     down_weight,
     configs: Config,
-    is_nkipy: bool = True,
 ):
     """
     Single transformer layer for both context encoding (prefill) and token generation (decode).
@@ -49,14 +48,13 @@ def transformer_layer(
         q_norm_weight,
         k_norm_weight,
         configs.norm_eps,
-        configs.n_heads,
+        configs.num_heads,
         configs.head_dim,
-        configs.n_kv_heads,
+        configs.num_kv_heads,
         cache_k,
         cache_v,
         start_pos=start_pos,
         o_weight=o_weight,
-        is_nkipy=is_nkipy,
     )
 
     # Residual connection after attention

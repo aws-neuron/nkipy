@@ -21,8 +21,6 @@ def repeat_kv_kernel(x, n_rep: int):
     z = np.repeat(x, n_rep, axis=2)
     return z
 
-    # Prepare RoPE tensors
-
 
 def attention_kernel(
     x,
@@ -37,7 +35,6 @@ def attention_kernel(
     cache_v,
     start_pos: Optional[nt.tensor],
     o_weight,
-    is_nkipy: bool,
 ):
     """
     Unified attention kernel for Qwen3.
@@ -45,12 +42,18 @@ def attention_kernel(
     Performs:
     1. QKV projection
     2. QK RMSNorm
-    3. RoPE
+    3. RoPE (cos/sin caches are compile-time constants)
     4. KV cache update
     5. GQA (repeat_kv)
-    6. Attention scores with causal mask
+    6. Attention scores with causal mask (compile-time constant)
     7. Softmax
     8. Output projection + all-reduce
+
+    Note: Some numpy arrays in this kernel (RoPE frequencies, causal mask) are
+    computed from constant arguments rather than runtime tensor inputs. During
+    compilation for Trainium, these execute at compile time and become HLO
+    constants baked into the compiled graph (similar to Zig's comptime). On CPU,
+    they execute as regular numpy.
     """
     is_prefill = start_pos is None
     batch_size, seq_len, _ = x.shape
@@ -104,17 +107,13 @@ def attention_kernel(
     xq, xk = apply_rotary_emb_kernel(xq, xk, freqs_cos, freqs_sin)
 
     # KV cache update
-    if is_nkipy:
-        if is_prefill:
-            cache_k[:, :seq_len] = xk
-            cache_v[:, :seq_len] = xv
-        else:
-            assert seq_len == 1, "seq_len must be 1 for decode"
-            cache_k[:, start_pos] = xk
-            cache_v[:, start_pos] = xv
+    if is_prefill:
+        cache_k[:, :seq_len] = xk
+        cache_v[:, :seq_len] = xv
     else:
-        cache_k[:, start_pos[0] : start_pos[0] + seq_len] = xk
-        cache_v[:, start_pos[0] : start_pos[0] + seq_len] = xv
+        assert seq_len == 1, "seq_len must be 1 for decode"
+        cache_k[:, start_pos] = xk
+        cache_v[:, start_pos] = xv
 
     # GQA: repeat KV heads
     keys = repeat_kv_kernel(cache_k, n_rep)
@@ -130,7 +129,9 @@ def attention_kernel(
     scores = (xq @ keys.transpose(0, 1, 3, 2)) / np.float32(np.sqrt(head_dim))
     scores = scores.astype(nl.bfloat16)
 
-    # Construct causal mask constant
+    # Comptime: causal mask is a numpy array computed from constants at compile
+    # time and baked as an HLO constant. The zeros(...) + array pattern promotes
+    # it to a runtime tensor so it can participate in ops with runtime tensors.
     causal_mask = np.triu(np.ones((k_seq_len, k_seq_len)) * -100000, k=1).astype(
         scores.dtype
     )
@@ -161,13 +162,10 @@ def attention_kernel(
     output_to_be_reduced = np.matmul(output, o_weight)
 
     # All-reduce for tensor parallelism
-    if is_nkipy and dist.get_world_size() > 1:
-        output = cc.all_reduce(
-            output_to_be_reduced,
-            replica_groups=[list(range(dist.get_world_size()))],
-            reduce_op=np.add,
-        )
-    else:
-        output = output_to_be_reduced
+    output = cc.all_reduce(
+        output_to_be_reduced,
+        replica_groups=[list(range(dist.get_world_size()))],
+        reduce_op=np.add,
+    )
 
     return output, cache_k, cache_v
