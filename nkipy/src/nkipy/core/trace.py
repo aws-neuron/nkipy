@@ -172,6 +172,29 @@ class NKIPyKernel:
                 print(f"Failed to parse function source for aliasing detection: {e}")
                 returned_var_names = []
 
+            # Insert explicit copy for pass-through outputs (outputs that are
+            # unmodified input parameters). The Neuron compiler cannot handle
+            # outputs that are raw parameter references because inputs and outputs
+            # occupy separate memory regions on device.
+            ret = list(ret)
+            ctx = HLOTraceContext._global_ctx
+            for i, r in enumerate(ret):
+                if not isinstance(r, NKIPyTensorRef):
+                    continue
+                bt = r.backend_tensor
+                if bt.is_parameter:
+                    # Skip mutable aliases — those are handled via input_output_alias
+                    var_name = (
+                        returned_var_names[i]
+                        if i < len(returned_var_names)
+                        else None
+                    )
+                    if var_name not in mutable_params:
+                        copy_tensor = ctx.build_op(
+                            "copy", [bt], bt.shape, bt.dtype
+                        )
+                        ret[i] = NKIPyTensorRef(copy_tensor, name="")
+
             idx = 0
             for r in ret:
                 if not isinstance(r, NKIPyTensorRef):
