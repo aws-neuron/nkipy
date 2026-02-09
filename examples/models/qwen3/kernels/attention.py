@@ -88,20 +88,10 @@ def attention_kernel(
         freqs_cos = freqs_cos[0:seq_len]
         freqs_sin = freqs_sin[0:seq_len]
     else:
-        # FIXME: start_pos is a tensor, need to handle indexing np with tensor
-        freqs_sin = (
-            tensor_apis.zeros(
-                (freqs_sin.shape[0], freqs_sin.shape[1]), dtype=freqs_sin.dtype
-            )
-            + freqs_sin
-        )
-        freqs_cos = (
-            tensor_apis.zeros(
-                (freqs_cos.shape[0], freqs_cos.shape[1]), dtype=freqs_cos.dtype
-            )
-            + freqs_cos
-        )
-
+        # Promote comptime numpy arrays to runtime tensors so they can be
+        # indexed with the runtime tensor start_pos.
+        freqs_cos = tensor_apis.constant(freqs_cos)
+        freqs_sin = tensor_apis.constant(freqs_sin)
         freqs_cos = freqs_cos[start_pos]
         freqs_sin = freqs_sin[start_pos]
     xq, xk = apply_rotary_emb_kernel(xq, xk, freqs_cos, freqs_sin)
@@ -130,16 +120,11 @@ def attention_kernel(
     scores = scores.astype(nl.bfloat16)
 
     # Comptime: causal mask is a numpy array computed from constants at compile
-    # time and baked as an HLO constant. The zeros(...) + array pattern promotes
-    # it to a runtime tensor so it can participate in ops with runtime tensors.
+    # time. Promote to runtime tensor so it can participate in ops with runtime tensors.
     causal_mask = np.triu(np.ones((k_seq_len, k_seq_len)) * -100000, k=1).astype(
         scores.dtype
     )
-
-    # FIXME: need a way to automatically convert constant to tensor
-    causal_mask = (
-        tensor_apis.zeros((k_seq_len, k_seq_len), dtype=scores.dtype) + causal_mask
-    )
+    causal_mask = tensor_apis.constant(causal_mask)
     # Apply causal mask
     if is_prefill:
         scores = scores + np.expand_dims(causal_mask[:seq_len, :k_seq_len], axis=[0, 1])

@@ -63,6 +63,7 @@ from nkipy.core.ops.conv import (
 # Creation operations
 # -----------------------------------------------------------------------------
 from nkipy.core.ops.creation import (
+    constant,
     empty_like,
     full,
     full_like,
@@ -200,6 +201,7 @@ __all__ = [
     "bitwise_not",
     "logical_not",
     # Creation
+    "constant",
     "zeros",
     "full",
     "zeros_like",
