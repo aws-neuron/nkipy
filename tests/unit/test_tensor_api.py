@@ -1735,5 +1735,46 @@ def test_ml_dtypes_constant_encoding(sim_mode, dtype_name):
         )
 
 
+def test_passthrough_identity(sim_mode):
+    """Test that returning an unmodified input works (single output)."""
+
+    def kernel(x):
+        return x
+
+    shape = (4, 4)
+    np.random.seed(0)
+    x = np.random.random_sample(shape).astype(np.float32)
+
+    out = simulate_kernel_unified(kernel, sim_mode, x)
+    simulate_assert_allclose(out, x)
+
+    if NEURON_AVAILABLE:
+        out_baremetal = baremetal_run_kernel_unified(kernel, sim_mode, x)
+        baremetal_assert_allclose(out_baremetal, x)
+
+
+def test_passthrough_with_compute(sim_mode):
+    """Test returning both a computed result and an unmodified input."""
+
+    def kernel(a, b):
+        c = np.add(a, b, dtype=np.float32)
+        return (c, a)
+
+    shape = (4, 4)
+    np.random.seed(0)
+    a = np.random.random_sample(shape).astype(np.float32)
+    b = np.random.random_sample(shape).astype(np.float32)
+
+    c_sim, a_sim = simulate_kernel_unified(kernel, sim_mode, a, b)
+    c_ref = np.add(a, b, dtype=np.float32)
+    simulate_assert_allclose(c_sim, c_ref)
+    simulate_assert_allclose(a_sim, a)
+
+    if NEURON_AVAILABLE:
+        c_hw, a_hw = baremetal_run_kernel_unified(kernel, sim_mode, a, b)
+        baremetal_assert_allclose(c_hw, c_ref)
+        baremetal_assert_allclose(a_hw, a)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
