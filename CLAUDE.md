@@ -19,11 +19,12 @@ uv sync
 # Install with all dependency groups (test, docs, examples)
 uv sync --all-groups
 
-# Run tests
-uv run pytest                                        # all tests
-uv run pytest tests/unit/test_tensor_api.py          # single file
-uv run pytest tests/unit/test_tensor_api.py::test_fn # single test
-uv run pytest -x                                     # stop on first failure
+# Run tests (use targeted tests during development)
+uv run pytest tests/unit/test_tensor_api.py -k "test_fn" -v  # single test
+uv run pytest tests/unit/test_tensor_api.py -v               # single file
+
+# Run full test suite as a final check after all changes are done
+uv run pytest tests/ -n auto
 
 # Lint and format
 uv run ruff check .            # lint (E, F, I rules)
@@ -79,7 +80,7 @@ Python (SpikeTensor, SpikeModel) → spike_singleton.py (lifecycle)
 
 ### Testing
 
-Tests are in `tests/` (nkipy) and `spike/tests/` (spike). `conftest.py` configures `NEURON_RT_VISIBLE_CORES` isolation for pytest-xdist parallel execution on hardware.
+Tests are in `tests/` (nkipy) and `spike/tests/` (spike). `conftest.py` configures `NEURON_RT_VISIBLE_CORES` isolation for pytest-xdist parallel execution on hardware. It also implements `pytest_xdist_auto_num_workers` to cap `-n auto` at the number of available Neuron cores (using `Spike.get_visible_neuron_core_count()`), since each worker needs a dedicated core.
 
 ## Code Style
 
