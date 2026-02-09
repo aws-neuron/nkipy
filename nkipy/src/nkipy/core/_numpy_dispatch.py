@@ -63,6 +63,7 @@ def register_all_numpy_apis():
     _register_numpy_api(np.sqrt, ops.sqrt)
     _register_numpy_api(np.square, ops.square)
     _register_numpy_api(np.negative, ops.negative)
+    _register_numpy_api(np.reciprocal, ops.reciprocal)
     _register_numpy_api(np.sin, ops.sin)
     _register_numpy_api(np.cos, ops.cos)
     _register_numpy_api(np.tan, ops.tan)
