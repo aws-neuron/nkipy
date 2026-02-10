@@ -172,6 +172,15 @@ class Compiler:
         mode = "hlo" if isinstance(ir, HLOModule) else "unknown"
         cmd = self._build_compile_command(mode)
 
+        def _compilation_error(message, result=None):
+            """Build a RuntimeError with compiler output when available."""
+            parts = [message, f"Command: {' '.join(cmd)}"]
+            if result is not None:
+                decode = lambda b: b.decode("utf-8", errors="replace") if b else ""
+                parts.append(f"stderr:\n{decode(result.stderr)}")
+                parts.append(f"stdout:\n{decode(result.stdout)}")
+            return RuntimeError("\n".join(parts))
+
         current_dir = os.getcwd()
         try:
             os.chdir(work_dir)
@@ -192,7 +201,12 @@ class Compiler:
                 sys.argv = cmd
                 neuronx_cc_main()
             else:
-                subprocess.run(cmd, check=True, capture_output=True)
+                result = subprocess.run(cmd, capture_output=True)
+                if result.returncode != 0:
+                    raise _compilation_error(
+                        f"Compilation failed (exit code {result.returncode}).",
+                        result,
+                    )
         finally:
             if use_neuronx_cc_python_interface:
                 sys.argv = original_argv
@@ -200,8 +214,9 @@ class Compiler:
 
         output_path = work_dir / output_file
         if not output_path.exists():
-            raise RuntimeError(
-                f"Compilation failed: {output_file} expected but not generated"
+            raise _compilation_error(
+                f"Compilation failed: {output_file} expected but not generated.",
+                result if not use_neuronx_cc_python_interface else None,
             )
 
         return output_path
