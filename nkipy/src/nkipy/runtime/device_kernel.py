@@ -5,9 +5,16 @@ import os
 import shutil
 import time
 import types
+from typing import Optional
 
 from nkipy.core import compile
-from nkipy.core.compile import CompilationTarget, _get_build_dir, compile_to_neff, trace
+from nkipy.core.compile import (
+    CompilationTarget,
+    CompilerConfig,
+    _get_build_dir,
+    compile_to_neff,
+    trace,
+)
 from nkipy.core.logger import get_logger
 from nkipy.core.trace import NKIPyKernel
 from nkipy.runtime import device_tensor
@@ -45,6 +52,7 @@ class DeviceKernel(SpikeModel):
         kernel,
         *args,
         name=None,
+        compiler_config: Optional[CompilerConfig] = None,
         additional_compiler_args=None,
         use_cached_if_exists=True,
         build_dir=None,
@@ -56,14 +64,32 @@ class DeviceKernel(SpikeModel):
         Args:
             kernel: The kernel function to compile
             name: Optional name for the kernel. If None, uses kernel.__name__
-            additional_compiler_args: Optional additional compiler arguments to append
+            compiler_config: Structured compiler configuration (recommended).
+                Use CompilerConfig.for_nkipy() or CompilerConfig.for_nki() for presets.
+                If not provided, auto-detects kernel type and uses appropriate preset.
+            additional_compiler_args: Optional additional compiler arguments (legacy).
+                If both compiler_config and additional_compiler_args are provided,
+                the additional args will be appended.
             use_cached_if_exists: If True, use cached neff if it exists.
             build_dir: Overriding the build directory for the kernel
             target: Compilation target for the kernel
-            \*args, \*\*kwargs: Arguments for specialization (numpy array or DeviceTensor)
+            *args, **kwargs: Arguments for specialization (numpy array or DeviceTensor)
 
         Returns:
             DeviceKernel: A DeviceKernel instance with the compiled kernel
+
+        Example:
+            # With structured config (recommended):
+            kernel = DeviceKernel.compile_and_load(
+                my_func, x, w,
+                compiler_config=CompilerConfig.for_nkipy(model_type="transformer")
+            )
+
+            # Legacy string args (still supported):
+            kernel = DeviceKernel.compile_and_load(
+                my_func, x, w,
+                additional_compiler_args="--model-type transformer"
+            )
         """
         if name is None:
             # FIXME: this is likely to introduce unexpected conflict
@@ -115,13 +141,21 @@ class DeviceKernel(SpikeModel):
             if isinstance(kernel, types.FunctionType):
                 # Treat untraced function as NKIPy
                 traced_kernel = trace(kernel)
-                compiler_args = compile.nkipy_compiler_args
+                is_nkipy = True
             elif isinstance(kernel, NKIPyKernel):
                 traced_kernel = kernel
-                compiler_args = compile.nkipy_compiler_args
+                is_nkipy = True
             else:
                 logger.info("Continue as NKI kernel")
                 traced_kernel = kernel
+                is_nkipy = False
+
+            # Resolve compiler args: compiler_config takes precedence, else auto-detect
+            if compiler_config is not None:
+                compiler_args = compiler_config.to_args()
+            elif is_nkipy:
+                compiler_args = compile.nkipy_compiler_args
+            else:
                 compiler_args = compile.nki_compiler_args
 
             # Append user-provided additional compiler args if any
