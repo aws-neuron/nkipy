@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=48"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-nkipy"
+version = "0.9.0"
+description = "NKIPy plugin for vLLM"
+readme = "README.md"
+license = {text = "Apache 2"}
+dependencies = [
+    "vllm >= 0.9.0",
+    "torch >= 2.0.0",
+    "torch-to-nkipy",
+    "nkipy",
+]
+requires-python = ">=3.10"
+
+[project.entry-points."vllm.platform_plugins"]
+nkipy = "vllm_nkipy:register"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vllm_nkipy*"]
+exclude = []
+namespaces = false
+
+

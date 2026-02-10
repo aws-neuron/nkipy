@@ -8,7 +8,7 @@ requires-python = ">=3.10"
 dependencies = ["nkipy"]
 
 [tool.uv.workspace]
-members = ["nkipy", "spike", "spike-torch", "torch-to-nkipy"]
+members = ["nkipy", "spike", "spike-torch", "torch-to-nkipy", "vllm-nkipy"]
 
 [[tool.uv.index]]
 name = "neuron"
@@ -20,6 +20,7 @@ spike = { workspace = true }
 spike-torch = { workspace = true }
 nkipy = { workspace = true }
 torch-to-nkipy = { workspace = true }
+vllm-nkipy = { workspace = true }
 
 [dependency-groups]
 dev = ["spike"]
@@ -64,7 +65,7 @@ exclude = ["build", "third-party"]
 select = ["E", "F", "I"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["nkipy", "spike", "spike_torch", "torch_to_nkipy"]
+known-first-party = ["nkipy", "spike", "spike_torch", "torch_to_nkipy", "vllm_nkipy"]
 
 [tool.ruff.format]
 quote-style = "double"
@@ -82,7 +83,7 @@ module = "neuronxcc.*"
 ignore_missing_imports = true
 
 [tool.coverage.run]
-source = ["nkipy/src/nkipy", "spike/src/spike", "spike-torch/src/spike_torch", "torch-to-nkipy/src/torch_to_nkipy"]
+source = ["nkipy/src/nkipy", "spike/src/spike", "spike-torch/src/spike_torch", "torch-to-nkipy/src/torch_to_nkipy", "vllm-nkipy/vllm_nkipy"]
 branch = true
 
 [tool.coverage.report]
