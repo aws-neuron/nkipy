@@ -32,6 +32,9 @@ from nkipy.core.tensor import NKIPyTensorRef
 # Legacy frontend (neuronxcc.nki)
 try:
     from neuronxcc.nki.compile import GenericKernel as LegacyGenericKernel
+    from neuronxcc.nki.compiler.backends.neuron.CompileOpts import (
+        OptLevel,  # noqa: F401
+    )
     from neuronxcc.nki.compiler.backends.neuron.FrameworkKernel import (
         UnifiedKernel as LegacyUnifiedKernel,
     )
@@ -275,6 +278,7 @@ class NKICustomOp:
         compiler_args: str = "",
         is_nki_beta_2_version: bool = False,
         platform_target: Optional[str] = None,
+        opt_level=None,
     ):
         operands = list(operands)
 
@@ -297,15 +301,20 @@ class NKICustomOp:
         if platform_target is None:
             platform_target = _get_platform_target_default()
 
-        # Trace the kernel with the appropriate NKIOp class
-        traced_kernel = NKIOpClass.trace(
-            kernel,
+        # Build trace kwargs
+        trace_kwargs = dict(
             grid=grid,
             kernel_return=kernel_return,
             experimental_flags=compiler_args,
             enable_cache=False,
             platform_target=platform_target,
+            # opt_level=OptLevel.skip_middle_end,
         )
+        if opt_level is not None:
+            trace_kwargs["opt_level"] = opt_level
+
+        # Trace the kernel with the appropriate NKIOp class
+        traced_kernel = NKIOpClass.trace(kernel, **trace_kwargs)
 
         # Get TraceResult config
         self.config = traced_kernel.dump_config(*operands)
@@ -324,6 +333,8 @@ def wrap_nki_kernel(
     grid: Optional[Tuple[int, ...]] = (),
     is_nki_beta_2_version: bool = False,
     platform_target: Optional[str] = None,
+    experimental_flags: str = "",
+    opt_level=None,
 ):
     """Wrap an NKI kernel for use in NKIPy's HLO tracing flow.
 
@@ -337,6 +348,10 @@ def wrap_nki_kernel(
                                If False, use the legacy frontend (neuronxcc.nki).
                                Note: Beta 2 frontend does not support CPU execution.
         platform_target: Target platform (e.g., "trn1", "trn2"). If None, auto-detected.
+        experimental_flags: Additional compiler flags passed to NKI trace
+                            (e.g., "--flag1 --flag2").
+        opt_level: Optimization level for NKI compilation
+                   (e.g., OptLevel.skip_middle_end). None uses default.
 
     Returns:
         NKICustomOp that can be called during HLO tracing
@@ -345,6 +360,8 @@ def wrap_nki_kernel(
         kernel,
         operands,
         grid,
+        compiler_args=experimental_flags,
         is_nki_beta_2_version=is_nki_beta_2_version,
         platform_target=platform_target,
+        opt_level=opt_level,
     )

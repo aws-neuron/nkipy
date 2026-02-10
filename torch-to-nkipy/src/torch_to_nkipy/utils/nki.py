@@ -41,6 +41,35 @@ class NKIOpRegistry:
     # Maps custom op names to kernels
     _nki_name_map: Dict[str, Callable] = {}
     _processed_nki_kernel_hash: Set[str] = set()
+    _default_compiler_args: str = ""
+    _default_opt_level: str = ""
+
+    @classmethod
+    def set_default_compiler_args(cls, args: str) -> None:
+        """Set default compiler args applied to all NKI ops.
+
+        These are merged with any per-op compiler_args at lowering time.
+        """
+        cls._default_compiler_args = args
+
+    @classmethod
+    def get_default_compiler_args(cls) -> str:
+        """Get the current default compiler args."""
+        return cls._default_compiler_args
+
+    @classmethod
+    def set_default_opt_level(cls, opt_level: str) -> None:
+        """Set default opt_level for all NKI ops.
+
+        Pass the OptLevel enum expression as a string,
+        e.g. "OptLevel.skip_middle_end".
+        """
+        cls._default_opt_level = opt_level
+
+    @classmethod
+    def get_default_opt_level(cls) -> str:
+        """Get the current default opt_level string."""
+        return cls._default_opt_level
 
     @classmethod
     def canonicalize_custom_op_name(cls, custom_op_name: str) -> str:

@@ -41,8 +41,15 @@ def nki_op_handler(node: fx.Node, computation_node: ComputationNode) -> None:
     wrapped_nki_kernel = NKIOpRegistry.get_nki_kernel(custom_op_name)
     nki_kernel = wrapped_nki_kernel.func
     grid = wrapped_nki_kernel.grid
-    compiler_args = wrapped_nki_kernel.compiler_args
+    # Merge global default compiler args with per-op args
+    default_args = NKIOpRegistry.get_default_compiler_args()
+    per_op_args = wrapped_nki_kernel.compiler_args
+    if default_args and per_op_args:
+        compiler_args = f"{default_args}, {per_op_args}"
+    else:
+        compiler_args = default_args or per_op_args
     alias_map = wrapped_nki_kernel.alias_map
+    opt_level = NKIOpRegistry.get_default_opt_level()
     ast_block = computation_node.ast_code_block
     # from nkipy.core.nki_op import NKICustomOp
     # We always import, this overhead should be minimal
@@ -55,6 +62,12 @@ def nki_op_handler(node: fx.Node, computation_node: ComputationNode) -> None:
     ast_block.add_from_import(
         module=str(nki_kernel.__module__), name=str(nki_kernel.__name__)
     )
+    # Import OptLevel if opt_level is set
+    if opt_level:
+        ast_block.add_from_import(
+            module="neuronxcc.nki.compiler.backends.neuron.CompileOpts",
+            name="OptLevel",
+        )
     # Add a line to create an NKICustomOp object with the NKI kernel
     arg_list = [
         (
@@ -66,24 +79,28 @@ def nki_op_handler(node: fx.Node, computation_node: ComputationNode) -> None:
         for arg in node.args
     ]
     hash_str = get_nki_kernel_hash(
-        str(nki_kernel.__name__), ",".join(arg_list), f"{grid}", compiler_args
+        str(nki_kernel.__name__), ",".join(arg_list), f"{grid}",
+        compiler_args + opt_level,
     )
     kernel_name = f"{nki_kernel.__name__}_kernel_{hash_str}"
     # Only add assignment if the kernel is new
     # This line does tracing under the hood when being processed by nkipy,
     # can be pretty slow if there's no caching
     if not NKIOpRegistry.is_processed(hash_str):
+        nki_kwargs = {
+            "grid": f"{grid}",
+            "kernel_return": "True",
+            "compiler_args": repr(compiler_args),
+        }
+        if opt_level:
+            nki_kwargs["opt_level"] = opt_level
         ast_block.add_class_call_assignment(
             class_or_obj_name=NKI_CUSTOM_OP_CLASS_NAME,
             args=[
                 nki_kernel.__name__,
                 arg_list,
             ],
-            kwargs={
-                "grid": f"{grid}",
-                "kernel_return": "True",
-                "compiler_args": compiler_args,
-            },
+            kwargs=nki_kwargs,
             target_name=kernel_name,
         )
         NKIOpRegistry.add_processed_kernel_hash(hash_str)
