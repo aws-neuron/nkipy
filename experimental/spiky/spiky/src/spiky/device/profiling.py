@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 def _get_config():
     """Get backend config with lazy import to avoid circular dependency."""
     from spiky.torch.config import get_nkipy_backend_config
+
     return get_nkipy_backend_config()
 
 

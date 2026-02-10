@@ -8,8 +8,8 @@ because the C++ runtime segfaults if you close and re-init the device within
 a single process.
 """
 
-import os
 import logging
+import os
 
 # Set NEURON_RT_ROOT_COMM_ID before any NRT initialization.
 # The Neuron runtime reads this env var at init time to set up the
@@ -27,6 +27,7 @@ def has_neuron_hardware() -> bool:
     """Check if Neuron hardware is available."""
     try:
         import spiky
+
         return spiky.device_count() > 0
     except Exception:
         return False

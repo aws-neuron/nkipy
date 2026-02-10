@@ -9,12 +9,12 @@ This module provides the bridge between torch-to-nkipy and spiky runtime:
 """
 
 import atexit
+import logging
+import threading
 import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
-import logging
-import threading
 
 import numpy as np
 import torch
@@ -28,11 +28,17 @@ logger = logging.getLogger(__name__)
 
 # dtype string (from C++ DeviceTensor) -> numpy dtype
 _DTYPE_STR_TO_NUMPY = {
-    "float32": np.float32, "float16": np.float16, "float64": np.float64,
-    "int8": np.int8, "uint8": np.uint8,
-    "int16": np.int16, "uint16": np.uint16,
-    "int32": np.int32, "uint32": np.uint32,
-    "int64": np.int64, "uint64": np.uint64,
+    "float32": np.float32,
+    "float16": np.float16,
+    "float64": np.float64,
+    "int8": np.int8,
+    "uint8": np.uint8,
+    "int16": np.int16,
+    "uint16": np.uint16,
+    "int32": np.int32,
+    "uint32": np.uint32,
+    "int64": np.int64,
+    "uint64": np.uint64,
 }
 
 
@@ -42,7 +48,9 @@ def _device_tensor_to_torch(device_tensor, device: torch.device) -> torch.Tensor
     np_dtype = _DTYPE_STR_TO_NUMPY.get(device_tensor.dtype)
 
     if np_dtype is None and device_tensor.dtype == "bfloat16":
-        arr = np.frombuffer(bytes(raw_bytes), dtype=np.uint16).reshape(device_tensor.shape)
+        arr = np.frombuffer(bytes(raw_bytes), dtype=np.uint16).reshape(
+            device_tensor.shape
+        )
         return torch.from_numpy(arr.copy()).view(torch.bfloat16).to(device)
 
     if np_dtype is None:
@@ -50,6 +58,7 @@ def _device_tensor_to_torch(device_tensor, device: torch.device) -> torch.Tensor
 
     arr = np.frombuffer(bytes(raw_bytes), dtype=np_dtype).reshape(device_tensor.shape)
     return torch.from_numpy(arr.copy()).to(device)
+
 
 # Track live callables for cleanup at interpreter shutdown.
 # Using weak refs so callables can still be garbage-collected normally.
@@ -135,7 +144,8 @@ class NKIPyCallable:
         Args:
             config: CallableConfig with bucket and execution settings
             compiler_fn: Callback to compile for a specific bucket size.
-                         Signature: (bucket_size: int) -> (neff_path: str, alias_map: Dict[int,int], none_idx_list: List[int])
+                         Signature: (bucket_size: int) ->
+                         (neff_path, alias_map, none_idx_list)
         """
         self._config = config
         self._compiler_fn = compiler_fn
@@ -284,7 +294,9 @@ class NKIPyCallable:
             skip_padding = True
         else:
             # Determine padding strategy based on input_layout config
-            actual_len, bucket_size, skip_padding = self._determine_padding_strategy(args)
+            actual_len, bucket_size, skip_padding = self._determine_padding_strategy(
+                args
+            )
 
         # Check if we need to JIT compile
         if bucket_size not in self._compiled_buckets:
@@ -321,11 +333,17 @@ class NKIPyCallable:
 
         # Wrap execution in optional profiling context
         ntff_meta = self._config.ntff_meta
-        if ntff_meta is not None and ntff_meta.save_ntff and bucket_size in self._compiled_buckets:
+        if (
+            ntff_meta is not None
+            and ntff_meta.save_ntff
+            and bucket_size in self._compiled_buckets
+        ):
             from spiky.device.profiling import nkipy_profile
+
             profile_ctx = nkipy_profile(ntff_meta, self._compiled_buckets[bucket_size])
         else:
             from contextlib import nullcontext
+
             profile_ctx = nullcontext((False, None))
 
         with profile_ctx as (save_trace, ntff_file):
@@ -335,7 +353,9 @@ class NKIPyCallable:
                     bundle_id=self._bundle_id,
                     bucket_size=bucket_size,
                     inputs=inputs_np,
-                    next_inputs=[],  # no self-prefetch; content-blind hit check causes stale data
+                    # No self-prefetch: content-blind hit check causes
+                    # stale data.
+                    next_inputs=[],
                     pad_on_device=pad_on_device,
                     keep_outputs_on_device=self._config.keep_outputs_on_device,
                     unpad_outputs=self._config.unpad_outputs,
@@ -365,16 +385,19 @@ class NKIPyCallable:
 
         # Attach metadata when output_layout="padded"
         if self._config.output_layout == "padded" and self._config.dynamic_specs:
-            from spiky.utils.tensor_metadata import attach_metadata, PaddingMetadata
+            from spiky.utils.tensor_metadata import PaddingMetadata, attach_metadata
 
             primary_spec = list(self._config.dynamic_specs.values())[0]
             for out in result:
-                attach_metadata(out, PaddingMetadata(
-                    original_size=actual_len,
-                    padded_size=bucket_size,
-                    pad_dim=primary_spec.dim_idx,
-                    arg_indices=tuple(self._config.dynamic_specs.keys()),
-                ))
+                attach_metadata(
+                    out,
+                    PaddingMetadata(
+                        original_size=actual_len,
+                        padded_size=bucket_size,
+                        pad_dim=primary_spec.dim_idx,
+                        arg_indices=tuple(self._config.dynamic_specs.keys()),
+                    ),
+                )
 
         # Handle alias_map: copy aliased outputs back to input tensors
         if self._alias_map:

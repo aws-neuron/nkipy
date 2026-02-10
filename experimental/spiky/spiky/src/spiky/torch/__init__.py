@@ -6,13 +6,6 @@
 Importing this module registers the 'nkipy' backend with torch.compile.
 """
 
-from spiky.torch.config import (
-    NKIPyBackendConfig,
-    get_nkipy_backend_config,
-    reset_nkipy_backend_config,
-    set_nkipy_backend_config,
-)
-
 # Import backend module to register 'nkipy' backend with torch.compile
 # This import triggers register_backend() call
 from spiky.torch.backend import (
@@ -20,23 +13,33 @@ from spiky.torch.backend import (
     is_nkipy_backend_initialized,
     reset_nkipy_backend,
 )
+from spiky.torch.config import (
+    NKIPyBackendConfig,
+    get_nkipy_backend_config,
+    reset_nkipy_backend_config,
+    set_nkipy_backend_config,
+)
+
 
 # Device utilities - lazy import to avoid circular deps
 def current_device() -> int:
     """Return the current Neuron device index."""
     from spiky.device.module import current_device as _current_device
+
     return _current_device()
 
 
 def set_device(device: int) -> None:
     """Set the current Neuron device."""
     from spiky.device.module import set_device as _set_device
+
     _set_device(device)
 
 
 def device_count() -> int:
     """Return the number of Neuron devices available."""
     from spiky.device.module import device_count as _device_count
+
     return _device_count()
 
 

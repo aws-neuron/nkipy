@@ -1,11 +1,13 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # SPDX-License-Identifier: Apache-2.0
 
 """Parity tests (kept as-is; currently skipped)."""
 
 import pytest
-import torch
-
 import spiky.torch as spiky_torch  # noqa: F401
+import torch
 
 TORCH_TO_NKIPY_AVAILABLE = False
 
@@ -44,4 +46,3 @@ class TestViewOpsParity:
         x_nkipy = original.to("nkipy")
         y_nkipy = x_nkipy.t()
         torch.testing.assert_close(y_nkipy.cpu(), original.t())
-

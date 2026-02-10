@@ -1,11 +1,13 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # SPDX-License-Identifier: Apache-2.0
 
 """Integration tests for nkipy device integration with PyTorch."""
 
 import pytest
-import torch
-
 import spiky.torch as spiky_torch
+import torch
 
 
 class TestTensorMethods:
@@ -102,4 +104,3 @@ class TestTensorProperties:
         assert x.storage_offset() == 0
         y = x[2:]
         assert y.storage_offset() == 2
-

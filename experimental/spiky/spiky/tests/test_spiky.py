@@ -1,7 +1,9 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Non-distributed tests for spiky: smoke, correctness, dynamic shapes, lifecycle, stats.
+"""Non-distributed tests for spiky.
+
+Covers: smoke, correctness, dynamic shapes, lifecycle, stats.
 
 All tests run on real Neuron hardware via the session-scoped hw_backend fixture.
 """
@@ -9,9 +11,8 @@ All tests run on real Neuron hardware via the session-scoped hw_backend fixture.
 import pytest
 import torch
 import torch.nn as nn
-from torch.testing import assert_close
-
 from conftest import requires_neuron
+from torch.testing import assert_close
 
 pytestmark = [requires_neuron]
 
@@ -76,6 +77,7 @@ class TestDeviceSmoke:
 
     def test_device_count(self, hw_backend):
         import spiky
+
         assert spiky.device_count() > 0
 
     def test_tensor_to_device(self, hw_backend):
@@ -211,10 +213,12 @@ class TestBackendLifecycle:
 
     def test_is_initialized(self, hw_backend):
         from spiky.torch.backend import is_nkipy_backend_initialized
+
         assert is_nkipy_backend_initialized() is True
 
     def test_double_init_raises(self, hw_backend):
         from spiky.torch.backend import init_nkipy_backend
+
         with pytest.raises(RuntimeError):
             init_nkipy_backend()
 
@@ -224,11 +228,16 @@ class TestMemoryAndStats:
 
     def test_memory_stats_schema(self, hw_backend):
         import spiky
+
         stats = spiky.get_memory_stats()
         expected_keys = {
-            "used_bytes", "cached_bytes", "total_bytes",
-            "allocation_count", "reuse_count",
-            "cache_hit_count", "cache_miss_count",
+            "used_bytes",
+            "cached_bytes",
+            "total_bytes",
+            "allocation_count",
+            "reuse_count",
+            "cache_hit_count",
+            "cache_miss_count",
         }
         assert set(stats.keys()) == expected_keys
         for v in stats.values():
@@ -236,11 +245,13 @@ class TestMemoryAndStats:
 
     def test_clear_and_trim(self, hw_backend):
         import spiky
+
         spiky.clear_memory_pool()
         spiky.trim_memory_pool(0)
 
     def test_stats_api(self, hw_backend):
         import spiky
+
         spiky.get_stats()
         spiky.reset_stats()
 
@@ -339,6 +350,7 @@ class TestDynamicShapes:
         """Dynamic shapes through a multi-layer model."""
         old_config = self._with_spiky_config(hw_backend)
         try:
+
             class MLP(nn.Module):
                 def __init__(self):
                     super().__init__()
@@ -395,7 +407,9 @@ class TestDynamicShapes:
             torch.manual_seed(42)
             model = nn.Linear(32, 64, bias=False)
             compiled = torch.compile(
-                model, backend="nkipy", dynamic=True,
+                model,
+                backend="nkipy",
+                dynamic=True,
                 options={"buckets": [4, 16]},
             )
 
@@ -473,7 +487,9 @@ class TestStaticCallablePath:
 
         model_dev = model.to("nkipy")
         compiled = torch.compile(
-            model_dev, backend="nkipy", options={"pipelined": False},
+            model_dev,
+            backend="nkipy",
+            options={"pipelined": False},
         )
         x_dev = x.to("nkipy")
         with torch.no_grad():
@@ -530,7 +546,9 @@ class TestStaticCallablePath:
 
         model_dev = model.to("nkipy")
         compiled = torch.compile(
-            model_dev, backend="nkipy", options={"pipelined": False},
+            model_dev,
+            backend="nkipy",
+            options={"pipelined": False},
         )
         x_dev = x.to("nkipy")
         with torch.no_grad():
@@ -719,7 +737,8 @@ class TestKeepOutputsOnDevice:
         """Output shape is correct with keep_outputs_on_device=True."""
         model = nn.Linear(32, 64, bias=False).to("nkipy")
         compiled = torch.compile(
-            model, backend="nkipy",
+            model,
+            backend="nkipy",
             options={"keep_outputs_on_device": True},
         )
         x = torch.randn(8, 32, dtype=torch.float32, device="nkipy")
@@ -738,7 +757,8 @@ class TestKeepOutputsOnDevice:
 
         model_dev = model.to("nkipy")
         compiled = torch.compile(
-            model_dev, backend="nkipy",
+            model_dev,
+            backend="nkipy",
             options={"keep_outputs_on_device": True},
         )
         x_dev = x.to("nkipy")
@@ -758,7 +778,8 @@ class TestKeepOutputsOnDevice:
 
         model_dev = model.to("nkipy")
         compiled = torch.compile(
-            model_dev, backend="nkipy",
+            model_dev,
+            backend="nkipy",
             options={"keep_outputs_on_device": True, "pipelined": False},
         )
         x_dev = x.to("nkipy")
@@ -799,6 +820,7 @@ class TestOutputLayoutPadded:
     @staticmethod
     def _restore_config(old_config):
         from spiky.torch.config import set_nkipy_backend_config
+
         set_nkipy_backend_config(old_config)
 
     def test_padded_output_shape(self, hw_backend):
@@ -807,7 +829,9 @@ class TestOutputLayoutPadded:
         try:
             model = nn.Linear(32, 64, bias=False)
             compiled = torch.compile(
-                model, backend="nkipy", dynamic=True,
+                model,
+                backend="nkipy",
+                dynamic=True,
                 options={"output_layout": "padded", "buckets": [8, 16]},
             )
 
@@ -942,7 +966,8 @@ class TestProfilingIntegration:
 
         ntff_files = list(ntff_output_dir.glob("kernel_*/*.ntff"))
         assert len(ntff_files) == 1, (
-            f"Expected exactly 1 NTFF file for exe_idx=[1], got {len(ntff_files)}: {ntff_files}"
+            f"Expected exactly 1 NTFF file for exe_idx=[1], "
+            f"got {len(ntff_files)}: {ntff_files}"
         )
         # The NTFF file should be named "1.ntff" (matching exe_idx=1)
         assert ntff_files[0].name == "1.ntff", (

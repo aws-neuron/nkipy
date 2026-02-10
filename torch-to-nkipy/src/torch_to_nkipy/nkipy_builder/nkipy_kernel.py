@@ -79,7 +79,8 @@ class NKIPyKernel:
         self._rank = rank
         self._world_size = world_size
         self.kernel_hash = hash_gm_with_tensors(
-            gm, example_inputs,
+            gm,
+            example_inputs,
             additional_compiler_args=additional_compiler_args,
         )
         self.kernel_paths = self._setup_paths()

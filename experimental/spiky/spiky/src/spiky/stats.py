@@ -85,17 +85,25 @@ def get_memory_stats() -> dict:
     """
     if not _SPIKY_AVAILABLE:
         return {
-            "used_bytes": 0, "cached_bytes": 0, "total_bytes": 0,
-            "allocation_count": 0, "reuse_count": 0,
-            "cache_hit_count": 0, "cache_miss_count": 0,
+            "used_bytes": 0,
+            "cached_bytes": 0,
+            "total_bytes": 0,
+            "allocation_count": 0,
+            "reuse_count": 0,
+            "cache_hit_count": 0,
+            "cache_miss_count": 0,
         }
     if hasattr(_core, "get_memory_stats"):
         return _core.get_memory_stats()
     # Fallback: construct from available APIs
     return {
-        "used_bytes": 0, "cached_bytes": 0, "total_bytes": 0,
-        "allocation_count": 0, "reuse_count": 0,
-        "cache_hit_count": 0, "cache_miss_count": 0,
+        "used_bytes": 0,
+        "cached_bytes": 0,
+        "total_bytes": 0,
+        "allocation_count": 0,
+        "reuse_count": 0,
+        "cache_hit_count": 0,
+        "cache_miss_count": 0,
     }
 
 

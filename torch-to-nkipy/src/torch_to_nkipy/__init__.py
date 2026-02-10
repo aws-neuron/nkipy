@@ -14,12 +14,12 @@ Primary exports:
 
 # IR building exports (primary functionality of this package)
 from torch_to_nkipy.nkipy_builder import (
+    ComputationNode,
+    InputNode,
+    NKIPyAST,
     NKIPyBuilder,
     NKIPyKernel,
-    NKIPyAST,
-    InputNode,
     OutputNode,
-    ComputationNode,
 )
 from torch_to_nkipy.utils import NKIOpRegistry, mark_subgraph_identity
 from torch_to_nkipy.utils.graph import (
@@ -27,7 +27,6 @@ from torch_to_nkipy.utils.graph import (
     load_func_from_file,
     save_string_to_file,
 )
-
 
 __all__ = [
     # IR Building (primary exports)

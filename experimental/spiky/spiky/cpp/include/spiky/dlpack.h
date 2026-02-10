@@ -1,3 +1,6 @@
+// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 #pragma once
 
 // Minimal DLPack definitions used by spiky. This avoids depending on an external

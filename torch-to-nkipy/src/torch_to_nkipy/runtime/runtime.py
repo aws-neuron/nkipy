@@ -29,8 +29,8 @@ import torch
 
 from nkipy.core.compile import compile_to_neff, trace
 from torch_to_nkipy.backend.nkipy_backend_config import get_nkipy_backend_config
-from torch_to_nkipy.device.runtime_backend import LoadedModel
 from torch_to_nkipy.device import load_spike_model, nkipy_profile, spike_execute
+from torch_to_nkipy.device.runtime_backend import LoadedModel
 from torch_to_nkipy.utils.dtype import meta_tensor_to_numpy, numpy_to_torch_dtype
 from torch_to_nkipy.utils.graph import load_func_from_file
 from torch_to_nkipy.utils.name import (

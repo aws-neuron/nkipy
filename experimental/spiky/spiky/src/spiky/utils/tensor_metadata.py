@@ -9,9 +9,9 @@ efficient multi-stage pipelines where padded tensors pass between stages
 without redundant pad/unpad operations.
 """
 
+import weakref
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
-import weakref
 
 
 @dataclass(frozen=True)

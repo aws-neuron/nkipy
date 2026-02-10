@@ -3,11 +3,16 @@
 
 """NKIPy backend implementation for PyTorch Dynamo."""
 
+from __future__ import annotations
+
 import builtins
 import logging
 import os
 from pathlib import Path
-from typing import Callable, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Callable, Optional, Sequence, Union
+
+if TYPE_CHECKING:
+    from spiky.callable import NKIPyCallable
 
 import torch
 import torch._dynamo
@@ -20,14 +25,14 @@ from torch._functorch._aot_autograd.utils import make_boxed_func
 from torch._functorch.aot_autograd import aot_module_simplified
 from torch._inductor.utils import InputType
 
+from spiky.device.init import nkipy_close, nkipy_init
+from spiky.runtime.parallel import in_parallel_compile_context
 from spiky.torch.config import (
     NKIPyBackendConfig,
     get_nkipy_backend_config,
     reset_nkipy_backend_config,
     set_nkipy_backend_config,
 )
-from spiky.device.init import nkipy_close, nkipy_init
-from spiky.runtime.parallel import in_parallel_compile_context
 
 # Import from torch-to-nkipy for IR building
 from torch_to_nkipy.nkipy_builder.nkipy_kernel import NKIPyKernel
@@ -138,6 +143,7 @@ def init_nkipy_backend(
 
     # Register torch device
     from spiky.device import _register_device
+
     _register_device()
 
     # Auto-detect rank and world_size
@@ -192,13 +198,17 @@ class CompiledWrapper(torch.nn.Module):
         self._rank = config.rank
         self._world_size = config.world_size
         self._pipelined = (options or {}).get("pipelined", config.pipelined)
-        self._keep_outputs_on_device = (options or {}).get("keep_outputs_on_device", config.keep_outputs_on_device)
-        self._callable: Optional['NKIPyCallable'] = None
+        self._keep_outputs_on_device = (options or {}).get(
+            "keep_outputs_on_device", config.keep_outputs_on_device
+        )
+        self._callable: Optional["NKIPyCallable"] = None
 
     def forward(self, *args, **kwargs):
         if self._handle is None:
             self._handle = NKIPyKernel(
-                self._gm, args, self._options,
+                self._gm,
+                args,
+                self._options,
                 cache_dir=self._cache_dir,
                 additional_compiler_args=self._additional_compiler_args,
                 rank=self._rank,
@@ -216,7 +226,7 @@ class CompiledWrapper(torch.nn.Module):
             return kernel._execute_on_host(*args)
 
     def _create_static_callable(self, kernel, args):
-        from spiky.callable import NKIPyCallable, CallableConfig
+        from spiky.callable import CallableConfig, NKIPyCallable
         from spiky.runtime.compile import compile_model
 
         _nkipy_func = kernel.nkipy_func
@@ -227,7 +237,9 @@ class CompiledWrapper(torch.nn.Module):
 
         def static_compiler_fn(bucket_size: int):
             neff_path, io_specs = compile_model(
-                nkipy_func=_nkipy_func, args=_args, kernel_dir=_kernel_dir,
+                nkipy_func=_nkipy_func,
+                args=_args,
+                kernel_dir=_kernel_dir,
             )
             return str(neff_path), _alias_map, _none_idx_list
 
@@ -292,7 +304,7 @@ def _create_spiky_callable(
         NKIPyCallable instance, or None if routing should fall back to default path
     """
     try:
-        from spiky.callable import NKIPyCallable, CallableConfig
+        from spiky.callable import CallableConfig, NKIPyCallable
         from spiky.utils.dynamic_shapes import discover_dynamic_specs, infer_buckets
     except ImportError:
         logger.warning("spiky not available, falling back to default path")
@@ -326,19 +338,19 @@ def _create_spiky_callable(
             shape = []
             for dim_size in inp.shape:
                 shape.append(int(dim_size))
-            input_metadata.append({
-                "shape": tuple(shape),
-                "dtype": inp.dtype,
-                "is_floating_point": inp.is_floating_point(),
-            })
+            input_metadata.append(
+                {
+                    "shape": tuple(shape),
+                    "dtype": inp.dtype,
+                    "is_floating_point": inp.is_floating_point(),
+                }
+            )
         else:
             input_metadata.append(None)
             symint_indices.append(i)
 
     # Build mapping from arg_idx to dynamic dim
-    dynamic_arg_to_dim = {
-        spec.arg_idx: spec.dim_idx for spec in dynamic_specs.values()
-    }
+    dynamic_arg_to_dim = {spec.arg_idx: spec.dim_idx for spec in dynamic_specs.values()}
 
     # Create compiler callback that uses make_fx + NKIPyKernel
     def compiler_fn(bucket_size: int):
@@ -351,8 +363,9 @@ def _create_spiky_callable(
         4. Pass only tensor inputs to NKIPyKernel
         5. Force NEFF compilation
         """
-        from spiky.runtime.compile import compile_model
         from torch.fx.experimental.proxy_tensor import make_fx
+
+        from spiky.runtime.compile import compile_model
 
         # Create concrete inputs from metadata
         concrete_inputs = []
@@ -379,9 +392,9 @@ def _create_spiky_callable(
 
         # Re-trace with make_fx to get a graph with concrete shapes
         with torch.no_grad():
-            concrete_gm = make_fx(
-                gm, decomposition_table=core_aten_decompositions()
-            )(*concrete_inputs)
+            concrete_gm = make_fx(gm, decomposition_table=core_aten_decompositions())(
+                *concrete_inputs
+            )
 
         # Remove SymInt placeholder nodes — NKIPyKernel only takes tensors
         graph = concrete_gm.graph
@@ -410,7 +423,9 @@ def _create_spiky_callable(
 
         # Build IR via NKIPyKernel (tensor inputs only)
         kernel = NKIPyKernel(
-            concrete_gm, tensor_inputs, options,
+            concrete_gm,
+            tensor_inputs,
+            options,
             cache_dir=config.nkipy_cache,
             additional_compiler_args=config.additional_compiler_args,
             rank=config.rank,
@@ -428,11 +443,15 @@ def _create_spiky_callable(
     # Determine output layout and derive unpad_outputs consistently.
     # When output_layout is "padded", the engine must NOT unpad so that
     # the caller receives padded tensors with correct PaddingMetadata.
-    output_layout = options.get("output_layout", config.output_layout) if options else config.output_layout
+    output_layout = (
+        options.get("output_layout", config.output_layout)
+        if options
+        else config.output_layout
+    )
     if options and "unpad_outputs" in options:
         unpad_outputs = options["unpad_outputs"]
     else:
-        unpad_outputs = (output_layout != "padded")
+        unpad_outputs = output_layout != "padded"
 
     # Create callable config
     callable_config = CallableConfig(
@@ -441,11 +460,21 @@ def _create_spiky_callable(
         dynamic_specs=dynamic_specs,
         symint_indices=symint_indices,
         jit_enabled=options.get("jit", True) if options else True,
-        pipelined=options.get("pipelined", config.pipelined) if options else config.pipelined,
+        pipelined=options.get("pipelined", config.pipelined)
+        if options
+        else config.pipelined,
         unpad_outputs=unpad_outputs,
-        pad_on_device=options.get("pad_on_device", config.pad_on_device) if options else config.pad_on_device,
-        keep_outputs_on_device=options.get("keep_outputs_on_device", config.keep_outputs_on_device) if options else config.keep_outputs_on_device,
-        input_layout=options.get("input_layout", config.input_layout) if options else config.input_layout,
+        pad_on_device=options.get("pad_on_device", config.pad_on_device)
+        if options
+        else config.pad_on_device,
+        keep_outputs_on_device=options.get(
+            "keep_outputs_on_device", config.keep_outputs_on_device
+        )
+        if options
+        else config.keep_outputs_on_device,
+        input_layout=options.get("input_layout", config.input_layout)
+        if options
+        else config.input_layout,
         output_layout=output_layout,
         cc_enabled=config.world_size > 1,
         rank_id=config.rank,

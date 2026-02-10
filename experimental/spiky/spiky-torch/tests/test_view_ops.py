@@ -1,11 +1,13 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # SPDX-License-Identifier: Apache-2.0
 
 """Tests for view operations on nkipy tensors."""
 
 import pytest
-import torch
-
 import spiky.torch as spiky_torch  # noqa: F401
+import torch
 
 
 class TestView:
@@ -130,4 +132,3 @@ class TestSqueeze:
         x = torch.randn(1, 3, 1, 4, device="nkipy")
         y = x.squeeze(0)
         assert y.shape == (3, 1, 4)
-

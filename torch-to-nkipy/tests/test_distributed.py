@@ -8,7 +8,6 @@ These tests should be run with torchrun, e.g.:
     torchrun --nproc_per_node=2 -m pytest tests/test_distributed.py -v
 """
 
-
 import torch
 import torch.distributed as dist
 import torch.nn as nn

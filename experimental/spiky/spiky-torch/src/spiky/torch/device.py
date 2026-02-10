@@ -1,5 +1,7 @@
-"""Device module for nkipy - provides torch.nkipy.* functions.
-"""
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Device module for nkipy - provides torch.nkipy.* functions."""
 
 import torch
 
@@ -32,7 +34,7 @@ class DeviceModule:
     @staticmethod
     def synchronize(device: int | None = None) -> None:
         # No-op: spiky.torch operations are synchronous.
-        (void := device)  # keep signature; silence linters without extra deps
+        _ = device  # keep signature; silence linters without extra deps
         return None
 
     @staticmethod
@@ -51,7 +53,7 @@ class DeviceModule:
 
     @staticmethod
     def get_device_capability(device: int | None = None) -> tuple[int, int]:
-        (void := device)
+        _ = device
         return (1, 0)
 
     @staticmethod
@@ -77,4 +79,3 @@ class DeviceModule:
 
 
 device_module = DeviceModule()
-

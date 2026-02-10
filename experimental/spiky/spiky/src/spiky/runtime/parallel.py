@@ -12,9 +12,9 @@ from typing import List, Union
 
 import torch
 
-from spiky.torch.config import get_nkipy_backend_config
-from spiky.runtime.cache import hashes_to_kernel_dirs, get_kernel_hash_from_path
+from spiky.runtime.cache import get_kernel_hash_from_path, hashes_to_kernel_dirs
 from spiky.runtime.compile import compile_model_wrapped
+from spiky.torch.config import get_nkipy_backend_config
 
 logger = logging.getLogger(__name__)
 
@@ -108,7 +108,9 @@ def parallel_compile_context(num_workers: int = 1):
                 """workers from every process..."""
             )
         nkipy_config = get_nkipy_backend_config()
-        nkipy_cache_prefix = nkipy_config.nkipy_cache_prefix if nkipy_config else "./nkipy_cache"
+        nkipy_cache_prefix = (
+            nkipy_config.nkipy_cache_prefix if nkipy_config else "./nkipy_cache"
+        )
         all_cache_dirs = [
             Path(f"{nkipy_cache_prefix}/rank_{r}") for r in range(world_size)
         ]

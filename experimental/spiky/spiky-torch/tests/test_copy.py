@@ -1,10 +1,12 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # SPDX-License-Identifier: Apache-2.0
 
 """Tests for copy operations between CPU and nkipy device."""
 
-import torch
-
 import spiky.torch as spiky_torch  # noqa: F401
+import torch
 
 
 class TestCPUToNkipy:
@@ -106,4 +108,3 @@ class TestDtypeConversion:
         nkipy_tensor = torch.randn(10, 10, device="nkipy", dtype=torch.float16)
         cpu_tensor = nkipy_tensor.to("cpu", dtype=torch.float32)
         assert cpu_tensor.dtype == torch.float32
-

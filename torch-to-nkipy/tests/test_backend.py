@@ -15,11 +15,9 @@ import pytest
 
 from torch_to_nkipy.backend.nkipy_backend import (
     init_nkipy_backend,
-    is_nkipy_backend_initialized,
     reset_nkipy_backend,
 )
 from torch_to_nkipy.backend.nkipy_backend_config import (
-    NKIPyBackendConfig,
     get_nkipy_backend_config,
 )
 
@@ -115,7 +113,7 @@ class TestBackendInitialization:
 
         init_nkipy_backend(
             nkipy_cache=isolated_backend["cache_dir"],
-            additional_compiler_args="--fast-math"
+            additional_compiler_args="--fast-math",
         )
 
         config = get_nkipy_backend_config()
@@ -192,8 +190,7 @@ class TestBackendEdgeCases:
         """Test that default rank is 0 when no env vars or torch.distributed."""
         # Clear relevant env vars
         env_without_rank = {
-            k: v for k, v in os.environ.items()
-            if k not in ["LOCAL_RANK", "RANK"]
+            k: v for k, v in os.environ.items() if k not in ["LOCAL_RANK", "RANK"]
         }
         with patch.dict(os.environ, env_without_rank, clear=True):
             isolated_backend["init"]()
@@ -203,8 +200,7 @@ class TestBackendEdgeCases:
     def test_default_world_size_is_one(self, isolated_backend):
         """Test that default world_size is 1 when no env vars or torch.distributed."""
         env_without_world_size = {
-            k: v for k, v in os.environ.items()
-            if k != "WORLD_SIZE"
+            k: v for k, v in os.environ.items() if k != "WORLD_SIZE"
         }
         with patch.dict(os.environ, env_without_world_size, clear=True):
             isolated_backend["init"]()

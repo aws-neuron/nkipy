@@ -24,6 +24,7 @@ __all__ = [
 def _register_device():
     """Register nkipy device with PyTorch (called on init_nkipy_backend)."""
     from spiky.backend import get_backend
+
     get_backend().register_torch_device()
     # Import distributed for side effects (backend registration)
     from spiky.device import distributed  # noqa: F401

@@ -23,13 +23,13 @@ import torch.nn as nn
 NEURON_AVAILABLE = False
 try:
     import spiky
+
     NEURON_AVAILABLE = spiky.device_count() > 0
 except Exception:
     pass
 
 DISTRIBUTED_ENV = (
-    os.environ.get("RANK") is not None
-    or os.environ.get("LOCAL_RANK") is not None
+    os.environ.get("RANK") is not None or os.environ.get("LOCAL_RANK") is not None
 )
 
 pytestmark = pytest.mark.skipif(
@@ -50,7 +50,7 @@ def setup_module(module):
 
 def teardown_module(module):
     """Cleanup distributed backend after all tests."""
-    from spiky.torch.backend import reset_nkipy_backend, is_nkipy_backend_initialized
+    from spiky.torch.backend import is_nkipy_backend_initialized, reset_nkipy_backend
 
     if is_nkipy_backend_initialized():
         reset_nkipy_backend()
@@ -80,8 +80,9 @@ class TestDistributedExecution:
         assert torch.allclose(
             result_cpu,
             torch.full_like(result_cpu, expected_val),
-            rtol=1e-4, atol=1e-4,
-        ), f"Rank {rank}: expected {expected_val}, got {result_cpu[0,0].item()}"
+            rtol=1e-4,
+            atol=1e-4,
+        ), f"Rank {rank}: expected {expected_val}, got {result_cpu[0, 0].item()}"
 
     def test_mlp_with_all_reduce(self):
         class MLP(nn.Module):
@@ -157,16 +158,19 @@ class TestDistributedConfig:
 
     def test_rank_matches(self):
         from spiky.torch.config import get_nkipy_backend_config
+
         config = get_nkipy_backend_config()
         assert config.rank == dist.get_rank()
 
     def test_world_size_matches(self):
         from spiky.torch.config import get_nkipy_backend_config
+
         config = get_nkipy_backend_config()
         assert config.world_size == dist.get_world_size()
 
     def test_per_rank_cache(self):
         from spiky.torch.config import get_nkipy_backend_config
+
         config = get_nkipy_backend_config()
         rank = dist.get_rank()
         assert f"rank_{rank}" in config.nkipy_cache
@@ -174,4 +178,5 @@ class TestDistributedConfig:
 
 if __name__ == "__main__":
     import sys
+
     sys.exit(pytest.main([__file__, "-v"] + sys.argv[1:]))

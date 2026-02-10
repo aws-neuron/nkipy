@@ -13,6 +13,8 @@ import numpy as np
 import torch
 
 from nkipy.core.compile import compile_to_neff, trace
+from spiky.runtime.cache import get_kernel_hash_from_path, hashes_to_kernel_dirs
+from spiky.runtime.specs import IOSpecs, TensorSpec
 from spiky.torch.config import get_nkipy_backend_config
 from spiky.utils.dtype import meta_tensor_to_numpy, numpy_to_torch_dtype
 from spiky.utils.names import (
@@ -24,9 +26,6 @@ from spiky.utils.names import (
     NKIPY_FUNC_NAME,
 )
 from spiky.utils.target import get_platform_target
-from spiky.runtime.specs import TensorSpec, IOSpecs
-from spiky.runtime.cache import hashes_to_kernel_dirs, get_kernel_hash_from_path
-
 
 # Import graph utilities from torch-to-nkipy for IR building
 from torch_to_nkipy.utils.graph import load_func_from_file

@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # SPDX-License-Identifier: Apache-2.0
 
 """Tests for nkipy memory allocator."""
@@ -5,9 +8,8 @@
 import gc
 
 import pytest
-import torch
-
 import spiky.torch as spiky_torch
+import torch
 
 
 class TestAllocationTracking:
@@ -70,4 +72,3 @@ class TestAllocationSizes:
     def test_large_allocation(self):
         x = torch.empty(10 * 1024 * 1024 // 4, dtype=torch.float32, device="nkipy")
         assert x.numel() > 0
-

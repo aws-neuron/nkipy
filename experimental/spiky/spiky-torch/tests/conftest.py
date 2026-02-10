@@ -1,7 +1,9 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Pytest configuration and fixtures for spiky.torch tests.
-"""
+# SPDX-License-Identifier: Apache-2.0
+
+"""Pytest configuration and fixtures for spiky.torch tests."""
 
 import gc
 import os
@@ -58,4 +60,3 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if "test_performance" in item.nodeid:
             item.add_marker(pytest.mark.slow)
-

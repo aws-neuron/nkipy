@@ -64,18 +64,22 @@ class _SpikyCompiled:
     def __init__(self, model, options: dict):
         self._model = model
         self._options = options
-        self._wrapper = None        # CompiledWrapper — captured from fw_compiler
-        self._frozen_params = None   # model params in aot_module_simplified order
+        self._wrapper = None  # CompiledWrapper — captured from fw_compiler
+        self._frozen_params = None  # model params in aot_module_simplified order
 
     def _trace(self, first_args):
         """Run torch.compile once to trace. Capture CompiledWrapper + frozen params."""
-        from spiky.torch.backend import (
-            init_nkipy_backend, is_nkipy_backend_initialized, CompiledWrapper,
-        )
-        from torch._functorch.aot_autograd import aot_module_simplified
-        from torch._functorch._aot_autograd.utils import make_boxed_func
-        from torch._decomp import core_aten_decompositions
         import torch._functorch._aot_autograd.runtime_wrappers as rw
+        from torch._decomp import core_aten_decompositions
+        from torch._functorch._aot_autograd.utils import make_boxed_func
+        from torch._functorch.aot_autograd import aot_module_simplified
+
+        from spiky.torch.backend import (
+            CompiledWrapper,
+            init_nkipy_backend,
+            is_nkipy_backend_initialized,
+        )
+
         rw.AliasOfInputHandler.__call__ = rw.NoopAliasHandler.__call__
 
         if not is_nkipy_backend_initialized():
@@ -88,13 +92,16 @@ class _SpikyCompiled:
 
             def _fw_compiler(decomposed_gm, flat_inputs):
                 num_params = len(flat_inputs) - num_user_inputs
-                captured["params"] = [x.detach().clone() for x in flat_inputs[:num_params]]
+                captured["params"] = [
+                    x.detach().clone() for x in flat_inputs[:num_params]
+                ]
                 wrapper = CompiledWrapper(decomposed_gm, self._options)
                 captured["wrapper"] = wrapper
                 return make_boxed_func(wrapper)
 
             return aot_module_simplified(
-                gm, example_inputs,
+                gm,
+                example_inputs,
                 fw_compiler=_fw_compiler,
                 decompositions=core_aten_decompositions(),
                 keep_inference_input_mutations=True,
@@ -129,7 +136,11 @@ class _SpikyCompiled:
 
     def flush(self) -> None:
         """Flush any pending pipelined execution."""
-        if self._wrapper is not None and hasattr(self._wrapper, '_callable') and self._wrapper._callable is not None:
+        if (
+            self._wrapper is not None
+            and hasattr(self._wrapper, "_callable")
+            and self._wrapper._callable is not None
+        ):
             self._wrapper._callable.flush()
 
     def close(self) -> None:

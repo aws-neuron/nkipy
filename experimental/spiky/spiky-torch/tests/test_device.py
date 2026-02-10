@@ -1,11 +1,13 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # SPDX-License-Identifier: Apache-2.0
 
 """Tests for nkipy device registration and properties."""
 
 import pytest
-import torch
-
 import spiky.torch as spiky_torch
+import torch
 
 
 class TestDeviceAvailability:
@@ -73,4 +75,3 @@ class TestTorchNkipyModule:
             assert spiky_torch.current_device() == 0
         finally:
             spiky_torch.set_device(original)
-

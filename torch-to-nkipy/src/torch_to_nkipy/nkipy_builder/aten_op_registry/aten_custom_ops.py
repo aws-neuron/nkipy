@@ -79,7 +79,9 @@ def nki_op_handler(node: fx.Node, computation_node: ComputationNode) -> None:
         for arg in node.args
     ]
     hash_str = get_nki_kernel_hash(
-        str(nki_kernel.__name__), ",".join(arg_list), f"{grid}",
+        str(nki_kernel.__name__),
+        ",".join(arg_list),
+        f"{grid}",
         compiler_args + opt_level,
     )
     kernel_name = f"{nki_kernel.__name__}_kernel_{hash_str}"

@@ -3,7 +3,6 @@
 
 """Tests for the runtime backend abstraction layer."""
 
-import pytest
 from unittest.mock import MagicMock
 
 
@@ -52,8 +51,8 @@ class TestBackendManager:
     def test_set_runtime_type_spike(self):
         """Test setting runtime type to spike."""
         from torch_to_nkipy.device.runtime_backend import (
-            set_runtime_type,
             get_runtime_type,
+            set_runtime_type,
         )
 
         set_runtime_type(False)
@@ -62,8 +61,8 @@ class TestBackendManager:
     def test_set_runtime_type_spiky(self):
         """Test setting runtime type to spiky."""
         from torch_to_nkipy.device.runtime_backend import (
-            set_runtime_type,
             get_runtime_type,
+            set_runtime_type,
         )
 
         set_runtime_type(True)
@@ -220,10 +219,10 @@ class TestModuleExports:
         """Test device module exports expected symbols."""
         # These imports should work without error
         from torch_to_nkipy.device import (
-            nkipy_init,
-            nkipy_close,
             is_nkipy_device_initialized,
             load_spike_model,
+            nkipy_close,
+            nkipy_init,
             spike_execute,
         )
 
@@ -235,9 +234,10 @@ class TestModuleExports:
 
     def test_loader_returns_loaded_model_type(self):
         """Test that loader's return type annotation is LoadedModel."""
+        import inspect
+
         from torch_to_nkipy.device.loader import load_spike_model
         from torch_to_nkipy.device.runtime_backend import LoadedModel
-        import inspect
 
         sig = inspect.signature(load_spike_model)
         # Check return annotation

@@ -6,20 +6,9 @@
 End-to-end tests for torch.compile workflow, profiling, and backward compatibility.
 """
 
-import shutil
-from pathlib import Path
-
 import pytest
 import torch
-
 from base import NKIPyTestBase
-
-from torch_to_nkipy.backend.nkipy_backend import (
-    init_nkipy_backend,
-    is_nkipy_backend_initialized,
-    reset_nkipy_backend,
-)
-from torch_to_nkipy.backend.nkipy_backend_config import get_nkipy_backend_config
 
 # Check if Neuron hardware is available
 try:
@@ -258,8 +247,10 @@ class TestBackwardCompatibility:
     def test_old_function_names_importable(self):
         """Test that old function names are still importable."""
         # These imports should not raise
-        from torch_to_nkipy.device import nkipy_execute_model  # noqa: F401
-        from torch_to_nkipy.device import nkipy_load_model  # noqa: F401
+        from torch_to_nkipy.device import (
+            nkipy_execute_model,  # noqa: F401
+            nkipy_load_model,  # noqa: F401
+        )
         from torch_to_nkipy.runtime import execute_model  # noqa: F401
 
 

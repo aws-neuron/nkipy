@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # SPDX-License-Identifier: Apache-2.0
 
 """Performance tests for nkipy device integration (slow)."""
@@ -5,9 +8,8 @@
 import gc
 import time
 
-import torch
-
 import spiky.torch as spiky_torch
+import torch
 
 
 class TestAllocationPerformance:

@@ -35,8 +35,8 @@ class NKIPyBackendConfig:
     pad_on_device: bool = True
     keep_outputs_on_device: bool = False
     pipelined: bool = True
-    input_layout: str = "auto"      # "auto" or "padded"
-    output_layout: str = "unpad"    # "unpad" or "padded"
+    input_layout: str = "auto"  # "auto" or "padded"
+    output_layout: str = "unpad"  # "unpad" or "padded"
 
     def __post_init__(self):
         object.__setattr__(

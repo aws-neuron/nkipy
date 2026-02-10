@@ -39,7 +39,9 @@ def pad_inputs(
                 # Create padding configuration
                 pad_width = [(0, 0)] * inp.ndim
                 pad_width[spec.dim_idx] = (0, bucket_size - original_size)
-                padded.append(np.pad(inp, pad_width, mode="constant", constant_values=0))
+                padded.append(
+                    np.pad(inp, pad_width, mode="constant", constant_values=0)
+                )
             else:
                 padded.append(inp)
         else:

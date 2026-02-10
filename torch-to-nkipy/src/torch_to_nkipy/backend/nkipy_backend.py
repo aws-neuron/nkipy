@@ -191,7 +191,9 @@ class CompiledWrapper(torch.nn.Module):
     def forward(self, *args, **kwargs):
         if self._handle is None:
             self._handle = NKIPyKernel(
-                self._gm, args, self._options,
+                self._gm,
+                args,
+                self._options,
                 cache_dir=self._cache_dir,
                 additional_compiler_args=self._additional_compiler_args,
                 rank=self._rank,

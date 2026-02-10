@@ -1,3 +1,6 @@
+// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 // Spiky execution engine (bucketed execution + padding + unified buffers + pipelining).
 //
 // This implementation is derived from neuron_vm's unified-buffer path and adapted

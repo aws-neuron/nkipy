@@ -47,19 +47,23 @@ class SpikyBackend(RuntimeBackend):
     def is_initialized(self) -> bool:
         """Check if spiky runtime is initialized."""
         import spiky
+
         return spiky.is_initialized() and self._initialized
 
     def current_device(self) -> int:
         """Return current device index."""
         import spiky.torch
+
         return spiky.torch.current_device()
 
     def set_device(self, device: int) -> None:
         """Set current device."""
         import spiky.torch
+
         spiky.torch.set_device(device)
 
     def device_count(self) -> int:
         """Return number of available devices."""
         import spiky
+
         return spiky.device_count()

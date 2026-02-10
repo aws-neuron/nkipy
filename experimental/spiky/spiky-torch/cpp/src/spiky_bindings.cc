@@ -1,3 +1,6 @@
+// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 #include <ATen/core/dispatch/Dispatcher.h>
 #include <ATen/native/CPUFallback.h>
 #include <c10/util/Logging.h>

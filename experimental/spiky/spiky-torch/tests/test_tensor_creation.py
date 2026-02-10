@@ -1,11 +1,13 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # SPDX-License-Identifier: Apache-2.0
 
 """Tests for tensor creation on nkipy device."""
 
 import pytest
-import torch
-
 import spiky.torch as spiky_torch  # noqa: F401
+import torch
 
 
 class TestEmptyTensor:
@@ -93,4 +95,3 @@ class TestLargeTensors:
     def test_large_2d(self):
         x = torch.empty(1000, 1000, device="nkipy")
         assert x.numel() == 1_000_000
-

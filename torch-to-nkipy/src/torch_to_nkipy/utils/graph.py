@@ -36,6 +36,7 @@ def _get_compiler_version() -> str:
     if _compiler_version_str is None:
         try:
             import neuronxcc
+
             _compiler_version_str = str(neuronxcc.__version__)
         except ModuleNotFoundError:
             raise ModuleNotFoundError("Neuronxcc is not properly installed!")

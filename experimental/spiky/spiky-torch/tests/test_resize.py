@@ -1,10 +1,12 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # SPDX-License-Identifier: Apache-2.0
 
 """Tests for resize operations on nkipy tensors."""
 
-import torch
-
 import spiky.torch as spiky_torch  # noqa: F401
+import torch
 
 
 class TestResize:
@@ -60,4 +62,3 @@ class TestResizePreservesData:
         x = original.to("nkipy")
         x.resize_(10)
         torch.testing.assert_close(x.cpu(), original[:10])
-

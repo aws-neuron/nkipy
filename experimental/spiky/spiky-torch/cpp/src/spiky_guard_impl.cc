@@ -1,3 +1,6 @@
+// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 #include "spiky_torch/guard_impl.h"
 
 #include "spiky_torch/device.h"
