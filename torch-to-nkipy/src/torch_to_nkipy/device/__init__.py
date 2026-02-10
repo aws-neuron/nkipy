@@ -3,8 +3,10 @@
 
 """Device management for NKIPy on AWS Neuron hardware."""
 
-# Import spike_torch for device registration (automatic on import)
-import spike_torch  # noqa: F401
+# Import runtime backend and register torch device
+from torch_to_nkipy.device.runtime_backend import get_backend
+
+get_backend().register_torch_device()
 
 # Import submodules for side effects (device registration)
 from torch_to_nkipy.device import device_module, distributed_backend  # noqa: F401

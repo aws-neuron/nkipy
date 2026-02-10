@@ -1,12 +1,14 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import spike_torch
+"""Device utilities for Neuron hardware."""
+
+from torch_to_nkipy.device.runtime_backend import get_backend
 
 
 def current_device() -> int:
     """Return the current Neuron device index."""
-    return spike_torch.current_device()
+    return get_backend().current_device()
 
 
 def set_device(device: int) -> None:
@@ -15,12 +17,12 @@ def set_device(device: int) -> None:
     Args:
         device: Device index to set as current
     """
-    spike_torch.set_device(device)
+    get_backend().set_device(device)
 
 
 def device_count() -> int:
     """Return the number of Neuron devices available."""
-    return spike_torch.device_count()
+    return get_backend().device_count()
 
 
 def get_amp_supported_dtype():

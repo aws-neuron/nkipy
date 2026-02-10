@@ -13,12 +13,12 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from torch_to_nkipy import init_nkipy_backend, reset_nkipy_backend
+from torch_to_nkipy.backend.nkipy_backend import init_nkipy_backend, reset_nkipy_backend
 
 
 def setup_distributed():
     """Initialize distributed backend if not already done."""
-    from torch_to_nkipy import is_nkipy_backend_initialized
+    from torch_to_nkipy.backend.nkipy_backend import is_nkipy_backend_initialized
 
     if not dist.is_initialized():
         dist.init_process_group("nkipy")
@@ -28,7 +28,7 @@ def setup_distributed():
 
 def cleanup_distributed():
     """Cleanup distributed backend."""
-    from torch_to_nkipy import is_nkipy_backend_initialized
+    from torch_to_nkipy.backend.nkipy_backend import is_nkipy_backend_initialized
 
     if is_nkipy_backend_initialized():
         reset_nkipy_backend()
@@ -176,7 +176,7 @@ class TestDistributedConfig:
 
     def test_rank_detection(self):
         """Test that rank is correctly detected from torch.distributed."""
-        from torch_to_nkipy import get_nkipy_backend_config
+        from torch_to_nkipy.backend.nkipy_backend_config import get_nkipy_backend_config
 
         config = get_nkipy_backend_config()
         expected_rank = dist.get_rank()
@@ -185,7 +185,7 @@ class TestDistributedConfig:
 
     def test_world_size_detection(self):
         """Test that world_size is correctly detected from torch.distributed."""
-        from torch_to_nkipy import get_nkipy_backend_config
+        from torch_to_nkipy.backend.nkipy_backend_config import get_nkipy_backend_config
 
         config = get_nkipy_backend_config()
         expected_world_size = dist.get_world_size()
@@ -194,7 +194,7 @@ class TestDistributedConfig:
 
     def test_rank_in_cache_path(self):
         """Test that each rank has its own cache directory."""
-        from torch_to_nkipy import get_nkipy_backend_config
+        from torch_to_nkipy.backend.nkipy_backend_config import get_nkipy_backend_config
 
         config = get_nkipy_backend_config()
         rank = dist.get_rank()

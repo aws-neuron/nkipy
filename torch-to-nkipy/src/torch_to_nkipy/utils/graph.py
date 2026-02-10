@@ -27,13 +27,26 @@ logger = logging.getLogger(__name__)
 _MARK_SG_OP = torch.ops.nkipy.mark_subgraph_identity.default
 
 
-compiler_version_args_str = None
+_compiler_version_str = None
+
+
+def _get_compiler_version() -> str:
+    """Get the neuronxcc compiler version string (cached)."""
+    global _compiler_version_str
+    if _compiler_version_str is None:
+        try:
+            import neuronxcc
+            _compiler_version_str = str(neuronxcc.__version__)
+        except ModuleNotFoundError:
+            raise ModuleNotFoundError("Neuronxcc is not properly installed!")
+    return _compiler_version_str
 
 
 def hash_gm_with_tensors(
     graph_module: torch.fx.GraphModule,
     example_inputs: List[torch.Tensor],
     hash_length: int = 8,
+    additional_compiler_args: str = "",
 ) -> str:
     """Hash a GraphModule and its input tensors.
 
@@ -41,6 +54,7 @@ def hash_gm_with_tensors(
         graph_module: The FX graph module to hash
         example_inputs: List of input tensors
         hash_length: Length of the output hash string (default: 8)
+        additional_compiler_args: Extra compiler flags to include in hash
 
     Returns:
         str: Hash string of specified length
@@ -48,19 +62,7 @@ def hash_gm_with_tensors(
     Raises:
         ValueError: If hash_length is invalid
     """
-    global compiler_version_args_str
-    if compiler_version_args_str is None:
-        try:
-            import neuronxcc
-
-            compiler_version_str = str(neuronxcc.__version__)
-        except ModuleNotFoundError:
-            raise ModuleNotFoundError("Neuronxcc is not properly installed!")
-        # Import here to avoid circular import
-        from torch_to_nkipy.runtime.runtime import get_nkipy_backend_config
-
-        compiler_args_str = get_nkipy_backend_config().additional_compiler_args
-        compiler_version_args_str = compiler_version_str + compiler_args_str
+    compiler_version_args_str = _get_compiler_version() + additional_compiler_args
 
     if hash_length > 32:
         raise ValueError("hash_length must be <= 32")
@@ -72,9 +74,13 @@ def hash_gm_with_tensors(
     )
     hasher.update(graph_module.code.encode("utf-8"))
 
-    for tensor in example_inputs:
-        shape_str = str(tensor.shape)
-        dtype_str = str(tensor.dtype)
+    for inp in example_inputs:
+        if not hasattr(inp, "shape"):
+            # Non-tensor inputs (e.g. SymInt from dynamic shapes) — hash repr
+            hasher.update(repr(inp).encode("utf-8"))
+            continue
+        shape_str = str(inp.shape)
+        dtype_str = str(inp.dtype)
         hasher.update(shape_str.encode("utf-8"))
         hasher.update(dtype_str.encode("utf-8"))
 

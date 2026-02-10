@@ -18,6 +18,9 @@ class NKIPyBackendConfig:
         rank: Process rank for distributed setup
         world_size: Total number of processes
         additional_compiler_args: Custom compiler flags
+        use_spiky: Whether to use spiky runtime instead of spike
+        max_bucket_size: Maximum bucket size for dynamic shapes (default: 2048)
+        bucket_strategy: Bucket generation strategy ("power_of_2" or "linear")
     """
 
     nkipy_cache_prefix: str
@@ -26,6 +29,10 @@ class NKIPyBackendConfig:
     rank: int
     world_size: int
     additional_compiler_args: str
+    use_spiky: bool = False
+    # Dynamic shape options
+    max_bucket_size: int = 2048
+    bucket_strategy: str = "power_of_2"
 
     def __post_init__(self):
         object.__setattr__(
@@ -41,7 +48,10 @@ class NKIPyBackendConfig:
             f"  log_level: {self.log_level}\n"
             f"  rank: {self.rank}\n"
             f"  world_size: {self.world_size}\n"
-            f"  additionl_compiler_flags: {self.additional_compiler_args}\n"
+            f"  additional_compiler_args: {self.additional_compiler_args}\n"
+            f"  use_spiky: {self.use_spiky}\n"
+            f"  max_bucket_size: {self.max_bucket_size}\n"
+            f"  bucket_strategy: {self.bucket_strategy}\n"
         )
 
 

@@ -3,8 +3,7 @@
 
 """Model loading utilities for Neuron device."""
 
-import spike_torch
-from spike import SpikeModel
+from torch_to_nkipy.device.runtime_backend import LoadedModel, get_backend
 
 
 def load_spike_model(
@@ -12,8 +11,8 @@ def load_spike_model(
     cc_enabled: bool,
     device_id: int,
     device_count: int,
-) -> SpikeModel:
-    """Load NEFF and return a SpikeModel instance.
+) -> LoadedModel:
+    """Load NEFF and return a LoadedModel instance.
 
     Args:
         neff_file: Path to the NEFF file
@@ -22,14 +21,13 @@ def load_spike_model(
         device_count: Total number of devices/world size
 
     Returns:
-        SpikeModel instance ready for execution
+        LoadedModel instance ready for execution
     """
-    return SpikeModel.load_from_neff(
-        neff_path=neff_file,
-        core_id=spike_torch.current_device(),
+    return get_backend().load_model(
+        neff_file=neff_file,
         cc_enabled=cc_enabled,
-        rank_id=device_id,
-        world_size=device_count,
+        device_id=device_id,
+        device_count=device_count,
     )
 
 

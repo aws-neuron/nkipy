@@ -97,6 +97,7 @@ def init_nkipy_backend(
     world_size: Optional[int] = None,
     core_offset: int = 0,
     additional_compiler_args: str = "",
+    use_spiky: Optional[bool] = None,
 ) -> None:
     """Initialize the NKIPy backend.
 
@@ -116,12 +117,28 @@ def init_nkipy_backend(
               visible_cores = [rank + core_offset]
               Useful for multi-node setups where cores start at different indices.
         additional_compiler_args: Custom compiler flags
+        use_spiky: Use experimental spiky runtime instead of spike.
+              If None, checks NKIPY_USE_SPIKY environment variable.
+              Defaults to False (use spike).
 
     Raises:
         RuntimeError: If backend is already initialized
     """
     if is_nkipy_backend_initialized():
         raise RuntimeError("NKIPy backend has already been initialized.")
+
+    # Resolve use_spiky: explicit arg > env var > default False
+    if use_spiky is None:
+        use_spiky = os.environ.get("NKIPY_USE_SPIKY", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+
+    # Configure runtime backend type BEFORE any initialization
+    from torch_to_nkipy.device.runtime_backend import set_runtime_type
+
+    set_runtime_type(use_spiky)
 
     # Auto-detect rank and world_size
     rank = _get_rank(rank)
@@ -143,6 +160,7 @@ def init_nkipy_backend(
         rank=rank,
         world_size=world_size,
         additional_compiler_args=additional_compiler_args,
+        use_spiky=use_spiky,
     )
     set_nkipy_backend_config(nkipy_backend_config)
 
@@ -164,10 +182,21 @@ class CompiledWrapper(torch.nn.Module):
         self._gm = gm
         self._handle = None
         self._options = options
+        config = get_nkipy_backend_config()
+        self._cache_dir = config.nkipy_cache
+        self._additional_compiler_args = config.additional_compiler_args
+        self._rank = config.rank
+        self._world_size = config.world_size
 
     def forward(self, *args, **kwargs):
         if self._handle is None:
-            self._handle = NKIPyKernel(self._gm, args, self._options)
+            self._handle = NKIPyKernel(
+                self._gm, args, self._options,
+                cache_dir=self._cache_dir,
+                additional_compiler_args=self._additional_compiler_args,
+                rank=self._rank,
+                world_size=self._world_size,
+            )
         return self._handle(*args, **kwargs)
 
 
@@ -179,13 +208,14 @@ def nkipy_backend_fn_decomposed(
     """Decompose the graph for NKIPy backend.
 
     Args:
-        graph: The FX graph module to decompose
+        gm: The FX graph module to decompose
         example_inputs: Example inputs for the graph
+        options: Backend options
 
     Returns:
         Callable: The decomposed graph
     """
-
+    # Default path (spike backend or static shapes)
     if count_subgraph_markers(gm) == 0:
         compiled_fn = CompiledWrapper(gm, options)
     else:

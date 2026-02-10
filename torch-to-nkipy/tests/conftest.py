@@ -10,12 +10,12 @@ import pytest
 
 # Skip all tests in this folder if torch_to_nkipy cannot be imported
 try:
-    from torch_to_nkipy import (
-        get_nkipy_backend_config,
+    from torch_to_nkipy.backend.nkipy_backend import (
         init_nkipy_backend,
         is_nkipy_backend_initialized,
         reset_nkipy_backend,
     )
+    from torch_to_nkipy.backend.nkipy_backend_config import get_nkipy_backend_config
 
     TORCH_TO_NKIPY_AVAILABLE = True
 except ImportError:

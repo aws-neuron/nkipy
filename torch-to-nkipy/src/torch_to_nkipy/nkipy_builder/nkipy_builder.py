@@ -134,6 +134,13 @@ class NKIPyBuilder:
         numpy_inputs = []
 
         for i, example_input in enumerate(self.example_inputs):
+            if not hasattr(example_input, "shape"):
+                # Non-tensor input (e.g. SymInt from dynamic shapes)
+                raw_torch_inputs.append(f"arg_torch_{i} = {repr(example_input)}")
+                torch_inputs.append(f"arg_torch_{i}")
+                raw_numpy_inputs.append(f"arg_np_{i} = arg_torch_{i}")
+                numpy_inputs.append(f"arg_np_{i}")
+                continue
             shape = example_input.shape
             dtype = example_input.dtype
             tensor_size_dtype_str = f"size={tuple(shape)}, dtype={dtype}"
@@ -305,14 +312,27 @@ class NKIPyBuilder:
         Process an output node.
 
         Creates OutputNodes for each output and adds them to the AST.
+        Skips outputs that were already added as aliased outputs by
+        _add_aliased_output (e.g. from copy_ nodes), to avoid
+        double-counting when aot_autograd includes mutations as outputs.
 
         Args:
             node: The output FX node
         """
+        # Collect names already present from aliased outputs
+        existing_output_names = {o.name for o in self.nkipy_func_ast.outputs}
+
         # For each result in the output tuple
         for arg_idx, arg_node in enumerate(node.args[0]):
             if arg_node is None:
                 self.nkipy_func_ast.add_none_output_idx(arg_idx)
+                continue
+            # Skip if already added as an aliased output (e.g. from copy_)
+            if arg_node.name in existing_output_names:
+                logger.debug(
+                    f"Skipping duplicate output {arg_idx}: {arg_node.name} "
+                    f"(already present as aliased output)"
+                )
                 continue
             # Create and add an output node
             output_node = OutputNode(name=arg_node.name)

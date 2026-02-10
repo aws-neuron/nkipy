@@ -3,47 +3,33 @@
 
 """Model execution on Neuron device."""
 
-import spike_torch
+from typing import Dict, Optional
+
 import torch
-from spike import SpikeModel, get_spike_singleton
-from spike._spike import NrtTensor
 
-
-def _torch_to_nkipy_tensor(tensor: torch.Tensor, name: str) -> NrtTensor:
-    """Convert PyTorch tensor (on nkipy device) to non-owning NrtTensor."""
-    nrt_ptr, size, core_id = spike_torch.get_tensor_info(tensor.data_ptr())
-    return NrtTensor.wrap(nrt_ptr, core_id, size, name)
+from torch_to_nkipy.device.runtime_backend import LoadedModel, get_backend
 
 
 def spike_execute(
-    model: SpikeModel,
-    inputs: dict,
-    outputs: dict,
+    model: LoadedModel,
+    inputs: Dict[str, torch.Tensor],
+    outputs: Dict[str, torch.Tensor],
     save_trace: bool = False,
-    ntff_name: str = None,
+    ntff_name: Optional[str] = None,
 ):
     """Execute model with PyTorch tensors on nkipy device.
 
     Args:
-        model: SpikeModel instance from load_spike_model
+        model: LoadedModel instance from load_spike_model
         inputs: Dict mapping input names to PyTorch tensors on nkipy device
         outputs: Dict mapping output names to PyTorch tensors on nkipy device
         save_trace: Whether to save execution trace
         ntff_name: Optional name for the trace file
     """
-    # Convert to NrtTensor (non-owning wrappers)
-    input_tensors = {
-        name: _torch_to_nkipy_tensor(t, name) for name, t in inputs.items()
-    }
-    output_tensors = {
-        name: _torch_to_nkipy_tensor(t, name) for name, t in outputs.items()
-    }
-
-    # Execute using spike's existing API
-    get_spike_singleton().execute(
-        model.model_ref,
-        inputs=input_tensors,
-        outputs=output_tensors,
+    get_backend().execute(
+        model=model,
+        inputs=inputs,
+        outputs=outputs,
         save_trace=save_trace,
         ntff_name=ntff_name,
     )

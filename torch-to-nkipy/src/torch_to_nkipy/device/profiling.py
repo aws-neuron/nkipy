@@ -9,14 +9,13 @@ import shutil
 from contextlib import contextmanager
 from pathlib import Path
 
-from torch_to_nkipy.backend.nkipy_backend_config import get_nkipy_backend_config
 from torch_to_nkipy.utils.ntff_meta import NtffMeta
 
 logger = logging.getLogger(__name__)
 
 
 @contextmanager
-def nkipy_profile(ntff_meta: NtffMeta, neff_path: str):
+def nkipy_profile(ntff_meta: NtffMeta, neff_path: str, rank: int = 0):
     """Context manager determining profiling settings.
 
     Yields (save_trace, ntff_name) tuple for use in spike_execute.
@@ -31,7 +30,7 @@ def nkipy_profile(ntff_meta: NtffMeta, neff_path: str):
         not ntff_meta.save_ntff_exe_idx
         or ntff_meta.curr_exe_idx in ntff_meta.save_ntff_exe_idx
     )
-    rank_check = get_nkipy_backend_config().rank == 0
+    rank_check = rank == 0
     should_profile = ntff_meta.save_ntff and exe_idx_check and rank_check
     ntff_file = None
 

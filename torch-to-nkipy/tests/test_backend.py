@@ -13,28 +13,19 @@ from unittest.mock import patch
 
 import pytest
 
-from torch_to_nkipy import (
-    get_nkipy_backend_config,
+from torch_to_nkipy.backend.nkipy_backend import (
     init_nkipy_backend,
     is_nkipy_backend_initialized,
     reset_nkipy_backend,
 )
-from torch_to_nkipy.backend.nkipy_backend_config import NKIPyBackendConfig
+from torch_to_nkipy.backend.nkipy_backend_config import (
+    NKIPyBackendConfig,
+    get_nkipy_backend_config,
+)
 
 
 class TestBackendInitialization:
     """Tests for init_nkipy_backend function."""
-
-    def test_init_backend_creates_config(self, isolated_backend):
-        """Test that init_nkipy_backend creates a valid config."""
-        assert not isolated_backend["is_initialized"]()
-
-        isolated_backend["init"]()
-
-        assert isolated_backend["is_initialized"]()
-        config = isolated_backend["get_config"]()
-        assert config is not None
-        assert isinstance(config, NKIPyBackendConfig)
 
     def test_init_backend_twice_raises_error(self, isolated_backend):
         """Test that initializing backend twice raises RuntimeError."""

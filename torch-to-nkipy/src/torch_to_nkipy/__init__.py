@@ -1,27 +1,46 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""PyTorch integration for NKIPy - torch.compile backend for AWS Neuron."""
+"""torch-to-nkipy: IR building for NKIPy.
 
-# Import device module for side effects (registers "nkipy" device)
-from torch_to_nkipy import device  # noqa: F401
+This package provides tools for converting PyTorch FX graphs to NKIPy IR.
+For runtime, device management, and PyTorch integration, use `spiky.torch`.
 
-# Re-export from submodules
-from torch_to_nkipy.backend import (
-    get_nkipy_backend_config,
-    init_nkipy_backend,
-    is_nkipy_backend_initialized,
-    reset_nkipy_backend,
+Primary exports:
+- NKIPyBuilder: Builds NKIPy IR from FX graphs
+- NKIPyKernel: Manages kernel compilation and execution
+- NKIPyAST, InputNode, OutputNode, ComputationNode: AST types
+"""
+
+# IR building exports (primary functionality of this package)
+from torch_to_nkipy.nkipy_builder import (
+    NKIPyBuilder,
+    NKIPyKernel,
+    NKIPyAST,
+    InputNode,
+    OutputNode,
+    ComputationNode,
 )
 from torch_to_nkipy.utils import NKIOpRegistry, mark_subgraph_identity
+from torch_to_nkipy.utils.graph import (
+    gm_split_and_wrap,
+    load_func_from_file,
+    save_string_to_file,
+)
+
 
 __all__ = [
-    # Backend initialization
-    "init_nkipy_backend",
-    "is_nkipy_backend_initialized",
-    "reset_nkipy_backend",
-    "get_nkipy_backend_config",
+    # IR Building (primary exports)
+    "NKIPyBuilder",
+    "NKIPyKernel",
+    "NKIPyAST",
+    "InputNode",
+    "OutputNode",
+    "ComputationNode",
     # Utilities
     "mark_subgraph_identity",
     "NKIOpRegistry",
+    "gm_split_and_wrap",
+    "load_func_from_file",
+    "save_string_to_file",
 ]

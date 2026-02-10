@@ -28,8 +28,8 @@ import numpy as np
 import torch
 
 from nkipy.core.compile import compile_to_neff, trace
-from spike import SpikeModel
 from torch_to_nkipy.backend.nkipy_backend_config import get_nkipy_backend_config
+from torch_to_nkipy.device.runtime_backend import LoadedModel
 from torch_to_nkipy.device import load_spike_model, nkipy_profile, spike_execute
 from torch_to_nkipy.utils.dtype import meta_tensor_to_numpy, numpy_to_torch_dtype
 from torch_to_nkipy.utils.graph import load_func_from_file
@@ -86,7 +86,7 @@ class NeuronExecutable:
     It contains everything needed to execute the model and interpret its results.
     """
 
-    nkipy_model: SpikeModel  # Reference to the loaded SpikeModel
+    nkipy_model: LoadedModel  # Reference to the loaded model
     io_specs: IOSpecs  # Input/output specifications for tensor allocation and binding
     neff_path: str
 
@@ -137,6 +137,9 @@ def compile_load_execute(
     none_idx_list: List[int],
     kernel_dir: Path,
     ntff_meta: NtffMeta,
+    rank: int = 0,
+    world_size: int = 1,
+    additional_compiler_args: str = "",
 ) -> List[torch.Tensor]:
     """
     End-to-end function to compile, load, and execute a model on Neuron hardware.
@@ -163,6 +166,9 @@ def compile_load_execute(
             kernel_hash=kernel_hash,
             args=args,
             kernel_dir=kernel_dir,
+            rank=rank,
+            world_size=world_size,
+            additional_compiler_args=additional_compiler_args,
         )
 
     # Second phase: Execute the loaded model with provided inputs (with profiling)
@@ -175,6 +181,7 @@ def compile_load_execute(
             none_idx_list=none_idx_list,
             args=args,
             ntff_meta=ntff_meta,
+            rank=rank,
         )
 
     return output_tensors
@@ -185,6 +192,9 @@ def load_model(
     kernel_hash: str,
     args: Tuple[torch.Tensor, ...],
     kernel_dir: Path,
+    rank: int = 0,
+    world_size: int = 1,
+    additional_compiler_args: str = "",
 ) -> NeuronExecutable:
     """
     Load a compiled Neuron model, compiling it first if not already cached.
@@ -208,17 +218,17 @@ def load_model(
             nkipy_func=nkipy_func,
             args=args,
             kernel_dir=kernel_dir,
+            additional_compiler_args=additional_compiler_args,
         )
 
         # Load the compiled model into the Neuron runtime
-        config = get_nkipy_backend_config()
-        logger.info(f"Rank {config.rank}: loading from {neff_path}...")
+        logger.info(f"Rank {rank}: loading from {neff_path}...")
         nkipy_model = load_spike_model(
             neff_file=str(neff_path),
             # Enable collective communication for distributed execution
-            cc_enabled=config.world_size > 1,
-            device_id=config.rank,
-            device_count=config.world_size,
+            cc_enabled=world_size > 1,
+            device_id=rank,
+            device_count=world_size,
         )
 
         # Create and cache the executable
@@ -234,6 +244,7 @@ def compile_model(
     kernel_dir: Path,
     numpy_args: Tuple[np.ndarray] = None,
     use_numpy_args: bool = False,
+    additional_compiler_args: str = "",
 ) -> Tuple[Path, IOSpecs]:
     """
     Compile a Python function to a Neuron executable (NEFF).
@@ -288,13 +299,12 @@ def compile_model(
         traced_kernel.specialize(*args_numpy)
 
     # Step 4: Compile the specialized kernel to a Neuron executable (NEFF)
-    nkipy_config = get_nkipy_backend_config()
     neff_path = compile_to_neff(
         trace_kernel=traced_kernel,
         target=get_platform_target(),
         output_dir=kernel_compile_dir,
         save_artifacts=True,  # Save additional artifacts for debugging
-        additional_compiler_args=nkipy_config.additional_compiler_args,
+        additional_compiler_args=additional_compiler_args,
     )
 
     # Step 5: Extract and save I/O specifications for later use
@@ -437,13 +447,14 @@ def in_parallel_compile_context():
 
 
 def run_neff_model(
-    nkipy_model: SpikeModel,
+    nkipy_model: LoadedModel,
     args: Tuple[torch.Tensor, ...],
     alias_map: Dict[int, int],
     none_idx_list: List[int],
     io_specs: IOSpecs,
     neff_path: str,
     ntff_meta: NtffMeta,
+    rank: int = 0,
 ) -> List[torch.Tensor]:
     """
     Execute a compiled NEFF model on Neuron hardware with the given inputs.
@@ -456,7 +467,7 @@ def run_neff_model(
     5. Cleaning up temporary resources
 
     Args:
-        nkipy_model: Reference to the loaded SpikeModel
+        nkipy_model: Reference to the loaded model (LoadedModel)
         args: Input tensors for model execution
         alias_map: Mapping from output indices to input indices for in-place operations
         io_specs: Input/output specifications that define tensor shapes and types
@@ -493,7 +504,7 @@ def run_neff_model(
     neff_input_dict = dict(zip(neff_input_names, neff_input_tensors))
     neff_output_dict = dict(zip(neff_output_names, neff_output_tensors))
 
-    with nkipy_profile(ntff_meta, neff_path) as (save_trace, ntff_name):
+    with nkipy_profile(ntff_meta, neff_path, rank=rank) as (save_trace, ntff_name):
         # Execute the model on Neuron hardware
         spike_execute(
             model=nkipy_model,

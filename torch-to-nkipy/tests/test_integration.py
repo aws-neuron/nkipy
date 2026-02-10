@@ -14,12 +14,12 @@ import torch
 
 from base import NKIPyTestBase
 
-from torch_to_nkipy import (
-    get_nkipy_backend_config,
+from torch_to_nkipy.backend.nkipy_backend import (
     init_nkipy_backend,
     is_nkipy_backend_initialized,
     reset_nkipy_backend,
 )
+from torch_to_nkipy.backend.nkipy_backend_config import get_nkipy_backend_config
 
 # Check if Neuron hardware is available
 try:

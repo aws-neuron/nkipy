@@ -12,7 +12,6 @@ import torch
 import torch.fx as fx
 from torch._inductor.utils import InputType
 
-from torch_to_nkipy.backend.nkipy_backend_config import get_nkipy_backend_config
 from torch_to_nkipy.nkipy_builder.nkipy_builder import NKIPyBuilder
 from torch_to_nkipy.runtime.runtime import (
     compile_load_execute,
@@ -58,6 +57,10 @@ class NKIPyKernel:
         gm: fx.GraphModule,
         example_inputs: Sequence[InputType],
         options: Optional[dict[str, Union[str, builtins.int, builtins.bool]]] = None,
+        cache_dir: str = "",
+        additional_compiler_args: str = "",
+        rank: int = 0,
+        world_size: int = 1,
     ):
         """
         Initialize a NKIPyKernel.
@@ -65,8 +68,20 @@ class NKIPyKernel:
         Args:
             gm: The FX GraphModule to compile
             example_inputs: Example inputs for tracing and optimization
+            options: Backend options
+            cache_dir: Directory for kernel cache artifacts
+            additional_compiler_args: Extra compiler flags (included in kernel hash)
+            rank: Process rank for distributed execution
+            world_size: Total number of processes
         """
-        self.kernel_hash = hash_gm_with_tensors(gm, example_inputs)
+        self._cache_dir = cache_dir
+        self._additional_compiler_args = additional_compiler_args
+        self._rank = rank
+        self._world_size = world_size
+        self.kernel_hash = hash_gm_with_tensors(
+            gm, example_inputs,
+            additional_compiler_args=additional_compiler_args,
+        )
         self.kernel_paths = self._setup_paths()
         self.nkipy_func = None
         self.alias_map: Dict[int, int] = {}
@@ -98,8 +113,7 @@ class NKIPyKernel:
         Returns:
             Dictionary mapping artifact names to their file paths
         """
-        config = get_nkipy_backend_config()
-        kernel_dir = Path(config.nkipy_cache) / f"kernel_{self.kernel_hash}"
+        kernel_dir = Path(self._cache_dir) / f"kernel_{self.kernel_hash}"
         return {
             "kernel_dir": kernel_dir,
             "func_file": kernel_dir / NKIPY_FUNC_FILE,
@@ -265,6 +279,9 @@ class NKIPyKernel:
             none_idx_list=self.none_idx_list,
             kernel_dir=self.kernel_paths["kernel_dir"],
             ntff_meta=self.ntff_meta,
+            rank=self._rank,
+            world_size=self._world_size,
+            additional_compiler_args=self._additional_compiler_args,
         )
 
     def _save_arg_shape_dtype(self, args):
