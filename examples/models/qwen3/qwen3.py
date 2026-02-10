@@ -10,7 +10,6 @@ from config import Config, get_config
 from kernels.sampling import greedy_sampling
 from kernels.transformer_layer import transformer_layer
 from nkipy.runtime import DeviceKernel, DeviceTensor
-from parallel_state import initialize_model_parallel
 from safetensors.torch import load_file
 from transformers import AutoTokenizer
 from utils import print_log
@@ -339,34 +338,35 @@ class Qwen3Model:
             yield next_id_torch
 
 
-def main():
+def load_model(args):
+    """Initialize distributed environment, load weights, and build a Qwen3Model.
+
+    Args:
+        args: Namespace with .model, .prompt, .max_new_tokens, .checkpoint attributes.
+
+    Returns:
+        (model, input_ids, tokenizer) tuple ready for generation.
+    """
     os.environ["TOKENIZERS_PARALLELISM"] = "true"  # disable warning
     os.environ["OMP_NUM_THREADS"] = "1"  # disable warning
     os.environ["NEURON_RT_ROOT_COMM_ID"] = "localhost:61239"
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-n", "--max-new-tokens", type=int, default=16)
-    parser.add_argument("prompt", nargs="?", default="The capital of France is")
-    parser.add_argument("--checkpoint", default="/kaena/qwen3_shards_30B_A3B_TP8")
-    parser.add_argument("--model", default="Qwen/Qwen3-30B-A3B")
-    args = parser.parse_args()
-    prompt = args.prompt
 
-    initialize_model_parallel()
+    dist.init_process_group()
+    torch.set_num_threads(128 // dist.get_world_size())
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+    os.environ["NEURON_RT_VISIBLE_CORES"] = str(dist.get_rank())
 
-    model_name = args.model
-
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model_inputs = tokenizer(prompt, return_tensors="np")
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    model_inputs = tokenizer(args.prompt, return_tensors="np")
     input_ids = model_inputs["input_ids"]
-    config = get_config(model_name, input_ids.shape[1], args.max_new_tokens)
+    config = get_config(args.model, input_ids.shape[1], args.max_new_tokens)
 
     print_log("Loading Model Weights")
-    t = time.time()
 
     shard_path = os.path.join(args.checkpoint, f"shard_{dist.get_rank()}.safetensors")
     weights = load_file(shard_path, device="cpu")
 
-    # Create and run the model
     model = Qwen3Model(weights, config)
 
     # warming
@@ -379,12 +379,25 @@ def main():
         t += 1
     print_log(f"--> Finished warming the model in {time.time() - start:.2f}s")
 
+    return model, input_ids, tokenizer
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-n", "--max-new-tokens", type=int, default=16)
+    parser.add_argument("prompt", nargs="?", default="The capital of France is")
+    parser.add_argument("--checkpoint", default="/kaena/qwen3_shards_30B_A3B_TP8")
+    parser.add_argument("--model", default="Qwen/Qwen3-30B-A3B")
+    args = parser.parse_args()
+
+    model, input_ids, tokenizer = load_model(args)
+
     dist.barrier()
     # Generate tokens and measure performance
     start = time.time()
     t = 0
     if dist.get_rank() == 0:
-        print(f"\n{prompt}", end="")
+        print(f"\n{args.prompt}", end="")
     for id in model.generate(input_ids):
         if t == 0:
             first_token_time = time.time()
