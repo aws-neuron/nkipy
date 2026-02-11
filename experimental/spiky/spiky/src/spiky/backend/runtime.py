@@ -15,8 +15,8 @@ class SpikyBackend(RuntimeBackend):
         self._initialized = False
 
     def register_torch_device(self) -> None:
-        """Import spiky.torch to register nkipy device."""
-        import spiky.torch  # noqa: F401
+        """Import spike_torch to register nkipy as a PyTorch custom device."""
+        import spike_torch  # noqa: F401
 
     def init(self, visible_core: int) -> None:
         """Initialize spiky runtime for the given core."""

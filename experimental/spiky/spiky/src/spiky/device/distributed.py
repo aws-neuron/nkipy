@@ -1,6 +1,8 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import logging
+
 import torch
 import torch.distributed as dist
 from torch._C._distributed_c10d import (
@@ -11,6 +13,8 @@ from torch._C._distributed_c10d import (
     ReduceOptions,
     ScatterOptions,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def neuron_barrier(device_id, global_device_id, global_device_count):
@@ -60,8 +64,21 @@ class ProcessGroupNeuron(ProcessGroup):
     https://pytorch.org/tutorials/intermediate/process_group_cpp_extension_tutorial.html.
     """
 
+    _NOT_IMPL_MSG = (
+        "ProcessGroupNeuron.{op} is not yet implemented. "
+        "NKIPy collective operations use the NKI communicator "
+        "directly via the compiled graph, not via torch.distributed."
+    )
+
     def __init__(self, prefix_store, rank, size, timeout):
         super().__init__(rank, size)
+        logger.info(
+            "ProcessGroupNeuron created (rank=%d, size=%d). "
+            "Note: torch.distributed collectives are not yet supported. "
+            "Use compiled graph-level collectives instead.",
+            rank,
+            size,
+        )
 
     def getBackendName(self):  # noqa N802
         return "nkipy"
@@ -74,7 +91,7 @@ class ProcessGroupNeuron(ProcessGroup):
         return self._group_name
 
     def allreduce(self, tensors, all_reduce_options):
-        raise NotImplementedError(__class__.allreduce)
+        raise NotImplementedError(self._NOT_IMPL_MSG.format(op="allreduce"))
 
     def _allgather_base(
         self,
@@ -82,35 +99,39 @@ class ProcessGroupNeuron(ProcessGroup):
         input_tensor: torch.Tensor,
         opts: AllgatherOptions,
     ):
-        raise NotImplementedError(__class__._allgather_base)
+        raise NotImplementedError(self._NOT_IMPL_MSG.format(op="_allgather_base"))
 
     def allgather(self, output_tensors_list, input_tensors, opts=None):
-        raise NotImplementedError(__class__.allgather)
+        raise NotImplementedError(self._NOT_IMPL_MSG.format(op="allgather"))
 
     def allgather_coalesced(self, output_tensors_list, input_tensors, opts=None):
-        raise NotImplementedError(__class__.allgather_coalesced)
+        raise NotImplementedError(self._NOT_IMPL_MSG.format(op="allgather_coalesced"))
 
     def broadcast(self, tensors, opts):
-        raise NotImplementedError(__class__.broadcast)
+        raise NotImplementedError(self._NOT_IMPL_MSG.format(op="broadcast"))
 
     def reduce_scatter(self, output_tensors, input_tensors_list, opts):
-        raise NotImplementedError(__class__.reduce_scatter)
+        raise NotImplementedError(self._NOT_IMPL_MSG.format(op="reduce_scatter"))
 
     def reduce_scatter_coalesced(self, output_tensors, input_tensors_list, opts):
-        raise NotImplementedError(__class__.reduce_scatter_coalesced)
+        raise NotImplementedError(
+            self._NOT_IMPL_MSG.format(op="reduce_scatter_coalesced")
+        )
 
     def _reduce_scatter_base(self, output_tensor, input_tensor, opts):
-        raise NotImplementedError(__class__._reduce_scatter_base)
+        raise NotImplementedError(
+            self._NOT_IMPL_MSG.format(op="_reduce_scatter_base")
+        )
 
     def barrier(self, opts):
         neuron_barrier(0, self.rank(), self.size())
         return _ret_work(None)
 
     def reduce(self, tensors: list[torch.Tensor], opts: ReduceOptions):
-        raise NotImplementedError(__class__.reduce)
+        raise NotImplementedError(self._NOT_IMPL_MSG.format(op="reduce"))
 
     def allreduce_coalesced(self, *args):
-        raise NotImplementedError(__class__.allreduce_coalesced)
+        raise NotImplementedError(self._NOT_IMPL_MSG.format(op="allreduce_coalesced"))
 
     def alltoall(
         self,
@@ -118,10 +139,10 @@ class ProcessGroupNeuron(ProcessGroup):
         input_tensor_list: list[torch.Tensor],
         opts: AllToAllOptions,
     ):
-        raise NotImplementedError(__class__.alltoall)
+        raise NotImplementedError(self._NOT_IMPL_MSG.format(op="alltoall"))
 
     def alltoall_base(self, output, input, output_split_sizes, input_split_sizes, opts):
-        raise NotImplementedError(__class__.alltoall_base)
+        raise NotImplementedError(self._NOT_IMPL_MSG.format(op="alltoall_base"))
 
     def gather(
         self,
@@ -129,7 +150,7 @@ class ProcessGroupNeuron(ProcessGroup):
         input_tensor_list: list[torch.Tensor],
         opts: GatherOptions,
     ):
-        raise NotImplementedError(__class__.gather)
+        raise NotImplementedError(self._NOT_IMPL_MSG.format(op="gather"))
 
     def scatter(
         self,
@@ -137,13 +158,13 @@ class ProcessGroupNeuron(ProcessGroup):
         input_tensors_list: list[list[torch.Tensor]],
         opts: ScatterOptions,
     ):
-        raise NotImplementedError(__class__.scatter)
+        raise NotImplementedError(self._NOT_IMPL_MSG.format(op="scatter"))
 
     def recv_anysource(self, *args):
-        raise NotImplementedError
+        raise NotImplementedError(self._NOT_IMPL_MSG.format(op="recv_anysource"))
 
     def monitored_barrier(self, *args):
-        raise NotImplementedError
+        raise NotImplementedError(self._NOT_IMPL_MSG.format(op="monitored_barrier"))
 
     def Options(self, *args):  # noqa N802
-        raise NotImplementedError
+        raise NotImplementedError(self._NOT_IMPL_MSG.format(op="Options"))

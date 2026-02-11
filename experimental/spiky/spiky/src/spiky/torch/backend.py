@@ -39,12 +39,15 @@ from torch_to_nkipy.nkipy_builder.nkipy_kernel import NKIPyKernel
 from torch_to_nkipy.utils.graph import _count_subgraph_markers as count_subgraph_markers
 from torch_to_nkipy.utils.graph import gm_split_and_wrap
 
-# FIXME replace the AliasOfInputHandler in aot_module_simplified
-runtime_wrappers.AliasOfInputHandler.__call__ = (
-    runtime_wrappers.NoopAliasHandler.__call__
-)
-
 logger = logging.getLogger(__name__)
+
+_ALIAS_HANDLER_PATCHED = False
+
+# Ops that produce incorrect results when inputs are zero-padded
+_PAD_UNSAFE_OPS = frozenset({
+    "softmax", "_softmax", "mean", "layer_norm", "group_norm",
+    "batch_norm", "var", "std", "var_mean",
+})
 
 
 def _get_rank(explicit_rank: Optional[int] = None) -> int:
@@ -140,6 +143,14 @@ def init_nkipy_backend(
     """
     if is_nkipy_backend_initialized():
         raise RuntimeError("NKIPy backend has already been initialized.")
+
+    # Patch AliasOfInputHandler once (scoped to init, not module import)
+    global _ALIAS_HANDLER_PATCHED
+    if not _ALIAS_HANDLER_PATCHED:
+        runtime_wrappers.AliasOfInputHandler.__call__ = (
+            runtime_wrappers.NoopAliasHandler.__call__
+        )
+        _ALIAS_HANDLER_PATCHED = True
 
     # Register torch device
     from spiky.device import _register_device
@@ -319,6 +330,21 @@ def _create_spiky_callable(
     if not dynamic_specs:
         return None  # No dynamic dims, fall back to default path
 
+    # Warn about ops that are not invariant to zero-padding
+    unsafe_found = []
+    for node in gm.graph.nodes:
+        if node.op == "call_function":
+            target_str = getattr(node.target, "__name__", str(node.target))
+            op_name = target_str.rsplit(".", 1)[-1]
+            if op_name in _PAD_UNSAFE_OPS:
+                unsafe_found.append(op_name)
+    if unsafe_found:
+        logger.warning(
+            "Dynamic shapes with zero-padding may produce incorrect results for: %s. "
+            "Consider static shapes or masking for these operations.",
+            unsafe_found,
+        )
+
     # Get or infer bucket sizes
     buckets = options.get("buckets") if options else None
     if buckets is None:
@@ -330,7 +356,7 @@ def _create_spiky_callable(
         )
 
     # Capture input metadata (concrete shapes, dtypes) before SymInts disappear.
-    # SymInt entries are recorded as None; track their indices for runtime filtering.
+    # SymInt entries get type "symint"; regular scalars preserve their value.
     input_metadata = []
     symint_indices = []
     for i, inp in enumerate(example_inputs):
@@ -345,9 +371,12 @@ def _create_spiky_callable(
                     "is_floating_point": inp.is_floating_point(),
                 }
             )
-        else:
-            input_metadata.append(None)
+        elif isinstance(inp, torch.SymInt):
+            input_metadata.append({"type": "symint"})
             symint_indices.append(i)
+        else:
+            # Regular scalar (int, float, bool) — preserve concrete value
+            input_metadata.append({"type": "scalar", "value": inp})
 
     # Build mapping from arg_idx to dynamic dim
     dynamic_arg_to_dim = {spec.arg_idx: spec.dim_idx for spec in dynamic_specs.values()}
@@ -371,10 +400,18 @@ def _create_spiky_callable(
         concrete_inputs = []
         symint_indices = []
         for i, meta in enumerate(input_metadata):
-            if meta is None:
+            is_symint = meta is None or (
+                isinstance(meta, dict) and meta.get("type") == "symint"
+            )
+            if is_symint:
                 # SymInt entry — provide bucket_size as concrete value
                 concrete_inputs.append(bucket_size)
                 symint_indices.append(i)
+                continue
+
+            if isinstance(meta, dict) and meta.get("type") == "scalar":
+                # Regular scalar — preserve original value
+                concrete_inputs.append(meta["value"])
                 continue
 
             shape = list(meta["shape"])
@@ -387,6 +424,8 @@ def _create_spiky_callable(
 
             if meta["is_floating_point"]:
                 concrete_inputs.append(torch.randn(*shape, dtype=dtype))
+            elif dtype == torch.bool:
+                concrete_inputs.append(torch.zeros(*shape, dtype=torch.bool))
             else:
                 concrete_inputs.append(torch.randint(0, 100, shape, dtype=dtype))
 

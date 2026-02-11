@@ -45,7 +45,7 @@ def setup_module(module):
     if not dist.is_initialized():
         dist.init_process_group("gloo")
     if not is_nkipy_backend_initialized():
-        init_nkipy_backend()
+        init_nkipy_backend(nkipy_cache="./.nkipy_test_cache")
 
 
 def teardown_module(module):

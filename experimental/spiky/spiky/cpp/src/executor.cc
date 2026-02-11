@@ -604,10 +604,14 @@ std::vector<DeviceTensor> Engine::DetachOutputs(int64_t bundle_id, int buffer_id
     std::vector<int64_t> padded_shape = info.shape;
     size_t elem_size = ElemSizeBytes(info.dtype);
 
+    // Only unpad outputs whose pad_dim size matches a bucket size (was actually padded).
+    // Reduction outputs (e.g., sum(dim=0)) have different sizes and must be skipped.
     bool needs_unpad = unpad_outputs && (actual_len > 0) &&
                        (pad_dim >= 0) &&
                        (pad_dim < static_cast<int64_t>(padded_shape.size())) &&
-                       (actual_len < padded_shape[static_cast<size_t>(pad_dim)]);
+                       (actual_len < padded_shape[static_cast<size_t>(pad_dim)]) &&
+                       (padded_shape[static_cast<size_t>(pad_dim)] == bucket_size ||
+                        padded_shape[static_cast<size_t>(pad_dim)] == ub.max_bucket_size);
 
     std::vector<int64_t> out_shape = padded_shape;
     if (needs_unpad) out_shape[static_cast<size_t>(pad_dim)] = actual_len;
@@ -630,7 +634,6 @@ std::vector<DeviceTensor> Engine::DetachOutputs(int64_t bundle_id, int buffer_id
     outputs.emplace_back(detached, dev, out_bytes, out_shape, info.dtype);
   }
 
-  (void)bucket_size;
   return outputs;
 }
 
@@ -649,39 +652,53 @@ std::vector<DeviceTensor> Engine::Execute(int64_t bundle_id, int64_t bucket_size
     throw std::runtime_error("spiky: runtime not initialized (call spiky.init())");
   }
 
-  std::lock_guard<std::mutex> lock(mutex_);
+  // Phase 1: Registry setup under global lock.
+  Bundle* bundle_ptr;
+  Bundle::Bucket* bk_ptr;
+  UnifiedBuffers* ub_ptr;
+  bool is_static;
+  int64_t effective_actual_len;
+  int64_t effective_bucket;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
 
-  Bundle& bundle = GetBundleOrThrow(bundle_id);
-  EnsureBucketLoaded(bundle, bucket_size);
-  auto& bk = bundle.buckets_.at(bucket_size);
+    bundle_ptr = &GetBundleOrThrow(bundle_id);
+    Bundle& bundle = *bundle_ptr;
+    EnsureBucketLoaded(bundle, bucket_size);
+    bk_ptr = &bundle.buckets_.at(bucket_size);
 
-  // Detect static bundle: no dynamic specs and single bucket.
-  const bool is_static = bundle.dynamic_specs_.empty()
-                       && bundle.sorted_bucket_sizes_.size() == 1;
+    is_static = bundle.dynamic_specs_.empty()
+                && bundle.sorted_bucket_sizes_.size() == 1;
 
-  int64_t effective_actual_len = is_static ? 0
-      : ((actual_len > 0) ? actual_len : DetectActualLen(inputs, bundle.dynamic_specs_));
-  int64_t effective_bucket = bucket_size;
+    effective_actual_len = is_static ? 0
+        : ((actual_len > 0) ? actual_len : DetectActualLen(inputs, bundle.dynamic_specs_));
+    effective_bucket = bucket_size;
 
-  // Ensure unified buffers exist at max bucket.
-  // For static bundles, max_bucket == bucket_size so skip redundant load.
-  int64_t max_bucket = bundle.sorted_bucket_sizes_.empty() ? bucket_size : bundle.sorted_bucket_sizes_.back();
-  if (max_bucket != bucket_size) {
-    EnsureBucketLoaded(bundle, max_bucket);
+    int64_t max_bucket = bundle.sorted_bucket_sizes_.empty() ? bucket_size : bundle.sorted_bucket_sizes_.back();
+    if (max_bucket != bucket_size) {
+      EnsureBucketLoaded(bundle, max_bucket);
+    }
+
+    if (unified_buffers_.count(bundle_id) == 0) {
+      auto& max_bk = bundle.buckets_.at(max_bucket);
+      AllocateUnifiedBuffers(bundle_id, max_bucket, max_bk.input_infos, max_bk.output_infos);
+    }
+
+    ub_ptr = &unified_buffers_.at(bundle_id);
+    if (ub_ptr->max_bucket_size < max_bucket) {
+      auto& max_bk = bundle.buckets_.at(max_bucket);
+      ReallocateUnifiedBuffers(bundle_id, max_bucket, max_bk.input_infos, max_bk.output_infos);
+      ub_ptr = &unified_buffers_.at(bundle_id);
+    }
+
+    CreateBucketTensorSets(bundle_id, bucket_size, bk_ptr->input_infos, bk_ptr->output_infos);
   }
 
-  if (unified_buffers_.count(bundle_id) == 0) {
-    auto& max_bk = bundle.buckets_.at(max_bucket);
-    AllocateUnifiedBuffers(bundle_id, max_bucket, max_bk.input_infos, max_bk.output_infos);
-  }
-
-  UnifiedBuffers& ub = unified_buffers_.at(bundle_id);
-  if (ub.max_bucket_size < max_bucket) {
-    auto& max_bk = bundle.buckets_.at(max_bucket);
-    ReallocateUnifiedBuffers(bundle_id, max_bucket, max_bk.input_infos, max_bk.output_infos);
-  }
-
-  CreateBucketTensorSets(bundle_id, bucket_size, bk.input_infos, bk.output_infos);
+  // Phase 2: Execution under per-bundle lock.
+  std::lock_guard<std::mutex> bundle_lock(bundle_ptr->Mutex());
+  Bundle& bundle = *bundle_ptr;
+  auto& bk = *bk_ptr;
+  UnifiedBuffers& ub = *ub_ptr;
 
   int buf_idx = 0;
   DeviceMemoryPool& pool = DeviceMemoryPool::Global();
@@ -709,21 +726,25 @@ std::vector<DeviceTensor> Engine::Execute(int64_t bundle_id, int64_t bucket_size
 
   auto end = std::chrono::high_resolution_clock::now();
 
+  // Phase 3: Stats update under global lock.
   double h2d_ms = std::chrono::duration<double, std::milli>(t_h2d_end - t_h2d_start).count();
   double exec_ms = std::chrono::duration<double, std::milli>(t_exec_end - t_exec_start).count();
   double d2d_ms = std::chrono::duration<double, std::milli>(t_detach_end - t_detach_start).count();
   double total_ms = std::chrono::duration<double, std::milli>(end - start).count();
 
-  stats_.total_executions++;
-  stats_.bucket_hits[bucket_size]++;
-  stats_.total_execution_time_ms += total_ms;
-  stats_.total_h2d_time_ms += h2d_ms;
-  stats_.total_nrt_exec_time_ms += exec_ms;
-  stats_.total_d2h_time_ms += d2d_ms;
-  stats_.min_execution_time_ms = std::min(stats_.min_execution_time_ms, total_ms);
-  stats_.max_execution_time_ms = std::max(stats_.max_execution_time_ms, total_ms);
-  if (effective_actual_len > 0) {
-    stats_.total_pad_ratio_sum += static_cast<double>(bucket_size) / static_cast<double>(effective_actual_len);
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    stats_.total_executions++;
+    stats_.bucket_hits[bucket_size]++;
+    stats_.total_execution_time_ms += total_ms;
+    stats_.total_h2d_time_ms += h2d_ms;
+    stats_.total_nrt_exec_time_ms += exec_ms;
+    stats_.total_d2h_time_ms += d2d_ms;
+    stats_.min_execution_time_ms = std::min(stats_.min_execution_time_ms, total_ms);
+    stats_.max_execution_time_ms = std::max(stats_.max_execution_time_ms, total_ms);
+    if (effective_actual_len > 0) {
+      stats_.total_pad_ratio_sum += static_cast<double>(bucket_size) / static_cast<double>(effective_actual_len);
+    }
   }
 
   return outputs;
@@ -745,37 +766,53 @@ std::vector<DeviceTensor> Engine::ExecutePipelined(int64_t bundle_id, int64_t bu
     throw std::runtime_error("spiky: runtime not initialized (call spiky.init())");
   }
 
-  std::lock_guard<std::mutex> lock(mutex_);
+  // Phase 1: Registry setup under global lock.
+  Bundle* bundle_ptr;
+  Bundle::Bucket* bk_ptr;
+  UnifiedBuffers* ub_ptr;
+  UnifiedPipelineState* st_ptr;
+  int64_t effective_actual_len;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
 
-  Bundle& bundle = GetBundleOrThrow(bundle_id);
-  EnsureBucketLoaded(bundle, bucket_size);
-  auto& bk = bundle.buckets_.at(bucket_size);
+    bundle_ptr = &GetBundleOrThrow(bundle_id);
+    Bundle& bundle = *bundle_ptr;
+    EnsureBucketLoaded(bundle, bucket_size);
+    bk_ptr = &bundle.buckets_.at(bucket_size);
 
-  // Detect static bundle: no dynamic specs and single bucket.
-  const bool is_static = bundle.dynamic_specs_.empty()
-                       && bundle.sorted_bucket_sizes_.size() == 1;
+    const bool is_static = bundle.dynamic_specs_.empty()
+                         && bundle.sorted_bucket_sizes_.size() == 1;
 
-  int64_t effective_actual_len = is_static ? 0
-      : ((actual_len > 0) ? actual_len : DetectActualLen(inputs, bundle.dynamic_specs_));
+    effective_actual_len = is_static ? 0
+        : ((actual_len > 0) ? actual_len : DetectActualLen(inputs, bundle.dynamic_specs_));
 
-  int64_t max_bucket = bundle.sorted_bucket_sizes_.empty() ? bucket_size : bundle.sorted_bucket_sizes_.back();
-  if (max_bucket != bucket_size) {
-    EnsureBucketLoaded(bundle, max_bucket);
+    int64_t max_bucket = bundle.sorted_bucket_sizes_.empty() ? bucket_size : bundle.sorted_bucket_sizes_.back();
+    if (max_bucket != bucket_size) {
+      EnsureBucketLoaded(bundle, max_bucket);
+    }
+
+    if (unified_buffers_.count(bundle_id) == 0) {
+      auto& max_bk = bundle.buckets_.at(max_bucket);
+      AllocateUnifiedBuffers(bundle_id, max_bucket, max_bk.input_infos, max_bk.output_infos);
+    }
+
+    ub_ptr = &unified_buffers_.at(bundle_id);
+    if (ub_ptr->max_bucket_size < max_bucket) {
+      auto& max_bk = bundle.buckets_.at(max_bucket);
+      ReallocateUnifiedBuffers(bundle_id, max_bucket, max_bk.input_infos, max_bk.output_infos);
+      ub_ptr = &unified_buffers_.at(bundle_id);
+    }
+    CreateBucketTensorSets(bundle_id, bucket_size, bk_ptr->input_infos, bk_ptr->output_infos);
+
+    st_ptr = &unified_pipeline_states_.at(bundle_id);
   }
 
-  if (unified_buffers_.count(bundle_id) == 0) {
-    auto& max_bk = bundle.buckets_.at(max_bucket);
-    AllocateUnifiedBuffers(bundle_id, max_bucket, max_bk.input_infos, max_bk.output_infos);
-  }
-
-  UnifiedBuffers& ub = unified_buffers_.at(bundle_id);
-  if (ub.max_bucket_size < max_bucket) {
-    auto& max_bk = bundle.buckets_.at(max_bucket);
-    ReallocateUnifiedBuffers(bundle_id, max_bucket, max_bk.input_infos, max_bk.output_infos);
-  }
-  CreateBucketTensorSets(bundle_id, bucket_size, bk.input_infos, bk.output_infos);
-
-  UnifiedPipelineState& st = unified_pipeline_states_.at(bundle_id);
+  // Phase 2: Execution under per-bundle lock.
+  std::lock_guard<std::mutex> bundle_lock(bundle_ptr->Mutex());
+  Bundle& bundle = *bundle_ptr;
+  auto& bk = *bk_ptr;
+  UnifiedBuffers& ub = *ub_ptr;
+  UnifiedPipelineState& st = *st_ptr;
   DeviceMemoryPool& pool = DeviceMemoryPool::Global();
   int dev = static_cast<int>(core_id_);
 
@@ -818,16 +855,19 @@ std::vector<DeviceTensor> Engine::ExecutePipelined(int64_t bundle_id, int64_t bu
 
     st.first_call = false;
 
-    double h2d_ms = std::chrono::duration<double, std::milli>(t_h2d_end - t_h2d_start).count();
-    double exec_ms = std::chrono::duration<double, std::milli>(t_exec_end - t_exec_start).count();
-    double d2d_ms = std::chrono::duration<double, std::milli>(t_detach_end - t_detach_start).count();
-    stats_.total_h2d_time_ms += h2d_ms;
-    stats_.total_nrt_exec_time_ms += exec_ms;
-    stats_.total_d2h_time_ms += d2d_ms;
-    stats_.total_executions++;
-    stats_.bucket_hits[bucket_size]++;
-    stats_.total_execution_time_ms += std::chrono::duration<double, std::milli>(
-        std::chrono::high_resolution_clock::now() - start).count();
+    {
+      double h2d_ms = std::chrono::duration<double, std::milli>(t_h2d_end - t_h2d_start).count();
+      double exec_ms = std::chrono::duration<double, std::milli>(t_exec_end - t_exec_start).count();
+      double d2d_ms = std::chrono::duration<double, std::milli>(t_detach_end - t_detach_start).count();
+      std::lock_guard<std::mutex> lock(mutex_);
+      stats_.total_h2d_time_ms += h2d_ms;
+      stats_.total_nrt_exec_time_ms += exec_ms;
+      stats_.total_d2h_time_ms += d2d_ms;
+      stats_.total_executions++;
+      stats_.bucket_hits[bucket_size]++;
+      stats_.total_execution_time_ms += std::chrono::duration<double, std::milli>(
+          std::chrono::high_resolution_clock::now() - start).count();
+    }
     return outputs;
   }
 
@@ -872,16 +912,19 @@ std::vector<DeviceTensor> Engine::ExecutePipelined(int64_t bundle_id, int64_t bu
       st.prefetched_bucket_size = 0;
     }
 
-    double h2d_ms = std::chrono::duration<double, std::milli>(t_h2d_end - t_h2d_start).count();
-    double exec_ms = std::chrono::duration<double, std::milli>(t_exec_end - t_exec_start).count();
-    double d2d_ms = std::chrono::duration<double, std::milli>(t_detach_end - t_detach_start).count();
-    stats_.total_h2d_time_ms += h2d_ms;
-    stats_.total_nrt_exec_time_ms += exec_ms;
-    stats_.total_d2h_time_ms += d2d_ms;
-    stats_.total_executions++;
-    stats_.bucket_hits[bucket_size]++;
-    stats_.total_execution_time_ms += std::chrono::duration<double, std::milli>(
-        std::chrono::high_resolution_clock::now() - start).count();
+    {
+      double h2d_ms = std::chrono::duration<double, std::milli>(t_h2d_end - t_h2d_start).count();
+      double exec_ms = std::chrono::duration<double, std::milli>(t_exec_end - t_exec_start).count();
+      double d2d_ms = std::chrono::duration<double, std::milli>(t_detach_end - t_detach_start).count();
+      std::lock_guard<std::mutex> lock(mutex_);
+      stats_.total_h2d_time_ms += h2d_ms;
+      stats_.total_nrt_exec_time_ms += exec_ms;
+      stats_.total_d2h_time_ms += d2d_ms;
+      stats_.total_executions++;
+      stats_.bucket_hits[bucket_size]++;
+      stats_.total_execution_time_ms += std::chrono::duration<double, std::milli>(
+          std::chrono::high_resolution_clock::now() - start).count();
+    }
     return outputs;
   }
 
@@ -926,16 +969,19 @@ std::vector<DeviceTensor> Engine::ExecutePipelined(int64_t bundle_id, int64_t bu
     st.prefetched_bucket_size = 0;
   }
 
-  double h2d_ms = std::chrono::duration<double, std::milli>(t_h2d_end - t_h2d_start).count();
-  double exec_ms = std::chrono::duration<double, std::milli>(t_exec_end - t_exec_start).count();
-  double d2d_ms = std::chrono::duration<double, std::milli>(t_detach_end - t_detach_start).count();
-  stats_.total_h2d_time_ms += h2d_ms;
-  stats_.total_nrt_exec_time_ms += exec_ms;
-  stats_.total_d2h_time_ms += d2d_ms;
-  stats_.total_executions++;
-  stats_.bucket_hits[bucket_size]++;
-  stats_.total_execution_time_ms += std::chrono::duration<double, std::milli>(
-      std::chrono::high_resolution_clock::now() - start).count();
+  {
+    double h2d_ms = std::chrono::duration<double, std::milli>(t_h2d_end - t_h2d_start).count();
+    double exec_ms = std::chrono::duration<double, std::milli>(t_exec_end - t_exec_start).count();
+    double d2d_ms = std::chrono::duration<double, std::milli>(t_detach_end - t_detach_start).count();
+    std::lock_guard<std::mutex> lock(mutex_);
+    stats_.total_h2d_time_ms += h2d_ms;
+    stats_.total_nrt_exec_time_ms += exec_ms;
+    stats_.total_d2h_time_ms += d2d_ms;
+    stats_.total_executions++;
+    stats_.bucket_hits[bucket_size]++;
+    stats_.total_execution_time_ms += std::chrono::duration<double, std::milli>(
+        std::chrono::high_resolution_clock::now() - start).count();
+  }
 
   return outputs;
 }

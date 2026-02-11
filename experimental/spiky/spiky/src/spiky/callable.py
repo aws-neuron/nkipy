@@ -26,6 +26,8 @@ from spiky.utils.ntff_meta import NtffMeta
 
 logger = logging.getLogger(__name__)
 
+_KEEP_ON_DEVICE_WARNED = False
+
 # dtype string (from C++ DeviceTensor) -> numpy dtype
 _DTYPE_STR_TO_NUMPY = {
     "float32": np.float32,
@@ -324,9 +326,9 @@ class NKIPyCallable:
             if tensor_device is None:
                 tensor_device = t.device
             if t.device.type != "cpu":
-                inputs_np.append(t.detach().cpu().numpy())
+                inputs_np.append(t.detach().cpu().contiguous().numpy())
             else:
-                inputs_np.append(t.detach().numpy())
+                inputs_np.append(t.detach().contiguous().numpy())
 
         # When inputs are already padded, skip device-side padding
         pad_on_device = self._config.pad_on_device and not skip_padding
@@ -379,6 +381,14 @@ class NKIPyCallable:
         # Convert back to torch tensors
         device = tensor_device or torch.device("cpu")
         if self._config.keep_outputs_on_device:
+            global _KEEP_ON_DEVICE_WARNED
+            if not _KEEP_ON_DEVICE_WARNED:
+                logger.warning(
+                    "keep_outputs_on_device currently performs a host roundtrip "
+                    "for tensor conversion. True zero-copy device tensors require "
+                    "spike-torch integration (not yet implemented)."
+                )
+                _KEEP_ON_DEVICE_WARNED = True
             result = list(_device_tensor_to_torch(out, device) for out in outputs)
         else:
             result = list(torch.from_numpy(out).to(device) for out in outputs)

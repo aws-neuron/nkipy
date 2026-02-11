@@ -5,6 +5,8 @@
 # Project-specific
 /trash
 nkipy_cache
+.nkipy_cache
+.nkipy_test_cache*
 tmp_*
 artifacts*
 *.neff

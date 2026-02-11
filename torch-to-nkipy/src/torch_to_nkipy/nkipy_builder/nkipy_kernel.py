@@ -57,7 +57,7 @@ class NKIPyKernel:
         gm: fx.GraphModule,
         example_inputs: Sequence[InputType],
         options: Optional[dict[str, Union[str, builtins.int, builtins.bool]]] = None,
-        cache_dir: str = "",
+        cache_dir: str = ".nkipy_cache",
         additional_compiler_args: str = "",
         rank: int = 0,
         world_size: int = 1,

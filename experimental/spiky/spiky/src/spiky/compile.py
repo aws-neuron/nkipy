@@ -65,7 +65,7 @@ class _SpikyCompiled:
         self._model = model
         self._options = options
         self._wrapper = None  # CompiledWrapper — captured from fw_compiler
-        self._frozen_params = None  # model params in aot_module_simplified order
+        self._num_params = None  # param count from aot_module_simplified
 
     def _trace(self, first_args):
         """Run torch.compile once to trace. Capture CompiledWrapper + frozen params."""
@@ -92,9 +92,7 @@ class _SpikyCompiled:
 
             def _fw_compiler(decomposed_gm, flat_inputs):
                 num_params = len(flat_inputs) - num_user_inputs
-                captured["params"] = [
-                    x.detach().clone() for x in flat_inputs[:num_params]
-                ]
+                captured["num_params"] = num_params
                 wrapper = CompiledWrapper(decomposed_gm, self._options)
                 captured["wrapper"] = wrapper
                 return make_boxed_func(wrapper)
@@ -113,7 +111,7 @@ class _SpikyCompiled:
             first_output = compiled(*first_args)
 
         self._wrapper = captured["wrapper"]
-        self._frozen_params = captured["params"]
+        self._num_params = captured["num_params"]
         return first_output
 
     @torch._dynamo.disable
@@ -126,9 +124,17 @@ class _SpikyCompiled:
         if self._wrapper is None:
             return self._trace(args)
 
+        # Extract fresh params each call (not frozen clones from trace time)
+        params = [p.detach() for p in self._model.parameters()]
+        buffers = [b.detach() for b in self._model.buffers()]
+        frozen = params + buffers
+        assert len(frozen) == self._num_params, (
+            f"Expected {self._num_params} params+buffers, got {len(frozen)}"
+        )
+
         # Direct call — no dynamo, no guard checks
         with torch.no_grad():
-            outputs = self._wrapper(*tuple(self._frozen_params) + args)
+            outputs = self._wrapper(*tuple(frozen) + args)
 
         if isinstance(outputs, (list, tuple)) and len(outputs) == 1:
             return outputs[0]
@@ -146,7 +152,7 @@ class _SpikyCompiled:
     def close(self) -> None:
         """Clean up compiled resources."""
         self._wrapper = None
-        self._frozen_params = None
+        self._num_params = None
 
     def __del__(self):
         self.close()

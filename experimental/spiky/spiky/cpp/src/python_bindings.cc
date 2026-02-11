@@ -85,8 +85,14 @@ DLDataType DTypeFromBuffer(const py::buffer_info& info) {
   if (info.format == "H" && itemsize == 2) return DLDataType{kDLUInt, 16, 1};
   if (info.format == "I" && itemsize == 4) return DLDataType{kDLUInt, 32, 1};
   if (info.format == "Q" && itemsize == 8) return DLDataType{kDLUInt, 64, 1};
-  (void)fmt;
-  return DLDataType{kDLFloat, 32, 1};
+  if (info.format == "b" && itemsize == 1) return DLDataType{kDLInt, 8, 1};
+  if (info.format == "h" && itemsize == 2) return DLDataType{kDLInt, 16, 1};
+  throw std::runtime_error(
+      std::string("spiky: unsupported buffer format '") + fmt +
+      "' with itemsize " + std::to_string(itemsize) +
+      ". Supported: f(float32), e(float16), d(float64), "
+      "b(int8), h(int16), i(int32), q(int64), "
+      "B(uint8), H(uint16), I(uint32), Q(uint64)");
 }
 
 struct DLTensorHolder {

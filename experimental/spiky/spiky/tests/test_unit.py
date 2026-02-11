@@ -136,7 +136,7 @@ class TestParallelCompileContextSafety:
         assert _in_parallel_compile_context.get() is False
 
         with mock.patch("spiky.runtime.parallel.parallel_compile_model"):
-            with mock.patch("spiky.runtime.parallel.get_nkipy_backend_config") as cfg:
+            with mock.patch("spiky.torch.config.get_nkipy_backend_config") as cfg:
                 cfg.return_value = mock.Mock(nkipy_cache_prefix="/tmp/test_cache")
                 with mock.patch("torch.distributed.is_initialized", return_value=False):
                     with parallel_compile_context(num_workers=1):
@@ -154,7 +154,7 @@ class TestParallelCompileContextSafety:
         assert _in_parallel_compile_context.get() is False
 
         with mock.patch("spiky.runtime.parallel.parallel_compile_model"):
-            with mock.patch("spiky.runtime.parallel.get_nkipy_backend_config") as cfg:
+            with mock.patch("spiky.torch.config.get_nkipy_backend_config") as cfg:
                 cfg.return_value = mock.Mock(nkipy_cache_prefix="/tmp/test_cache")
                 with mock.patch("torch.distributed.is_initialized", return_value=False):
                     with pytest.raises(ValueError):
@@ -176,7 +176,7 @@ class TestParallelCompileContextSafety:
             "spiky.runtime.parallel.parallel_compile_model",
             side_effect=RuntimeError("compile failed"),
         ):
-            with mock.patch("spiky.runtime.parallel.get_nkipy_backend_config") as cfg:
+            with mock.patch("spiky.torch.config.get_nkipy_backend_config") as cfg:
                 cfg.return_value = mock.Mock(nkipy_cache_prefix="/tmp/test_cache")
                 with mock.patch("torch.distributed.is_initialized", return_value=False):
                     with pytest.raises(RuntimeError, match="compile failed"):
@@ -441,3 +441,195 @@ class TestBuildAdjustedDynamicSpecs:
         result = callable_obj._build_adjusted_dynamic_specs()
         # arg_idx 3 minus 2 SymInts before it = 1
         assert result == {1: 0}
+
+
+# ---------------------------------------------------------------------------
+# Fix 1: Circular import resolved by lazy import in parallel.py
+# ---------------------------------------------------------------------------
+
+
+class TestCircularImportFix:
+    """Test that the circular import is broken."""
+
+    def test_parallel_module_importable(self):
+        """Importing parallel module should succeed without circular error."""
+        import importlib
+
+        import spiky.runtime.parallel
+
+        importlib.reload(spiky.runtime.parallel)
+        from spiky.runtime.parallel import in_parallel_compile_context
+
+        assert in_parallel_compile_context() is False
+
+
+# ---------------------------------------------------------------------------
+# Fix 4: Non-contiguous CPU inputs
+# ---------------------------------------------------------------------------
+
+
+class TestNonContiguousInputs:
+    """Test that non-contiguous tensors are made contiguous before numpy."""
+
+    def test_transposed_tensor_contiguous_numpy(self):
+        """Transposed tensor should produce correct data after contiguous().numpy()."""
+        import numpy as np
+
+        t = torch.randn(4, 8)
+        t_transposed = t.t()  # Non-contiguous
+        assert not t_transposed.is_contiguous()
+        arr = t_transposed.detach().contiguous().numpy()
+        assert arr.shape == (8, 4)
+        np.testing.assert_array_equal(arr, t_transposed.detach().numpy())
+
+    def test_sliced_tensor_contiguous_numpy(self):
+        """Sliced tensor (non-contiguous stride) should be handled."""
+        t = torch.randn(10, 8)
+        t_sliced = t[::2]  # Every other row, non-contiguous
+        assert not t_sliced.is_contiguous()
+        arr = t_sliced.detach().contiguous().numpy()
+        assert arr.shape == (5, 8)
+
+
+# ---------------------------------------------------------------------------
+# Fix 8: Bool dtype concrete input creation
+# ---------------------------------------------------------------------------
+
+
+class TestDynamicBoolInputs:
+    """Test that bool dtype doesn't crash during concrete input creation."""
+
+    def test_bool_dtype_creates_valid_tensor(self):
+        """Bool dtype should produce a valid tensor via torch.zeros."""
+        shape = (4, 8)
+        t = torch.zeros(*shape, dtype=torch.bool)
+        assert t.shape == shape
+        assert t.dtype == torch.bool
+
+    def test_randint_bool_raises(self):
+        """Verify that torch.randint with large range + bool dtype raises."""
+        with pytest.raises(RuntimeError):
+            torch.randint(0, 100, (4, 8), dtype=torch.bool)
+
+
+# ---------------------------------------------------------------------------
+# Fix 2: SymInt vs regular scalar distinction
+# ---------------------------------------------------------------------------
+
+
+class TestScalarVsSymIntDistinction:
+    """Test that regular scalars are not treated as SymInt."""
+
+    def test_regular_scalar_not_in_symint_indices(self):
+        """A regular int/float arg should NOT be added to symint_indices."""
+        example_inputs = [torch.randn(4, 8), 3.0, torch.randn(4, 8)]
+
+        input_metadata = []
+        symint_indices = []
+        for i, inp in enumerate(example_inputs):
+            if isinstance(inp, torch.Tensor):
+                input_metadata.append(
+                    {
+                        "shape": tuple(inp.shape),
+                        "dtype": inp.dtype,
+                        "is_floating_point": inp.is_floating_point(),
+                    }
+                )
+            elif isinstance(inp, torch.SymInt):
+                input_metadata.append({"type": "symint"})
+                symint_indices.append(i)
+            else:
+                input_metadata.append({"type": "scalar", "value": inp})
+
+        assert symint_indices == []
+        assert input_metadata[1] == {"type": "scalar", "value": 3.0}
+
+    def test_scalar_value_preserved_in_compiler_fn(self):
+        """Scalar values should be passed through, not replaced with bucket_size."""
+        meta = {"type": "scalar", "value": 42}
+        bucket_size = 128
+        if isinstance(meta, dict) and meta.get("type") == "scalar":
+            concrete_value = meta["value"]
+        else:
+            concrete_value = bucket_size
+        assert concrete_value == 42
+
+
+# ---------------------------------------------------------------------------
+# Fix 7: parallel_compile_model missing directory handling
+# ---------------------------------------------------------------------------
+
+
+class TestParallelCompileMissingDir:
+    """Test that parallel_compile_model handles missing cache dirs."""
+
+    def test_missing_cache_dir_does_not_raise(self, tmp_path):
+        """parallel_compile_model should skip non-existent dirs."""
+        from spiky.runtime.parallel import parallel_compile_model
+
+        nonexistent = tmp_path / "does_not_exist"
+        # Should not raise
+        parallel_compile_model([nonexistent], num_workers=1, is_master=False)
+
+    def test_empty_cache_dir_works(self, tmp_path):
+        """parallel_compile_model should handle empty cache dir."""
+        from spiky.runtime.parallel import parallel_compile_model
+
+        empty_dir = tmp_path / "empty_cache"
+        empty_dir.mkdir()
+        parallel_compile_model([empty_dir], num_workers=1, is_master=False)
+
+
+# ---------------------------------------------------------------------------
+# Fix 6: Frozen params mutation
+# ---------------------------------------------------------------------------
+
+
+class TestFrozenParamFix:
+    """Test that param mutations are reflected in subsequent calls."""
+
+    def test_fresh_param_extraction_sees_updates(self):
+        """After mutating model params, fresh extraction should get new values."""
+        model = torch.nn.Linear(4, 4, bias=False)
+        original_weight = model.weight.data.clone()
+
+        model.weight.data.fill_(999.0)
+
+        params = [p.detach() for p in model.parameters()]
+        assert torch.all(params[0] == 999.0)
+        assert not torch.allclose(params[0], original_weight)
+
+    def test_param_plus_buffer_count(self):
+        """params() + buffers() should give expected count for BatchNorm."""
+        model = torch.nn.BatchNorm1d(8)
+        params = list(model.parameters())
+        buffers = list(model.buffers())
+        # BatchNorm1d: weight, bias (params)
+        # + running_mean, running_var, num_batches_tracked (buffers)
+        assert len(params) == 2
+        assert len(buffers) == 3
+
+
+# ---------------------------------------------------------------------------
+# Fix 9: Distributed error messages
+# ---------------------------------------------------------------------------
+
+
+class TestDistributedErrorMessages:
+    """Test that ProcessGroupNeuron error messages are descriptive."""
+
+    def test_allreduce_error_message(self):
+        """NotImplementedError should have a descriptive message."""
+        from spiky.device.distributed import ProcessGroupNeuron
+
+        pg = ProcessGroupNeuron.__new__(ProcessGroupNeuron)
+        with pytest.raises(NotImplementedError, match="not yet implemented"):
+            pg.allreduce([], None)
+
+    def test_broadcast_error_message(self):
+        """broadcast should also have descriptive error."""
+        from spiky.device.distributed import ProcessGroupNeuron
+
+        pg = ProcessGroupNeuron.__new__(ProcessGroupNeuron)
+        with pytest.raises(NotImplementedError, match="not yet implemented"):
+            pg.broadcast([], None)

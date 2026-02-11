@@ -13,8 +13,6 @@ from typing import List, Union
 import torch
 
 from spiky.runtime.cache import get_kernel_hash_from_path, hashes_to_kernel_dirs
-from spiky.runtime.compile import compile_model_wrapped
-from spiky.torch.config import get_nkipy_backend_config
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +31,9 @@ def parallel_compile_model(
         nkipy_cache_dir = [nkipy_cache_dir]
 
     for cache_dir in nkipy_cache_dir:
+        cache_dir = Path(cache_dir)
+        if not cache_dir.exists():
+            continue
         kernels = [p for p in os.listdir(cache_dir) if p.startswith("kernel_")]
         hashes = [get_kernel_hash_from_path(p) for p in kernels]
         for h, kernel_path in zip(hashes, kernels):
@@ -57,6 +58,8 @@ def parallel_compile_model(
         f"Parallel compiling {len(unique_kernels)} unique kernels with {num_workers} workers..."  # noqa
     )
     from concurrent.futures import ProcessPoolExecutor
+
+    from spiky.runtime.compile import compile_model_wrapped
 
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
         futures = []
@@ -107,6 +110,8 @@ def parallel_compile_context(num_workers: int = 1):
                 """single-process execution. Spawning parallel """
                 """workers from every process..."""
             )
+        from spiky.torch.config import get_nkipy_backend_config
+
         nkipy_config = get_nkipy_backend_config()
         nkipy_cache_prefix = (
             nkipy_config.nkipy_cache_prefix if nkipy_config else "./nkipy_cache"

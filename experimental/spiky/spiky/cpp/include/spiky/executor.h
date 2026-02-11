@@ -55,6 +55,8 @@ class Bundle {
 
   std::vector<int64_t> SortedBuckets() const { return sorted_bucket_sizes_; }
 
+  std::mutex& Mutex() { return mutex_; }
+
  private:
   friend class Engine;
 
@@ -74,6 +76,7 @@ class Bundle {
   bool cc_enabled_{false};
   uint32_t rank_id_{0};
   uint32_t world_size_{1};
+  mutable std::mutex mutex_;
 };
 
 // Global engine (bundle registry + buffer/pipeline state).

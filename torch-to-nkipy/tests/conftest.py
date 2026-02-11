@@ -47,7 +47,7 @@ if TORCH_TO_NKIPY_AVAILABLE:
             return
 
         if not is_nkipy_backend_initialized():
-            init_nkipy_backend()
+            init_nkipy_backend(nkipy_cache="./.nkipy_test_cache")
 
         yield
 
@@ -66,7 +66,7 @@ if TORCH_TO_NKIPY_AVAILABLE:
         if is_nkipy_backend_initialized():
             reset_nkipy_backend()
 
-        cache_dir = f"./test_cache_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+        cache_dir = f"./.nkipy_test_cache_{os.getpid()}_{uuid.uuid4().hex[:8]}"
 
         def init_with_cache(**kwargs):
             return init_nkipy_backend(nkipy_cache=cache_dir, **kwargs)
