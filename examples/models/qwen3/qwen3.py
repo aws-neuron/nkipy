@@ -27,10 +27,10 @@ class Qwen3Model:
         self.tok_embedding = model_weights.get("tok_embedding")
 
         # Initialize kernels to None - will be loaded lazily
+        self.kernel_cte = None
         self.kernel_cte_greedy_sampling = None
         self.kernel_tkg = None
         self.kernel_tkg_greedy_sampling = None
-        self.block_wise_moe_layers = []
 
         self.norm_weight = None
         self.lm_head_weight = None
@@ -156,31 +156,38 @@ class Qwen3Model:
         start_pos = DeviceTensor.from_numpy(
             np.empty(shape=(1), dtype=np.int32), "start_pos"
         )
-        for layer_id in range(self.config.num_layers):
-            cte_layer = DeviceKernel.compile_and_load(
-                transformer_layer,
-                name="cte_layer",
-                x=x_context,
-                start_pos=None,
-                qkv_weight=self.layer_tensors[layer_id]["qkv_weight"],
-                o_weight=self.layer_tensors[layer_id]["o_weight"],
-                input_weight=self.layer_tensors[layer_id]["input_weight"],
-                q_norm_weight=self.layer_tensors[layer_id]["q_norm_weight"],
-                k_norm_weight=self.layer_tensors[layer_id]["k_norm_weight"],
-                post_attention_weight=self.layer_tensors[layer_id][
-                    "post_attention_weight"
-                ],
-                router_weight=self.layer_tensors[layer_id]["router_weight"],
-                gate_up_weight=self.layer_tensors[layer_id]["gate_up_weight"],
-                down_weight=self.layer_tensors[layer_id]["down_weight"],
-                cache_k=self.layer_tensors[layer_id]["cache_k"],
-                cache_v=self.layer_tensors[layer_id]["cache_v"],
-                configs=self.config,
-                build_dir=BUILD_DIR,
-                additional_compiler_args=self.config.additional_compiler_args_nkipy,
-            )
-            self.block_wise_moe_layers.append(cte_layer)
+        self.kernel_cte = DeviceKernel.compile_and_load(
+            transformer_layer,
+            name="cte_layer",
+            x=x_context,
+            start_pos=None,
+            qkv_weight=self.layer_tensors[0]["qkv_weight"],
+            o_weight=self.layer_tensors[0]["o_weight"],
+            input_weight=self.layer_tensors[0]["input_weight"],
+            q_norm_weight=self.layer_tensors[0]["q_norm_weight"],
+            k_norm_weight=self.layer_tensors[0]["k_norm_weight"],
+            post_attention_weight=self.layer_tensors[0]["post_attention_weight"],
+            router_weight=self.layer_tensors[0]["router_weight"],
+            gate_up_weight=self.layer_tensors[0]["gate_up_weight"],
+            down_weight=self.layer_tensors[0]["down_weight"],
+            cache_k=self.layer_tensors[0]["cache_k"],
+            cache_v=self.layer_tensors[0]["cache_v"],
+            configs=self.config,
+            build_dir=BUILD_DIR,
+            additional_compiler_args=self.config.additional_compiler_args_nkipy,
+        )
 
+        self.kernel_tkg_greedy_sampling = DeviceKernel.compile_and_load(
+            greedy_sampling,
+            name="tkg_greedy_sampling",
+            h=x_token,
+            norm_weight=self.norm_weight,
+            lm_head_weight=self.lm_head_weight,
+            configs=self.config,
+            use_nki_rmsnorm=USE_NKI_RMSNORM,
+            build_dir=BUILD_DIR,
+            additional_compiler_args=self.config.additional_compiler_args_nkipy,
+        )
         self.kernel_cte_greedy_sampling = DeviceKernel.compile_and_load(
             greedy_sampling,
             name="cte_greedy_sampling",
@@ -195,6 +202,7 @@ class Qwen3Model:
 
         self.kernel_tkg = DeviceKernel.compile_and_load(
             transformer_layer,
+            name="tkg_layer",
             x=x_token,
             start_pos=start_pos,
             qkv_weight=self.layer_tensors[0]["qkv_weight"],
@@ -209,18 +217,6 @@ class Qwen3Model:
             gate_up_weight=self.layer_tensors[0]["gate_up_weight"],
             down_weight=self.layer_tensors[0]["down_weight"],
             configs=self.config,
-            build_dir=BUILD_DIR,
-            additional_compiler_args=self.config.additional_compiler_args_nkipy,
-        )
-
-        self.kernel_tkg_greedy_sampling = DeviceKernel.compile_and_load(
-            greedy_sampling,
-            name="tkg_greedy_sampling",
-            h=x_token,
-            norm_weight=self.norm_weight,
-            lm_head_weight=self.lm_head_weight,
-            configs=self.config,
-            use_nki_rmsnorm=USE_NKI_RMSNORM,
             build_dir=BUILD_DIR,
             additional_compiler_args=self.config.additional_compiler_args_nkipy,
         )
@@ -245,7 +241,7 @@ class Qwen3Model:
 
         # Process through all layers (context phase)
         for i in range(self.config.num_layers):
-            self.block_wise_moe_layers[i](
+            self.kernel_cte(
                 inputs={
                     "x": hidden_states,
                     # Layer i weights
@@ -421,8 +417,4 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\nInterrupted!")
-        sys.exit(0)
+    main()
