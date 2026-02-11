@@ -172,11 +172,75 @@ result = softmax_kernel(x)
 
 The `@baremetal_jit` decorator compiles the kernel and executes it on Trainium hardware.
 
+## Development
+
+### Common Commands
+
+```bash
+# Run tests (targeted during development)
+uv run pytest tests/unit/test_tensor_api.py -k "test_fn" -v  # single test
+uv run pytest tests/unit/test_tensor_api.py -v               # single file
+
+# Run full test suite
+uv run pytest tests/ -n auto
+
+# Lint and format
+uv run ruff check .            # lint (E, F, I rules)
+uv run ruff check . --fix      # auto-fix lint issues
+uv run ruff format .           # format code
+uv run ruff format --check .   # check formatting without changes
+
+# Type checking
+uv run mypy nkipy/
+
+# Build docs
+uv run make -C docs html
+```
+
+### Architecture
+
+#### NKIPy Core (`nkipy/src/nkipy/`)
+
+- **`core/ops/`** — Operation registry using the `Op` dispatcher pattern. Each op registers backend implementations (currently `hlo` and `cpu`) via `@op.impl('backend')`. Operations are organized by category: `binary.py`, `unary.py`, `reduce.py`, `transform.py`, `indexing.py`, `creation.py`, `conv.py`, `nn.py`, `collectives.py`, `linalg.py`.
+- **`core/ops/_registry.py`** — Global backend state management and the `Op` class that dispatches to the correct implementation based on the active backend.
+- **`core/tensor.py`** — `NKIPyTensorRef`, the main tensor type during tracing. Implements `TensorArithmeticMixin` for operator overloading.
+- **`core/trace.py`** — Tracing engine that captures computation graphs.
+- **`core/compile.py`** — HLO lowering and compilation via neuronx-cc.
+- **`core/backend/hlo.py`** — HLO backend interface.
+- **`runtime/decorators.py`** — `@simulate_jit` and `@baremetal_jit` decorators.
+- **`runtime/execute.py`** — Execution backends (simulation and device).
+- **`runtime/baremetal_executor.py`** — Hardware execution via Spike.
+- **`distributed/`** — Multi-device collective operations.
+- **`third_party/`** — Generated protobuf files for XLA HLO representation. Built during `nkipy` package build via custom `setup.py` that compiles `.proto` files.
+
+#### Spike Runtime (`spike/`)
+
+C++ runtime with nanobind Python bindings. Architecture layers:
+```
+Python (SpikeTensor, SpikeModel) → spike_singleton.py (lifecycle)
+    → C++ nanobind bindings → libnrt (Neuron Runtime)
+```
+
+- Built with scikit-build-core + CMake
+- Singleton pattern: 1 Python process → 1 Spike instance → 1 libnrt instance
+- Provides `spike-run` CLI command
+
+### Testing
+
+Tests are in `tests/` (nkipy) and `spike/tests/` (spike). `conftest.py` configures `NEURON_RT_VISIBLE_CORES` isolation for pytest-xdist parallel execution on hardware. It also implements `pytest_xdist_auto_num_workers` to cap `-n auto` at the number of available Neuron cores (using `Spike.get_visible_neuron_core_count()`), since each worker needs a dedicated core.
+
+### Code Style
+
+- **Python**: Ruff (line-length 88, double quotes, isort via `I` rule)
+- **C++**: clang-format
+- Pre-commit hooks enforce both via `.pre-commit-config.yaml`
+- Protobuf files in `nkipy/third_party/` are generated — do not edit manually
+
 ## Documentation
 
 For more information, please refer to the detailed documentation:
 
-- [Installation Guide](./docs/installation.md)
-- [Quickstart](./docs/quickstart.md)
-- [Tutorials](./docs/tutorials/index.md)
+- [Installation Guide](https://aws-neuron.github.io/nkipy/installation.html)
+- [Quickstart](https://aws-neuron.github.io/nkipy/quickstart.html)
+- [Tutorials](https://aws-neuron.github.io/nkipy/tutorials/index.html)
 - [Spike README](./spike/README.md)

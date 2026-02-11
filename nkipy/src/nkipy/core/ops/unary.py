@@ -83,6 +83,16 @@ log = _make_unary_op("log", np.log)
 sqrt = _make_unary_op("sqrt", np.sqrt)
 negative = _make_unary_op("negative", np.negative)
 
+reciprocal = Op("reciprocal")
+
+
+@reciprocal.impl("hlo")
+def _reciprocal_hlo(x, out=None, dtype=None):
+    from nkipy.core.ops.binary import divide
+
+    return divide(1.0, x)
+
+
 square = Op("square")
 
 

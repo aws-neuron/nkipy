@@ -6,6 +6,21 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
 
+def pytest_xdist_auto_num_workers(config):
+    """Cap xdist auto worker count to the number of Neuron cores.
+
+    Each xdist worker is assigned a dedicated Neuron core via
+    NEURON_RT_VISIBLE_CORES. Using more workers than cores causes
+    allocation failures.
+    """
+    try:
+        from spike._spike import Spike
+
+        return Spike.get_visible_neuron_core_count()
+    except Exception:
+        return None
+
+
 def pytest_configure(config):
     """Set NEURON_RT_VISIBLE_CORES based on xdist worker ID.
 

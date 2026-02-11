@@ -111,6 +111,7 @@ def test_expand_dims_0(sim_mode):
         np.floor,
         np.log,
         np.negative,
+        np.reciprocal,
         np.rint,
         # np.round,
         np.sqrt,
