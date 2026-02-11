@@ -37,25 +37,23 @@ def _set_build_dir(build_dir):
 # Compiler arguments
 DEFAULT_ADDITIONAL_COMPILER_ARGS = "--lnc 1"
 NKIPY_KERNEL_ADDITIONAL_COMPILER_ARGS = "--internal-tensorizer-opt-level=2"
-NKI_KERNEL_ADDITIONAL_COMPILER_ARGS = "--internal-tensorizer-opt-level=nki"
 
 nkipy_compiler_args = (
     DEFAULT_ADDITIONAL_COMPILER_ARGS + " " + NKIPY_KERNEL_ADDITIONAL_COMPILER_ARGS
-)
-nki_compiler_args = (
-    DEFAULT_ADDITIONAL_COMPILER_ARGS + " " + NKI_KERNEL_ADDITIONAL_COMPILER_ARGS
 )
 
 
 class CompilationTarget(Enum):
     TRN1 = "trn1"
     TRN2 = "trn2"
+    TRN3 = "trn3"
     DEFAULT = "default"
 
 
 def get_platform_target() -> str:
     _TRN_1 = "trn1"
     _TRN_2 = "trn2"
+    _TRN_3 = "trn3"
 
     fpath = "/sys/devices/virtual/dmi/id/product_name"
     try:
@@ -64,7 +62,7 @@ def get_platform_target() -> str:
     except IOError:
         raise RuntimeError(
             'Unable to read platform target. If running on CPU, please supply \
-        compiler argument target, with one of options trn1, trn1n, or trn2. Ex: \
+        compiler argument target, with one of supported platform options. Ex: \
         "--target trn1"'
         )
 
@@ -73,12 +71,10 @@ def get_platform_target() -> str:
         return CompilationTarget.TRN1
     elif _TRN_2 in instance_type:
         return CompilationTarget.TRN2
+    elif _TRN_3 in instance_type:
+        return CompilationTarget.TRN3
     else:
-        raise RuntimeError(
-            f'Unsupported Platform - {fc}. If you want to compile on CPU, \
-        please supply compiler argument target, with one of options trn1, \
-        trn1n, or trn2. Ex: "--target trn1"'
-        )
+        raise RuntimeError(f"Unsupported Platform - {fc}.")
 
 
 @dataclass
@@ -172,6 +168,18 @@ class Compiler:
         mode = "hlo" if isinstance(ir, HLOModule) else "unknown"
         cmd = self._build_compile_command(mode)
 
+        def _compilation_error(message, result=None):
+            """Build a RuntimeError with compiler output when available."""
+            parts = [message, f"Command: {' '.join(cmd)}"]
+            if result is not None:
+
+                def decode(b):
+                    return b.decode("utf-8", errors="replace") if b else ""
+
+                parts.append(f"stderr:\n{decode(result.stderr)}")
+                parts.append(f"stdout:\n{decode(result.stdout)}")
+            return RuntimeError("\n".join(parts))
+
         current_dir = os.getcwd()
         try:
             os.chdir(work_dir)
@@ -192,7 +200,12 @@ class Compiler:
                 sys.argv = cmd
                 neuronx_cc_main()
             else:
-                subprocess.run(cmd, check=True, capture_output=True)
+                result = subprocess.run(cmd, capture_output=True)
+                if result.returncode != 0:
+                    raise _compilation_error(
+                        f"Compilation failed (exit code {result.returncode}).",
+                        result,
+                    )
         finally:
             if use_neuronx_cc_python_interface:
                 sys.argv = original_argv
@@ -200,8 +213,9 @@ class Compiler:
 
         output_path = work_dir / output_file
         if not output_path.exists():
-            raise RuntimeError(
-                f"Compilation failed: {output_file} expected but not generated"
+            raise _compilation_error(
+                f"Compilation failed: {output_file} expected but not generated.",
+                result if not use_neuronx_cc_python_interface else None,
             )
 
         return output_path

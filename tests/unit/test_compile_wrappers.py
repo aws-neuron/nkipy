@@ -6,9 +6,17 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import numpy as np
-from nkipy.core.compile import CompilationTarget, compile_to_neff, lower_to_nki, trace
+from nkipy.core.compile import (
+    CompilationConfig,
+    CompilationTarget,
+    Compiler,
+    compile_to_neff,
+    lower_to_nki,
+    trace,
+)
 
 
 class TestCompilerWrappers(unittest.TestCase):
@@ -113,6 +121,102 @@ class TestCompilerWrappers(unittest.TestCase):
 
         with self.assertRaises(Exception):
             compile_to_neff(self.traced_kernel, output_dir=invalid_dir)
+
+
+class TestCompilerErrorSurfacing(unittest.TestCase):
+    """Tests that Compiler.compile() surfaces subprocess errors properly."""
+
+    def setUp(self):
+        self.work_dir = Path(tempfile.mkdtemp())
+        self.config = CompilationConfig(target=CompilationTarget.TRN1)
+        self.compiler = Compiler(self.config)
+
+        # Mock IR that writes a valid .pb file when serialized
+        self.mock_ir = MagicMock()
+        self.mock_ir.__class__ = type("HLOModule", (), {})
+        proto = MagicMock()
+        proto.SerializeToString.return_value = b"fake-proto"
+        self.mock_ir.to_proto.return_value = proto
+
+    def tearDown(self):
+        shutil.rmtree(self.work_dir)
+
+    @patch("nkipy.core.compile.isinstance", return_value=True)
+    @patch("nkipy.core.compile.subprocess.run")
+    def test_nonzero_exit_surfaces_stderr_and_stdout(self, mock_run, _mock_isinstance):
+        """When neuronx-cc exits non-zero, the RuntimeError includes stderr and stdout."""
+        mock_run.return_value = MagicMock(
+            returncode=1,
+            stderr=b"error: invalid HLO\n",
+            stdout=b"compiling graph...\n",
+        )
+
+        with self.assertRaises(RuntimeError) as ctx:
+            self.compiler.compile(
+                self.mock_ir,
+                self.work_dir,
+                "file.neff",
+            )
+
+        msg = str(ctx.exception)
+        self.assertIn("exit code 1", msg)
+        self.assertIn("error: invalid HLO", msg)
+        self.assertIn("compiling graph...", msg)
+        self.assertIn("neuronx-cc", msg)
+
+    @patch("nkipy.core.compile.isinstance", return_value=True)
+    @patch("nkipy.core.compile.subprocess.run")
+    def test_zero_exit_missing_output_surfaces_stderr(self, mock_run, _mock_isinstance):
+        """When neuronx-cc exits 0 but output file is missing, stderr/stdout are shown."""
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stderr=b"warning: skipped codegen\n",
+            stdout=b"",
+        )
+
+        with self.assertRaises(RuntimeError) as ctx:
+            self.compiler.compile(
+                self.mock_ir,
+                self.work_dir,
+                "file.neff",
+            )
+
+        msg = str(ctx.exception)
+        self.assertIn("expected but not generated", msg)
+        self.assertIn("warning: skipped codegen", msg)
+
+    @patch("nkipy.core.compile.isinstance", return_value=True)
+    @patch("nkipy.core.compile.subprocess.run")
+    def test_success_returns_output_path(self, mock_run, _mock_isinstance):
+        """When compilation succeeds and output exists, return its path."""
+        output_file = "file.neff"
+        (self.work_dir / output_file).write_bytes(b"fake-neff")
+
+        mock_run.return_value = MagicMock(returncode=0, stderr=b"", stdout=b"")
+
+        result = self.compiler.compile(
+            self.mock_ir,
+            self.work_dir,
+            output_file,
+        )
+
+        self.assertEqual(result, self.work_dir / output_file)
+
+    @patch("nkipy.core.compile.isinstance", return_value=True)
+    @patch("nkipy.core.compile.subprocess.run")
+    def test_cwd_restored_after_failure(self, mock_run, _mock_isinstance):
+        """Working directory is restored even when compilation fails."""
+        mock_run.return_value = MagicMock(returncode=1, stderr=b"", stdout=b"")
+
+        cwd_before = Path.cwd()
+        with self.assertRaises(RuntimeError):
+            self.compiler.compile(
+                self.mock_ir,
+                self.work_dir,
+                "file.neff",
+            )
+
+        self.assertEqual(Path.cwd(), cwd_before)
 
 
 if __name__ == "__main__":
