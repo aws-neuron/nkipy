@@ -4,42 +4,7 @@ import functools
 
 from nkipy.core import compile
 from nkipy.core.compile import trace
-from nkipy.runtime.execute import baremetal_run_traced_kernel, simulate_traced_kernel
-
-
-def simulate_jit(kernel_func):
-    """Decorator to execute a kernel using simulation.
-
-    This decorator wraps a kernel function to automatically trace and simulate it.
-    Useful for debugging and testing without hardware.
-
-    Args:
-        kernel_func: The kernel function to decorate
-
-    Returns:
-        A wrapped function that executes via simulation
-
-    Example:
-        @simulate
-        def my_kernel(A, B):
-            return A @ B
-
-        result = my_kernel(input_a, input_b)
-    """
-
-    @functools.wraps(kernel_func)
-    def wrapper(*args, **kwargs):
-        traced_kernel = trace(
-            kernel_func,
-            debug_kernel=True,
-            experimental_flags="enable-mutable-parameter",
-            trace_time_unroll_builtin_range=True,
-            show_compiler_tb=True,
-        )
-        traced_kernel.specialize(*args, **kwargs)
-        return simulate_traced_kernel(traced_kernel, *args, **kwargs)
-
-    return wrapper
+from nkipy.runtime.execute import baremetal_run_traced_kernel
 
 
 def baremetal_jit(

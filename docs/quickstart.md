@@ -15,11 +15,10 @@ uv sync
 
 ## Basic Usage
 
-NKIPy kernels can run in three modes:
+NKIPy kernels can run in two modes:
 
-1. **Pure NumPy (CPU)** - Run kernels directly as NumPy code for prototyping
-2. **Simulation Mode** - Use `@simulate_jit` to trace and simulate execution
-3. **Trainium Hardware** - Use `@baremetal_jit` to compile and run on Trainium
+1. **CPU (Direct)** - Call kernels directly as NumPy code for prototyping
+2. **Trainium Hardware** - Use `@baremetal_jit` to compile and run on Trainium
 
 For complete code examples, see the [Basic Usage section in the README](https://github.com/aws-neuron/nkipy/blob/main/README.md#basic-usage).
 
@@ -31,7 +30,7 @@ The best way to learn NKIPy is through hands-on tutorials:
 
 - **[Simple Tutorial](tutorials/01_simple.ipynb)** - Learn the basics with a softmax kernel
   - Define a NKIPy kernel
-  - Run as NumPy, simulation, and on Trainium hardware
+  - Run on CPU and on Trainium hardware
   - Understand tracing and compilation
 
 - **[NKIPy to NKI](tutorials/02_nkipy_to_nki.ipynb)** - Learn how NKIPy lowers to NKI code

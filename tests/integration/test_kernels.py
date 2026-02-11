@@ -12,9 +12,9 @@ from utils import (
     NEURON_AVAILABLE,
     baremetal_assert_allclose,
     baremetal_run_kernel_unified,
-    sim_mode,  # noqa: F401 - pytest fixture
-    simulate_assert_allclose,
-    simulate_kernel_unified,
+    cpu_assert_allclose,
+    trace_and_run,
+    trace_mode,  # noqa: F401 - pytest fixture
 )
 
 
@@ -55,7 +55,7 @@ SPECS_BY_FILE = collect_kernel_specs()
 
 
 @pytest.mark.parametrize("file_name,kernel_spec", SPECS_BY_FILE.items())
-def test_simulate_kernel_default(sim_mode, file_name, kernel_spec):
+def test_kernel_default(trace_mode, file_name, kernel_spec):
     """Test kernel with default shapes and types from spec"""
 
     if not kernel_spec.is_pure_numpy:
@@ -84,19 +84,19 @@ def test_simulate_kernel_default(sim_mode, file_name, kernel_spec):
     numpy_func = kernel_spec.function
     expected = numpy_func(*inputs)
 
-    # Test simulation with unified IR/HLO
-    result = simulate_kernel_unified(kernel_spec.function, sim_mode, *inputs)
+    # Trace to validate HLO, then run on CPU
+    result = trace_and_run(kernel_spec.function, trace_mode, *inputs)
 
     if isinstance(result, tuple):
         for r, e in zip(result, expected):
-            simulate_assert_allclose(r, e)
+            cpu_assert_allclose(r, e)
     else:
-        simulate_assert_allclose(result, expected)
+        cpu_assert_allclose(result, expected)
 
     # Test hardware if available
     if NEURON_AVAILABLE:
         hardware_result = baremetal_run_kernel_unified(
-            kernel_spec.function, sim_mode, *inputs
+            kernel_spec.function, trace_mode, *inputs
         )
 
         if isinstance(hardware_result, tuple):

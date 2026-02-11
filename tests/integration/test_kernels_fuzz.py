@@ -35,8 +35,8 @@ from nkipy.core.specs import ScalarInputSpec, TensorInputSpec, TypeSpec
 from utils import (
     NEURON_AVAILABLE,
     baremetal_run_kernel_unified,
-    sim_mode,  # noqa: F401 - pytest fixture
-    simulate_kernel_unified,
+    trace_and_run,
+    trace_mode,  # noqa: F401 - pytest fixture
 )
 
 
@@ -73,7 +73,7 @@ def generate_dtype(type_spec: TypeSpec) -> Type:
 
 
 @pytest.mark.parametrize("kernel_spec", simple_specs)
-def test_kernel_fuzz(sim_mode, kernel_spec):
+def test_kernel_fuzz(trace_mode, kernel_spec):
     """Fuzz test kernel with various valid shapes and dtypes"""
 
     # TODO: use some environment variable to control number of fuzz
@@ -107,20 +107,20 @@ def test_kernel_fuzz(sim_mode, kernel_spec):
         numpy_func = kernel_spec.function
         expected = numpy_func(*inputs)
 
-        # Test simulation with unified IR/HLO
-        result = simulate_kernel_unified(kernel_spec.function, sim_mode, *inputs)
+        # Trace to validate HLO, then run on CPU
+        result = trace_and_run(kernel_spec.function, trace_mode, *inputs)
 
         # Use different tolerances for different dtypes
         rtol = 1e-3 if any(x.dtype == np.float16 for x in inputs) else 1e-5
         assert np.allclose(result, expected, rtol=rtol, atol=rtol)
         print(
-            f"Simulation test passed for shapes {shape_a} and dtypes {[x.dtype for x in inputs]}"
+            f"CPU test passed for shapes {shape_a} and dtypes {[x.dtype for x in inputs]}"
         )
 
         # Test hardware if available
         if NEURON_AVAILABLE:
             hardware_result = baremetal_run_kernel_unified(
-                kernel_spec.function, sim_mode, *inputs
+                kernel_spec.function, trace_mode, *inputs
             )
 
             # Use looser tolerances for hardware

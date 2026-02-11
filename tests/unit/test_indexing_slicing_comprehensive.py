@@ -24,9 +24,9 @@ from utils import (
     NEURON_AVAILABLE,
     baremetal_assert_allclose,
     baremetal_run_kernel_unified,
-    sim_mode,  # noqa: F401 - pytest fixture
-    simulate_assert_allclose,
-    simulate_kernel_unified,
+    cpu_assert_allclose,
+    trace_and_run,
+    trace_mode,  # noqa: F401 - pytest fixture
 )
 
 
@@ -53,7 +53,7 @@ class TestIndexingSlicingCore:
             "large_1d": np.random.randn(1024).astype(np.float32),
         }
 
-    def test_basic_slice_1d(self, sim_mode, sample_tensors):
+    def test_basic_slice_1d(self, trace_mode, sample_tensors):
         """Test basic 1D slicing with explicit copy"""
 
         def kernel(a):
@@ -63,15 +63,15 @@ class TestIndexingSlicingCore:
         a = sample_tensors["small_1d"]
         expected = a[5:15]
 
-        result = simulate_kernel_unified(kernel, sim_mode, a)
-        simulate_assert_allclose(result, expected)
+        result = trace_and_run(kernel, trace_mode, a)
+        cpu_assert_allclose(result, expected)
         assert result.shape == (10,)
 
         if NEURON_AVAILABLE:
-            out_baremetal = baremetal_run_kernel_unified(kernel, sim_mode, a)
+            out_baremetal = baremetal_run_kernel_unified(kernel, trace_mode, a)
             baremetal_assert_allclose(expected, out_baremetal)
 
-    def test_basic_slice_2d(self, sim_mode, sample_tensors):
+    def test_basic_slice_2d(self, trace_mode, sample_tensors):
         """Test basic 2D slicing with explicit copy"""
 
         def kernel(a):
@@ -81,15 +81,15 @@ class TestIndexingSlicingCore:
         a = sample_tensors["small_2d"]
         expected = a[0:3, :4]
 
-        result = simulate_kernel_unified(kernel, sim_mode, a)
-        simulate_assert_allclose(result, expected)
+        result = trace_and_run(kernel, trace_mode, a)
+        cpu_assert_allclose(result, expected)
         assert result.shape == (3, 4)
 
         if NEURON_AVAILABLE:
-            out_baremetal = baremetal_run_kernel_unified(kernel, sim_mode, a)
+            out_baremetal = baremetal_run_kernel_unified(kernel, trace_mode, a)
             baremetal_assert_allclose(expected, out_baremetal)
 
-    def test_basic_slice_3d(self, sim_mode, sample_tensors):
+    def test_basic_slice_3d(self, trace_mode, sample_tensors):
         """Test basic 3D slicing with explicit copy"""
 
         def kernel(a):
@@ -99,15 +99,15 @@ class TestIndexingSlicingCore:
         a = sample_tensors["small_3d"]
         expected = a[0:2, :, 4:8]
 
-        result = simulate_kernel_unified(kernel, sim_mode, a)
-        simulate_assert_allclose(result, expected)
+        result = trace_and_run(kernel, trace_mode, a)
+        cpu_assert_allclose(result, expected)
         assert result.shape == (2, 8, 4)
 
         if NEURON_AVAILABLE:
-            out_baremetal = baremetal_run_kernel_unified(kernel, sim_mode, a)
+            out_baremetal = baremetal_run_kernel_unified(kernel, trace_mode, a)
             baremetal_assert_allclose(expected, out_baremetal)
 
-    def test_step_slicing(self, sim_mode, sample_tensors):
+    def test_step_slicing(self, trace_mode, sample_tensors):
         """Test slicing with step parameter"""
 
         def kernel(a):
@@ -118,12 +118,12 @@ class TestIndexingSlicingCore:
         expected = a[::2, 1::3]
 
         try:
-            result = simulate_kernel_unified(kernel, sim_mode, a)
-            simulate_assert_allclose(result, expected)
+            result = trace_and_run(kernel, trace_mode, a)
+            cpu_assert_allclose(result, expected)
             assert result.shape == expected.shape
 
             if NEURON_AVAILABLE:
-                out_baremetal = baremetal_run_kernel_unified(kernel, sim_mode, a)
+                out_baremetal = baremetal_run_kernel_unified(kernel, trace_mode, a)
                 baremetal_assert_allclose(expected, out_baremetal)
         except AssertionError as e:
             if "Only support scale 1 for now" in str(e):
@@ -131,7 +131,7 @@ class TestIndexingSlicingCore:
             else:
                 raise
 
-    def test_nested_slicing(self, sim_mode, sample_tensors):
+    def test_nested_slicing(self, trace_mode, sample_tensors):
         """Test chained slicing operations"""
 
         def kernel(a):
@@ -142,15 +142,15 @@ class TestIndexingSlicingCore:
         a = sample_tensors["small_2d"]
         expected = a[0:6, :][2:4, 4:8]
 
-        result = simulate_kernel_unified(kernel, sim_mode, a)
-        simulate_assert_allclose(result, expected)
+        result = trace_and_run(kernel, trace_mode, a)
+        cpu_assert_allclose(result, expected)
         assert result.shape == (2, 4)
 
         if NEURON_AVAILABLE:
-            out_baremetal = baremetal_run_kernel_unified(kernel, sim_mode, a)
+            out_baremetal = baremetal_run_kernel_unified(kernel, trace_mode, a)
             baremetal_assert_allclose(expected, out_baremetal)
 
-    def test_basic_assignment(self, sim_mode, sample_tensors):
+    def test_basic_assignment(self, trace_mode, sample_tensors):
         """Test basic assignment through views"""
 
         def kernel(a, b):
@@ -164,14 +164,14 @@ class TestIndexingSlicingCore:
         expected = a.copy()
         expected[0:3, :4] = b
 
-        result = simulate_kernel_unified(kernel, sim_mode, a, b)
-        simulate_assert_allclose(result, expected)
+        result = trace_and_run(kernel, trace_mode, a, b)
+        cpu_assert_allclose(result, expected)
 
         if NEURON_AVAILABLE:
-            out_baremetal = baremetal_run_kernel_unified(kernel, sim_mode, a, b)
+            out_baremetal = baremetal_run_kernel_unified(kernel, trace_mode, a, b)
             baremetal_assert_allclose(expected, out_baremetal)
 
-    def test_view_assignment_semantics(self, sim_mode, sample_tensors):
+    def test_view_assignment_semantics(self, trace_mode, sample_tensors):
         """Test that assignment through views modifies the original tensor"""
 
         def kernel(a, b):
@@ -186,19 +186,19 @@ class TestIndexingSlicingCore:
         expected = a.copy()
         expected[0:5, :][1:3, 2:4] = b
 
-        if sim_mode == "hlo":
+        if trace_mode == "hlo":
             pytest.skip(
                 "View assignment semantics differ in HLO mode - operations create new tensors"
             )
 
-        result = simulate_kernel_unified(kernel, sim_mode, a, b)
-        simulate_assert_allclose(result, expected)
+        result = trace_and_run(kernel, trace_mode, a, b)
+        cpu_assert_allclose(result, expected)
 
         if NEURON_AVAILABLE:
-            out_baremetal = baremetal_run_kernel_unified(kernel, sim_mode, a, b)
+            out_baremetal = baremetal_run_kernel_unified(kernel, trace_mode, a, b)
             baremetal_assert_allclose(expected, out_baremetal)
 
-    def test_explicit_copy_requirement(self, sim_mode, sample_tensors):
+    def test_explicit_copy_requirement(self, trace_mode, sample_tensors):
         """Test that explicit copy is required for kernel returns"""
 
         def kernel_with_copy(a):
@@ -212,12 +212,12 @@ class TestIndexingSlicingCore:
         expected = a[0:3, :4]
 
         # With copy should work
-        result = simulate_kernel_unified(kernel_with_copy, sim_mode, a)
-        simulate_assert_allclose(result, expected)
+        result = trace_and_run(kernel_with_copy, trace_mode, a)
+        cpu_assert_allclose(result, expected)
 
         # Without copy should work now as well
-        result = simulate_kernel_unified(kernel_without_copy, sim_mode, a)
-        simulate_assert_allclose(result, expected)
+        result = trace_and_run(kernel_without_copy, trace_mode, a)
+        cpu_assert_allclose(result, expected)
 
 
 class TestIndexingSlicingMLPatterns:
@@ -237,7 +237,7 @@ class TestIndexingSlicingMLPatterns:
             "large_1d": np.random.randn(1024).astype(np.float32),
         }
 
-    def test_numpy_array_indexing_1d(self, sim_mode, sample_tensors):
+    def test_numpy_array_indexing_1d(self, trace_mode, sample_tensors):
         """Test 1D array indexing - essential for sequence gathering"""
 
         def kernel(a):
@@ -248,15 +248,15 @@ class TestIndexingSlicingMLPatterns:
         a = sample_tensors["large_1d"]
         expected = a[[0, 2, 4, 6]]
 
-        result = simulate_kernel_unified(kernel, sim_mode, a)
-        simulate_assert_allclose(result, expected)
+        result = trace_and_run(kernel, trace_mode, a)
+        cpu_assert_allclose(result, expected)
         assert result.shape == (4,)
 
         if NEURON_AVAILABLE:
-            out_baremetal = baremetal_run_kernel_unified(kernel, sim_mode, a)
+            out_baremetal = baremetal_run_kernel_unified(kernel, trace_mode, a)
             baremetal_assert_allclose(expected, out_baremetal)
 
-    def test_numpy_array_indexing_2d_rows(self, sim_mode, sample_tensors):
+    def test_numpy_array_indexing_2d_rows(self, trace_mode, sample_tensors):
         """Test 2D row selection - common for batch processing"""
 
         def kernel(a):
@@ -267,15 +267,15 @@ class TestIndexingSlicingMLPatterns:
         a = sample_tensors["small_2d"]
         expected = a[[0, 2], :]
 
-        result = simulate_kernel_unified(kernel, sim_mode, a)
-        simulate_assert_allclose(result, expected)
+        result = trace_and_run(kernel, trace_mode, a)
+        cpu_assert_allclose(result, expected)
         assert result.shape == (2, 16)
 
         if NEURON_AVAILABLE:
-            out_baremetal = baremetal_run_kernel_unified(kernel, sim_mode, a)
+            out_baremetal = baremetal_run_kernel_unified(kernel, trace_mode, a)
             baremetal_assert_allclose(expected, out_baremetal)
 
-    def test_batch_indexing_pattern(self, sim_mode, sample_tensors):
+    def test_batch_indexing_pattern(self, trace_mode, sample_tensors):
         """Test batch selection pattern - very common in ML"""
 
         def kernel(a):
@@ -286,15 +286,15 @@ class TestIndexingSlicingMLPatterns:
         a = sample_tensors["batch_seq"]
         expected = a[[0, 2], :, :]
 
-        result = simulate_kernel_unified(kernel, sim_mode, a)
-        simulate_assert_allclose(result, expected)
+        result = trace_and_run(kernel, trace_mode, a)
+        cpu_assert_allclose(result, expected)
         assert result.shape == (2, 32, 64)
 
         if NEURON_AVAILABLE:
-            out_baremetal = baremetal_run_kernel_unified(kernel, sim_mode, a)
+            out_baremetal = baremetal_run_kernel_unified(kernel, trace_mode, a)
             baremetal_assert_allclose(expected, out_baremetal)
 
-    def test_list_indexing(self, sim_mode, sample_tensors):
+    def test_list_indexing(self, trace_mode, sample_tensors):
         """Test Python list indexing - should work like numpy arrays"""
 
         def kernel(a):
@@ -305,15 +305,15 @@ class TestIndexingSlicingMLPatterns:
         a = sample_tensors["small_2d"]
         expected = a[[0, 2, 4]]
 
-        result = simulate_kernel_unified(kernel, sim_mode, a)
-        simulate_assert_allclose(result, expected)
+        result = trace_and_run(kernel, trace_mode, a)
+        cpu_assert_allclose(result, expected)
         assert result.shape == (3, 16)
 
         if NEURON_AVAILABLE:
-            out_baremetal = baremetal_run_kernel_unified(kernel, sim_mode, a)
+            out_baremetal = baremetal_run_kernel_unified(kernel, trace_mode, a)
             baremetal_assert_allclose(expected, out_baremetal)
 
-    def test_mixed_slice_and_array_indexing(self, sim_mode, sample_tensors):
+    def test_mixed_slice_and_array_indexing(self, trace_mode, sample_tensors):
         """Test combining slicing with array indexing"""
 
         def kernel(a):
@@ -326,15 +326,15 @@ class TestIndexingSlicingMLPatterns:
         a = sample_tensors["small_2d"]
         expected = a[:, 2:10][[0, 2]]
 
-        result = simulate_kernel_unified(kernel, sim_mode, a)
-        simulate_assert_allclose(result, expected)
+        result = trace_and_run(kernel, trace_mode, a)
+        cpu_assert_allclose(result, expected)
         assert result.shape == (2, 8)
 
         if NEURON_AVAILABLE:
-            out_baremetal = baremetal_run_kernel_unified(kernel, sim_mode, a)
+            out_baremetal = baremetal_run_kernel_unified(kernel, trace_mode, a)
             baremetal_assert_allclose(expected, out_baremetal)
 
-    def test_sequence_token_selection(self, sim_mode, sample_tensors):
+    def test_sequence_token_selection(self, trace_mode, sample_tensors):
         """Test selecting specific tokens from sequences - common in NLP"""
 
         def kernel(a):
@@ -346,15 +346,15 @@ class TestIndexingSlicingMLPatterns:
         a = sample_tensors["batch_seq"]
         expected = a[:, [0, 5, 10, 15], :]
 
-        result = simulate_kernel_unified(kernel, sim_mode, a)
-        simulate_assert_allclose(result, expected)
+        result = trace_and_run(kernel, trace_mode, a)
+        cpu_assert_allclose(result, expected)
         assert result.shape == (4, 4, 64)
 
         if NEURON_AVAILABLE:
-            out_baremetal = baremetal_run_kernel_unified(kernel, sim_mode, a)
+            out_baremetal = baremetal_run_kernel_unified(kernel, trace_mode, a)
             baremetal_assert_allclose(expected, out_baremetal)
 
-    def test_attention_head_selection(self, sim_mode, sample_tensors):
+    def test_attention_head_selection(self, trace_mode, sample_tensors):
         """Test selecting specific attention heads - critical for transformers"""
 
         def kernel(a):
@@ -365,15 +365,15 @@ class TestIndexingSlicingMLPatterns:
         a = sample_tensors["attention"]
         expected = a[:, [0, 2, 4, 6], :, :]
 
-        result = simulate_kernel_unified(kernel, sim_mode, a)
-        simulate_assert_allclose(result, expected)
+        result = trace_and_run(kernel, trace_mode, a)
+        cpu_assert_allclose(result, expected)
         assert result.shape == (2, 4, 32, 64)
 
         if NEURON_AVAILABLE:
-            out_baremetal = baremetal_run_kernel_unified(kernel, sim_mode, a)
+            out_baremetal = baremetal_run_kernel_unified(kernel, trace_mode, a)
             baremetal_assert_allclose(expected, out_baremetal)
 
-    def test_view_usage_without_intermediate_copy(self, sim_mode, sample_tensors):
+    def test_view_usage_without_intermediate_copy(self, trace_mode, sample_tensors):
         """Test that views can be used directly without intermediate copying"""
 
         def kernel(tensor):
@@ -388,15 +388,15 @@ class TestIndexingSlicingMLPatterns:
         a = sample_tensors["large_1d"][:6]  # Use first 6 elements
         expected = a[1:5] * 2.0
 
-        result = simulate_kernel_unified(kernel, sim_mode, a)
-        simulate_assert_allclose(result, expected)
+        result = trace_and_run(kernel, trace_mode, a)
+        cpu_assert_allclose(result, expected)
         assert result.shape == (4,)
 
         if NEURON_AVAILABLE:
-            out_baremetal = baremetal_run_kernel_unified(kernel, sim_mode, a)
+            out_baremetal = baremetal_run_kernel_unified(kernel, trace_mode, a)
             baremetal_assert_allclose(expected, out_baremetal)
 
-    def test_view_as_index_pattern(self, sim_mode, sample_tensors):
+    def test_view_as_index_pattern(self, trace_mode, sample_tensors):
         """Test using views as indices to other tensors - critical for MoE models"""
 
         def kernel(top_k_indices, weights):
@@ -417,21 +417,21 @@ class TestIndexingSlicingMLPatterns:
         expected_idx = top_k_indices[0:5]
         expected_weight = weights[expected_idx]
 
-        result_idx, result_weight = simulate_kernel_unified(
-            kernel, sim_mode, top_k_indices, weights
+        result_idx, result_weight = trace_and_run(
+            kernel, trace_mode, top_k_indices, weights
         )
 
-        simulate_assert_allclose(result_idx, expected_idx)
-        simulate_assert_allclose(result_weight, expected_weight)
+        cpu_assert_allclose(result_idx, expected_idx)
+        cpu_assert_allclose(result_weight, expected_weight)
 
         if NEURON_AVAILABLE:
             baremetal_idx, baremetal_weight = baremetal_run_kernel_unified(
-                kernel, sim_mode, top_k_indices, weights
+                kernel, trace_mode, top_k_indices, weights
             )
             baremetal_assert_allclose(expected_idx, baremetal_idx)
             baremetal_assert_allclose(expected_weight, baremetal_weight)
 
-    def test_single_view_as_index_pattern(self, sim_mode, sample_tensors):
+    def test_single_view_as_index_pattern(self, trace_mode, sample_tensors):
         """Test using views as indices to other tensors - critical for MoE models"""
 
         def kernel(top_k_indices, weights):
@@ -452,16 +452,16 @@ class TestIndexingSlicingMLPatterns:
         expected_idx = top_k_indices[0]
         expected_weight = weights[expected_idx]
 
-        result_idx, result_weight = simulate_kernel_unified(
-            kernel, sim_mode, top_k_indices, weights
+        result_idx, result_weight = trace_and_run(
+            kernel, trace_mode, top_k_indices, weights
         )
 
-        simulate_assert_allclose(result_idx, expected_idx)
-        simulate_assert_allclose(result_weight, expected_weight)
+        cpu_assert_allclose(result_idx, expected_idx)
+        cpu_assert_allclose(result_weight, expected_weight)
 
         if NEURON_AVAILABLE:
             baremetal_idx, baremetal_weight = baremetal_run_kernel_unified(
-                kernel, sim_mode, top_k_indices, weights
+                kernel, trace_mode, top_k_indices, weights
             )
             baremetal_assert_allclose(expected_idx, baremetal_idx)
             baremetal_assert_allclose(expected_weight, baremetal_weight)
@@ -483,7 +483,7 @@ class TestIndexingSlicingAdvanced:
             "batch_seq": np.random.randn(4, 32, 64).astype(np.float32),
         }
 
-    def test_negative_indexing_basic(self, sim_mode, sample_tensors):
+    def test_negative_indexing_basic(self, trace_mode, sample_tensors):
         """Test basic negative indexing"""
 
         def kernel(a):
@@ -494,17 +494,17 @@ class TestIndexingSlicingAdvanced:
         expected = a[-1, :]
 
         try:
-            result = simulate_kernel_unified(kernel, sim_mode, a)
-            simulate_assert_allclose(result, expected)
+            result = trace_and_run(kernel, trace_mode, a)
+            cpu_assert_allclose(result, expected)
             assert result.shape == (16,)
 
             if NEURON_AVAILABLE:
-                out_baremetal = baremetal_run_kernel_unified(kernel, sim_mode, a)
+                out_baremetal = baremetal_run_kernel_unified(kernel, trace_mode, a)
                 baremetal_assert_allclose(expected, out_baremetal)
         except Exception as e:
             pytest.skip(f"Negative indexing not yet working: {e}")
 
-    def test_negative_slice_indexing(self, sim_mode, sample_tensors):
+    def test_negative_slice_indexing(self, trace_mode, sample_tensors):
         """Test negative slice indexing"""
 
         def kernel(a):
@@ -515,16 +515,16 @@ class TestIndexingSlicingAdvanced:
         expected = a[:-2, 1:-1]
 
         try:
-            result = simulate_kernel_unified(kernel, sim_mode, a)
-            simulate_assert_allclose(result, expected)
+            result = trace_and_run(kernel, trace_mode, a)
+            cpu_assert_allclose(result, expected)
 
             if NEURON_AVAILABLE:
-                out_baremetal = baremetal_run_kernel_unified(kernel, sim_mode, a)
+                out_baremetal = baremetal_run_kernel_unified(kernel, trace_mode, a)
                 baremetal_assert_allclose(expected, out_baremetal)
         except Exception as e:
             pytest.skip(f"Negative slice indexing not yet working: {e}")
 
-    def test_ellipsis_support(self, sim_mode, sample_tensors):
+    def test_ellipsis_support(self, trace_mode, sample_tensors):
         """Test ellipsis notation"""
 
         def kernel(a):
@@ -534,9 +534,9 @@ class TestIndexingSlicingAdvanced:
         a = sample_tensors["small_3d"]
 
         with pytest.raises((NotImplementedError, ValueError, TypeError)):
-            simulate_kernel_unified(kernel, sim_mode, a)
+            trace_and_run(kernel, trace_mode, a)
 
-    def test_newaxis_support(self, sim_mode, sample_tensors):
+    def test_newaxis_support(self, trace_mode, sample_tensors):
         """Test adding new dimensions via indexing"""
 
         def kernel(a):
@@ -546,9 +546,9 @@ class TestIndexingSlicingAdvanced:
         a = sample_tensors["small_2d"]
 
         with pytest.raises((NotImplementedError, ValueError, TypeError)):
-            simulate_kernel_unified(kernel, sim_mode, a)
+            trace_and_run(kernel, trace_mode, a)
 
-    def test_boolean_indexing_basic(self, sim_mode, sample_tensors):
+    def test_boolean_indexing_basic(self, trace_mode, sample_tensors):
         """Test basic boolean indexing"""
 
         def kernel(a):
@@ -557,15 +557,15 @@ class TestIndexingSlicingAdvanced:
 
         a = sample_tensors["small_2d"]
 
-        # NOTE: simulation on CPU should pass
+        # NOTE: CPU execution should pass
 
         if NEURON_AVAILABLE:
             with pytest.raises(
                 (NotImplementedError, AssertionError, TypeError, RuntimeError)
             ):
-                baremetal_run_kernel_unified(kernel, sim_mode, a)
+                baremetal_run_kernel_unified(kernel, trace_mode, a)
 
-    def test_mixed_static_dynamic_indexing(self, sim_mode, sample_tensors):
+    def test_mixed_static_dynamic_indexing(self, trace_mode, sample_tensors):
         """Test mixing static slicing with dynamic indexing"""
 
         def kernel(a):
@@ -576,15 +576,15 @@ class TestIndexingSlicingAdvanced:
         a = sample_tensors["batch_seq"]
         expected = a[0:2, [0, 5, 10, 15], :]
 
-        result = simulate_kernel_unified(kernel, sim_mode, a)
-        simulate_assert_allclose(result, expected)
+        result = trace_and_run(kernel, trace_mode, a)
+        cpu_assert_allclose(result, expected)
         assert result.shape == (2, 4, 64)
 
         if NEURON_AVAILABLE:
-            out_baremetal = baremetal_run_kernel_unified(kernel, sim_mode, a)
+            out_baremetal = baremetal_run_kernel_unified(kernel, trace_mode, a)
             baremetal_assert_allclose(expected, out_baremetal)
 
-    def test_step_slicing_with_offset(self, sim_mode, sample_tensors):
+    def test_step_slicing_with_offset(self, trace_mode, sample_tensors):
         """Test step slicing with non-zero start offset"""
 
         def kernel(a):
@@ -596,15 +596,15 @@ class TestIndexingSlicingAdvanced:
         a = sample_tensors["small_2d"]
         expected = a[1::2, 2::3]
 
-        result = simulate_kernel_unified(kernel, sim_mode, a)
-        simulate_assert_allclose(result, expected)
+        result = trace_and_run(kernel, trace_mode, a)
+        cpu_assert_allclose(result, expected)
         assert result.shape == expected.shape
 
         if NEURON_AVAILABLE:
-            out_baremetal = baremetal_run_kernel_unified(kernel, sim_mode, a)
+            out_baremetal = baremetal_run_kernel_unified(kernel, trace_mode, a)
             baremetal_assert_allclose(expected, out_baremetal)
 
-    def test_negative_slice_with_step(self, sim_mode, sample_tensors):
+    def test_negative_slice_with_step(self, trace_mode, sample_tensors):
         """Test combining negative slice with step"""
 
         def kernel(a):
@@ -614,15 +614,15 @@ class TestIndexingSlicingAdvanced:
         a = sample_tensors["small_2d"]
         expected = a[:-1:2, 1:-1:2]
 
-        result = simulate_kernel_unified(kernel, sim_mode, a)
-        simulate_assert_allclose(result, expected)
+        result = trace_and_run(kernel, trace_mode, a)
+        cpu_assert_allclose(result, expected)
         assert result.shape == expected.shape
 
         if NEURON_AVAILABLE:
-            out_baremetal = baremetal_run_kernel_unified(kernel, sim_mode, a)
+            out_baremetal = baremetal_run_kernel_unified(kernel, trace_mode, a)
             baremetal_assert_allclose(expected, out_baremetal)
 
-    def test_step_slicing_assignment(self, sim_mode, sample_tensors):
+    def test_step_slicing_assignment(self, trace_mode, sample_tensors):
         """Test assignment to step-sliced views"""
 
         def kernel(a, b):
@@ -638,11 +638,11 @@ class TestIndexingSlicingAdvanced:
         expected = a.copy()
         expected[::2, ::2] = b
 
-        result = simulate_kernel_unified(kernel, sim_mode, a, b)
-        simulate_assert_allclose(result, expected)
+        result = trace_and_run(kernel, trace_mode, a, b)
+        cpu_assert_allclose(result, expected)
 
         if NEURON_AVAILABLE:
-            out_baremetal = baremetal_run_kernel_unified(kernel, sim_mode, a, b)
+            out_baremetal = baremetal_run_kernel_unified(kernel, trace_mode, a, b)
             baremetal_assert_allclose(expected, out_baremetal)
 
 
@@ -661,7 +661,7 @@ class TestIndexingSlicingErrorHandling:
             "batch_seq": np.random.randn(4, 32, 64).astype(np.float32),
         }
 
-    def test_direct_view_return_error(self, sim_mode, sample_tensors):
+    def test_direct_view_return_error(self, trace_mode, sample_tensors):
         """Test that returning views directly from kernels fails with clear error"""
 
         def kernel(a):
@@ -670,11 +670,11 @@ class TestIndexingSlicingErrorHandling:
         a = sample_tensors["small_2d"]
 
         # HLO mode: views work fine, just verify it runs
-        result = simulate_kernel_unified(kernel, sim_mode, a)
+        result = trace_and_run(kernel, trace_mode, a)
         expected = a[0:3, :4]
-        simulate_assert_allclose(result, expected)
+        cpu_assert_allclose(result, expected)
 
-    def test_multi_axis_gather_limitation(self, sim_mode, sample_tensors):
+    def test_multi_axis_gather_limitation(self, trace_mode, sample_tensors):
         """Test that multi-axis array indexing fails with helpful error"""
 
         def kernel(a):
@@ -687,9 +687,9 @@ class TestIndexingSlicingErrorHandling:
         with pytest.raises(
             (ValueError, AssertionError), match="Only one.*index.*supported"
         ):
-            simulate_kernel_unified(kernel, sim_mode, a)
+            trace_and_run(kernel, trace_mode, a)
 
-    def test_complex_boolean_expression_unsupported(self, sim_mode, sample_tensors):
+    def test_complex_boolean_expression_unsupported(self, trace_mode, sample_tensors):
         """Test that complex boolean expressions are not supported"""
 
         def kernel(a):
@@ -698,9 +698,9 @@ class TestIndexingSlicingErrorHandling:
         a = sample_tensors["small_2d"]
 
         with pytest.raises((NotImplementedError, ValueError, TypeError)):
-            simulate_kernel_unified(kernel, sim_mode, a)
+            trace_and_run(kernel, trace_mode, a)
 
-    def test_out_of_bounds_indexing(self, sim_mode, sample_tensors):
+    def test_out_of_bounds_indexing(self, trace_mode, sample_tensors):
         """Test out of bounds indexing behavior"""
 
         def kernel(a):
@@ -712,7 +712,7 @@ class TestIndexingSlicingErrorHandling:
 
         # This should either work (with undefined behavior) or fail gracefully
         try:
-            result = simulate_kernel_unified(kernel, sim_mode, a)
+            result = trace_and_run(kernel, trace_mode, a)
             # If it works, just check the shape of valid indices
             assert result.shape[0] == 3
         except (IndexError, ValueError, RuntimeError):
@@ -742,7 +742,7 @@ class TestIndexingSlicingIntegration:
             ),  # Attention
         }
 
-    def test_embedding_lookup_pattern(self, sim_mode, sample_tensors):
+    def test_embedding_lookup_pattern(self, trace_mode, sample_tensors):
         """Test embedding lookup pattern common in NLP"""
 
         def kernel(embeddings, token_ids):
@@ -768,17 +768,17 @@ class TestIndexingSlicingIntegration:
         expected_embeddings = embeddings[flat_tokens]
         expected = expected_embeddings.reshape(8, 5, 512)
 
-        result = simulate_kernel_unified(kernel, sim_mode, embeddings, sequences)
-        simulate_assert_allclose(result, expected)
+        result = trace_and_run(kernel, trace_mode, embeddings, sequences)
+        cpu_assert_allclose(result, expected)
         assert result.shape == (8, 5, 512)
 
         if NEURON_AVAILABLE:
             out_baremetal = baremetal_run_kernel_unified(
-                kernel, sim_mode, embeddings, sequences
+                kernel, trace_mode, embeddings, sequences
             )
             baremetal_assert_allclose(expected, out_baremetal)
 
-    def test_attention_head_extraction_pattern(self, sim_mode, sample_tensors):
+    def test_attention_head_extraction_pattern(self, trace_mode, sample_tensors):
         """Test extracting specific attention heads and positions"""
 
         def kernel(attention_weights):
@@ -790,15 +790,15 @@ class TestIndexingSlicingIntegration:
         attention = sample_tensors["attention_weights"]
         expected = attention[:, [0, 3, 6, 9], :16, :16]
 
-        result = simulate_kernel_unified(kernel, sim_mode, attention)
-        simulate_assert_allclose(result, expected)
+        result = trace_and_run(kernel, trace_mode, attention)
+        cpu_assert_allclose(result, expected)
         assert result.shape == (8, 4, 16, 16)
 
         if NEURON_AVAILABLE:
-            out_baremetal = baremetal_run_kernel_unified(kernel, sim_mode, attention)
+            out_baremetal = baremetal_run_kernel_unified(kernel, trace_mode, attention)
             baremetal_assert_allclose(expected, out_baremetal)
 
-    def test_batch_sequence_filtering_pattern(self, sim_mode, sample_tensors):
+    def test_batch_sequence_filtering_pattern(self, trace_mode, sample_tensors):
         """Test filtering specific batches and sequence ranges"""
 
         def kernel(sequences):
@@ -810,12 +810,12 @@ class TestIndexingSlicingIntegration:
         sequences = sample_tensors["sequences"]
         expected = sequences[[0, 2, 4, 6], 10:50]
 
-        result = simulate_kernel_unified(kernel, sim_mode, sequences)
-        simulate_assert_allclose(result, expected)
+        result = trace_and_run(kernel, trace_mode, sequences)
+        cpu_assert_allclose(result, expected)
         assert result.shape == (4, 40)
 
         if NEURON_AVAILABLE:
-            out_baremetal = baremetal_run_kernel_unified(kernel, sim_mode, sequences)
+            out_baremetal = baremetal_run_kernel_unified(kernel, trace_mode, sequences)
             baremetal_assert_allclose(expected, out_baremetal)
 
 
@@ -833,7 +833,7 @@ class TestIndexingSlicingRegression:
             "small_2d": np.random.randn(8, 16).astype(np.float32),
         }
 
-    def test_numpy_function_dispatch_compatibility(self, sim_mode, sample_tensors):
+    def test_numpy_function_dispatch_compatibility(self, trace_mode, sample_tensors):
         """Test that NumPy function dispatch still works with views"""
 
         def kernel(a):
@@ -844,12 +844,12 @@ class TestIndexingSlicingRegression:
         a = sample_tensors["small_2d"]
         expected = np.sum(a[0:4, 0:8], axis=1)
 
-        result = simulate_kernel_unified(kernel, sim_mode, a)
-        simulate_assert_allclose(result, expected)
+        result = trace_and_run(kernel, trace_mode, a)
+        cpu_assert_allclose(result, expected)
         assert result.shape == (4,)
 
         if NEURON_AVAILABLE:
-            out_baremetal = baremetal_run_kernel_unified(kernel, sim_mode, a)
+            out_baremetal = baremetal_run_kernel_unified(kernel, trace_mode, a)
             baremetal_assert_allclose(expected, out_baremetal)
 
 

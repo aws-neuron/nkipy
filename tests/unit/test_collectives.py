@@ -6,12 +6,12 @@ import nkipy.distributed.collectives as cc
 import numpy as np
 import pytest
 from utils import (
-    sim_mode,  # noqa: F401 - pytest fixture
-    simulate_kernel_unified,
+    trace_and_run,
+    trace_mode,  # noqa: F401 - pytest fixture
 )
 
 
-def test_all_reduce(sim_mode):
+def test_all_reduce(trace_mode):
     """Test all_reduce collective in both IR and HLO modes"""
 
     def kernel(input_data):
@@ -22,18 +22,18 @@ def test_all_reduce(sim_mode):
     # Create test input
     input_data = np.random.rand(128, 256).astype(np.float32)
 
-    # Simulate (assumes all ranks have the same data)
-    output = simulate_kernel_unified(kernel, sim_mode, input_data)
+    # CPU execution (assumes all ranks have the same data)
+    output = trace_and_run(kernel, trace_mode, input_data)
 
     # With 2 devices and same input, output should be 2x input (sum of 2 copies)
     expected = input_data * 2
     assert np.allclose(output, expected), (
         "All-reduce with 2 devices should return 2x input"
     )
-    print(f"✓ all_reduce {sim_mode.upper()} test passed")
+    print(f"✓ all_reduce {trace_mode.upper()} test passed")
 
 
-def test_all_gather(sim_mode):
+def test_all_gather(trace_mode):
     """Test all_gather collective in both IR and HLO modes"""
 
     def kernel(input_data):
@@ -44,8 +44,8 @@ def test_all_gather(sim_mode):
     # Create test input
     input_data = np.random.rand(128, 256).astype(np.float32)
 
-    # Simulate (assumes all ranks have the same data)
-    output = simulate_kernel_unified(kernel, sim_mode, input_data)
+    # CPU execution (assumes all ranks have the same data)
+    output = trace_and_run(kernel, trace_mode, input_data)
 
     # With 2 devices, output should be concatenated along dim 0: shape (256, 256)
     expected = np.concatenate([input_data, input_data], axis=0)
@@ -53,10 +53,10 @@ def test_all_gather(sim_mode):
     assert np.allclose(output, expected), (
         "All-gather with 2 devices should concatenate inputs"
     )
-    print(f"✓ all_gather {sim_mode.upper()} test passed")
+    print(f"✓ all_gather {trace_mode.upper()} test passed")
 
 
-def test_reduce_scatter(sim_mode):
+def test_reduce_scatter(trace_mode):
     """Test reduce_scatter collective in both IR and HLO modes"""
 
     def kernel(input_data):
@@ -69,8 +69,8 @@ def test_reduce_scatter(sim_mode):
     # Create test input
     input_data = np.random.rand(128, 256).astype(np.float32)
 
-    # Simulate (assumes all ranks have the same data)
-    output = simulate_kernel_unified(kernel, sim_mode, input_data)
+    # CPU execution (assumes all ranks have the same data)
+    output = trace_and_run(kernel, trace_mode, input_data)
 
     # With 2 devices, output should be half the size along dim 0: shape (64, 256)
     # Each device gets a slice that's been reduced across all devices
@@ -80,10 +80,10 @@ def test_reduce_scatter(sim_mode):
     assert np.allclose(output, expected), (
         "Reduce-scatter with 2 devices should reduce and scatter"
     )
-    print(f"✓ reduce_scatter {sim_mode.upper()} test passed")
+    print(f"✓ reduce_scatter {trace_mode.upper()} test passed")
 
 
-def test_all_to_all(sim_mode):
+def test_all_to_all(trace_mode):
     """Test all_to_all collective in both IR and HLO modes
 
     With 2 devices, split_dimension=1, concat_dimension=0:
@@ -113,8 +113,8 @@ def test_all_to_all(sim_mode):
     # Create test input
     input_data = np.random.rand(128, 256).astype(np.float32)
 
-    # Simulate (assumes all ranks have the same data)
-    output = simulate_kernel_unified(kernel, sim_mode, input_data)
+    # CPU execution (assumes all ranks have the same data)
+    output = trace_and_run(kernel, trace_mode, input_data)
 
     # Shape should change: (128, 256) -> (256, 128)
     assert output.shape == (256, 128), f"Expected shape (256, 128), got {output.shape}"
@@ -126,10 +126,10 @@ def test_all_to_all(sim_mode):
     assert np.allclose(output, expected), (
         "All-to-all should split columns and stack rows"
     )
-    print(f"✓ all_to_all {sim_mode.upper()} test passed")
+    print(f"✓ all_to_all {trace_mode.upper()} test passed")
 
 
-def test_combined_ops(sim_mode):
+def test_combined_ops(trace_mode):
     """Test combining collectives with regular operations in both IR and HLO modes"""
 
     def kernel(input_data, weight):
@@ -148,14 +148,14 @@ def test_combined_ops(sim_mode):
     input_data = np.random.rand(128, 256).astype(np.float32)
     weight = np.random.rand(128, 256).astype(np.float32)
 
-    # Simulate (assumes all ranks have the same data)
-    output = simulate_kernel_unified(kernel, sim_mode, input_data, weight)
+    # CPU execution (assumes all ranks have the same data)
+    output = trace_and_run(kernel, trace_mode, input_data, weight)
 
     # Compute expected result: 2x (due to all-reduce sum across 2 devices) + 1.0
     expected = (input_data * weight) * 2 + 1.0
 
     assert np.allclose(output, expected), "Combined operations should work correctly"
-    print(f"✓ combined_ops {sim_mode.upper()} test passed")
+    print(f"✓ combined_ops {trace_mode.upper()} test passed")
 
 
 if __name__ == "__main__":

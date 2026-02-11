@@ -15,8 +15,8 @@ This module provides two ways to use NKI kernels in NKIPy:
    - Useful for explicit control over specialization
 
 Supports two NKI frontends:
-- Legacy frontend (neuronxcc.nki): Default, supports simulation
-- Beta 2 frontend (nki): New frontend, hardware-only (no simulation support)
+- Legacy frontend (neuronxcc.nki): Default, supports CPU execution
+- Beta 2 frontend (nki): New frontend, hardware-only (no CPU execution support)
 """
 
 import dataclasses
@@ -223,9 +223,7 @@ def _generate_nki_custom_call(kernel, *args, **kwargs):
 
     operands = [arg for arg in args if isinstance(arg, (NKIPyTensorRef, np.ndarray))]
     if get_backend() == "cpu":
-        raise NotImplementedError(
-            "CPU backend is not supported for NKICustomOp, simulation is not available"
-        )
+        raise NotImplementedError("CPU execution is not supported for NKI custom ops")
     return _build_hlo_custom_call(config, operands)
 
 
@@ -308,7 +306,7 @@ class NKICustomOp:
     def __call__(self, *operands):
         if get_backend() == "cpu":
             raise NotImplementedError(
-                "CPU backend is not supported for NKICustomOp, simulation not available"
+                "CPU execution is not supported for NKI custom ops"
             )
         return _build_hlo_custom_call(self.config, operands)
 
@@ -330,7 +328,7 @@ def wrap_nki_kernel(
         grid: SPMD grid configuration (ignored if kernel is already @nki.jit with grid)
         is_nki_beta_2_version: If True, use the new Beta 2 NKI frontend (nki package).
                                If False, use the legacy frontend (neuronxcc.nki).
-                               Note: Beta 2 frontend does not support simulation.
+                               Note: Beta 2 frontend does not support CPU execution.
         platform_target: Target platform (e.g., "trn1", "trn2"). If None, auto-detected.
 
     Returns:

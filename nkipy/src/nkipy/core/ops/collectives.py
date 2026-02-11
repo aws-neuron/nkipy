@@ -16,9 +16,9 @@ all_gather = Op("all_gather")
 
 @all_gather.impl("cpu")
 def _all_gather_cpu(data, all_gather_dim, replica_groups, **kwargs):
-    """Simulate all_gather with duplicated data assumption (CPU).
+    """CPU implementation of all_gather with duplicated data assumption.
 
-    In CPU simulation, we assume all ranks have identical data.
+    In CPU execution, we assume all ranks have identical data.
     all_gather collects data from all ranks and concatenates along the gather dimension.
 
     Shape: dim[all_gather_dim] *= world_size
@@ -62,9 +62,9 @@ all_reduce = Op("all_reduce")
 
 @all_reduce.impl("cpu")
 def _all_reduce_cpu(data, replica_groups, reduce_op=np.add, **kwargs):
-    """Simulate all_reduce with duplicated data assumption (CPU).
+    """CPU implementation of all_reduce with duplicated data assumption.
 
-    In CPU simulation, we assume all ranks have identical data.
+    In CPU execution, we assume all ranks have identical data.
     all_reduce applies the reduction operation across all ranks.
 
     Shape: unchanged
@@ -122,9 +122,9 @@ reduce_scatter = Op("reduce_scatter")
 def _reduce_scatter_cpu(
     data, reduce_scatter_dim: int, replica_groups, reduce_op=np.add, **kwargs
 ):
-    """Simulate reduce_scatter with duplicated data assumption (CPU).
+    """CPU implementation of reduce_scatter with duplicated data assumption.
 
-    In CPU simulation, we assume all ranks have identical data.
+    In CPU execution, we assume all ranks have identical data.
     reduce_scatter first reduces across ranks, then scatters the result.
 
     Shape: dim[reduce_scatter_dim] //= world_size
@@ -191,9 +191,9 @@ all_to_all = Op("all_to_all")
 def _all_to_all_cpu(
     data, split_dimension: int, concat_dimension: int, replica_groups, **kwargs
 ):
-    """Simulate all_to_all with duplicated data assumption (CPU).
+    """CPU implementation of all_to_all with duplicated data assumption.
 
-    In CPU simulation, we assume all ranks have identical data.
+    In CPU execution, we assume all ranks have identical data.
     all_to_all splits data along split_dimension and redistributes along
     concat_dimension.
 
