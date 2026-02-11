@@ -4,7 +4,13 @@ import numpy as np
 def compute_cos_sin_cache(
     head_dim: int, max_seq_len: int, base: int = 10000, dtype=np.float32
 ):
-    """Compute cosine and sine cache for RoPE (Rotary Position Embedding)."""
+    """Compute cosine and sine cache for RoPE (Rotary Position Embedding).
+
+    Comptime: This function uses only numpy operations on constant arguments (not
+    runtime tensor inputs). When compiled for Trainium, these computations execute
+    at compile time and the resulting arrays are baked into the HLO graph as
+    constants. On CPU, they execute as regular numpy.
+    """
     freqs = 1.0 / (base ** (np.arange(0, head_dim, 2)[: (head_dim // 2)] / head_dim))
     t = np.arange(max_seq_len, dtype=np.float32)
     freqs = np.outer(t, freqs)

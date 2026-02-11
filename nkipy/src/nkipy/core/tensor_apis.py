@@ -2,6 +2,24 @@
 # SPDX-License-Identifier: Apache-2.0
 """Backward compatible support for tensor APIs"""
 
-from nkipy.core.ops import conv2d, conv3d, full, rms_norm, softmax, topk, zeros
+from nkipy.core.ops import (
+    constant,
+    conv2d,
+    conv3d,
+    full,
+    rms_norm,
+    softmax,
+    topk,
+    zeros,
+)
 
-__all__ = ["topk", "rms_norm", "softmax", "conv2d", "conv3d", "zeros", "full"]
+__all__ = [
+    "constant",
+    "topk",
+    "rms_norm",
+    "softmax",
+    "conv2d",
+    "conv3d",
+    "zeros",
+    "full",
+]

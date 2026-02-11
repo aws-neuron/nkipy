@@ -1,13 +1,6 @@
 import numpy as np
 
 
-def repeat_kv_kernel(x, n_rep: int):
-    if n_rep == 1:
-        return x
-    z = np.repeat(x, n_rep, axis=2)
-    return z
-
-
 def silu_kernel_(x):
     """SiLU (Swish) activation function: x * sigmoid(x)."""
     return x * (1 / (1 + np.exp(-x)))

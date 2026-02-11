@@ -41,8 +41,7 @@ _CONFIG = None  # Store model config for post-processing
 def get_split_style(name: str):
     """Return the split style for this parameter name, or None to replicate."""
     for pat, style in base_model_tp_plan.items():
-        pat = f"*{pat}*"
-        if fnmatch.fnmatch(name, f"{pat}"):
+        if fnmatch.fnmatch(name, f"*{pat}*"):
             return style
     return None
 
@@ -115,7 +114,7 @@ def build_and_save_shard(rank, head_dim):
     # Process shard to new format before saving
     processed_shard = post_process_shard(shard, rank)
 
-    # make al contiguous
+    # make all contiguous
     for name, part in processed_shard.items():
         processed_shard[name] = part.contiguous()
 

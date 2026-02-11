@@ -314,3 +314,67 @@ def _full_hlo(shape, fill_value, dtype):
         result_tensor = fill_tensor
 
     return NKIPyTensorRef(result_tensor)
+
+
+# -----------------------------------------------------------------------------
+# constant - promote compile-time numpy arrays to runtime tensors
+# -----------------------------------------------------------------------------
+constant = Op("constant")
+
+
+@constant.impl("cpu")
+def _constant_cpu(value, dtype=None):
+    """Convert value to numpy array (CPU).
+
+    When not tracing, this simply ensures the value is an ndarray.
+    """
+    return np.asarray(value, dtype=dtype)
+
+
+@constant.impl("hlo")
+def _constant_hlo(value, dtype=None):
+    """Promote a numpy array or scalar to an HLO constant tensor.
+
+    This is the primary API for promoting compile-time numpy arrays
+    to runtime tensors during HLO tracing. It wraps the value as a
+    single HLO constant op.
+
+    Behavior:
+    - NKIPyTensorRef: pass-through (idempotent), with optional dtype cast
+    - np.ndarray: create HLO constant
+    - scalar (int, float, bool): create scalar HLO constant
+    - list/tuple: convert to np.ndarray first, then create HLO constant
+    """
+    from nkipy.core.backend.hlo import as_hlo_tensor, get_hlo_context
+    from nkipy.core.tensor import NKIPyTensorRef
+
+    # Idempotent: if already a traced tensor, just handle dtype
+    if isinstance(value, NKIPyTensorRef):
+        if dtype is not None and value.dtype != np.dtype(dtype):
+            from nkipy.core.ops.transform import astype
+
+            return astype(value, dtype)
+        return value
+
+    ctx = get_hlo_context()
+
+    # Determine target dtype
+    if dtype is not None:
+        target_dtype = np.dtype(dtype)
+    elif hasattr(value, "dtype"):
+        target_dtype = np.dtype(value.dtype)
+    elif isinstance(value, float):
+        target_dtype = np.dtype(np.float32)
+    elif isinstance(value, int):
+        target_dtype = np.dtype(np.int32)
+    elif isinstance(value, bool):
+        target_dtype = np.dtype(np.bool_)
+    else:
+        target_dtype = np.dtype(np.asarray(value).dtype)
+
+    # Convert lists/tuples to ndarray
+    if isinstance(value, (list, tuple)):
+        value = np.asarray(value, dtype=target_dtype)
+
+    hlo_tensor = as_hlo_tensor(ctx, value, target_dtype)
+    return NKIPyTensorRef(hlo_tensor)

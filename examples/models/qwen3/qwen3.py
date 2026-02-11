@@ -7,11 +7,9 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from config import Config, get_config
-from kernels.rope import compute_cos_sin_cache
 from kernels.sampling import greedy_sampling
-from kernels.transformer_layer import context_encoding, tokengen
+from kernels.transformer_layer import transformer_layer
 from nkipy.runtime import DeviceKernel, DeviceTensor
-from parallel_state import initialize_model_parallel
 from safetensors.torch import load_file
 from transformers import AutoTokenizer
 from utils import print_log
@@ -33,12 +31,7 @@ class Qwen3Model:
         self.kernel_tkg = None
         self.kernel_tkg_greedy_sampling = None
         self.block_wise_moe_layers = []
-        self.tkg_layers = []
 
-        # Initialize shared tensors as separate variables
-        self.freqs_cos = None
-        self.freqs_sin = None
-        self.mask = None
         self.norm_weight = None
         self.lm_head_weight = None
 
@@ -53,15 +46,7 @@ class Qwen3Model:
         t = time.time()
         print_log("Preparing Tensors")
 
-        # Prepare RoPE tensors
-        freqs_cos, freqs_sin = compute_cos_sin_cache(
-            self.config.head_dim,
-            self.config.max_seq_len,
-            base=1000000,
-            dtype=self.config.dtype,
-        )
-
-        n_local_kv_heads = max(1, self.config.n_kv_heads // dist.get_world_size())
+        n_local_kv_heads = max(1, self.config.num_kv_heads // dist.get_world_size())
 
         cache_k = np.zeros(
             (
@@ -88,7 +73,7 @@ class Qwen3Model:
 
         # Prepare layer weights and tensors as class members
         self.layer_tensors = []
-        for layer_id in range(self.config.n_layers):
+        for layer_id in range(self.config.num_layers):
             qkv_weight = weights.get(f"layers.{layer_id}.qkv_weight")
             o_weight = weights.get(f"layers.{layer_id}.o_weight")
             gate_up_weight = weights.get(f"layers.{layer_id}.gate_up_weight")
@@ -120,16 +105,16 @@ class Qwen3Model:
                         router_weight, f"router_weight_L{layer_id}"
                     ),
                     "q_norm_weight": DeviceTensor.from_torch(
-                        q_norm_weight.unsqueeze(0), f"q_norm_weight_L{layer_id}"
+                        q_norm_weight, f"q_norm_weight_L{layer_id}"
                     ),
                     "k_norm_weight": DeviceTensor.from_torch(
-                        k_norm_weight.unsqueeze(0), f"k_norm_weight_L{layer_id}"
+                        k_norm_weight, f"k_norm_weight_L{layer_id}"
                     ),
                     "input_weight": DeviceTensor.from_torch(
-                        input_weight.unsqueeze(0), f"input_weight_L{layer_id}"
+                        input_weight, f"input_weight_L{layer_id}"
                     ),
                     "post_attention_weight": DeviceTensor.from_torch(
-                        post_attention_weight.unsqueeze(0),
+                        post_attention_weight,
                         f"post_attention_weight_L{layer_id}",
                     ),
                     "cache_k": DeviceTensor.from_numpy(cache_k, f"cache_k_L{layer_id}"),
@@ -138,18 +123,9 @@ class Qwen3Model:
             )
 
         # Create shared tensors as separate class members using DeviceTensor.from_torch for weights and from_numpy for computed arrays
-        self.freqs_cos = DeviceTensor.from_numpy(freqs_cos, "freqs_cos")
-        self.freqs_sin = DeviceTensor.from_numpy(freqs_sin, "freqs_sin")
         self.norm_weight = DeviceTensor.from_torch(norm_weight, "norm_weight")
         self.lm_head_weight = DeviceTensor.from_torch(lm_head_weight, "lm_head_weight")
 
-        # Create causal mask
-        mask = np.full(
-            (self.config.max_seq_len, self.config.max_seq_len),
-            np.float32("-100000"),
-            dtype=self.config.dtype,
-        )
-        self.mask = DeviceTensor.from_numpy(np.triu(mask, k=1), "mask")
         print_log(f"--> Finished Preparing Tensors in {time.time() - t:.2f}s")
 
     def _prepare_kernels(self):
@@ -180,20 +156,17 @@ class Qwen3Model:
         start_pos = DeviceTensor.from_numpy(
             np.empty(shape=(1), dtype=np.int32), "start_pos"
         )
-        for layer_id in range(self.config.n_layers):
+        for layer_id in range(self.config.num_layers):
             cte_layer = DeviceKernel.compile_and_load(
-                context_encoding,
+                transformer_layer,
                 name="cte_layer",
                 x=x_context,
-                start_pos=start_pos,
-                mask=self.mask,
+                start_pos=None,
                 qkv_weight=self.layer_tensors[layer_id]["qkv_weight"],
                 o_weight=self.layer_tensors[layer_id]["o_weight"],
                 input_weight=self.layer_tensors[layer_id]["input_weight"],
                 q_norm_weight=self.layer_tensors[layer_id]["q_norm_weight"],
                 k_norm_weight=self.layer_tensors[layer_id]["k_norm_weight"],
-                freqs_cos=self.freqs_cos,
-                freqs_sin=self.freqs_sin,
                 post_attention_weight=self.layer_tensors[layer_id][
                     "post_attention_weight"
                 ],
@@ -204,6 +177,7 @@ class Qwen3Model:
                 cache_v=self.layer_tensors[layer_id]["cache_v"],
                 configs=self.config,
                 build_dir=BUILD_DIR,
+                additional_compiler_args=self.config.additional_compiler_args_nkipy,
             )
             self.block_wise_moe_layers.append(cte_layer)
 
@@ -216,13 +190,13 @@ class Qwen3Model:
             configs=self.config,
             use_nki_rmsnorm=USE_NKI_RMSNORM,
             build_dir=BUILD_DIR,
+            additional_compiler_args=self.config.additional_compiler_args_nkipy,
         )
 
         self.kernel_tkg = DeviceKernel.compile_and_load(
-            tokengen,
+            transformer_layer,
             x=x_token,
             start_pos=start_pos,
-            mask=None,
             qkv_weight=self.layer_tensors[0]["qkv_weight"],
             o_weight=self.layer_tensors[0]["o_weight"],
             input_weight=self.layer_tensors[0]["input_weight"],
@@ -234,10 +208,9 @@ class Qwen3Model:
             router_weight=self.layer_tensors[0]["router_weight"],
             gate_up_weight=self.layer_tensors[0]["gate_up_weight"],
             down_weight=self.layer_tensors[0]["down_weight"],
-            freqs_cos=self.freqs_cos,
-            freqs_sin=self.freqs_sin,
             configs=self.config,
             build_dir=BUILD_DIR,
+            additional_compiler_args=self.config.additional_compiler_args_nkipy,
         )
 
         self.kernel_tkg_greedy_sampling = DeviceKernel.compile_and_load(
@@ -249,6 +222,7 @@ class Qwen3Model:
             configs=self.config,
             use_nki_rmsnorm=USE_NKI_RMSNORM,
             build_dir=BUILD_DIR,
+            additional_compiler_args=self.config.additional_compiler_args_nkipy,
         )
 
         print_log(
@@ -259,13 +233,8 @@ class Qwen3Model:
         """Run inference and generate tokens with tensor parallelism (collectives inside kernels)"""
         context_len = self.config.context_len
 
-        # Embed input tokens
-        hidden_states = DeviceTensor.from_numpy(
-            np.asarray(
-                self.tok_embedding[input_ids].to(dtype=torch.float32),
-                dtype=self.config.dtype,
-            ),
-            "hidden_states",
+        hidden_states = DeviceTensor.from_torch(
+            self.tok_embedding[input_ids], "hidden_states"
         )
 
         # Initial position - next_id tensor for storing generated tokens
@@ -275,12 +244,10 @@ class Qwen3Model:
         )
 
         # Process through all layers (context phase)
-        for i in range(self.config.n_layers):
+        for i in range(self.config.num_layers):
             self.block_wise_moe_layers[i](
                 inputs={
                     "x": hidden_states,
-                    "start_pos": t_start_pos,
-                    "mask": self.mask,
                     # Layer i weights
                     "qkv_weight": self.layer_tensors[i]["qkv_weight"],
                     "o_weight": self.layer_tensors[i]["o_weight"],
@@ -295,9 +262,6 @@ class Qwen3Model:
                     "router_weight": self.layer_tensors[i]["router_weight"],
                     "gate_up_weight": self.layer_tensors[i]["gate_up_weight"],
                     "down_weight": self.layer_tensors[i]["down_weight"],
-                    # Shared tensors
-                    "freqs_cos": self.freqs_cos,
-                    "freqs_sin": self.freqs_sin,
                 },
                 outputs={
                     "output0": hidden_states,
@@ -324,16 +288,12 @@ class Qwen3Model:
             # Update the start position for this iteration
             t_start_pos = DeviceTensor.from_numpy(np.array([pos], dtype=np.int32))
 
-            # Embed the new token
-            h0 = np.asarray(
-                self.tok_embedding[next_id_torch].to(dtype=torch.float32),
-                dtype=self.config.dtype,
+            hidden_states = DeviceTensor.from_torch(
+                self.tok_embedding[next_id_torch], "h0/res1"
             )
-
-            hidden_states = DeviceTensor.from_numpy(h0, "h0/res1")
             t_res1 = hidden_states  # Output becomes next layer's input
 
-            for i in range(0, self.config.n_layers):
+            for i in range(0, self.config.num_layers):
                 self.kernel_tkg(
                     inputs={
                         "x": hidden_states,
@@ -352,9 +312,6 @@ class Qwen3Model:
                         "router_weight": self.layer_tensors[i]["router_weight"],
                         "gate_up_weight": self.layer_tensors[i]["gate_up_weight"],
                         "down_weight": self.layer_tensors[i]["down_weight"],
-                        # Shared tensors
-                        "freqs_cos": self.freqs_cos,
-                        "freqs_sin": self.freqs_sin,
                     },
                     outputs={
                         "output0": t_res1,
@@ -381,34 +338,35 @@ class Qwen3Model:
             yield next_id_torch
 
 
-def main():
+def load_model(args):
+    """Initialize distributed environment, load weights, and build a Qwen3Model.
+
+    Args:
+        args: Namespace with .model, .prompt, .max_new_tokens, .checkpoint attributes.
+
+    Returns:
+        (model, input_ids, tokenizer) tuple ready for generation.
+    """
     os.environ["TOKENIZERS_PARALLELISM"] = "true"  # disable warning
     os.environ["OMP_NUM_THREADS"] = "1"  # disable warning
     os.environ["NEURON_RT_ROOT_COMM_ID"] = "localhost:61239"
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-n", "--max-new-tokens", type=int, default=16)
-    parser.add_argument("prompt", nargs="?", default="The capital of France is")
-    parser.add_argument("--checkpoint", default="/kaena/qwen3_shards_30B_A3B_TP8")
-    parser.add_argument("--model", default="Qwen/Qwen3-30B-A3B")
-    args = parser.parse_args()
-    prompt = args.prompt
 
-    initialize_model_parallel()
+    dist.init_process_group()
+    torch.set_num_threads(128 // dist.get_world_size())
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+    os.environ["NEURON_RT_VISIBLE_CORES"] = str(dist.get_rank())
 
-    model_name = args.model
-
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model_inputs = tokenizer(prompt, return_tensors="np")
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    model_inputs = tokenizer(args.prompt, return_tensors="np")
     input_ids = model_inputs["input_ids"]
-    config = get_config(model_name, input_ids.shape[1], args.max_new_tokens)
+    config = get_config(args.model, input_ids.shape[1], args.max_new_tokens)
 
     print_log("Loading Model Weights")
-    t = time.time()
 
     shard_path = os.path.join(args.checkpoint, f"shard_{dist.get_rank()}.safetensors")
     weights = load_file(shard_path, device="cpu")
 
-    # Create and run the model
     model = Qwen3Model(weights, config)
 
     # warming
@@ -421,12 +379,25 @@ def main():
         t += 1
     print_log(f"--> Finished warming the model in {time.time() - start:.2f}s")
 
+    return model, input_ids, tokenizer
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-n", "--max-new-tokens", type=int, default=16)
+    parser.add_argument("prompt", nargs="?", default="The capital of France is")
+    parser.add_argument("--checkpoint", default="/kaena/qwen3_shards_30B_A3B_TP8")
+    parser.add_argument("--model", default="Qwen/Qwen3-30B-A3B")
+    args = parser.parse_args()
+
+    model, input_ids, tokenizer = load_model(args)
+
     dist.barrier()
     # Generate tokens and measure performance
     start = time.time()
     t = 0
     if dist.get_rank() == 0:
-        print(f"\n{prompt}", end="")
+        print(f"\n{args.prompt}", end="")
     for id in model.generate(input_ids):
         if t == 0:
             first_token_time = time.time()
