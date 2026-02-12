@@ -11,32 +11,25 @@ class SpikeError(SpikeRuntimeError):
 class NrtError(SpikeRuntimeError):
     pass
 
-class BenchmarkResult:
-    @property
-    def mean_ms(self) -> float:
-        """Mean execution time in milliseconds"""
+class SystemTraceSession:
+    def __init__(self, core_id: int | None = None) -> None:
+        """
+        Create a trace session. Trace the given core_id or if core_id is omitted, traces all visible NeuronCores.
+        """
 
-    @property
-    def min_ms(self) -> float:
-        """Minimum execution time in milliseconds"""
+    def stop(self) -> None:
+        """Stop tracing. Called automatically on __exit__."""
 
-    @property
-    def max_ms(self) -> float:
-        """Maximum execution time in milliseconds"""
+    def fetch_events_json(self) -> str:
+        """
+        Fetch events as JSON string, consumes events from the system trace ring buffer
+        """
 
-    @property
-    def std_dev_ms(self) -> float:
-        """Standard deviation in milliseconds"""
+    def drain_events(self) -> None:
+        """Discard events in the buffer"""
 
-    @property
-    def iterations(self) -> int:
-        """Number of benchmark iterations"""
-
-    @property
-    def warmup_iterations(self) -> int:
-        """Number of warmup iterations"""
-
-    def __repr__(self) -> str: ...
+    def __enter__(self) -> SystemTraceSession: ...
+    def __exit__(self, *args) -> None: ...
 
 class TensorMetadata:
     @property
@@ -133,16 +126,6 @@ class Spike:
         save_trace: bool | None = False,
     ) -> None:
         """Execute a model with given inputs and outputs"""
-
-    def benchmark(
-        self,
-        model: NrtModel,
-        inputs: Mapping[str, NrtTensor],
-        outputs: Mapping[str, NrtTensor],
-        warmup_iterations: int = 1,
-        benchmark_iterations: int = 1,
-    ) -> BenchmarkResult:
-        """Benchmark a model execution"""
 
     def allocate_tensor(
         self, size: int, core_id: int = 0, name: str | None = None

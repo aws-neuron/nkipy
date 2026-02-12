@@ -166,11 +166,18 @@ class TestDeviceKernelTensor:
             benchmark_iter=3,
         )
 
-        # Verify values are reasonable
+        # Verify execution time values are reasonable
         assert stats.mean_ms > 0
         assert stats.min_ms > 0
         assert stats.max_ms >= stats.min_ms
         assert stats.std_dev_ms >= 0
+        assert stats.iterations == 3
+        assert stats.warmup_iterations == 2
+
+        # Verify raw per-iteration durations
+        assert isinstance(stats.durations_ms, list)
+        assert len(stats.durations_ms) == 3
+        assert all(d > 0 for d in stats.durations_ms)
 
 
 if __name__ == "__main__":

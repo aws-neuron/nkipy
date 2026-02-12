@@ -15,6 +15,7 @@
 
 #include "model.h"
 #include "spike.h"
+#include "sys_trace.h"
 #include "tensor.h"
 
 namespace nb = nanobind;
@@ -34,38 +35,24 @@ NB_MODULE(_spike, m) {
   // nb::cpp_function_def<NrtError>(&NrtError::error_code, nb::scope(nrt_error),
   // nb::name("error_code"), nb::is_method());
 
-  // BenchmarkResult struct
-  nb::class_<BenchmarkResult>(m, "BenchmarkResult")
-      .def_ro("mean_ms", &BenchmarkResult::mean_ms,
-              "Mean execution time in milliseconds")
-      .def_ro("min_ms", &BenchmarkResult::min_ms,
-              "Minimum execution time in milliseconds")
-      .def_ro("max_ms", &BenchmarkResult::max_ms,
-              "Maximum execution time in milliseconds")
-      .def_ro("std_dev_ms", &BenchmarkResult::std_dev_ms,
-              "Standard deviation in milliseconds")
-      .def_ro("iterations", &BenchmarkResult::iterations,
-              "Number of benchmark iterations")
-      .def_ro("warmup_iterations", &BenchmarkResult::warmup_iterations,
-              "Number of warmup iterations")
-      .def("__repr__", [](const BenchmarkResult &br) {
-        return "BenchmarkResult(mean=" + std::to_string(br.mean_ms) +
-               "ms, "
-               "min=" +
-               std::to_string(br.min_ms) +
-               "ms, "
-               "max=" +
-               std::to_string(br.max_ms) +
-               "ms, "
-               "std_dev=" +
-               std::to_string(br.std_dev_ms) +
-               "ms, "
-               "iterations=" +
-               std::to_string(br.iterations) +
-               ", "
-               "warmup_iterations=" +
-               std::to_string(br.warmup_iterations) + ")";
-      });
+  // SysTraceGuard — RAII wrapper for NRT system trace capture.
+  // Exposed as a context manager for Python use.
+  nb::class_<SysTraceGuard>(m, "SystemTraceSession")
+      .def(nb::init<std::optional<uint32_t>>(), nb::arg("core_id") = nb::none(),
+           "Create a trace session. Trace the given core_id or if core_id is "
+           "omitted, traces all visible NeuronCores. ")
+      .def("stop", &SysTraceGuard::stop,
+           "Stop tracing. Called automatically on __exit__.")
+      .def("fetch_events_json", &SysTraceGuard::fetch_events_json,
+           "Fetch events as JSON string, consumes events from the system trace "
+           "ring buffer")
+      .def("drain_events", &SysTraceGuard::drain_events,
+           "Discard events in the buffer")
+      .def(
+          "__enter__",
+          [](SysTraceGuard &self) -> SysTraceGuard & { return self; },
+          nb::rv_policy::reference)
+      .def("__exit__", [](SysTraceGuard &self, nb::args) { self.stop(); });
 
   // TensorMetadata struct
   nb::class_<TensorMetadata>(m, "TensorMetadata")
@@ -137,10 +124,6 @@ NB_MODULE(_spike, m) {
                                                      // allow multiple cores
                                                      // to execute (enable CC)
            "Execute a model with given inputs and outputs")
-
-      .def("benchmark", &Spike::benchmark, "model"_a, "inputs"_a, "outputs"_a,
-           "warmup_iterations"_a = 1, "benchmark_iterations"_a = 1,
-           "Benchmark a model execution")
 
       // Keep Spike alive for tensors that depend on it
       .def("allocate_tensor", &Spike::allocate_tensor, "size"_a,

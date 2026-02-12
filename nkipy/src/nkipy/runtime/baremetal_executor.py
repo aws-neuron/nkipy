@@ -84,6 +84,7 @@ class BaremetalExecutor:
         *args,
         warmup_iterations: int = 5,
         benchmark_iterations: int = 100,
+        mode: str = "device",
         artifacts_dir: Optional[str] = None,
         **kwargs,
     ) -> Dict[str, float]:
@@ -95,6 +96,7 @@ class BaremetalExecutor:
             kwargs: Keyword arguments to pass to the kernel
             warmup_iterations: Number of warmup iterations
             benchmark_iterations: Number of benchmark iterations
+            mode: Timing mode ('device' or 'host')
             artifacts_dir: Optional directory for artifacts
 
         Returns:
@@ -117,6 +119,7 @@ class BaremetalExecutor:
             outputs=outputs,
             warmup_iter=warmup_iterations,
             benchmark_iter=benchmark_iterations,
+            mode=mode,
         )
         return stats
 
