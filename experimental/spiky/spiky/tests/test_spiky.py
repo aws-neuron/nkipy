@@ -3,10 +3,12 @@
 
 """Non-distributed tests for spiky.
 
-Covers: smoke, correctness, dynamic shapes, lifecycle, stats.
+Covers: smoke, correctness, dynamic shapes, lifecycle, stats, training.
 
 All tests run on real Neuron hardware via the session-scoped hw_backend fixture.
 """
+
+import copy
 
 import pytest
 import torch
@@ -558,19 +560,19 @@ class TestStaticCallablePath:
 
 
 # ---------------------------------------------------------------------------
-# Section 6: alias_map and none_idx_list
+# Section 6: alias_map and non_tensor_outputs
 # ---------------------------------------------------------------------------
 
 
 class TestAliasMapAndNoneIdx:
-    """Test alias_map and none_idx_list code paths in NKIPyCallable.
+    """Test alias_map and non_tensor_outputs code paths in NKIPyCallable.
 
-    These tests exercise the post-processing code in callable.py:351-365.
-    Whether alias_map/none_idx_list are populated depends on aot_autograd
+    These tests exercise the post-processing code in callable.py.
+    Whether alias_map/non_tensor_outputs are populated depends on aot_autograd
     decomposition. With empty maps (the common case for supported ops),
     the code correctly skips post-processing. These tests verify correctness
     through models with buffers and multi-op graphs that go through the
-    full NKIPyCallable path including the alias_map/none_idx_list checks.
+    full NKIPyCallable path including the alias_map/non_tensor_outputs checks.
     """
 
     def test_model_with_buffer(self, hw_backend):
@@ -973,3 +975,260 @@ class TestProfilingIntegration:
         assert ntff_files[0].name == "1.ntff", (
             f"Expected NTFF file named '1.ntff', got '{ntff_files[0].name}'"
         )
+
+
+# ---------------------------------------------------------------------------
+# Section 11: Training (forward + backward + optimizer step)
+# ---------------------------------------------------------------------------
+
+_TRAINING_NUM_STEPS = 3
+_TRAINING_LR = 0.01
+_TRAINING_RTOL = 1e-2
+_TRAINING_ATOL = 1e-2
+
+
+def _check_training(model, make_batch, num_steps=_TRAINING_NUM_STEPS, lr=_TRAINING_LR,
+                     rtol=_TRAINING_RTOL, atol=_TRAINING_ATOL):
+    """Train eager vs compiled for *num_steps*, assert losses and weights match."""
+    torch.manual_seed(42)
+
+    ref_model = copy.deepcopy(model)
+    comp_model = copy.deepcopy(model).to("nkipy")
+
+    ref_opt = torch.optim.SGD(ref_model.parameters(), lr=lr)
+    comp_opt = torch.optim.SGD(comp_model.parameters(), lr=lr, foreach=False)
+
+    loss_fn = nn.MSELoss()
+
+    @torch.compile(backend="nkipy", fullgraph=True)
+    def forward_with_loss(m, x, target):
+        out = m(x)
+        loss = loss_fn(out, target)
+        return out, loss
+
+    compiled_opt_step = torch.compile(comp_opt.step, backend="nkipy")
+
+    ref_losses = []
+    comp_losses = []
+
+    for step in range(num_steps):
+        torch.manual_seed(step)
+        x, target = make_batch()
+
+        # Eager
+        ref_opt.zero_grad()
+        ref_out = ref_model(x)
+        ref_loss = loss_fn(ref_out, target)
+        ref_loss.backward()
+        ref_opt.step()
+        ref_losses.append(ref_loss.item())
+
+        # Compiled
+        comp_opt.zero_grad()
+        comp_out, comp_loss = forward_with_loss(comp_model, x.to("nkipy"), target.to("nkipy"))
+        comp_loss.backward()
+        compiled_opt_step()
+        comp_losses.append(comp_loss.cpu().item())
+
+    # Per-step losses
+    for step, (rl, cl) in enumerate(zip(ref_losses, comp_losses)):
+        assert_close(
+            torch.tensor(cl), torch.tensor(rl), rtol=rtol, atol=atol,
+            msg=f"Step {step} loss mismatch",
+        )
+
+    # Final weights
+    for (pname, rp), (_, cp) in zip(
+        ref_model.named_parameters(), comp_model.named_parameters()
+    ):
+        assert_close(
+            cp.detach().cpu(), rp.detach(), rtol=rtol, atol=atol,
+            msg=f"Param '{pname}' mismatch after {num_steps} steps",
+        )
+
+
+class TestTraining:
+    """Training correctness: eager CPU vs compiled NKIPy."""
+
+    def test_training_linear(self, hw_backend):
+        """Linear layer with bias: losses and weights match eager after 3 steps."""
+        _check_training(
+            nn.Linear(32, 16, bias=True),
+            lambda: (torch.randn(4, 32), torch.randn(4, 16)),
+        )
+
+    def test_training_mlp(self, hw_backend):
+        """Three-layer MLP: losses and weights match eager after 3 steps."""
+        _check_training(
+            nn.Sequential(
+                nn.Linear(32, 64, bias=False), nn.ReLU(),
+                nn.Linear(64, 64, bias=False), nn.ReLU(),
+                nn.Linear(64, 16, bias=False),
+            ),
+            lambda: (torch.randn(4, 32), torch.randn(4, 16)),
+        )
+
+
+class TestTrainingDynamicShapes:
+    """Training with dynamic batch dimension and bucket selection."""
+
+    @staticmethod
+    def _with_spiky_config(hw_backend, pipelined=True):
+        from spiky.torch.config import (
+            NKIPyBackendConfig,
+            get_nkipy_backend_config,
+            set_nkipy_backend_config,
+        )
+
+        old_config = get_nkipy_backend_config()
+        new_config = NKIPyBackendConfig(
+            nkipy_cache_prefix=old_config.nkipy_cache_prefix,
+            log_level=old_config.log_level,
+            rank=old_config.rank,
+            world_size=old_config.world_size,
+            additional_compiler_args=old_config.additional_compiler_args,
+            pipelined=pipelined,
+        )
+        set_nkipy_backend_config(new_config)
+        return old_config
+
+    @staticmethod
+    def _restore_config(old_config):
+        from spiky.torch.config import set_nkipy_backend_config
+
+        set_nkipy_backend_config(old_config)
+
+    def test_training_dynamic_batch(self, hw_backend):
+        """Training with varying batch sizes via dynamic bucketing."""
+        old_config = self._with_spiky_config(hw_backend)
+        try:
+            torch.manual_seed(42)
+            model = nn.Linear(32, 16, bias=True)
+            batch_sizes = [4, 8, 4]
+
+            ref_model = copy.deepcopy(model)
+            comp_model = copy.deepcopy(model).to("nkipy")
+
+            ref_opt = torch.optim.SGD(ref_model.parameters(), lr=_TRAINING_LR)
+            comp_opt = torch.optim.SGD(comp_model.parameters(), lr=_TRAINING_LR, foreach=False)
+            loss_fn = nn.MSELoss()
+
+            @torch.compile(backend="nkipy", fullgraph=True, dynamic=True)
+            def forward_with_loss(m, x, target):
+                out = m(x)
+                loss = loss_fn(out, target)
+                return out, loss
+
+            compiled_opt_step = torch.compile(comp_opt.step, backend="nkipy")
+
+            for step, bs in enumerate(batch_sizes):
+                torch.manual_seed(step)
+                x = torch.randn(bs, 32)
+                target = torch.randn(bs, 16)
+
+                if step == 0:
+                    torch._dynamo.maybe_mark_dynamic(x, 0)
+                    torch._dynamo.maybe_mark_dynamic(target, 0)
+
+                # Eager
+                ref_opt.zero_grad()
+                ref_out = ref_model(x)
+                ref_loss = loss_fn(ref_out, target)
+                ref_loss.backward()
+                ref_opt.step()
+
+                # Compiled
+                comp_opt.zero_grad()
+                comp_out, comp_loss = forward_with_loss(
+                    comp_model, x.to("nkipy"), target.to("nkipy")
+                )
+                comp_loss.backward()
+                compiled_opt_step()
+
+                assert_close(
+                    torch.tensor(comp_loss.cpu().item()),
+                    torch.tensor(ref_loss.item()),
+                    rtol=_TRAINING_RTOL, atol=_TRAINING_ATOL,
+                    msg=f"Step {step} (batch={bs}) loss mismatch",
+                )
+
+            # Final weights
+            for (pname, rp), (_, cp) in zip(
+                ref_model.named_parameters(), comp_model.named_parameters()
+            ):
+                assert_close(
+                    cp.detach().cpu(), rp.detach(),
+                    rtol=_TRAINING_RTOL, atol=_TRAINING_ATOL,
+                    msg=f"Param '{pname}' mismatch after training",
+                )
+        finally:
+            self._restore_config(old_config)
+
+    def test_training_dynamic_explicit_buckets(self, hw_backend):
+        """Training with explicit bucket list for batch dimension."""
+        old_config = self._with_spiky_config(hw_backend)
+        try:
+            torch.manual_seed(42)
+            model = nn.Linear(32, 16, bias=True)
+            batch_sizes = [4, 8, 16]
+
+            ref_model = copy.deepcopy(model)
+            comp_model = copy.deepcopy(model).to("nkipy")
+
+            ref_opt = torch.optim.SGD(ref_model.parameters(), lr=_TRAINING_LR)
+            comp_opt = torch.optim.SGD(comp_model.parameters(), lr=_TRAINING_LR, foreach=False)
+            loss_fn = nn.MSELoss()
+
+            @torch.compile(
+                backend="nkipy", fullgraph=True, dynamic=True,
+                options={"buckets": [4, 8, 16]},
+            )
+            def forward_with_loss(m, x, target):
+                out = m(x)
+                loss = loss_fn(out, target)
+                return out, loss
+
+            compiled_opt_step = torch.compile(comp_opt.step, backend="nkipy")
+
+            for step, bs in enumerate(batch_sizes):
+                torch.manual_seed(step)
+                x = torch.randn(bs, 32)
+                target = torch.randn(bs, 16)
+
+                if step == 0:
+                    torch._dynamo.maybe_mark_dynamic(x, 0)
+                    torch._dynamo.maybe_mark_dynamic(target, 0)
+
+                # Eager
+                ref_opt.zero_grad()
+                ref_out = ref_model(x)
+                ref_loss = loss_fn(ref_out, target)
+                ref_loss.backward()
+                ref_opt.step()
+
+                # Compiled
+                comp_opt.zero_grad()
+                comp_out, comp_loss = forward_with_loss(
+                    comp_model, x.to("nkipy"), target.to("nkipy")
+                )
+                comp_loss.backward()
+                compiled_opt_step()
+
+                assert_close(
+                    torch.tensor(comp_loss.cpu().item()),
+                    torch.tensor(ref_loss.item()),
+                    rtol=_TRAINING_RTOL, atol=_TRAINING_ATOL,
+                    msg=f"Step {step} (batch={bs}) loss mismatch",
+                )
+
+            # Final weights
+            for (pname, rp), (_, cp) in zip(
+                ref_model.named_parameters(), comp_model.named_parameters()
+            ):
+                assert_close(
+                    cp.detach().cpu(), rp.detach(),
+                    rtol=_TRAINING_RTOL, atol=_TRAINING_ATOL,
+                    msg=f"Param '{pname}' mismatch after training",
+                )
+        finally:
+            self._restore_config(old_config)

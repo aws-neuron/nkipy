@@ -327,32 +327,32 @@ bool Engine::IsInitialized() const { return initialized_; }
 Bundle& Engine::GetBundleOrThrow(int64_t bundle_id) {
   auto it = bundles_.find(bundle_id);
   if (it == bundles_.end()) throw std::runtime_error("spiky: unknown bundle_id");
-  return it->second;
+  return *it->second;
 }
 
 const Bundle& Engine::GetBundleOrThrow(int64_t bundle_id) const {
   auto it = bundles_.find(bundle_id);
   if (it == bundles_.end()) throw std::runtime_error("spiky: unknown bundle_id");
-  return it->second;
+  return *it->second;
 }
 
 int64_t Engine::RegisterBundle(const BundleSpec& spec) {
   std::lock_guard<std::mutex> lock(mutex_);
   int64_t id = next_bundle_id_++;
-  Bundle b(id);
-  b.dynamic_specs_ = spec.dynamic_specs;
-  b.cc_enabled_ = spec.cc_enabled;
-  b.rank_id_ = spec.rank_id;
-  b.world_size_ = spec.world_size;
+  auto b = std::make_unique<Bundle>(id);
+  b->dynamic_specs_ = spec.dynamic_specs;
+  b->cc_enabled_ = spec.cc_enabled;
+  b->rank_id_ = spec.rank_id;
+  b->world_size_ = spec.world_size;
 
   for (const auto& kv : spec.bucket_to_neff) {
     Bundle::Bucket bk;
     bk.bucket_size = kv.first;
     bk.neff_path = kv.second;
-    b.buckets_[kv.first] = std::move(bk);
-    b.sorted_bucket_sizes_.push_back(kv.first);
+    b->buckets_[kv.first] = std::move(bk);
+    b->sorted_bucket_sizes_.push_back(kv.first);
   }
-  std::sort(b.sorted_bucket_sizes_.begin(), b.sorted_bucket_sizes_.end());
+  std::sort(b->sorted_bucket_sizes_.begin(), b->sorted_bucket_sizes_.end());
   bundles_.emplace(id, std::move(b));
   return id;
 }

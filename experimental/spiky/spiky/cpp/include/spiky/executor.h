@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <future>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -167,7 +168,7 @@ class Engine {
   int64_t device_id_{0};
   uint32_t core_id_{0};
 
-  std::unordered_map<int64_t, Bundle> bundles_;
+  std::unordered_map<int64_t, std::unique_ptr<Bundle>> bundles_;
   int64_t next_bundle_id_{0};
 
   std::unordered_map<int64_t, UnifiedBuffers> unified_buffers_;

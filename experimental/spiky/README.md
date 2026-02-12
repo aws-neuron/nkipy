@@ -5,6 +5,7 @@ Spiky is the user-facing runtime for [NKIPy](../../README.md) on AWS Neuron hard
 ## Features
 
 - **`torch.compile` backend** — Register `"nkipy"` as a backend and compile standard PyTorch models with one line
+- **Training** — Full forward/backward support with `aot_autograd`, including dynamic shapes with per-bucket non-tensor outputs (SymInt sizes for backward)
 - **Dynamic shapes** — Bucket-based compilation with JIT compilation for new sizes at runtime
 - **Pipelined execution** — Overlapped H2D transfers and NRT execution via unified double-buffering
 - **Device-side padding** — Inputs padded on-device to bucket size, outputs unpadded automatically
@@ -50,6 +51,10 @@ with torch.no_grad():
     out1 = compiled(x)
     out2 = compiled(torch.randn(16, 32))  # different size, bucket auto-selected
 ```
+
+### Training with dynamic shapes
+
+See [example_training.py](spiky/examples/example_training.py) for a complete training example with varying batch sizes.
 
 ### Per-function options
 

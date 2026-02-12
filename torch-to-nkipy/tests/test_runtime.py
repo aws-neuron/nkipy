@@ -409,7 +409,7 @@ class TestRunNeffModel:
             kernel_hash="run12345",
             args=(a, b),
             alias_map={},
-            none_idx_list=[],
+            non_tensor_outputs={},
             kernel_dir=kernel_dir,
             ntff_meta=ntff_meta,
         )

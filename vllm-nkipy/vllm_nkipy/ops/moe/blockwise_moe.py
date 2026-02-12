@@ -195,6 +195,17 @@ def run_cpu_part(top_k_indices, expert_affinities_masked, n_experts_per_ep, laye
     top_k_indices[smaller_indices | larger_indices] = ControlType.SKIP_DMA.value
     top_k_indices[~(smaller_indices | larger_indices)] -= n_experts_per_ep * ep_rank
 
+    # TODO: access real seq_len here?
+    # FIXME: assume reqs' length is all identical
+    # for e in range(parallel_state.get_prefill_ep_size()):
+    #     for b in range(self.config.max_batch_size_per_dp):
+    #         seq_offset = self.config.max_model_len * (
+    #             e * self.config.max_batch_size_per_dp + b
+    #         )
+    #         top_k_indices[
+    #             seq_offset + seq_len[b] : seq_offset + self.config.max_model_len
+    #         ] = ControlType.SKIP_DMA.value
+
     num_blocks, num_static_blocks = get_n_blocks(
         top_k_indices.shape[0],
         4,  # config.num_experts_per_tok

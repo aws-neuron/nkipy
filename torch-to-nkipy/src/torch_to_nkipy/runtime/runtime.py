@@ -22,7 +22,7 @@ import os
 import pickle
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Tuple, Union
+from typing import Any, Callable, Dict, List, Tuple, Union
 
 import numpy as np
 import torch
@@ -134,7 +134,7 @@ def compile_load_execute(
     kernel_hash: str,
     args: Tuple[torch.Tensor, ...],
     alias_map: Dict[int, int],
-    none_idx_list: List[int],
+    non_tensor_outputs: Dict[int, Any],
     kernel_dir: Path,
     ntff_meta: NtffMeta,
     rank: int = 0,
@@ -178,7 +178,7 @@ def compile_load_execute(
             io_specs=neuron_executable.io_specs,
             neff_path=neuron_executable.neff_path,
             alias_map=alias_map,
-            none_idx_list=none_idx_list,
+            non_tensor_outputs=non_tensor_outputs,
             args=args,
             ntff_meta=ntff_meta,
             rank=rank,
@@ -450,7 +450,7 @@ def run_neff_model(
     nkipy_model: LoadedModel,
     args: Tuple[torch.Tensor, ...],
     alias_map: Dict[int, int],
-    none_idx_list: List[int],
+    non_tensor_outputs: Dict[int, Any],
     io_specs: IOSpecs,
     neff_path: str,
     ntff_meta: NtffMeta,
@@ -514,8 +514,8 @@ def run_neff_model(
             ntff_name=ntff_name,
         )
 
-    for idx in none_idx_list:
-        dynamo_output_tensors.insert(idx, None)
+    for idx in sorted(non_tensor_outputs.keys()):
+        dynamo_output_tensors.insert(idx, non_tensor_outputs[idx])
 
     # Return only the newly allocated output tensors
     return dynamo_output_tensors

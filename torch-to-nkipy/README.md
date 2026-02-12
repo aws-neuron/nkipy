@@ -19,11 +19,13 @@ Torch-to-NKIPy is a PyTorch backend that bridges the gap between your existing P
 - **Seamless Integration**: Drop-in replacement for PyTorch's default backend via `torch.compile(backend="nkipy")`
 - **Fine-grained Control**: Mark subgraphs for selective compilation and control CPU/Trainium execution boundaries
 - **Custom NKI Kernels**: Inject optimized custom NKI (Neuron Kernel Interface) kernels for enhanced performance
-- **Comprehensive Op Support**: Extensive ATen operation registry with 50+ operations including:
+- **Training Support**: Works with `aot_autograd` for training workloads — supports both static and dynamic shapes in forward/backward graphs
+- **Comprehensive Op Support**: Extensive ATen operation registry with 60+ operations including:
   - Tensor operations (add, mul, matmul, etc.)
   - Activation functions (relu, gelu, sigmoid, etc.)
   - Normalization (layer_norm, softmax, etc.)
   - Indexing and slicing operations
+  - Type conversions (aten._to_copy, prims.convert_element_type)
   - Collective operations for distributed training
 - **Automatic Tensor Management**: Handles runtime tensor placement and data movement between CPU and Trainium devices
 - **Custom Device Registration**: C++ extension for PyTorch device integration with Neuron Runtime (NRT)
@@ -163,7 +165,7 @@ init_nkipy_backend(
 
 ## Supported Operations
 
-The package includes implementations for 50+ PyTorch operations:
+The package includes implementations for 60+ PyTorch operations:
 
 **Arithmetic:** add, sub, mul, div, pow, abs, reciprocal, sqrt, rsqrt
 
@@ -180,6 +182,8 @@ The package includes implementations for 50+ PyTorch operations:
 **Shape Operations:** expand, repeat, cat, split_with_sizes, view, permute
 
 **Tensor Creation:** full, arange, scalar_tensor, empty_permuted
+
+**Type Conversion:** _to_copy, prims.convert_element_type
 
 **Logical:** where, clamp, ne, bitwise_not
 

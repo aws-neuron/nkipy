@@ -33,7 +33,7 @@ from .names import (
     NKIPY_DEBUG_FUNC_NAME,
     NKIPY_FUNC_FILE,
     NKIPY_FUNC_NAME,
-    NONE_IDX_LIST,
+    NON_TENSOR_OUTPUTS_FILE,
     NUMPY_PKG,
 )
 from .ntff_meta import NtffMeta
@@ -85,7 +85,7 @@ __all__ = [
     "NKIPY_DEBUG_FUNC_NAME",
     "NKIPY_DEBUG_FUNC_FILE",
     "ALIAS_MAP_FILE",
-    "NONE_IDX_LIST",
+    "NON_TENSOR_OUTPUTS_FILE",
     "ARG_SHAPE_DTYPE_FILE",
     "NUMPY_PKG",
     "CC_PKG",

@@ -243,7 +243,7 @@ class CompiledWrapper(torch.nn.Module):
         _nkipy_func = kernel.nkipy_func
         _kernel_dir = kernel.kernel_paths["kernel_dir"]
         _alias_map = kernel.alias_map
-        _none_idx_list = kernel.none_idx_list
+        _non_tensor_outputs = kernel.non_tensor_outputs
         _args = args
 
         def static_compiler_fn(bucket_size: int):
@@ -252,7 +252,7 @@ class CompiledWrapper(torch.nn.Module):
                 args=_args,
                 kernel_dir=_kernel_dir,
             )
-            return str(neff_path), _alias_map, _none_idx_list
+            return str(neff_path), _alias_map, _non_tensor_outputs
 
         self._callable = NKIPyCallable(
             config=CallableConfig(
@@ -423,9 +423,9 @@ def _create_spiky_callable(
                     shape[dim] = bucket_size
 
             if meta["is_floating_point"]:
-                concrete_inputs.append(torch.randn(*shape, dtype=dtype))
+                concrete_inputs.append(torch.randn(shape, dtype=dtype))
             elif dtype == torch.bool:
-                concrete_inputs.append(torch.zeros(*shape, dtype=torch.bool))
+                concrete_inputs.append(torch.zeros(shape, dtype=torch.bool))
             else:
                 concrete_inputs.append(torch.randint(0, 100, shape, dtype=dtype))
 
@@ -477,7 +477,7 @@ def _create_spiky_callable(
             args=tensor_inputs,
             kernel_dir=kernel.kernel_paths["kernel_dir"],
         )
-        return str(neff_path), kernel.alias_map, kernel.none_idx_list
+        return str(neff_path), kernel.alias_map, kernel.non_tensor_outputs
 
     # Determine output layout and derive unpad_outputs consistently.
     # When output_layout is "padded", the engine must NOT unpad so that

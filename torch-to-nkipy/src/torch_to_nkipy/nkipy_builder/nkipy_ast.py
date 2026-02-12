@@ -6,7 +6,7 @@ import logging
 from ast import _Unparser
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from torch.fx.graph import _parse_stack_trace
 
@@ -427,7 +427,7 @@ class NKIPyAST:
     computations: List[ComputationNode] = field(default_factory=list)
     outputs: List[OutputNode] = field(default_factory=list)
     alias_map: Dict[int, int] = field(default_factory=dict)
-    none_ouput_idx: List[int] = field(default_factory=list)
+    non_tensor_outputs: Dict[int, Any] = field(default_factory=dict)
     nki_aliased_inputs: List[str] = field(default_factory=list)
 
     def add_input(self, node: InputNode) -> None:
@@ -446,9 +446,9 @@ class NKIPyAST:
         """Add an output node to the structure."""
         self.outputs.append(node)
 
-    def add_none_output_idx(self, idx: int):
-        """Add an none output idx."""
-        self.none_ouput_idx.append(idx)
+    def add_non_tensor_output(self, idx: int, value: Any):
+        """Record a non-tensor output (None or scalar) at the given index."""
+        self.non_tensor_outputs[idx] = value
 
     def _add_aliased_output(self, node: ComputationNode) -> None:
         """Add an aliased output based on a computation node.

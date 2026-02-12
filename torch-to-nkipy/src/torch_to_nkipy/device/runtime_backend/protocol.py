@@ -11,11 +11,10 @@ import torch
 
 @dataclass
 class LoadedModel:
-    """Abstraction for a loaded model (SpikeModel or spiky bundle_id).
+    """Abstraction for a loaded model.
 
     Attributes:
-        model_ref: The underlying model reference (SpikeModel for spike,
-                   bundle_id int for spiky)
+        model_ref: The underlying model reference (SpikeModel)
         neff_path: Path to the NEFF file
     """
 
@@ -24,11 +23,7 @@ class LoadedModel:
 
 
 class RuntimeBackend(Protocol):
-    """Protocol defining the interface for spike/spiky backends.
-
-    This protocol allows switching between different runtime implementations
-    (spike vs spiky) while maintaining a consistent API.
-    """
+    """Protocol defining the interface for the runtime backend."""
 
     def init(self, visible_core: int) -> None:
         """Initialize the runtime for the given core.

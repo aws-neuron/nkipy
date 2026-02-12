@@ -14,7 +14,7 @@ import threading
 import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -139,7 +139,7 @@ class NKIPyCallable:
     def __init__(
         self,
         config: CallableConfig,
-        compiler_fn: Callable[[int], Tuple[str, Dict[int, int], List[int]]],
+        compiler_fn: Callable[[int], Tuple[str, Dict[int, int], Dict[int, Any]]],
     ):
         """Initialize NKIPyCallable.
 
@@ -147,7 +147,7 @@ class NKIPyCallable:
             config: CallableConfig with bucket and execution settings
             compiler_fn: Callback to compile for a specific bucket size.
                          Signature: (bucket_size: int) ->
-                         (neff_path, alias_map, none_idx_list)
+                         (neff_path, alias_map, non_tensor_outputs)
         """
         self._config = config
         self._compiler_fn = compiler_fn
@@ -156,7 +156,8 @@ class NKIPyCallable:
         self._jit_lock = threading.Lock()
         self._buckets = list(config.buckets)  # Mutable copy
         self._alias_map: Optional[Dict[int, int]] = None
-        self._none_idx_list: Optional[List[int]] = None
+        # bucket_size -> {output_idx -> value}
+        self._non_tensor_outputs: Dict[int, Dict[int, Any]] = {}
 
         # Register for atexit cleanup
         _live_callables[id(self)] = weakref.ref(
@@ -201,11 +202,11 @@ class NKIPyCallable:
                 return
 
             logger.info(f"JIT compiling bucket size {bucket_size}")
-            neff_path, alias_map, none_idx_list = self._compiler_fn(bucket_size)
+            neff_path, alias_map, non_tensor_outputs = self._compiler_fn(bucket_size)
             self._compiled_buckets[bucket_size] = neff_path
+            self._non_tensor_outputs[bucket_size] = non_tensor_outputs
             if self._alias_map is None:
                 self._alias_map = alias_map
-                self._none_idx_list = none_idx_list
 
             # Re-register bundle with updated buckets
             self._reregister_bundle()
@@ -416,10 +417,11 @@ class NKIPyCallable:
                     args[input_idx].copy_(result[output_idx].to(args[input_idx].device))
             result = [r for i, r in enumerate(result) if i not in self._alias_map]
 
-        # Handle none_idx_list: insert None at specified positions
-        if self._none_idx_list:
-            for idx in self._none_idx_list:
-                result.insert(idx, None)
+        # Handle non-tensor outputs: insert actual values at specified positions
+        non_tensor_map = self._non_tensor_outputs.get(bucket_size, {})
+        if non_tensor_map:
+            for idx in sorted(non_tensor_map.keys()):
+                result.insert(idx, non_tensor_map[idx])
 
         return tuple(result)
 

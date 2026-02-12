@@ -31,7 +31,16 @@ from torch_to_nkipy.nkipy_builder.nkipy_kernel import NKIPyKernel
 from torch_to_nkipy.utils.graph import _count_subgraph_markers as count_subgraph_markers
 from torch_to_nkipy.utils.graph import gm_split_and_wrap
 
-# FIXME replace the AliasOfInputHandler in aot_module_simplified
+# Disable AOTAutograd's alias-of-input output reconstruction.
+#
+# After the compiled forward runs, AOTAutograd reconstructs user outputs that
+# alias inputs via gen_alias_from_base() (as_strided on the original CPU input).
+# This fails for NKIPy because outputs live on Neuron, not CPU.
+#
+# NKIPy handles aliases itself: aten.copy_ is detected during IR building,
+# recorded in alias_map (output_idx → input_idx), and applied at execution time.
+#
+# No official API exists to disable this, so we monkey-patch the class method.
 runtime_wrappers.AliasOfInputHandler.__call__ = (
     runtime_wrappers.NoopAliasHandler.__call__
 )
@@ -97,7 +106,6 @@ def init_nkipy_backend(
     world_size: Optional[int] = None,
     core_offset: int = 0,
     additional_compiler_args: str = "",
-    use_spiky: Optional[bool] = None,
 ) -> None:
     """Initialize the NKIPy backend.
 
@@ -117,28 +125,12 @@ def init_nkipy_backend(
               visible_cores = [rank + core_offset]
               Useful for multi-node setups where cores start at different indices.
         additional_compiler_args: Custom compiler flags
-        use_spiky: Use experimental spiky runtime instead of spike.
-              If None, checks NKIPY_USE_SPIKY environment variable.
-              Defaults to False (use spike).
 
     Raises:
         RuntimeError: If backend is already initialized
     """
     if is_nkipy_backend_initialized():
         raise RuntimeError("NKIPy backend has already been initialized.")
-
-    # Resolve use_spiky: explicit arg > env var > default False
-    if use_spiky is None:
-        use_spiky = os.environ.get("NKIPY_USE_SPIKY", "0").lower() in (
-            "1",
-            "true",
-            "yes",
-        )
-
-    # Configure runtime backend type BEFORE any initialization
-    from torch_to_nkipy.device.runtime_backend import set_runtime_type
-
-    set_runtime_type(use_spiky)
 
     # Auto-detect rank and world_size
     rank = _get_rank(rank)
@@ -160,7 +152,6 @@ def init_nkipy_backend(
         rank=rank,
         world_size=world_size,
         additional_compiler_args=additional_compiler_args,
-        use_spiky=use_spiky,
     )
     set_nkipy_backend_config(nkipy_backend_config)
 
@@ -199,7 +190,7 @@ class CompiledWrapper(torch.nn.Module):
                 rank=self._rank,
                 world_size=self._world_size,
             )
-        return self._handle(*args, **kwargs)
+        return self._handle(list(args))
 
 
 def nkipy_backend_fn_decomposed(

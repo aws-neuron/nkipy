@@ -5,7 +5,7 @@ import builtins
 import logging
 import pickle
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 import numpy as np
 import torch
@@ -35,7 +35,7 @@ from torch_to_nkipy.utils.name import (
     NKIPY_DEBUG_FUNC_FILE,
     NKIPY_FUNC_FILE,
     NKIPY_FUNC_NAME,
-    NONE_IDX_LIST,
+    NON_TENSOR_OUTPUTS_FILE,
 )
 from torch_to_nkipy.utils.nki import NKIOpRegistry
 from torch_to_nkipy.utils.ntff_meta import NtffMeta
@@ -86,7 +86,7 @@ class NKIPyKernel:
         self.kernel_paths = self._setup_paths()
         self.nkipy_func = None
         self.alias_map: Dict[int, int] = {}
-        self.none_idx_list: List[int] = []
+        self.non_tensor_outputs: Dict[int, Any] = {}
         self.gm = gm
 
         # FIXME fix to a default value
@@ -119,7 +119,7 @@ class NKIPyKernel:
             "kernel_dir": kernel_dir,
             "func_file": kernel_dir / NKIPY_FUNC_FILE,
             "alias_file": kernel_dir / ALIAS_MAP_FILE,
-            "none_output_idx_file": kernel_dir / NONE_IDX_LIST,
+            "none_output_idx_file": kernel_dir / NON_TENSOR_OUTPUTS_FILE,
             "debug_file": kernel_dir / NKIPY_DEBUG_FUNC_FILE,
             "arg_shape_dtype_file": kernel_dir / ARG_SHAPE_DTYPE_FILE,
         }
@@ -151,7 +151,12 @@ class NKIPyKernel:
             with open(self.kernel_paths["alias_file"], "rb") as f:
                 self.alias_map = pickle.load(f)
             with open(self.kernel_paths["none_output_idx_file"], "rb") as f:
-                self.none_idx_list = pickle.load(f)
+                loaded = pickle.load(f)
+                # Support both old format (List[int]) and new format (Dict[int, Any])
+                if isinstance(loaded, list):
+                    self.non_tensor_outputs = {idx: None for idx in loaded}
+                else:
+                    self.non_tensor_outputs = loaded
         except (IOError, pickle.UnpicklingError) as e:
             logger.error(f"Failed to load cached kernel: {e}")
             raise ValueError(f"Failed to load cached kernel: {e}") from e
@@ -225,10 +230,10 @@ class NKIPyKernel:
         ]
         return outputs_filtered
 
-    def _handle_none_output(self, outputs):
+    def _handle_non_tensor_outputs(self, outputs):
         outputs = list(outputs)
-        for idx in self.none_idx_list:
-            outputs.insert(idx, None)
+        for idx in sorted(self.non_tensor_outputs.keys()):
+            outputs.insert(idx, self.non_tensor_outputs[idx])
         return outputs
 
     def _execute_on_host(self, *args: torch.Tensor):
@@ -256,7 +261,7 @@ class NKIPyKernel:
         # Handle any inplace updates
         out_numpy = self._handle_inplace_update(args_numpy, out_numpy)
 
-        out_numpy = self._handle_none_output(out_numpy)
+        out_numpy = self._handle_non_tensor_outputs(out_numpy)
 
         # Convert back to PyTorch tensors
         out_tensor = convert_numpy_arrays_to_tensors(out_numpy)
@@ -277,7 +282,7 @@ class NKIPyKernel:
             kernel_hash=self.kernel_hash,
             args=args,
             alias_map=self.alias_map,
-            none_idx_list=self.none_idx_list,
+            non_tensor_outputs=self.non_tensor_outputs,
             kernel_dir=self.kernel_paths["kernel_dir"],
             ntff_meta=self.ntff_meta,
             rank=self._rank,
@@ -309,15 +314,20 @@ class NKIPyKernel:
             dummy_outputs.append(dummy_o)
         return tuple(dummy_outputs)
 
+    # Signal to AOTAutograd that __call__ accepts boxed args (a single list)
+    # so it won't emit the "doesn't take boxed arguments" warning.
+    _boxed_call = True
+
     @torch._dynamo.disable
-    def __call__(self, *args: torch.Tensor):
+    def __call__(self, args: List[torch.Tensor]):
         """
         Execute the compiled kernel with the given inputs.
 
         Routes execution to either host or device based on configuration.
 
         Args:
-            *args: Input tensors (PyTorch)
+            args: List of input tensors (PyTorch). Boxed calling convention
+                  expected by AOTAutograd.
 
         Returns:
             Output tensor(s) from the compiled function

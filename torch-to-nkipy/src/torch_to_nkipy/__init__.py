@@ -4,7 +4,6 @@
 """torch-to-nkipy: IR building for NKIPy.
 
 This package provides tools for converting PyTorch FX graphs to NKIPy IR.
-For runtime, device management, and PyTorch integration, use `spiky.torch`.
 
 Primary exports:
 - NKIPyBuilder: Builds NKIPy IR from FX graphs

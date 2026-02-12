@@ -93,7 +93,7 @@ class NKIPyBuilder:
             pickle.dump(self.nkipy_func_ast.alias_map, f)
 
         with open(none_idx_file, "wb") as f:
-            pickle.dump(self.nkipy_func_ast.none_ouput_idx, f)
+            pickle.dump(self.nkipy_func_ast.non_tensor_outputs, f)
 
     def save_debug_file(self, debug_file: Path) -> None:
         """
@@ -316,16 +316,28 @@ class NKIPyBuilder:
         _add_aliased_output (e.g. from copy_ nodes), to avoid
         double-counting when aot_autograd includes mutations as outputs.
 
+        When the same tensor appears multiple times in the output tuple
+        (e.g. aot_autograd saving an intermediate for backward), inserts
+        an explicit copy so neuronx-cc sees distinct output tensors.
+
         Args:
             node: The output FX node
         """
         # Collect names already present from aliased outputs
         existing_output_names = {o.name for o in self.nkipy_func_ast.outputs}
 
+        # Track names seen in this loop to detect duplicates
+        seen_in_loop = {}
+
         # For each result in the output tuple
         for arg_idx, arg_node in enumerate(node.args[0]):
             if arg_node is None:
-                self.nkipy_func_ast.add_none_output_idx(arg_idx)
+                self.nkipy_func_ast.add_non_tensor_output(arg_idx, None)
+                continue
+            # aot_autograd may include non-Node values (e.g. int for tensor
+            # sizes) in the output tuple for dynamic-shape backward graphs.
+            if not isinstance(arg_node, fx.Node):
+                self.nkipy_func_ast.add_non_tensor_output(arg_idx, arg_node)
                 continue
             # Skip if already added as an aliased output (e.g. from copy_)
             if arg_node.name in existing_output_names:
@@ -334,10 +346,30 @@ class NKIPyBuilder:
                     f"(already present as aliased output)"
                 )
                 continue
-            # Create and add an output node
-            output_node = OutputNode(name=arg_node.name)
+
+            if arg_node.name in seen_in_loop:
+                # Duplicate output — insert a copy so neuronx-cc sees
+                # distinct tensors (inputs and outputs occupy separate
+                # memory regions on device).
+                copy_name = f"{arg_node.name}_copy_{arg_idx}"
+                copy_node = ComputationNode(name=copy_name)
+                copy_node.ast_code_block.add_numpy_call_assignment(
+                    target=copy_name,
+                    func_name="copy",
+                    args=[arg_node.name],
+                )
+                self.nkipy_func_ast.add_computation(copy_node)
+                output_node = OutputNode(name=copy_name)
+                logger.debug(
+                    f"Inserted copy for duplicate output {arg_idx}: "
+                    f"{arg_node.name} -> {copy_name}"
+                )
+            else:
+                seen_in_loop[arg_node.name] = arg_idx
+                output_node = OutputNode(name=arg_node.name)
+                logger.debug(f"Added output node {arg_idx}: {arg_node.name}")
+
             self.nkipy_func_ast.add_output(output_node)
-            logger.debug(f"Added output node {arg_idx}: {arg_node.name}")
 
     def _process_get_attr(self, node: fx.Node) -> None:
         """

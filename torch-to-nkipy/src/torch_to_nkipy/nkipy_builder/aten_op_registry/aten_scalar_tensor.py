@@ -31,10 +31,15 @@ def scalar_tensor_default(node: fx.Node, computation_node: ComputationNode) -> N
     # Extract arguments and dtype
     value = node.args[0]
 
-    if "dtype" not in node.kwargs:
+    torch_dtype = node.kwargs.get("dtype")
+    if torch_dtype is None:
+        # Infer dtype from the node's output metadata (e.g. backward graphs
+        # may emit scalar_tensor without an explicit dtype kwarg).
+        meta_val = node.meta.get("val")
+        if meta_val is not None:
+            torch_dtype = meta_val.dtype
+    if torch_dtype is None:
         raise ValueError("scalar_tensor_default: no torch dtype found")
-
-    torch_dtype = node.kwargs["dtype"]
     numpy_dtype = torch_to_numpy_dtype_str(torch_dtype)
 
     # Special handling for constants
