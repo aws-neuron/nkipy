@@ -172,9 +172,6 @@ spike.tensor_read_to_pybuffer(tensor, buffer, offset=0, size=0)
 # Execution (releases GIL for CC support)
 spike.execute(model, inputs: Dict[str, NrtTensor], outputs: Dict[str, NrtTensor],
            ntff_name: str = None, save_trace: bool = False)
-
-# Benchmarking
-spike.benchmark(model, inputs, outputs, warmup_iterations=1, benchmark_iterations=1) -> BenchmarkResult
 ```
 
 ### High-Level API: SpikeTensor and SpikeModel
@@ -237,6 +234,7 @@ results = model.benchmark(
     outputs={"output": output_tensor}, # optional
     warmup_iter=5,
     benchmark_iter=100
+    mode="device", # device or host overhead measurement
 )
 
 print(f"Mean execution time: {results.mean_ms:.2f} ms")
@@ -281,6 +279,4 @@ except SpikeError as e:
 
 ### Future Work
 
-- [ ] **Improved benchmarking**: Integrate libnrt inspect APIs for device-side latency measurement
-- [ ] **Kernel switch overhead**: Add option to measure kernel switching costs
 - [ ] **NKI debugger integration**: Support for debugging NKI kernels via Spike

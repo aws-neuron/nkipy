@@ -311,8 +311,10 @@ def test_model_basic_operations(shared_spike_instance, add_neff_model, model_tra
 
 
 @pytest.mark.order(4)
-def test_model_benchmark(shared_spike_instance, add_neff_model, model_tracker):
-    """Test model benchmark using the shared Spike instance"""
+def test_sys_trace_session(shared_spike_instance, add_neff_model, model_tracker):
+    """Test SystemTraceSession context manager captures trace events during execute"""
+    from spike import SystemTraceSession
+
     spike = shared_spike_instance
 
     model = spike.load_model(add_neff_model)
@@ -325,18 +327,22 @@ def test_model_benchmark(shared_spike_instance, add_neff_model, model_tracker):
     spike.tensor_write(x, np.array([1.0], dtype=np.float32).tobytes(), 0)
     spike.tensor_write(y, np.array([1.0], dtype=np.float32).tobytes(), 0)
 
-    # Test benchmark with minimal iterations
+    import json
+
     try:
-        result = spike.benchmark(
-            model,
-            {"x": x, "y": y},
-            {"output0": output},
-            warmup_iterations=1,
-            benchmark_iterations=2,
-        )
+        with SystemTraceSession(model.core_id) as trace:
+            spike.execute(model, {"x": x, "y": y}, {"output0": output})
+            events_json = trace.fetch_events_json()
+
+        # Verify we got valid JSON with nc_exec_running events
+        assert events_json, "Expected non-empty events JSON"
+        root = json.loads(events_json)
+        events = root.get("events", [])
+        nc_exec_events = [e for e in events if e.get("event_type") == "nc_exec_running"]
+        assert len(nc_exec_events) > 0, "Expected at least one nc_exec_running event"
 
     except Exception as e:
-        pytest.fail(f"benchmark() failed: {e}")
+        pytest.fail(f"SystemTraceSession test failed: {e}")
 
     # Clean up
     spike.unload_model(model)

@@ -197,6 +197,48 @@ def test_nki_simple_beta_2():
 
 
 @pytest.mark.skipif(
+    not BETA2_NKI_AVAILABLE, reason="Beta 2 NKI frontend (nki) not available"
+)
+def test_nki_direct_jit_beta2_called_twice_different_shapes():
+    """Regression: calling the same @nki.jit beta2 kernel twice with different
+    shapes during a single NKIPy trace must not fail.
+
+    The underlying GenericKernel's C++ frontend.Kernel accumulates state during
+    specialize/trace. Without the clone+reset in _generate_nki_custom_call, the
+    second invocation hits stale state and raises.
+    """
+
+    @nki_beta2.jit(platform_target="trn2")
+    def nki_add_kernel(a_input, b_input):
+        a_tile = sbuf.view(dtype=a_input.dtype, shape=a_input.shape)  # noqa: F821
+        nisa_beta2.dma_copy(dst=a_tile, src=a_input)
+        b_tile = sbuf.view(dtype=b_input.dtype, shape=b_input.shape)  # noqa: F821
+        nisa_beta2.dma_copy(dst=b_tile, src=b_input)
+        c_tile = sbuf.view(dtype=a_input.dtype, shape=a_input.shape)  # noqa: F821
+        nisa_beta2.tensor_tensor(
+            dst=c_tile, data1=a_tile, data2=b_tile, op=nl_beta2.add
+        )
+        c_output = hbm.view(dtype=a_input.dtype, shape=a_input.shape)  # noqa: F821
+        nisa_beta2.dma_copy(dst=c_output, src=c_tile)
+        return c_output
+
+    # Two pairs of inputs with different second-dimension sizes
+    a1 = np.random.rand(128, 512).astype(np.float32)
+    b1 = np.random.rand(128, 512).astype(np.float32)
+    a2 = np.random.rand(128, 256).astype(np.float32)
+    b2 = np.random.rand(128, 256).astype(np.float32)
+
+    def test_func(a1, b1, a2, b2):
+        c1 = nki_add_kernel(a1, b1)  # first call: 128x512
+        c2 = nki_add_kernel(a2, b2)  # second call: 128x256 — was failing
+        return c1, c2
+
+    # Tracing alone exercises the bug path (no hardware needed)
+    traced = NKIPyKernel.trace(test_func, backend="hlo")
+    traced.specialize(a1, b1, a2, b2)
+
+
+@pytest.mark.skipif(
     not LEGACY_NKI_AVAILABLE, reason="Legacy NKI frontend (neuronxcc.nki) not available"
 )
 def test_nki_direct_jit(trace_mode):

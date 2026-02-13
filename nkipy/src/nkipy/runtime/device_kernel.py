@@ -46,9 +46,20 @@ def _hlo_content_hash(hlo_module: HLOModule, compiler_args: str) -> str:
     ``SerializeToString()`` is deterministic for the same computation graph.
     """
     h = hashlib.sha256()
+
+    # TODO: this SerializeToString can be slow for large HLO
     h.update(hlo_module.to_proto().SerializeToString())
     h.update(compiler_args.encode("utf-8"))
     return h.hexdigest()[:12]
+
+
+def _is_distributed() -> bool:
+    """Check if running in a multi-worker torch.distributed setting."""
+    return (
+        device_tensor._TORCH_ENABLED
+        and dist.is_initialized()
+        and dist.get_world_size() > 1
+    )
 
 
 class DeviceKernel(SpikeModel):
@@ -71,6 +82,10 @@ class DeviceKernel(SpikeModel):
     ):
         """Compile and load a kernel, returning a DeviceKernel instance.
 
+        In distributed mode, only the lead worker (rank 0) traces and compiles.
+        The resulting paths are broadcast to all workers, which then load the
+        NEFF collectively.
+
         Args:
             kernel: The kernel function to compile
             name: Optional name for the kernel. If None, uses kernel.__name__
@@ -86,108 +101,45 @@ class DeviceKernel(SpikeModel):
         if name is None:
             name = kernel.__name__
 
-        # Determine compiler args early so they can be included in the hash
-        if isinstance(kernel, types.FunctionType):
-            base_compiler_args = compile.nkipy_compiler_args
-        elif isinstance(kernel, NKIPyKernel):
-            base_compiler_args = compile.nkipy_compiler_args
-        else:
-            raise NotImplementedError(f"Unsupported kernel type: {type(kernel)}")
-        if additional_compiler_args:
-            full_compiler_args = base_compiler_args + " " + additional_compiler_args
-        else:
-            full_compiler_args = base_compiler_args
+        distributed = _is_distributed()
 
-        # Convert DeviceTensors to numpy arrays for tracing/compilation
-        numpy_args = []
-        for arg in args:
-            if isinstance(arg, DeviceTensor):
-                numpy_args.append(arg.numpy())
+        if distributed:
+            if dist.get_rank() == 0:
+                neff_path, cache_key = cls._trace_and_compile(
+                    kernel,
+                    name,
+                    args,
+                    kwargs,
+                    additional_compiler_args=additional_compiler_args,
+                    use_cached_if_exists=use_cached_if_exists,
+                    build_dir=build_dir,
+                    target=target,
+                )
+                dist.broadcast_object_list([neff_path, cache_key], src=0)
             else:
-                numpy_args.append(arg)
-
-        numpy_kwargs = {}
-        for key, value in kwargs.items():
-            if isinstance(value, DeviceTensor):
-                numpy_kwargs[key] = value.numpy()
-            else:
-                numpy_kwargs[key] = value
-
-        # Trace and specialize BEFORE hashing so that the cache key
-        # reflects the actual HLO (which depends on input shapes/dtypes),
-        # not just the source code.
-        if isinstance(kernel, types.FunctionType):
-            traced_kernel = trace(kernel)
-        elif isinstance(kernel, NKIPyKernel):
-            traced_kernel = kernel
+                info = [None, None]
+                dist.broadcast_object_list(info, src=0)
+                neff_path, cache_key = info
         else:
-            logger.info("Continue as NKI kernel")
-            traced_kernel = kernel
-
-        traced_kernel.specialize(*numpy_args, **numpy_kwargs)
-
-        # Compute content hash
-        hlo_module = traced_kernel._code
-        if isinstance(hlo_module, HLOModule):
-            content_hash = _hlo_content_hash(hlo_module, full_compiler_args)
-        else:
-            raise NotImplementedError("Only HLOModule is supported for content hashing")
-        cache_key = f"{name}_{content_hash}"
-
-        if use_cached_if_exists and cache_key in _LOADED_KERNELS:
-            logger.info(f"Using loaded kernel: {name} (hash={content_hash})")
-            return _LOADED_KERNELS[cache_key]
-
-        build_dir = build_dir or _get_build_dir()
-
-        # Include hash in the directory path so different HLO → different NEFF
-        output_dir = f"{build_dir}/{name}_{content_hash}"
-        neff_path = f"{output_dir}/{name}.neff"
-
-        if (
-            device_tensor._TORCH_ENABLED
-            and dist.is_initialized()
-            and dist.get_rank() != 0
-        ):
-            logger.info(
-                f"Rank {dist.get_rank()} is not the master rank, skipping compilation"
-            )
-        elif use_cached_if_exists and os.path.exists(neff_path):
-            logger.info(
-                f"Kernel found in '{neff_path}', using cached (hash={content_hash})"
-            )
-        else:
-            # Clean output directory if it exists and we're recompiling
-            if not use_cached_if_exists and os.path.exists(output_dir):
-                logger.info(f"Cleaning output directory: {output_dir}")
-                shutil.rmtree(output_dir)
-
-            logger.info(f"Compiling kernel: {name} (hash={content_hash})")
-            time_start = time.time()
-
-            logger.debug(f"Compiler arguments: {full_compiler_args}")
-
-            # traced_kernel is already specialized above; just compile.
-            compile_to_neff(
-                traced_kernel,
-                output_dir=output_dir,
-                neff_name=f"{name}.neff",
-                additional_compiler_args=full_compiler_args,
-                save_artifacts=True,
+            neff_path, cache_key = cls._trace_and_compile(
+                kernel,
+                name,
+                args,
+                kwargs,
+                additional_compiler_args=additional_compiler_args,
+                use_cached_if_exists=use_cached_if_exists,
+                build_dir=build_dir,
                 target=target,
             )
-            time_end = time.time()
-            logger.info(f"Compile time: {time_end - time_start:.2f} seconds")
 
-        if (
-            device_tensor._TORCH_ENABLED
-            and dist.is_initialized()
-            and dist.get_world_size() > 1
-        ):
-            # make sure the lead is done with compilation
+        # Check in-memory cache (consistent across all ranks)
+        if use_cached_if_exists and cache_key in _LOADED_KERNELS:
+            logger.info(f"Using loaded kernel: {name} (cache_key={cache_key})")
+            return _LOADED_KERNELS[cache_key]
+
+        # Load the compiled NEFF
+        if distributed:
             dist.barrier()
-
-            # Load with collective
             device_kernel = cls.load_from_neff(
                 neff_path,
                 name=name,
@@ -201,3 +153,85 @@ class DeviceKernel(SpikeModel):
         if use_cached_if_exists:
             _LOADED_KERNELS[cache_key] = device_kernel
         return device_kernel
+
+    @classmethod
+    def _trace_and_compile(
+        cls,
+        kernel,
+        name,
+        args,
+        kwargs,
+        *,
+        additional_compiler_args,
+        use_cached_if_exists,
+        build_dir,
+        target,
+    ):
+        """Trace, specialize, hash, and compile a kernel.
+
+        Returns:
+            tuple[str, str]: (neff_path, cache_key)
+        """
+        # Determine compiler args
+        if not isinstance(kernel, (types.FunctionType, NKIPyKernel)):
+            raise NotImplementedError(f"Unsupported kernel type: {type(kernel)}")
+
+        compiler_args = compile.nkipy_compiler_args
+        if additional_compiler_args:
+            compiler_args = compiler_args + " " + additional_compiler_args
+
+        # Convert DeviceTensors to numpy arrays for tracing
+        numpy_args = [
+            arg.numpy() if isinstance(arg, DeviceTensor) else arg for arg in args
+        ]
+        numpy_kwargs = {
+            k: v.numpy() if isinstance(v, DeviceTensor) else v
+            for k, v in kwargs.items()
+        }
+
+        # Trace and specialize
+        if isinstance(kernel, types.FunctionType):
+            traced_kernel = trace(kernel)
+        else:
+            traced_kernel = kernel
+
+        traced_kernel.specialize(*numpy_args, **numpy_kwargs)
+
+        # Compute content hash from HLO
+        hlo_module = traced_kernel._code
+        if not isinstance(hlo_module, HLOModule):
+            raise NotImplementedError("Only HLOModule is supported for content hashing")
+
+        content_hash = _hlo_content_hash(hlo_module, compiler_args)
+        cache_key = f"{name}_{content_hash}"
+
+        # Determine output paths
+        build_dir = build_dir or _get_build_dir()
+        output_dir = f"{build_dir}/{name}_{content_hash}"
+        neff_path = f"{output_dir}/{name}.neff"
+
+        # Compile if needed
+        if use_cached_if_exists and os.path.exists(neff_path):
+            logger.info(
+                f"Kernel found in '{neff_path}', using cached (hash={content_hash})"
+            )
+        else:
+            if not use_cached_if_exists and os.path.exists(output_dir):
+                logger.info(f"Cleaning output directory: {output_dir}")
+                shutil.rmtree(output_dir)
+
+            logger.info(f"Compiling kernel: {name} (hash={content_hash})")
+            logger.debug(f"Compiler arguments: {compiler_args}")
+
+            time_start = time.time()
+            compile_to_neff(
+                traced_kernel,
+                output_dir=output_dir,
+                neff_name=f"{name}.neff",
+                additional_compiler_args=compiler_args,
+                save_artifacts=True,
+                target=target,
+            )
+            logger.info(f"Compile time: {time.time() - time_start:.2f} seconds")
+
+        return neff_path, cache_key

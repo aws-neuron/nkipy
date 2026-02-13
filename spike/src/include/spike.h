@@ -6,23 +6,12 @@
 #include "model.h"
 #include "nrt_wrapper.h"
 #include "tensor.h"
-#include <chrono>
 #include <memory>
 #include <optional>
 #include <unordered_map>
 #include <vector>
 
 namespace spike {
-
-// Benchmark result structure
-struct BenchmarkResult {
-  double mean_ms;
-  double min_ms;
-  double max_ms;
-  double std_dev_ms;
-  size_t iterations;
-  size_t warmup_iterations;
-};
 
 // Tensor metadata structure
 struct TensorMetadata {
@@ -84,12 +73,6 @@ public:
                const std::unordered_map<std::string, NrtTensor &> &outputs,
                std::optional<std::string> ntff_name = std::nullopt,
                bool save_trace = false);
-
-  BenchmarkResult
-  benchmark(NrtModel &model,
-            const std::unordered_map<std::string, NrtTensor &> &inputs,
-            const std::unordered_map<std::string, NrtTensor &> &outputs,
-            size_t warmup_iterations = 1, size_t benchmark_iterations = 1);
 
   // Model introspection
   ModelTensorInfo get_tensor_info(NrtModel &model);
