@@ -48,6 +48,7 @@ set(SOURCES
     src/tensor_set.cpp
     src/model.cpp
     src/spike.cpp
+    src/sys_trace.cpp
     src/python_bindings.cpp
 )
 

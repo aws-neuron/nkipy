@@ -1,12 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 #include "spike.h"
-#include <algorithm>
-#include <cmath>
-#include <future>
 #include <iostream>
-#include <numeric>
-#include <thread>
 
 namespace spike {
 
@@ -119,54 +114,6 @@ void Spike::execute(NrtModel &model,
 
   // Execute
   model.execute(input_set, output_set, ntff_name, save_trace);
-}
-
-BenchmarkResult
-Spike::benchmark(NrtModel &model,
-                 const std::unordered_map<std::string, NrtTensor &> &inputs,
-                 const std::unordered_map<std::string, NrtTensor &> &outputs,
-                 size_t warmup_iterations, size_t benchmark_iterations) {
-  // Create tensor sets
-  NrtTensorSet input_set = create_tensor_sets(inputs);
-  NrtTensorSet output_set = create_tensor_sets(outputs);
-
-  // Warmup runs
-  for (size_t i = 0; i < warmup_iterations; ++i) {
-    model.execute(input_set, output_set, std::nullopt, false);
-  }
-
-  // Benchmark runs
-  std::vector<std::chrono::duration<double, std::milli>> durations;
-  durations.reserve(benchmark_iterations);
-
-  for (size_t i = 0; i < benchmark_iterations; ++i) {
-    auto start = std::chrono::high_resolution_clock::now();
-    model.execute(input_set, output_set, std::nullopt, false);
-    auto end = std::chrono::high_resolution_clock::now();
-
-    durations.push_back(end - start);
-  }
-
-  // Calculate statistics
-  double mean = std::accumulate(
-                    durations.begin(), durations.end(), 0.0,
-                    [](double sum, const auto &d) { return sum + d.count(); }) /
-                durations.size();
-
-  auto min_it = std::min_element(durations.begin(), durations.end());
-  auto max_it = std::max_element(durations.begin(), durations.end());
-
-  double variance = std::accumulate(durations.begin(), durations.end(), 0.0,
-                                    [mean](double sum, const auto &d) {
-                                      double diff = d.count() - mean;
-                                      return sum + diff * diff;
-                                    }) /
-                    durations.size();
-
-  double std_dev = std::sqrt(variance);
-
-  return BenchmarkResult{mean,    min_it->count(),      max_it->count(),
-                         std_dev, benchmark_iterations, warmup_iterations};
 }
 
 std::string Spike::dtype_to_string(nrt_dtype_t dtype) {
