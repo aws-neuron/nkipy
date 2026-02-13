@@ -34,7 +34,7 @@ from kernels.simple import kernel_specs as simple_specs
 from nkipy.core.specs import ScalarInputSpec, TensorInputSpec, TypeSpec
 from utils import (
     NEURON_AVAILABLE,
-    test_on_device,
+    on_device_test,
     trace_and_compile,
     trace_mode,  # noqa: F401 - pytest fixture
 )
@@ -108,7 +108,7 @@ def test_kernel_fuzz(trace_mode, kernel_spec):
 
         # Test hardware if available
         if NEURON_AVAILABLE:
-            hardware_result = test_on_device(kernel_spec.function, trace_mode, *inputs)
+            hardware_result = on_device_test(kernel_spec.function, trace_mode, *inputs)
 
             # Use looser tolerances for hardware
             hw_rtol = 1e-2 if any(x.dtype == np.float16 for x in inputs) else 1e-2

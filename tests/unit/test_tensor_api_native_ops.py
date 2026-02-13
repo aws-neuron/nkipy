@@ -7,7 +7,7 @@ import pytest
 from utils import (
     NEURON_AVAILABLE,
     baremetal_assert_allclose,
-    test_on_device,
+    on_device_test,
     trace_and_compile,
     trace_mode,  # noqa: F401 - pytest fixture
 )
@@ -277,7 +277,7 @@ def test_add_simple(trace_mode):
     expected = kernel_add(in0, in1)
 
     if NEURON_AVAILABLE:
-        out_device = test_on_device(kernel_add, trace_mode, in0, in1)
+        out_device = on_device_test(kernel_add, trace_mode, in0, in1)
         baremetal_assert_allclose(expected, out_device)
     else:
         trace_and_compile(kernel_add, trace_mode, in0, in1)
@@ -298,7 +298,7 @@ def test_binary_ops(trace_mode, kernel_fn, name, expects_error, dtype):
         expected = kernel_fn(in0, in1)
 
         if NEURON_AVAILABLE:
-            out_device = test_on_device(kernel_fn, trace_mode, in0, in1)
+            out_device = on_device_test(kernel_fn, trace_mode, in0, in1)
             baremetal_assert_allclose(expected, out_device)
         else:
             trace_and_compile(kernel_fn, trace_mode, in0, in1)
@@ -318,7 +318,7 @@ def test_unary_ops(trace_mode, kernel_fn, name, expects_error, dtype):
         expected = kernel_fn(in0)
 
         if NEURON_AVAILABLE:
-            out_device = test_on_device(kernel_fn, trace_mode, in0)
+            out_device = on_device_test(kernel_fn, trace_mode, in0)
             baremetal_assert_allclose(expected, out_device)
         else:
             trace_and_compile(kernel_fn, trace_mode, in0)
@@ -339,7 +339,7 @@ def test_inplace_ops(trace_mode, kernel_fn, name, expects_error, dtype):
         expected = kernel_fn(in0.copy(), in1)
 
         if NEURON_AVAILABLE:
-            out_device = test_on_device(kernel_fn, trace_mode, in0.copy(), in1)
+            out_device = on_device_test(kernel_fn, trace_mode, in0.copy(), in1)
             baremetal_assert_allclose(expected, out_device)
         else:
             trace_and_compile(kernel_fn, trace_mode, in0.copy(), in1)
@@ -358,7 +358,7 @@ def test_broadcasting(trace_mode, shape_a, shape_b, kernel_fn, name, expects_err
         expected = kernel_fn(in0, in1)
 
         if NEURON_AVAILABLE:
-            out_device = test_on_device(kernel_fn, trace_mode, in0, in1)
+            out_device = on_device_test(kernel_fn, trace_mode, in0, in1)
             baremetal_assert_allclose(expected, out_device)
         else:
             trace_and_compile(kernel_fn, trace_mode, in0, in1)
@@ -374,7 +374,7 @@ def test_matmul_shapes(trace_mode, shape_a, shape_b):
     expected = kernel_matmul(in0, in1)
 
     if NEURON_AVAILABLE:
-        out_device = test_on_device(kernel_matmul, trace_mode, in0, in1)
+        out_device = on_device_test(kernel_matmul, trace_mode, in0, in1)
         baremetal_assert_allclose(expected, out_device)
     else:
         trace_and_compile(kernel_matmul, trace_mode, in0, in1)
@@ -395,7 +395,7 @@ def test_matmul_broadcasting(
         expected = kernel_fn(in0, in1)
 
         if NEURON_AVAILABLE:
-            out_device = test_on_device(kernel_fn, trace_mode, in0, in1)
+            out_device = on_device_test(kernel_fn, trace_mode, in0, in1)
             baremetal_assert_allclose(expected, out_device)
         else:
             trace_and_compile(kernel_fn, trace_mode, in0, in1)
@@ -426,7 +426,7 @@ def test_reshape(trace_mode, kernel_fn, name, expects_error):
         expected = kernel_fn(in0)
 
         if NEURON_AVAILABLE:
-            out_device = test_on_device(kernel_fn, trace_mode, in0)
+            out_device = on_device_test(kernel_fn, trace_mode, in0)
             baremetal_assert_allclose(expected, out_device)
         else:
             trace_and_compile(kernel_fn, trace_mode, in0)
@@ -457,7 +457,7 @@ def test_reshape_variants(trace_mode, shape):
     expected = reshape_to_standard(in0)
 
     if NEURON_AVAILABLE:
-        out_device = test_on_device(reshape_to_standard, trace_mode, in0)
+        out_device = on_device_test(reshape_to_standard, trace_mode, in0)
         baremetal_assert_allclose(expected, out_device)
     else:
         trace_and_compile(reshape_to_standard, trace_mode, in0)
@@ -480,7 +480,7 @@ def test_transpose(trace_mode, kernel_fn, name, expects_error, shape):
         expected = kernel_fn(in0)
 
         if NEURON_AVAILABLE:
-            out_device = test_on_device(kernel_fn, trace_mode, in0)
+            out_device = on_device_test(kernel_fn, trace_mode, in0)
             baremetal_assert_allclose(expected, out_device)
         else:
             trace_and_compile(kernel_fn, trace_mode, in0)
@@ -500,11 +500,11 @@ def test_transpose_3d(trace_mode):
 
     if NEURON_AVAILABLE:
         # Test tuple version
-        out_device = test_on_device(transpose_3d_tuple, trace_mode, in0)
+        out_device = on_device_test(transpose_3d_tuple, trace_mode, in0)
         baremetal_assert_allclose(transpose_3d_tuple(in0), out_device)
 
         # Test args version
-        out_device = test_on_device(transpose_3d_args, trace_mode, in0)
+        out_device = on_device_test(transpose_3d_args, trace_mode, in0)
         baremetal_assert_allclose(transpose_3d_args(in0), out_device)
     else:
         trace_and_compile(transpose_3d_tuple, trace_mode, in0)
@@ -525,7 +525,7 @@ def test_astype(trace_mode, kernel_fn, name, expects_error, source_type):
         expected = kernel_fn(in0)
 
         if NEURON_AVAILABLE:
-            out_device = test_on_device(kernel_fn, trace_mode, in0)
+            out_device = on_device_test(kernel_fn, trace_mode, in0)
             baremetal_assert_allclose(expected, out_device)
         else:
             trace_and_compile(kernel_fn, trace_mode, in0)
@@ -543,7 +543,7 @@ def test_combined_operations(trace_mode):
     expected = combined_ops(in0)
 
     if NEURON_AVAILABLE:
-        out_device = test_on_device(combined_ops, trace_mode, in0)
+        out_device = on_device_test(combined_ops, trace_mode, in0)
         baremetal_assert_allclose(expected, out_device)
     else:
         trace_and_compile(combined_ops, trace_mode, in0)

@@ -72,7 +72,7 @@ def trace_and_compile(kernel_fn, trace_mode, *args, **kwargs):
     )
 
 
-def test_on_device(kernel_fn, trace_mode, *args, artifacts_dir=None, **kwargs):
+def on_device_test(kernel_fn, trace_mode, *args, artifacts_dir=None, **kwargs):
     """
     Unified baremetal execution function that traces and runs on device.
 

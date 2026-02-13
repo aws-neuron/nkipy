@@ -11,7 +11,7 @@ from nkipy.core.specs import KernelSpec, ScalarInputSpec, TensorInputSpec
 from utils import (
     NEURON_AVAILABLE,
     baremetal_assert_allclose,
-    test_on_device,
+    on_device_test,
     trace_and_compile,
     trace_mode,  # noqa: F401 - pytest fixture
 )
@@ -83,7 +83,7 @@ def test_kernel_default(trace_mode, file_name, kernel_spec):
     expected = kernel_spec.function(*inputs)
 
     if NEURON_AVAILABLE:
-        hardware_result = test_on_device(kernel_spec.function, trace_mode, *inputs)
+        hardware_result = on_device_test(kernel_spec.function, trace_mode, *inputs)
 
         if isinstance(hardware_result, tuple):
             for r, e in zip(hardware_result, expected):

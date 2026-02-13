@@ -16,7 +16,7 @@ import pytest
 from utils import (
     NEURON_AVAILABLE,
     baremetal_assert_allclose,
-    test_on_device,
+    on_device_test,
     trace_and_compile,
     trace_mode,  # noqa: F401 - pytest fixture
 )
@@ -54,7 +54,7 @@ class TestIndexingSlicingCore:
         expected = kernel(a)
 
         if NEURON_AVAILABLE:
-            out_baremetal = test_on_device(kernel, trace_mode, a)
+            out_baremetal = on_device_test(kernel, trace_mode, a)
             baremetal_assert_allclose(expected, out_baremetal)
         else:
             trace_and_compile(kernel, trace_mode, a)
@@ -68,7 +68,7 @@ class TestIndexingSlicingCore:
         expected = kernel(a)
 
         if NEURON_AVAILABLE:
-            out_baremetal = test_on_device(kernel, trace_mode, a)
+            out_baremetal = on_device_test(kernel, trace_mode, a)
             baremetal_assert_allclose(expected, out_baremetal)
         else:
             trace_and_compile(kernel, trace_mode, a)
@@ -82,7 +82,7 @@ class TestIndexingSlicingCore:
         expected = kernel(a)
 
         if NEURON_AVAILABLE:
-            out_baremetal = test_on_device(kernel, trace_mode, a)
+            out_baremetal = on_device_test(kernel, trace_mode, a)
             baremetal_assert_allclose(expected, out_baremetal)
         else:
             trace_and_compile(kernel, trace_mode, a)
@@ -96,7 +96,7 @@ class TestIndexingSlicingCore:
         expected = kernel(a)
 
         if NEURON_AVAILABLE:
-            out_baremetal = test_on_device(kernel, trace_mode, a)
+            out_baremetal = on_device_test(kernel, trace_mode, a)
             baremetal_assert_allclose(expected, out_baremetal)
         else:
             trace_and_compile(kernel, trace_mode, a)
@@ -111,7 +111,7 @@ class TestIndexingSlicingCore:
         expected = kernel(a)
 
         if NEURON_AVAILABLE:
-            out_baremetal = test_on_device(kernel, trace_mode, a)
+            out_baremetal = on_device_test(kernel, trace_mode, a)
             baremetal_assert_allclose(expected, out_baremetal)
         else:
             trace_and_compile(kernel, trace_mode, a)
@@ -127,7 +127,7 @@ class TestIndexingSlicingCore:
         expected = kernel(a.copy(), b)
 
         if NEURON_AVAILABLE:
-            out_baremetal = test_on_device(kernel, trace_mode, a, b)
+            out_baremetal = on_device_test(kernel, trace_mode, a, b)
             baremetal_assert_allclose(expected, out_baremetal)
         else:
             trace_and_compile(kernel, trace_mode, a, b)
@@ -149,7 +149,7 @@ class TestIndexingSlicingCore:
             )
 
         if NEURON_AVAILABLE:
-            out_baremetal = test_on_device(kernel, trace_mode, a, b)
+            out_baremetal = on_device_test(kernel, trace_mode, a, b)
             baremetal_assert_allclose(expected, out_baremetal)
         else:
             trace_and_compile(kernel, trace_mode, a, b)
@@ -182,7 +182,7 @@ class TestIndexingSlicingMLPatterns:
         expected = kernel(a)
 
         if NEURON_AVAILABLE:
-            out_baremetal = test_on_device(kernel, trace_mode, a)
+            out_baremetal = on_device_test(kernel, trace_mode, a)
             baremetal_assert_allclose(expected, out_baremetal)
         else:
             trace_and_compile(kernel, trace_mode, a)
@@ -197,7 +197,7 @@ class TestIndexingSlicingMLPatterns:
         expected = kernel(a)
 
         if NEURON_AVAILABLE:
-            out_baremetal = test_on_device(kernel, trace_mode, a)
+            out_baremetal = on_device_test(kernel, trace_mode, a)
             baremetal_assert_allclose(expected, out_baremetal)
         else:
             trace_and_compile(kernel, trace_mode, a)
@@ -212,7 +212,7 @@ class TestIndexingSlicingMLPatterns:
         expected = kernel(a)
 
         if NEURON_AVAILABLE:
-            out_baremetal = test_on_device(kernel, trace_mode, a)
+            out_baremetal = on_device_test(kernel, trace_mode, a)
             baremetal_assert_allclose(expected, out_baremetal)
         else:
             trace_and_compile(kernel, trace_mode, a)
@@ -227,7 +227,7 @@ class TestIndexingSlicingMLPatterns:
         expected = kernel(a)
 
         if NEURON_AVAILABLE:
-            out_baremetal = test_on_device(kernel, trace_mode, a)
+            out_baremetal = on_device_test(kernel, trace_mode, a)
             baremetal_assert_allclose(expected, out_baremetal)
         else:
             trace_and_compile(kernel, trace_mode, a)
@@ -243,7 +243,7 @@ class TestIndexingSlicingMLPatterns:
         expected = kernel(a)
 
         if NEURON_AVAILABLE:
-            out_baremetal = test_on_device(kernel, trace_mode, a)
+            out_baremetal = on_device_test(kernel, trace_mode, a)
             baremetal_assert_allclose(expected, out_baremetal)
         else:
             trace_and_compile(kernel, trace_mode, a)
@@ -258,7 +258,7 @@ class TestIndexingSlicingMLPatterns:
         expected = kernel(a)
 
         if NEURON_AVAILABLE:
-            out_baremetal = test_on_device(kernel, trace_mode, a)
+            out_baremetal = on_device_test(kernel, trace_mode, a)
             baremetal_assert_allclose(expected, out_baremetal)
         else:
             trace_and_compile(kernel, trace_mode, a)
@@ -273,7 +273,7 @@ class TestIndexingSlicingMLPatterns:
         expected = kernel(a)
 
         if NEURON_AVAILABLE:
-            out_baremetal = test_on_device(kernel, trace_mode, a)
+            out_baremetal = on_device_test(kernel, trace_mode, a)
             baremetal_assert_allclose(expected, out_baremetal)
         else:
             trace_and_compile(kernel, trace_mode, a)
@@ -289,7 +289,7 @@ class TestIndexingSlicingMLPatterns:
         expected = kernel(a)
 
         if NEURON_AVAILABLE:
-            out_baremetal = test_on_device(kernel, trace_mode, a)
+            out_baremetal = on_device_test(kernel, trace_mode, a)
             baremetal_assert_allclose(expected, out_baremetal)
         else:
             trace_and_compile(kernel, trace_mode, a)
@@ -311,7 +311,7 @@ class TestIndexingSlicingMLPatterns:
         expected_weight = weights[expected_idx]
 
         if NEURON_AVAILABLE:
-            baremetal_idx, baremetal_weight = test_on_device(
+            baremetal_idx, baremetal_weight = on_device_test(
                 kernel, trace_mode, top_k_indices, weights
             )
             baremetal_assert_allclose(expected_idx, baremetal_idx)
@@ -335,7 +335,7 @@ class TestIndexingSlicingMLPatterns:
         expected_weight = weights[expected_idx]
 
         if NEURON_AVAILABLE:
-            baremetal_idx, baremetal_weight = test_on_device(
+            baremetal_idx, baremetal_weight = on_device_test(
                 kernel, trace_mode, top_k_indices, weights
             )
             baremetal_assert_allclose(expected_idx, baremetal_idx)
@@ -372,7 +372,7 @@ class TestIndexingSlicingAdvanced:
             trace_and_compile(kernel, trace_mode, a)
 
             if NEURON_AVAILABLE:
-                out_baremetal = test_on_device(kernel, trace_mode, a)
+                out_baremetal = on_device_test(kernel, trace_mode, a)
                 baremetal_assert_allclose(expected, out_baremetal)
         except Exception as e:
             pytest.skip(f"Negative indexing not yet working: {e}")
@@ -389,7 +389,7 @@ class TestIndexingSlicingAdvanced:
             trace_and_compile(kernel, trace_mode, a)
 
             if NEURON_AVAILABLE:
-                out_baremetal = test_on_device(kernel, trace_mode, a)
+                out_baremetal = on_device_test(kernel, trace_mode, a)
                 baremetal_assert_allclose(expected, out_baremetal)
         except Exception as e:
             pytest.skip(f"Negative slice indexing not yet working: {e}")
@@ -425,7 +425,7 @@ class TestIndexingSlicingAdvanced:
             (NotImplementedError, AssertionError, TypeError, RuntimeError)
         ):
             if NEURON_AVAILABLE:
-                test_on_device(kernel, trace_mode, a)
+                on_device_test(kernel, trace_mode, a)
             else:
                 trace_and_compile(kernel, trace_mode, a)
 
@@ -439,7 +439,7 @@ class TestIndexingSlicingAdvanced:
         expected = kernel(a)
 
         if NEURON_AVAILABLE:
-            out_baremetal = test_on_device(kernel, trace_mode, a)
+            out_baremetal = on_device_test(kernel, trace_mode, a)
             baremetal_assert_allclose(expected, out_baremetal)
         else:
             trace_and_compile(kernel, trace_mode, a)
@@ -453,7 +453,7 @@ class TestIndexingSlicingAdvanced:
         expected = kernel(a)
 
         if NEURON_AVAILABLE:
-            out_baremetal = test_on_device(kernel, trace_mode, a)
+            out_baremetal = on_device_test(kernel, trace_mode, a)
             baremetal_assert_allclose(expected, out_baremetal)
         else:
             trace_and_compile(kernel, trace_mode, a)
@@ -467,7 +467,7 @@ class TestIndexingSlicingAdvanced:
         expected = kernel(a)
 
         if NEURON_AVAILABLE:
-            out_baremetal = test_on_device(kernel, trace_mode, a)
+            out_baremetal = on_device_test(kernel, trace_mode, a)
             baremetal_assert_allclose(expected, out_baremetal)
         else:
             trace_and_compile(kernel, trace_mode, a)
@@ -485,7 +485,7 @@ class TestIndexingSlicingAdvanced:
         expected = kernel(a, b)
 
         if NEURON_AVAILABLE:
-            out_baremetal = test_on_device(kernel, trace_mode, a, b)
+            out_baremetal = on_device_test(kernel, trace_mode, a, b)
             baremetal_assert_allclose(expected, out_baremetal)
         else:
             trace_and_compile(kernel, trace_mode, a, b)
@@ -518,7 +518,7 @@ class TestIndexingSlicingErrorHandling:
             (ValueError, AssertionError), match="Only one.*index.*supported"
         ):
             if NEURON_AVAILABLE:
-                test_on_device(kernel, trace_mode, a)
+                on_device_test(kernel, trace_mode, a)
             else:
                 trace_and_compile(kernel, trace_mode, a)
 
@@ -530,7 +530,7 @@ class TestIndexingSlicingErrorHandling:
 
         with pytest.raises((NotImplementedError, ValueError, TypeError)):
             if NEURON_AVAILABLE:
-                test_on_device(kernel, trace_mode, a)
+                on_device_test(kernel, trace_mode, a)
             else:
                 trace_and_compile(kernel, trace_mode, a)
 
@@ -545,7 +545,7 @@ class TestIndexingSlicingErrorHandling:
         if NEURON_AVAILABLE:
             # FIXME: Runtime may not report anything, but we should guard this
             try:
-                test_on_device(kernel, trace_mode, a)
+                on_device_test(kernel, trace_mode, a)
             except (IndexError, ValueError, RuntimeError):
                 pass
         else:
@@ -586,7 +586,7 @@ class TestIndexingSlicingIntegration:
         expected = kernel(embeddings, sequences)
 
         if NEURON_AVAILABLE:
-            out_baremetal = test_on_device(kernel, trace_mode, embeddings, sequences)
+            out_baremetal = on_device_test(kernel, trace_mode, embeddings, sequences)
             baremetal_assert_allclose(expected, out_baremetal)
         else:
             trace_and_compile(kernel, trace_mode, embeddings, sequences)
@@ -601,7 +601,7 @@ class TestIndexingSlicingIntegration:
         expected = kernel(attention)
 
         if NEURON_AVAILABLE:
-            out_baremetal = test_on_device(kernel, trace_mode, attention)
+            out_baremetal = on_device_test(kernel, trace_mode, attention)
             baremetal_assert_allclose(expected, out_baremetal)
         else:
             trace_and_compile(kernel, trace_mode, attention)
@@ -616,7 +616,7 @@ class TestIndexingSlicingIntegration:
         expected = kernel(sequences)
 
         if NEURON_AVAILABLE:
-            out_baremetal = test_on_device(kernel, trace_mode, sequences)
+            out_baremetal = on_device_test(kernel, trace_mode, sequences)
             baremetal_assert_allclose(expected, out_baremetal)
         else:
             trace_and_compile(kernel, trace_mode, sequences)
@@ -646,7 +646,7 @@ class TestIndexingSlicingRegression:
         expected = kernel(a)
 
         if NEURON_AVAILABLE:
-            out_baremetal = test_on_device(kernel, trace_mode, a)
+            out_baremetal = on_device_test(kernel, trace_mode, a)
             baremetal_assert_allclose(expected, out_baremetal)
         else:
             trace_and_compile(kernel, trace_mode, a)
