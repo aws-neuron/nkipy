@@ -113,11 +113,11 @@ If you prefer pip, see the [Installation Guide](./docs/installation.md) for deta
 
 ## Basic Usage
 
-NKIPy kernels look like NumPy functions and can run in three modes.
+NKIPy kernels look like NumPy functions and can run in two modes.
 
-### 1. Pure NumPy (CPU)
+### 1. CPU (Direct)
 
-Write and run kernels directly as NumPy code:
+Write and run kernels directly as NumPy code -- no decorator or special setup needed:
 
 ```python
 import numpy as np
@@ -127,31 +127,12 @@ def softmax_kernel(x):
     sum_x = np.sum(exp_x, axis=-1, keepdims=True)
     return exp_x / sum_x
 
-# Run on CPU with NumPy
+# Direct call runs on CPU via NumPy
 x = np.random.rand(2, 128).astype(np.float32)
 result = softmax_kernel(x)
 ```
 
-### 2. Simulation Mode
-
-Use the `@simulate_jit` decorator to trace and simulate execution:
-
-```python
-import numpy as np
-from nkipy.runtime import simulate_jit
-
-@simulate_jit
-def softmax_kernel(x):
-    exp_x = np.exp(x - np.max(x, axis=-1, keepdims=True))
-    sum_x = np.sum(exp_x, axis=-1, keepdims=True)
-    return exp_x / sum_x
-
-# Automatically traced and simulated
-x = np.random.rand(2, 128).astype(np.float32)
-result = softmax_kernel(x)
-```
-
-### 3. Trainium Hardware
+### 2. Trainium Hardware
 
 Use the `@baremetal_jit` decorator to compile and run on Trainium:
 
@@ -207,8 +188,8 @@ uv run make -C docs html
 - **`core/trace.py`** — Tracing engine that captures computation graphs.
 - **`core/compile.py`** — HLO lowering and compilation via neuronx-cc.
 - **`core/backend/hlo.py`** — HLO backend interface.
-- **`runtime/decorators.py`** — `@simulate_jit` and `@baremetal_jit` decorators.
-- **`runtime/execute.py`** — Execution backends (simulation and device).
+- **`runtime/decorators.py`** — `@baremetal_jit` decorator.
+- **`runtime/execute.py`** — Device execution backend.
 - **`runtime/baremetal_executor.py`** — Hardware execution via Spike.
 - **`distributed/`** — Multi-device collective operations.
 - **`third_party/`** — Generated protobuf files for XLA HLO representation. Built during `nkipy` package build via custom `setup.py` that compiles `.proto` files.

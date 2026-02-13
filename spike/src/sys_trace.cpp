@@ -13,8 +13,8 @@ SysTraceGuard::SysTraceGuard(std::optional<uint32_t> core_id)
   }
 
   if (core_id_.has_value()) {
-    nrt_sys_trace_config_set_capture_enabled_for_nc(config,
-                                                    core_id_.value(), true);
+    nrt_sys_trace_config_set_capture_enabled_for_nc(config, core_id_.value(),
+                                                    true);
   }
   // When core_id is not set the default config captures all cores.
 

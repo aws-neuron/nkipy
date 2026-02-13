@@ -7,10 +7,9 @@ import pytest
 from utils import (
     NEURON_AVAILABLE,
     baremetal_assert_allclose,
-    baremetal_run_kernel_unified,
-    sim_mode,  # noqa: F401 - pytest fixture
-    simulate_assert_allclose,
-    simulate_kernel_unified,
+    on_device_test,
+    trace_and_compile,
+    trace_mode,  # noqa: F401 - pytest fixture
 )
 
 
@@ -268,251 +267,229 @@ invalid_matmul_shapes = [
 ]
 
 
-def test_add_simple(sim_mode):
+def test_add_simple(trace_mode):
     shape = (256, 256)
     dtype = np.float32
 
-    np.random.seed(0)
     in0 = np.random.uniform(high=1.0, low=0.0, size=shape).astype(dtype)
     in1 = np.random.uniform(high=1.0, low=0.0, size=shape).astype(dtype)
 
-    # Test simulation - runs with both IR and HLO
-    out0 = simulate_kernel_unified(kernel_add, sim_mode, in0, in1)
-    out1 = kernel_add(in0, in1)
-    simulate_assert_allclose(out0, out1)
+    expected = kernel_add(in0, in1)
 
     if NEURON_AVAILABLE:
-        out_baremetal = baremetal_run_kernel_unified(kernel_add, sim_mode, in0, in1)
-        baremetal_assert_allclose(out1, out_baremetal)
+        out_device = on_device_test(kernel_add, trace_mode, in0, in1)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel_add, trace_mode, in0, in1)
 
 
 @pytest.mark.parametrize("kernel_fn,name,expects_error", binary_kernels)
 @pytest.mark.parametrize("dtype", [np.float32])
-def test_binary_ops(sim_mode, kernel_fn, name, expects_error, dtype):
+def test_binary_ops(trace_mode, kernel_fn, name, expects_error, dtype):
     shape = (256, 256)
-    np.random.seed(0)
+
     in0 = np.random.random_sample(shape).astype(dtype)
     in1 = np.random.random_sample(shape).astype(dtype)
 
     if expects_error:
         with pytest.raises(NotImplementedError):
-            simulate_kernel_unified(kernel_fn, sim_mode, in0, in1)
+            trace_and_compile(kernel_fn, trace_mode, in0, in1)
     else:
-        # Test simulation - runs with both IR and HLO
-        out0 = simulate_kernel_unified(kernel_fn, sim_mode, in0, in1)
-        out1 = kernel_fn(in0, in1)
-        simulate_assert_allclose(out0, out1)
+        expected = kernel_fn(in0, in1)
 
         if NEURON_AVAILABLE:
-            out_baremetal = baremetal_run_kernel_unified(kernel_fn, sim_mode, in0, in1)
-            baremetal_assert_allclose(out1, out_baremetal)
+            out_device = on_device_test(kernel_fn, trace_mode, in0, in1)
+            baremetal_assert_allclose(expected, out_device)
+        else:
+            trace_and_compile(kernel_fn, trace_mode, in0, in1)
 
 
 @pytest.mark.parametrize("kernel_fn,name,expects_error", unary_kernels)
 @pytest.mark.parametrize("dtype", [np.float32])
-def test_unary_ops(sim_mode, kernel_fn, name, expects_error, dtype):
+def test_unary_ops(trace_mode, kernel_fn, name, expects_error, dtype):
     shape = (256, 256)
-    np.random.seed(0)
+
     in0 = np.random.random_sample(shape).astype(dtype)
 
     if expects_error:
         with pytest.raises(NotImplementedError):
-            simulate_kernel_unified(kernel_fn, sim_mode, in0)
+            trace_and_compile(kernel_fn, trace_mode, in0)
     else:
-        # Test simulation - runs with both IR and HLO
-        out0 = simulate_kernel_unified(kernel_fn, sim_mode, in0)
-        out1 = kernel_fn(in0)
-        simulate_assert_allclose(out0, out1)
+        expected = kernel_fn(in0)
 
         if NEURON_AVAILABLE:
-            out_baremetal = baremetal_run_kernel_unified(kernel_fn, sim_mode, in0)
-            baremetal_assert_allclose(out1, out_baremetal)
+            out_device = on_device_test(kernel_fn, trace_mode, in0)
+            baremetal_assert_allclose(expected, out_device)
+        else:
+            trace_and_compile(kernel_fn, trace_mode, in0)
 
 
 @pytest.mark.parametrize("kernel_fn,name,expects_error", inplace_kernels)
 @pytest.mark.parametrize("dtype", [np.float32])
-def test_inplace_ops(sim_mode, kernel_fn, name, expects_error, dtype):
+def test_inplace_ops(trace_mode, kernel_fn, name, expects_error, dtype):
     shape = (256, 256)
-    np.random.seed(0)
+
     in0 = np.random.random_sample(shape).astype(dtype)
     in1 = np.random.random_sample(shape).astype(dtype)
 
     if expects_error:
         with pytest.raises(NotImplementedError):
-            simulate_kernel_unified(kernel_fn, sim_mode, in0.copy(), in1)
+            trace_and_compile(kernel_fn, trace_mode, in0.copy(), in1)
     else:
-        # Test simulation - runs with both IR and HLO
-        out0 = simulate_kernel_unified(kernel_fn, sim_mode, in0.copy(), in1)
-        out1 = kernel_fn(in0.copy(), in1)
-        simulate_assert_allclose(out0, out1)
+        expected = kernel_fn(in0.copy(), in1)
 
         if NEURON_AVAILABLE:
-            out_baremetal = baremetal_run_kernel_unified(
-                kernel_fn, sim_mode, in0.copy(), in1
-            )
-            baremetal_assert_allclose(out1, out_baremetal)
+            out_device = on_device_test(kernel_fn, trace_mode, in0.copy(), in1)
+            baremetal_assert_allclose(expected, out_device)
+        else:
+            trace_and_compile(kernel_fn, trace_mode, in0.copy(), in1)
 
 
 @pytest.mark.parametrize("shape_a,shape_b", shapes)
 @pytest.mark.parametrize("kernel_fn,name,expects_error", binary_kernels)
-def test_broadcasting(sim_mode, shape_a, shape_b, kernel_fn, name, expects_error):
-    np.random.seed(0)
+def test_broadcasting(trace_mode, shape_a, shape_b, kernel_fn, name, expects_error):
     in0 = np.random.random_sample(shape_a).astype(np.float32)
     in1 = np.random.random_sample(shape_b).astype(np.float32)
 
     if expects_error:
         with pytest.raises(NotImplementedError):
-            simulate_kernel_unified(kernel_fn, sim_mode, in0, in1)
+            trace_and_compile(kernel_fn, trace_mode, in0, in1)
     else:
-        # Test simulation - runs with both IR and HLO
-        out0 = simulate_kernel_unified(kernel_fn, sim_mode, in0, in1)
-        out1 = kernel_fn(in0, in1)
-        simulate_assert_allclose(out0, out1)
+        expected = kernel_fn(in0, in1)
 
         if NEURON_AVAILABLE:
-            out_baremetal = baremetal_run_kernel_unified(kernel_fn, sim_mode, in0, in1)
-            baremetal_assert_allclose(out1, out_baremetal)
+            out_device = on_device_test(kernel_fn, trace_mode, in0, in1)
+            baremetal_assert_allclose(expected, out_device)
+        else:
+            trace_and_compile(kernel_fn, trace_mode, in0, in1)
 
 
 @pytest.mark.parametrize("shape_a,shape_b", matmul_shapes)
-def test_matmul_shapes(sim_mode, shape_a, shape_b):
+def test_matmul_shapes(trace_mode, shape_a, shape_b):
     dtype = np.float32
-    np.random.seed(0)
+
     in0 = np.random.random_sample(shape_a).astype(dtype)
     in1 = np.random.random_sample(shape_b).astype(dtype)
 
-    # Test simulation - runs with both IR and HLO
-    out0 = simulate_kernel_unified(kernel_matmul, sim_mode, in0, in1)
-    out1 = kernel_matmul(in0, in1)
-    simulate_assert_allclose(out0, out1)
+    expected = kernel_matmul(in0, in1)
 
     if NEURON_AVAILABLE:
-        out_baremetal = baremetal_run_kernel_unified(kernel_matmul, sim_mode, in0, in1)
-        baremetal_assert_allclose(out1, out_baremetal)
+        out_device = on_device_test(kernel_matmul, trace_mode, in0, in1)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel_matmul, trace_mode, in0, in1)
 
 
 @pytest.mark.parametrize("shape_a,shape_b", matmul_broadcast_shapes)
 @pytest.mark.parametrize("kernel_fn,name,expects_error", matmul_kernels)
 def test_matmul_broadcasting(
-    sim_mode, shape_a, shape_b, kernel_fn, name, expects_error
+    trace_mode, shape_a, shape_b, kernel_fn, name, expects_error
 ):
-    np.random.seed(0)
     in0 = np.random.random_sample(shape_a).astype(np.float32)
     in1 = np.random.random_sample(shape_b).astype(np.float32)
 
     if expects_error:
         with pytest.raises(NotImplementedError):
-            simulate_kernel_unified(kernel_fn, sim_mode, in0, in1)
+            trace_and_compile(kernel_fn, trace_mode, in0, in1)
     else:
-        # Test simulation - runs with both IR and HLO
-        out0 = simulate_kernel_unified(kernel_fn, sim_mode, in0, in1)
-        out1 = kernel_fn(in0, in1)
-        simulate_assert_allclose(out0, out1)
+        expected = kernel_fn(in0, in1)
 
         if NEURON_AVAILABLE:
-            out_baremetal = baremetal_run_kernel_unified(kernel_fn, sim_mode, in0, in1)
-            baremetal_assert_allclose(out1, out_baremetal)
+            out_device = on_device_test(kernel_fn, trace_mode, in0, in1)
+            baremetal_assert_allclose(expected, out_device)
+        else:
+            trace_and_compile(kernel_fn, trace_mode, in0, in1)
 
 
 @pytest.mark.parametrize("shape_a,shape_b", invalid_matmul_shapes)
 @pytest.mark.parametrize("kernel_fn,name,expects_error", matmul_kernels)
 def test_invalid_matmul_shapes(
-    sim_mode, shape_a, shape_b, kernel_fn, name, expects_error
+    trace_mode, shape_a, shape_b, kernel_fn, name, expects_error
 ):
-    np.random.seed(0)
     in0 = np.random.random_sample(shape_a).astype(np.float32)
     in1 = np.random.random_sample(shape_b).astype(np.float32)
 
     with pytest.raises(AssertionError):
-        simulate_kernel_unified(kernel_fn, sim_mode, in0, in1)
+        trace_and_compile(kernel_fn, trace_mode, in0, in1)
 
 
 @pytest.mark.parametrize("kernel_fn,name,expects_error", reshape_kernels)
-def test_reshape(sim_mode, kernel_fn, name, expects_error):
+def test_reshape(trace_mode, kernel_fn, name, expects_error):
     shape = (256, 256)  # Starting shape with 65536 elements
-    np.random.seed(0)
+
     in0 = np.random.random_sample(shape).astype(np.float32)
 
     if expects_error:
         with pytest.raises(NotImplementedError):
-            simulate_kernel_unified(kernel_fn, sim_mode, in0)
+            trace_and_compile(kernel_fn, trace_mode, in0)
     else:
-        # Test simulation - runs with both IR and HLO
-        out0 = simulate_kernel_unified(kernel_fn, sim_mode, in0)
-        out1 = kernel_fn(in0)
-        assert out0.shape == out1.shape
-        simulate_assert_allclose(out0, out1)
+        expected = kernel_fn(in0)
 
         if NEURON_AVAILABLE:
-            out_baremetal = baremetal_run_kernel_unified(kernel_fn, sim_mode, in0)
-            baremetal_assert_allclose(out1, out_baremetal)
+            out_device = on_device_test(kernel_fn, trace_mode, in0)
+            baremetal_assert_allclose(expected, out_device)
+        else:
+            trace_and_compile(kernel_fn, trace_mode, in0)
 
 
-def test_reshape_invalid(sim_mode):
+def test_reshape_invalid(trace_mode):
     # Test invalid reshape (incompatible dimensions)
     shape = (256, 256)
-    np.random.seed(0)
+
     in0 = np.random.random_sample(shape).astype(np.float32)
 
     def invalid_reshape(a):
         return a.reshape(100, 100)  # 10000 elements != 65536 elements
 
     with pytest.raises(ValueError):
-        simulate_kernel_unified(invalid_reshape, sim_mode, in0)
+        trace_and_compile(invalid_reshape, trace_mode, in0)
 
 
 @pytest.mark.parametrize("shape", reshape_shapes)
-def test_reshape_variants(sim_mode, shape):
+def test_reshape_variants(trace_mode, shape):
     # Test different starting shapes but same final shape
-    np.random.seed(0)
+
     in0 = np.random.random_sample(shape).astype(np.float32)
 
     def reshape_to_standard(a):
         return a.reshape(32, 32, 64)
 
-    # Test simulation - runs with both IR and HLO
-    out0 = simulate_kernel_unified(reshape_to_standard, sim_mode, in0)
-    out1 = reshape_to_standard(in0)
-
-    assert out0.shape == out1.shape
-    simulate_assert_allclose(out0, out1)
+    expected = reshape_to_standard(in0)
 
     if NEURON_AVAILABLE:
-        out_baremetal = baremetal_run_kernel_unified(reshape_to_standard, sim_mode, in0)
-        baremetal_assert_allclose(out1, out_baremetal)
+        out_device = on_device_test(reshape_to_standard, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(reshape_to_standard, trace_mode, in0)
 
 
 @pytest.mark.parametrize("kernel_fn,name,expects_error", transpose_kernels)
 @pytest.mark.parametrize("shape", transpose_shapes)
-def test_transpose(sim_mode, kernel_fn, name, expects_error, shape):
-    np.random.seed(0)
+def test_transpose(trace_mode, kernel_fn, name, expects_error, shape):
     in0 = np.random.random_sample(shape).astype(np.float32)
 
     if expects_error:
         with pytest.raises(NotImplementedError):
-            simulate_kernel_unified(kernel_fn, sim_mode, in0)
+            trace_and_compile(kernel_fn, trace_mode, in0)
     else:
         # For 3D tensors with specific permutation kernels, need to adapt
         if len(shape) > 2 and name in ["transpose_tuple", "transpose_args"]:
             # Skip this combination as the kernels are designed for 2D
             return
 
-        # Test simulation - runs with both IR and HLO
-        out0 = simulate_kernel_unified(kernel_fn, sim_mode, in0)
-        out1 = kernel_fn(in0)
-
-        assert out0.shape == out1.shape
-        simulate_assert_allclose(out0, out1)
+        expected = kernel_fn(in0)
 
         if NEURON_AVAILABLE:
-            out_baremetal = baremetal_run_kernel_unified(kernel_fn, sim_mode, in0)
-            baremetal_assert_allclose(out1, out_baremetal)
+            out_device = on_device_test(kernel_fn, trace_mode, in0)
+            baremetal_assert_allclose(expected, out_device)
+        else:
+            trace_and_compile(kernel_fn, trace_mode, in0)
 
 
-def test_transpose_3d(sim_mode):
+def test_transpose_3d(trace_mode):
     # Specific test for 3D transpose with explicit permutation
     shape = (2, 3, 4)
-    np.random.seed(0)
+
     in0 = np.random.random_sample(shape).astype(np.float32)
 
     def transpose_3d_tuple(a):
@@ -521,73 +498,55 @@ def test_transpose_3d(sim_mode):
     def transpose_3d_args(a):
         return a.transpose(2, 0, 1)
 
-    # Test tuple version - simulation (runs with both IR and HLO)
-    out0 = simulate_kernel_unified(transpose_3d_tuple, sim_mode, in0)
-    out1 = transpose_3d_tuple(in0)
-
-    assert out0.shape == out1.shape
-    simulate_assert_allclose(out0, out1)
-
-    # Test args version - simulation (runs with both IR and HLO)
-    out0 = simulate_kernel_unified(transpose_3d_args, sim_mode, in0)
-    out1 = transpose_3d_args(in0)
-
-    assert out0.shape == out1.shape
-    simulate_assert_allclose(out0, out1)
-
     if NEURON_AVAILABLE:
         # Test tuple version
-        out_baremetal = baremetal_run_kernel_unified(transpose_3d_tuple, sim_mode, in0)
-        baremetal_assert_allclose(transpose_3d_tuple(in0), out_baremetal)
+        out_device = on_device_test(transpose_3d_tuple, trace_mode, in0)
+        baremetal_assert_allclose(transpose_3d_tuple(in0), out_device)
 
         # Test args version
-        out_baremetal = baremetal_run_kernel_unified(transpose_3d_args, sim_mode, in0)
-        baremetal_assert_allclose(transpose_3d_args(in0), out_baremetal)
+        out_device = on_device_test(transpose_3d_args, trace_mode, in0)
+        baremetal_assert_allclose(transpose_3d_args(in0), out_device)
+    else:
+        trace_and_compile(transpose_3d_tuple, trace_mode, in0)
+        trace_and_compile(transpose_3d_args, trace_mode, in0)
 
 
 @pytest.mark.parametrize("kernel_fn,name,expects_error", astype_kernels)
 @pytest.mark.parametrize("source_type", astype_types)
-def test_astype(sim_mode, kernel_fn, name, expects_error, source_type):
+def test_astype(trace_mode, kernel_fn, name, expects_error, source_type):
     shape = (256, 256)
-    np.random.seed(0)
+
     in0 = np.random.random_sample(shape).astype(source_type)
 
     if expects_error:
         with pytest.raises(NotImplementedError):
-            simulate_kernel_unified(kernel_fn, sim_mode, in0)
+            trace_and_compile(kernel_fn, trace_mode, in0)
     else:
-        # Test simulation - runs with both IR and HLO
-        out0 = simulate_kernel_unified(kernel_fn, sim_mode, in0)
-        out1 = kernel_fn(in0)
-
-        assert out0.dtype == out1.dtype
-        simulate_assert_allclose(out0, out1)
+        expected = kernel_fn(in0)
 
         if NEURON_AVAILABLE:
-            out_baremetal = baremetal_run_kernel_unified(kernel_fn, sim_mode, in0)
-            baremetal_assert_allclose(out1, out_baremetal)
+            out_device = on_device_test(kernel_fn, trace_mode, in0)
+            baremetal_assert_allclose(expected, out_device)
+        else:
+            trace_and_compile(kernel_fn, trace_mode, in0)
 
 
-def test_combined_operations(sim_mode):
+def test_combined_operations(trace_mode):
     # Test chaining operations: reshape -> transpose -> astype
     shape = (256, 256)
-    np.random.seed(0)
+
     in0 = np.random.random_sample(shape).astype(np.float32)
 
     def combined_ops(a):
         return a.reshape(64, 1024).transpose().astype(np.float16)
 
-    # Test simulation - runs with both IR and HLO
-    out0 = simulate_kernel_unified(combined_ops, sim_mode, in0)
-    out1 = combined_ops(in0)
-
-    assert out0.shape == out1.shape
-    assert out0.dtype == out1.dtype
-    simulate_assert_allclose(out0, out1, rtol=1e-2)  # Lower precision for float16
+    expected = combined_ops(in0)
 
     if NEURON_AVAILABLE:
-        out_baremetal = baremetal_run_kernel_unified(combined_ops, sim_mode, in0)
-        baremetal_assert_allclose(out1, out_baremetal)
+        out_device = on_device_test(combined_ops, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(combined_ops, trace_mode, in0)
 
 
 if __name__ == "__main__":

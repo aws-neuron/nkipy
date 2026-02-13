@@ -14,9 +14,9 @@ from nkipy.core.trace import NKIPyKernel
 from utils import (
     NEURON_AVAILABLE,
     baremetal_assert_allclose,
-    sim_mode,  # noqa: F401 - pytest fixture
-    simulate_assert_allclose,
-    simulate_kernel_unified,
+    cpu_assert_allclose,
+    trace_and_compile,
+    trace_mode,  # noqa: F401 - pytest fixture
 )
 
 
@@ -35,35 +35,32 @@ def nkipy_kernel_multi_alias(
     return a_input, c_input
 
 
-def test_single_alias(sim_mode):
-    """Test single alias pair in simulation and hardware"""
-    np.random.seed(42)
+def test_single_alias(trace_mode):
+    """Test single alias pair on CPU and hardware"""
     A = ((np.random.rand(128, 512) - 0.5) * 2).astype(np.float16)
     B = ((np.random.rand(128, 512) - 0.5) * 2).astype(np.float16)
 
-    # Compute expected result
     expected = A.copy()
     expected[0, :] = B[1, :]
 
-    # Test simulation
-    result = simulate_kernel_unified(nkipy_kernel_single_alias, sim_mode, A.copy(), B)
-    simulate_assert_allclose(result, expected)
+    result = nkipy_kernel_single_alias(A.copy(), B)
+    cpu_assert_allclose(result, expected)
 
     # Test hardware if available
     if NEURON_AVAILABLE:
         from nkipy.runtime import DeviceKernel, DeviceTensor
 
         # Compile kernel with appropriate backend
-        if sim_mode == "hlo":
+        if trace_mode == "hlo":
             traced_kernel = NKIPyKernel.trace(nkipy_kernel_single_alias, backend="hlo")
         else:
-            raise ValueError(f"Invalid sim_mode: {sim_mode}")
+            raise ValueError(f"Invalid trace_mode: {trace_mode}")
 
         kernel = DeviceKernel.compile_and_load(
             traced_kernel,
             A,
             B,
-            name=f"test_single_alias_{sim_mode}",
+            name=f"test_single_alias_{trace_mode}",
             use_cached_if_exists=False,
         )
 
@@ -78,11 +75,13 @@ def test_single_alias(sim_mode):
         )
 
         baremetal_assert_allclose(output.numpy(), expected)
+    else:
+        trace_and_compile(nkipy_kernel_single_alias, trace_mode, A.copy(), B)
 
 
-def test_multi_alias(sim_mode):
-    """Test multiple alias pairs in simulation and hardware"""
-    np.random.seed(43)
+def test_multi_alias(trace_mode):
+    """Test multiple alias pairs on CPU and hardware"""
+
     A = ((np.random.rand(128, 512) - 0.5) * 2).astype(np.float16)
     B = ((np.random.rand(128, 512) - 0.5) * 2).astype(np.float16)
     C = ((np.random.rand(128, 512) - 0.5) * 2).astype(np.float16)
@@ -93,29 +92,26 @@ def test_multi_alias(sim_mode):
     expected_C = C.copy()
     expected_C[2:3, :] = B[2:3, :]
 
-    # Test simulation
-    result_A, result_C = simulate_kernel_unified(
-        nkipy_kernel_multi_alias, sim_mode, A.copy(), B, C.copy()
-    )
-    simulate_assert_allclose(result_A, expected_A)
-    simulate_assert_allclose(result_C, expected_C)
+    result_A, result_C = nkipy_kernel_multi_alias(A.copy(), B, C.copy())
+    cpu_assert_allclose(result_A, expected_A)
+    cpu_assert_allclose(result_C, expected_C)
 
     # Test hardware if available
     if NEURON_AVAILABLE:
         from nkipy.runtime import DeviceKernel, DeviceTensor
 
         # Compile kernel with appropriate backend
-        if sim_mode == "hlo":
+        if trace_mode == "hlo":
             traced_kernel = NKIPyKernel.trace(nkipy_kernel_multi_alias, backend="hlo")
         else:
-            raise ValueError(f"Invalid sim_mode: {sim_mode}")
+            raise ValueError(f"Invalid trace_mode: {trace_mode}")
 
         kernel = DeviceKernel.compile_and_load(
             traced_kernel,
             A,
             B,
             C,
-            name=f"test_multi_alias_{sim_mode}",
+            name=f"test_multi_alias_{trace_mode}",
             use_cached_if_exists=False,
         )
 
@@ -136,6 +132,8 @@ def test_multi_alias(sim_mode):
 
         baremetal_assert_allclose(output0.numpy(), expected_A)
         baremetal_assert_allclose(output1.numpy(), expected_C)
+    else:
+        trace_and_compile(nkipy_kernel_multi_alias, trace_mode, A.copy(), B, C.copy())
 
 
 if __name__ == "__main__":

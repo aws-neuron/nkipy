@@ -166,11 +166,12 @@ def _conv2d_cpu(
     # Check for unsupported features
     if dilation != (1, 1):
         raise NotImplementedError(
-            f"conv2d simulation does not support dilation != 1, got dilation={dilation}"
+            f"conv2d CPU backend does not support dilation != 1, "
+            f"got dilation={dilation}"
         )
     if groups != 1:
         raise NotImplementedError(
-            f"conv2d simulation does not support groups != 1, got groups={groups}"
+            f"conv2d CPU backend does not support groups != 1, got groups={groups}"
         )
 
     stride_h, stride_w = stride
@@ -352,11 +353,12 @@ def _conv3d_cpu(
     # Check for unsupported features
     if dilation != (1, 1, 1):
         raise NotImplementedError(
-            f"conv3d simulation does not support dilation != 1, got dilation={dilation}"
+            f"conv3d CPU backend does not support dilation != 1, "
+            f"got dilation={dilation}"
         )
     if groups != 1:
         raise NotImplementedError(
-            f"conv3d simulation does not support groups != 1, got groups={groups}"
+            f"conv3d CPU backend does not support groups != 1, got groups={groups}"
         )
 
     stride_d, stride_h, stride_w = stride

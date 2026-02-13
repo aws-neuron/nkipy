@@ -8,8 +8,6 @@ import shutil
 import numpy as np
 
 from nkipy.core import compile
-from nkipy.core.ops._registry import set_backend
-from nkipy.core.trace import NKIPyKernel
 
 try:
     from nkipy.runtime.device_kernel import DeviceKernel
@@ -18,40 +16,6 @@ try:
     _RUNTIME_AVAILABLE = True
 except ImportError:
     _RUNTIME_AVAILABLE = False
-
-
-def cpu_simulate_traced_kernel(traced_kernel, *args, **kwargs):
-    """
-    CPU-based simulation using pure NumPy operations.
-
-    This simulation mode executes the kernel function directly with NumPy arrays,
-    using the CPU backend implementations of all operations.
-
-    Limitations (TODO):
-        - Mutable tensor semantics not supported (outputs are not written back)
-        - NKI kernels are not supported (only NKIPy kernels with HLO backend)
-    """
-    if not isinstance(traced_kernel, NKIPyKernel):
-        raise TypeError(
-            f"Expected NKIPyKernel for simulation, got {type(traced_kernel)}"
-        )
-
-    set_backend("cpu")
-    try:
-        result = traced_kernel.func(*args, **kwargs)
-        return result
-    finally:
-        set_backend(None)
-
-
-def simulate_traced_kernel(traced_kernel, *args, **kwargs):
-    # Step 1: make sure HLO can be generated
-    # Trace the kernel with the provided arguments
-    traced_kernel.specialize(*args, **kwargs)
-
-    # Step 2: simulate the HLO
-    # TODO: the HLO simulation is path now disabled, we use CPU simulation for now
-    return cpu_simulate_traced_kernel(traced_kernel, *args, **kwargs)
 
 
 def baremetal_run_traced_kernel(

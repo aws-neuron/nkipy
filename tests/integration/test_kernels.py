@@ -11,10 +11,9 @@ from nkipy.core.specs import KernelSpec, ScalarInputSpec, TensorInputSpec
 from utils import (
     NEURON_AVAILABLE,
     baremetal_assert_allclose,
-    baremetal_run_kernel_unified,
-    sim_mode,  # noqa: F401 - pytest fixture
-    simulate_assert_allclose,
-    simulate_kernel_unified,
+    on_device_test,
+    trace_and_compile,
+    trace_mode,  # noqa: F401 - pytest fixture
 )
 
 
@@ -55,7 +54,7 @@ SPECS_BY_FILE = collect_kernel_specs()
 
 
 @pytest.mark.parametrize("file_name,kernel_spec", SPECS_BY_FILE.items())
-def test_simulate_kernel_default(sim_mode, file_name, kernel_spec):
+def test_kernel_default(trace_mode, file_name, kernel_spec):
     """Test kernel with default shapes and types from spec"""
 
     if not kernel_spec.is_pure_numpy:
@@ -81,29 +80,18 @@ def test_simulate_kernel_default(sim_mode, file_name, kernel_spec):
         else:
             raise ValueError("Unknown input spec type")
 
-    numpy_func = kernel_spec.function
-    expected = numpy_func(*inputs)
+    expected = kernel_spec.function(*inputs)
 
-    # Test simulation with unified IR/HLO
-    result = simulate_kernel_unified(kernel_spec.function, sim_mode, *inputs)
-
-    if isinstance(result, tuple):
-        for r, e in zip(result, expected):
-            simulate_assert_allclose(r, e)
-    else:
-        simulate_assert_allclose(result, expected)
-
-    # Test hardware if available
     if NEURON_AVAILABLE:
-        hardware_result = baremetal_run_kernel_unified(
-            kernel_spec.function, sim_mode, *inputs
-        )
+        hardware_result = on_device_test(kernel_spec.function, trace_mode, *inputs)
 
         if isinstance(hardware_result, tuple):
             for r, e in zip(hardware_result, expected):
                 baremetal_assert_allclose(r, e)
         else:
             baremetal_assert_allclose(hardware_result, expected)
+    else:
+        trace_and_compile(kernel_spec.function, trace_mode, *inputs)
 
 
 if __name__ == "__main__":

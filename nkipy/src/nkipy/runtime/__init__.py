@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-from .decorators import baremetal_jit, simulate_jit
-from .execute import baremetal_run_traced_kernel, simulate_traced_kernel
+from .decorators import baremetal_jit
+from .execute import baremetal_run_traced_kernel
 from .utils import is_neuron_compatible
 
 try:
@@ -20,6 +20,4 @@ __all__ = [
     "baremetal_jit",
     "baremetal_run_traced_kernel",
     "is_neuron_compatible",
-    "simulate_jit",
-    "simulate_traced_kernel",
 ]

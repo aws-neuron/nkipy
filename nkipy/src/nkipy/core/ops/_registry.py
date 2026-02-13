@@ -8,8 +8,8 @@ This module provides:
 - Operation dispatcher (Op class)
 
 Backends:
+- 'cpu': CPU eager execution backend (default, no context required)
 - 'hlo': HLO tracing backend (requires HLOTraceContext)
-- 'cpu': CPU eager execution backend (no context required)
 - Future: 'mlir', etc.
 """
 
@@ -55,16 +55,14 @@ def set_backend(
 def get_backend() -> str:
     """Get the current backend name.
 
+    Returns 'cpu' by default when no backend has been explicitly set.
+    During tracing, the backend is set to 'hlo' by the tracing infrastructure.
+
     Returns:
         Current backend name.
-
-    Raises:
-        RuntimeError: If no backend is set.
     """
     if _current_backend is None:
-        raise RuntimeError(
-            "No backend set. Operations must be called within a traced kernel."
-        )
+        return "cpu"
     return _current_backend
 
 

@@ -10,8 +10,8 @@ from nkipy.core.trace import NKIPyKernel
 from utils import (
     NEURON_AVAILABLE,
     baremetal_assert_allclose,
-    baremetal_run_kernel_unified,
-    sim_mode,  # noqa: F401 - pytest fixture
+    on_device_test,
+    trace_mode,  # noqa: F401 - pytest fixture
 )
 
 # Import legacy frontend for existing tests
@@ -39,7 +39,7 @@ if BETA2_NKI_AVAILABLE:
         (-1.0, True),
     ],
 )
-def test_nki_with_grid(sim_mode, bias, add_bias):
+def test_nki_with_grid(trace_mode, bias, add_bias):
     """Test the NKI kernel workflow with parameterized bias and add_bias values (legacy frontend)"""
 
     # Simple matrix add kernel for testing, now with a launch grid and some flags
@@ -83,14 +83,14 @@ def test_nki_with_grid(sim_mode, bias, add_bias):
 
     # Test hardware - only if available
     if NEURON_AVAILABLE:
-        out_baremetal = baremetal_run_kernel_unified(test_func, sim_mode, a, b, d)
+        out_baremetal = on_device_test(test_func, trace_mode, a, b, d)
         baremetal_assert_allclose(ref, out_baremetal)
 
 
 @pytest.mark.skipif(
     not LEGACY_NKI_AVAILABLE, reason="Legacy NKI frontend (neuronxcc.nki) not available"
 )
-def test_nki_simple(sim_mode):
+def test_nki_simple(trace_mode):
     """Test the simple NKI kernel workflow (legacy frontend)"""
 
     # Simple matrix add kernel for testing, fixed shape 128*512
@@ -124,7 +124,7 @@ def test_nki_simple(sim_mode):
 
     # Test hardware - only if available
     if NEURON_AVAILABLE:
-        out_baremetal = baremetal_run_kernel_unified(test_func, sim_mode, a, b, d)
+        out_baremetal = on_device_test(test_func, trace_mode, a, b, d)
         baremetal_assert_allclose(ref, out_baremetal)
 
 
@@ -133,7 +133,7 @@ def test_nki_simple(sim_mode):
 )
 @pytest.mark.skipif(
     not NEURON_AVAILABLE,
-    reason="Hardware required - Beta 2 frontend does not support simulation",
+    reason="Hardware required - Beta 2 frontend does not support CPU execution",
 )
 def test_nki_simple_beta_2():
     """Test the simple NKI kernel workflow with Beta 2 frontend (hardware only)"""
@@ -191,8 +191,8 @@ def test_nki_simple_beta_2():
         c = nki_op(a, b)
         return np.add(c, d)
 
-    # Test hardware only (Beta 2 frontend does not support simulation)
-    out_baremetal = baremetal_run_kernel_unified(test_func, "hlo", a, b, d)
+    # Test hardware only (Beta 2 frontend does not support CPU execution)
+    out_baremetal = on_device_test(test_func, "hlo", a, b, d)
     baremetal_assert_allclose(ref, out_baremetal)
 
 
@@ -241,7 +241,7 @@ def test_nki_direct_jit_beta2_called_twice_different_shapes():
 @pytest.mark.skipif(
     not LEGACY_NKI_AVAILABLE, reason="Legacy NKI frontend (neuronxcc.nki) not available"
 )
-def test_nki_direct_jit(sim_mode):
+def test_nki_direct_jit(trace_mode):
     """Test using @nki.jit decorated kernel directly in NKIPy (no wrap_nki_kernel needed) - legacy frontend"""
 
     # Simple matrix add kernel with @nki.jit decorator
@@ -271,14 +271,14 @@ def test_nki_direct_jit(sim_mode):
 
     # Test hardware - only if available
     if NEURON_AVAILABLE:
-        out_baremetal = baremetal_run_kernel_unified(test_func, sim_mode, a, b, d)
+        out_baremetal = on_device_test(test_func, trace_mode, a, b, d)
         baremetal_assert_allclose(ref, out_baremetal)
 
 
 @pytest.mark.skipif(
     not LEGACY_NKI_AVAILABLE, reason="Legacy NKI frontend (neuronxcc.nki) not available"
 )
-def test_nki_direct_jit_with_grid(sim_mode):
+def test_nki_direct_jit_with_grid(trace_mode):
     """Test using @nki.jit decorated kernel with grid syntax: kernel[grid](args) - legacy frontend"""
 
     @nki_legacy.jit
@@ -309,14 +309,14 @@ def test_nki_direct_jit_with_grid(sim_mode):
 
     # Test hardware - only if available
     if NEURON_AVAILABLE:
-        out_baremetal = baremetal_run_kernel_unified(test_func, sim_mode, a, b, d)
+        out_baremetal = on_device_test(test_func, trace_mode, a, b, d)
         baremetal_assert_allclose(ref, out_baremetal)
 
 
 @pytest.mark.skipif(
     not LEGACY_NKI_AVAILABLE, reason="Legacy NKI frontend (neuronxcc.nki) not available"
 )
-def test_nki_mutable_tensor(sim_mode):
+def test_nki_mutable_tensor(trace_mode):
     """Test the simple NKI kernel workflow with mutable tensor (legacy frontend)"""
 
     # Simple matrix add kernel for testing, fixed shape 128*512
@@ -348,7 +348,7 @@ def test_nki_mutable_tensor(sim_mode):
     if NEURON_AVAILABLE:
         from nkipy.runtime import DeviceKernel, DeviceTensor
 
-        test_func = NKIPyKernel.trace(test_func, backend=sim_mode)
+        test_func = NKIPyKernel.trace(test_func, backend=trace_mode)
 
         device_kernel = DeviceKernel.compile_and_load(
             test_func, a, b, use_cached_if_exists=False

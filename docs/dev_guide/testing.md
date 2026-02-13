@@ -44,7 +44,7 @@ Unit tests for Spike verify the runtime APIs work correctly. Spike is a separate
 
 ### Integration Tests
 
-Integration tests run through the full pipeline: tracing → HLO lowering → compilation → execution (simulation or device).
+Integration tests run through the full pipeline: tracing → HLO lowering → compilation → execution (CPU or device).
 
 These tests verify that NKIPy kernels produce the same results as running the equivalent NumPy code on CPU.
 
