@@ -10,7 +10,7 @@ from nkipy.core.trace import NKIPyKernel
 from utils import (
     NEURON_AVAILABLE,
     baremetal_assert_allclose,
-    baremetal_run_kernel_unified,
+    test_on_device,
     trace_mode,  # noqa: F401 - pytest fixture
 )
 
@@ -83,7 +83,7 @@ def test_nki_with_grid(trace_mode, bias, add_bias):
 
     # Test hardware - only if available
     if NEURON_AVAILABLE:
-        out_baremetal = baremetal_run_kernel_unified(test_func, trace_mode, a, b, d)
+        out_baremetal = test_on_device(test_func, trace_mode, a, b, d)
         baremetal_assert_allclose(ref, out_baremetal)
 
 
@@ -124,7 +124,7 @@ def test_nki_simple(trace_mode):
 
     # Test hardware - only if available
     if NEURON_AVAILABLE:
-        out_baremetal = baremetal_run_kernel_unified(test_func, trace_mode, a, b, d)
+        out_baremetal = test_on_device(test_func, trace_mode, a, b, d)
         baremetal_assert_allclose(ref, out_baremetal)
 
 
@@ -192,7 +192,7 @@ def test_nki_simple_beta_2():
         return np.add(c, d)
 
     # Test hardware only (Beta 2 frontend does not support CPU execution)
-    out_baremetal = baremetal_run_kernel_unified(test_func, "hlo", a, b, d)
+    out_baremetal = test_on_device(test_func, "hlo", a, b, d)
     baremetal_assert_allclose(ref, out_baremetal)
 
 
@@ -271,7 +271,7 @@ def test_nki_direct_jit(trace_mode):
 
     # Test hardware - only if available
     if NEURON_AVAILABLE:
-        out_baremetal = baremetal_run_kernel_unified(test_func, trace_mode, a, b, d)
+        out_baremetal = test_on_device(test_func, trace_mode, a, b, d)
         baremetal_assert_allclose(ref, out_baremetal)
 
 
@@ -309,7 +309,7 @@ def test_nki_direct_jit_with_grid(trace_mode):
 
     # Test hardware - only if available
     if NEURON_AVAILABLE:
-        out_baremetal = baremetal_run_kernel_unified(test_func, trace_mode, a, b, d)
+        out_baremetal = test_on_device(test_func, trace_mode, a, b, d)
         baremetal_assert_allclose(ref, out_baremetal)
 
 

@@ -6,7 +6,7 @@ import nkipy.distributed.collectives as cc
 import numpy as np
 import pytest
 from utils import (
-    trace_and_run,
+    trace_and_compile,
     trace_mode,  # noqa: F401 - pytest fixture
 )
 
@@ -22,8 +22,10 @@ def test_all_reduce(trace_mode):
     # Create test input
     input_data = np.random.rand(128, 256).astype(np.float32)
 
+    trace_and_compile(kernel, trace_mode, input_data)
+
     # CPU execution (assumes all ranks have the same data)
-    output = trace_and_run(kernel, trace_mode, input_data)
+    output = kernel(input_data)
 
     # With 2 devices and same input, output should be 2x input (sum of 2 copies)
     expected = input_data * 2
@@ -44,8 +46,10 @@ def test_all_gather(trace_mode):
     # Create test input
     input_data = np.random.rand(128, 256).astype(np.float32)
 
+    trace_and_compile(kernel, trace_mode, input_data)
+
     # CPU execution (assumes all ranks have the same data)
-    output = trace_and_run(kernel, trace_mode, input_data)
+    output = kernel(input_data)
 
     # With 2 devices, output should be concatenated along dim 0: shape (256, 256)
     expected = np.concatenate([input_data, input_data], axis=0)
@@ -69,8 +73,10 @@ def test_reduce_scatter(trace_mode):
     # Create test input
     input_data = np.random.rand(128, 256).astype(np.float32)
 
+    trace_and_compile(kernel, trace_mode, input_data)
+
     # CPU execution (assumes all ranks have the same data)
-    output = trace_and_run(kernel, trace_mode, input_data)
+    output = kernel(input_data)
 
     # With 2 devices, output should be half the size along dim 0: shape (64, 256)
     # Each device gets a slice that's been reduced across all devices
@@ -113,8 +119,10 @@ def test_all_to_all(trace_mode):
     # Create test input
     input_data = np.random.rand(128, 256).astype(np.float32)
 
+    trace_and_compile(kernel, trace_mode, input_data)
+
     # CPU execution (assumes all ranks have the same data)
-    output = trace_and_run(kernel, trace_mode, input_data)
+    output = kernel(input_data)
 
     # Shape should change: (128, 256) -> (256, 128)
     assert output.shape == (256, 128), f"Expected shape (256, 128), got {output.shape}"
@@ -148,8 +156,10 @@ def test_combined_ops(trace_mode):
     input_data = np.random.rand(128, 256).astype(np.float32)
     weight = np.random.rand(128, 256).astype(np.float32)
 
+    trace_and_compile(kernel, trace_mode, input_data, weight)
+
     # CPU execution (assumes all ranks have the same data)
-    output = trace_and_run(kernel, trace_mode, input_data, weight)
+    output = kernel(input_data, weight)
 
     # Compute expected result: 2x (due to all-reduce sum across 2 devices) + 1.0
     expected = (input_data * weight) * 2 + 1.0

@@ -28,7 +28,6 @@ class TestDeviceKernelTensor:
     @pytest.fixture
     def test_matrices(self):
         """Create test matrices for matmul"""
-        np.random.seed(42)
         size = 1024
         A = ((np.random.rand(size, size) - 0.5) * 2).astype(np.float16)
         B = ((np.random.rand(size, size) - 0.5) * 2).astype(np.float16)

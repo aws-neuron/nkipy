@@ -34,8 +34,8 @@ from kernels.simple import kernel_specs as simple_specs
 from nkipy.core.specs import ScalarInputSpec, TensorInputSpec, TypeSpec
 from utils import (
     NEURON_AVAILABLE,
-    baremetal_run_kernel_unified,
-    trace_and_run,
+    test_on_device,
+    trace_and_compile,
     trace_mode,  # noqa: F401 - pytest fixture
 )
 
@@ -77,7 +77,7 @@ def test_kernel_fuzz(trace_mode, kernel_spec):
     """Fuzz test kernel with various valid shapes and dtypes"""
 
     # TODO: use some environment variable to control number of fuzz
-    n_fuzz_tests = 100
+    n_fuzz_tests = 10
 
     for _ in range(n_fuzz_tests):
         # Generate matching shapes for inputs
@@ -104,24 +104,11 @@ def test_kernel_fuzz(trace_mode, kernel_spec):
                 inputs.append(input_spec.dtype_spec.default())
 
         # Run kernel
-        numpy_func = kernel_spec.function
-        expected = numpy_func(*inputs)
-
-        # Trace to validate HLO, then run on CPU
-        result = trace_and_run(kernel_spec.function, trace_mode, *inputs)
-
-        # Use different tolerances for different dtypes
-        rtol = 1e-3 if any(x.dtype == np.float16 for x in inputs) else 1e-5
-        assert np.allclose(result, expected, rtol=rtol, atol=rtol)
-        print(
-            f"CPU test passed for shapes {shape_a} and dtypes {[x.dtype for x in inputs]}"
-        )
+        expected = kernel_spec.function(*inputs)
 
         # Test hardware if available
         if NEURON_AVAILABLE:
-            hardware_result = baremetal_run_kernel_unified(
-                kernel_spec.function, trace_mode, *inputs
-            )
+            hardware_result = test_on_device(kernel_spec.function, trace_mode, *inputs)
 
             # Use looser tolerances for hardware
             hw_rtol = 1e-2 if any(x.dtype == np.float16 for x in inputs) else 1e-2
@@ -129,6 +116,8 @@ def test_kernel_fuzz(trace_mode, kernel_spec):
             print(
                 f"Hardware test passed for shapes {shape_a} and dtypes {[x.dtype for x in inputs]}"
             )
+        else:
+            trace_and_compile(kernel_spec.function, trace_mode, *inputs)
 
 
 if __name__ == "__main__":

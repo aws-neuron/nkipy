@@ -3,11 +3,13 @@
 """Shared test utilities for NKIPy tests"""
 
 import os
+import shutil
 import tempfile
 from functools import partial
 
 import numpy as np
 import pytest
+from nkipy.core import compile
 from nkipy.core.trace import NKIPyKernel
 from nkipy.runtime import is_neuron_compatible
 from nkipy.runtime.execute import baremetal_run_traced_kernel
@@ -35,34 +37,42 @@ def trace_mode(request):
     return request.param
 
 
-def trace_and_run(kernel_fn, trace_mode, *args, **kwargs):
+def trace_and_compile(kernel_fn, trace_mode, *args, **kwargs):
     """
-    Validate kernel is traceable to HLO, then run on CPU.
+    Validate kernel is traceable to HLO and compilable to NEFF.
+
+    Traces the kernel to HLO IR and compiles it using the Neuron compiler,
+    but does not execute on device.
 
     Args:
         kernel_fn: The kernel function to test
         trace_mode: "hlo" or other supported tracing mode
         *args: Input arrays for the kernel
         **kwargs: Additional arguments
-
-    Returns:
-        CPU execution output
     """
     if trace_mode == "hlo":
         traced_kernel = NKIPyKernel.trace(kernel_fn, backend="hlo")
     else:
         raise ValueError(f"Unknown trace mode: {trace_mode}")
 
-    # Validate HLO generation
+    # Trace to HLO
     traced_kernel.specialize(*args, **kwargs)
 
-    # Run on CPU (default backend)
-    return kernel_fn(*args, **kwargs)
+    # Compile to NEFF
+    worker_id = os.environ.get("PYTEST_XDIST_WORKER", "main")
+    artifacts_dir = os.path.join(tempfile.gettempdir(), f"nkipy_artifacts_{worker_id}")
+    if os.path.exists(artifacts_dir):
+        shutil.rmtree(artifacts_dir)
+
+    additional_compiler_args = compile.nkipy_compiler_args
+    compile.compile_to_neff(
+        traced_kernel,
+        artifacts_dir,
+        additional_compiler_args=additional_compiler_args,
+    )
 
 
-def baremetal_run_kernel_unified(
-    kernel_fn, trace_mode, *args, artifacts_dir=None, **kwargs
-):
+def test_on_device(kernel_fn, trace_mode, *args, artifacts_dir=None, **kwargs):
     """
     Unified baremetal execution function that traces and runs on device.
 

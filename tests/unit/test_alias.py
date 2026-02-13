@@ -15,7 +15,7 @@ from utils import (
     NEURON_AVAILABLE,
     baremetal_assert_allclose,
     cpu_assert_allclose,
-    trace_and_run,
+    trace_and_compile,
     trace_mode,  # noqa: F401 - pytest fixture
 )
 
@@ -37,16 +37,13 @@ def nkipy_kernel_multi_alias(
 
 def test_single_alias(trace_mode):
     """Test single alias pair on CPU and hardware"""
-    np.random.seed(42)
     A = ((np.random.rand(128, 512) - 0.5) * 2).astype(np.float16)
     B = ((np.random.rand(128, 512) - 0.5) * 2).astype(np.float16)
 
-    # Compute expected result
     expected = A.copy()
     expected[0, :] = B[1, :]
 
-    # Test CPU execution
-    result = trace_and_run(nkipy_kernel_single_alias, trace_mode, A.copy(), B)
+    result = nkipy_kernel_single_alias(A.copy(), B)
     cpu_assert_allclose(result, expected)
 
     # Test hardware if available
@@ -78,11 +75,13 @@ def test_single_alias(trace_mode):
         )
 
         baremetal_assert_allclose(output.numpy(), expected)
+    else:
+        trace_and_compile(nkipy_kernel_single_alias, trace_mode, A.copy(), B)
 
 
 def test_multi_alias(trace_mode):
     """Test multiple alias pairs on CPU and hardware"""
-    np.random.seed(43)
+
     A = ((np.random.rand(128, 512) - 0.5) * 2).astype(np.float16)
     B = ((np.random.rand(128, 512) - 0.5) * 2).astype(np.float16)
     C = ((np.random.rand(128, 512) - 0.5) * 2).astype(np.float16)
@@ -93,10 +92,7 @@ def test_multi_alias(trace_mode):
     expected_C = C.copy()
     expected_C[2:3, :] = B[2:3, :]
 
-    # Test CPU execution
-    result_A, result_C = trace_and_run(
-        nkipy_kernel_multi_alias, trace_mode, A.copy(), B, C.copy()
-    )
+    result_A, result_C = nkipy_kernel_multi_alias(A.copy(), B, C.copy())
     cpu_assert_allclose(result_A, expected_A)
     cpu_assert_allclose(result_C, expected_C)
 
@@ -136,6 +132,8 @@ def test_multi_alias(trace_mode):
 
         baremetal_assert_allclose(output0.numpy(), expected_A)
         baremetal_assert_allclose(output1.numpy(), expected_C)
+    else:
+        trace_and_compile(nkipy_kernel_multi_alias, trace_mode, A.copy(), B, C.copy())
 
 
 if __name__ == "__main__":

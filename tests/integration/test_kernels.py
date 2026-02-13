@@ -11,9 +11,8 @@ from nkipy.core.specs import KernelSpec, ScalarInputSpec, TensorInputSpec
 from utils import (
     NEURON_AVAILABLE,
     baremetal_assert_allclose,
-    baremetal_run_kernel_unified,
-    cpu_assert_allclose,
-    trace_and_run,
+    test_on_device,
+    trace_and_compile,
     trace_mode,  # noqa: F401 - pytest fixture
 )
 
@@ -81,29 +80,18 @@ def test_kernel_default(trace_mode, file_name, kernel_spec):
         else:
             raise ValueError("Unknown input spec type")
 
-    numpy_func = kernel_spec.function
-    expected = numpy_func(*inputs)
+    expected = kernel_spec.function(*inputs)
 
-    # Trace to validate HLO, then run on CPU
-    result = trace_and_run(kernel_spec.function, trace_mode, *inputs)
-
-    if isinstance(result, tuple):
-        for r, e in zip(result, expected):
-            cpu_assert_allclose(r, e)
-    else:
-        cpu_assert_allclose(result, expected)
-
-    # Test hardware if available
     if NEURON_AVAILABLE:
-        hardware_result = baremetal_run_kernel_unified(
-            kernel_spec.function, trace_mode, *inputs
-        )
+        hardware_result = test_on_device(kernel_spec.function, trace_mode, *inputs)
 
         if isinstance(hardware_result, tuple):
             for r, e in zip(hardware_result, expected):
                 baremetal_assert_allclose(r, e)
         else:
             baremetal_assert_allclose(hardware_result, expected)
+    else:
+        trace_and_compile(kernel_spec.function, trace_mode, *inputs)
 
 
 if __name__ == "__main__":
