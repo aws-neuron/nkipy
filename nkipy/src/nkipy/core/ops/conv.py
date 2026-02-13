@@ -171,8 +171,7 @@ def _conv2d_cpu(
         )
     if groups != 1:
         raise NotImplementedError(
-            f"conv2d CPU backend does not support groups != 1, "
-            f"got groups={groups}"
+            f"conv2d CPU backend does not support groups != 1, got groups={groups}"
         )
 
     stride_h, stride_w = stride
@@ -359,8 +358,7 @@ def _conv3d_cpu(
         )
     if groups != 1:
         raise NotImplementedError(
-            f"conv3d CPU backend does not support groups != 1, "
-            f"got groups={groups}"
+            f"conv3d CPU backend does not support groups != 1, got groups={groups}"
         )
 
     stride_d, stride_h, stride_w = stride

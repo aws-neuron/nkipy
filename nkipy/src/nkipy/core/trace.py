@@ -185,14 +185,10 @@ class NKIPyKernel:
                 if bt.is_parameter:
                     # Skip mutable aliases — those are handled via input_output_alias
                     var_name = (
-                        returned_var_names[i]
-                        if i < len(returned_var_names)
-                        else None
+                        returned_var_names[i] if i < len(returned_var_names) else None
                     )
                     if var_name not in mutable_params:
-                        copy_tensor = ctx.build_op(
-                            "copy", [bt], bt.shape, bt.dtype
-                        )
+                        copy_tensor = ctx.build_op("copy", [bt], bt.shape, bt.dtype)
                         ret[i] = NKIPyTensorRef(copy_tensor, name="")
 
             idx = 0
