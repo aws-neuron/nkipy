@@ -78,8 +78,8 @@ def transformer_layer(
     for b in range(B):
         # Process each token in the sequence
         for t in range(L):
-            # Get token input [1, 1, D]
-            token_input = norm_z[b : b + 1, t : t + 1, :]
+            # Get token input [D]
+            token_input = norm_z[b, t, :]
 
             # Get token routing logits [n_experts]
             token_logits = router_logits[b, t]
@@ -92,11 +92,11 @@ def transformer_layer(
             top_k_logits /= np.sum(top_k_logits, axis=-1, keepdims=True)
 
             # Process through each selected expert
-            token_output = tensor_apis.zeros((1, 1, D), dtype=output.dtype)
+            token_output = tensor_apis.zeros((D), dtype=output.dtype)
 
             for e in range(top_k):
                 # Get expert index and weight for this token
-                expert_idx = top_k_indices[e : e + 1]
+                expert_idx = top_k_indices[e]
                 weight = top_k_logits[e]
 
                 # Process through the selected expert
@@ -108,7 +108,7 @@ def transformer_layer(
                 token_output += weight * expert_output
 
             # Store the result
-            output[b, t] = token_output[0, 0]
+            output[b, t] = token_output
 
     # All-reduce for tensor parallelism
     output = cc.all_reduce(

@@ -10,8 +10,7 @@ def feedforward_kernel(x, gate_up_weight, down_weight):
     """Feed-forward network kernel with SiLU activation and gating."""
     mm_gup = np.matmul(x, gate_up_weight)
 
-    split_axis = mm_gup.ndim - 1
-    xg, x_V = np.split(mm_gup, 2, axis=split_axis)
+    xg, x_V = np.split(mm_gup, 2, axis=-1)
 
     swish = silu_kernel_(xg)
 
