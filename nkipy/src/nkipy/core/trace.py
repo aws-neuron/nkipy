@@ -5,6 +5,7 @@
 import ast
 import inspect
 import textwrap
+import warnings
 
 import numpy as np
 
@@ -17,6 +18,31 @@ from nkipy.core.tensor import NKIPyTensorRef
 # Register numpy APIs to use ops module implementations
 # This replaces the tensor_apis registration
 register_all_numpy_apis()
+
+# Dtypes unsupported by Neuron hardware that should be auto-downcast
+_DTYPE_DOWNCAST = {
+    np.dtype("float64"): np.dtype("float32"),
+    np.dtype("int64"): np.dtype("int32"),
+    np.dtype("uint64"): np.dtype("uint32"),
+}
+
+
+def _sanitize_array_dtype(arr: np.ndarray, name: str = "") -> np.ndarray:
+    """Downcast arrays with unsupported dtypes (float64, int64, uint64).
+
+    Returns the array unchanged if its dtype is already supported, or a
+    downcasted copy with a user-visible warning otherwise.
+    """
+    target = _DTYPE_DOWNCAST.get(arr.dtype)
+    if target is None:
+        return arr
+    label = f" '{name}'" if name else ""
+    warnings.warn(
+        f"Input tensor{label} has dtype {arr.dtype} which is not supported by "
+        f"NeuronCore hardware. Automatically casting to {target}.",
+        stacklevel=3,
+    )
+    return arr.astype(target)
 
 
 class NKIPyKernel:
@@ -70,6 +96,7 @@ class NKIPyKernel:
             param = sig.parameters[name]
 
             if isinstance(arg, np.ndarray):
+                arg = _sanitize_array_dtype(arg, name)
                 tensor_ref = self._create_parameter_hlo(arg.shape, arg.dtype, name)
                 converted_value = tensor_ref
             else:
@@ -84,6 +111,7 @@ class NKIPyKernel:
                 if isinstance(arg, (list, tuple)):
                     for item in arg:
                         if isinstance(item, np.ndarray):
+                            item = _sanitize_array_dtype(item, f"{name}_item")
                             converted_args.append(
                                 self._create_parameter_hlo(
                                     item.shape, item.dtype, f"{name}_item"
@@ -97,6 +125,7 @@ class NKIPyKernel:
                 if isinstance(arg, dict):
                     for k, v in arg.items():
                         if isinstance(v, np.ndarray):
+                            v = _sanitize_array_dtype(v, k)
                             converted_kwargs[k] = self._create_parameter_hlo(
                                 v.shape, v.dtype, k
                             )

@@ -8,6 +8,7 @@ import shutil
 import numpy as np
 
 from nkipy.core import compile
+from nkipy.core.trace import _sanitize_array_dtype
 
 try:
     from nkipy.runtime.device_kernel import DeviceKernel
@@ -31,6 +32,16 @@ def baremetal_run_traced_kernel(
         raise RuntimeError(
             "Runtime is not available. Please install Spike to use this function."
         )
+
+    # Sanitize unsupported dtypes (float64/int64/uint64) before tracing
+    args = tuple(
+        _sanitize_array_dtype(a, f"arg{i}") if isinstance(a, np.ndarray) else a
+        for i, a in enumerate(args)
+    )
+    kwargs = {
+        k: _sanitize_array_dtype(v, k) if isinstance(v, np.ndarray) else v
+        for k, v in kwargs.items()
+    }
 
     # Trace the kernel with the provided arguments
     kernel.specialize(*args, **kwargs)
