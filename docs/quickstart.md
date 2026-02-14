@@ -62,6 +62,5 @@ Once you're comfortable with the basics:
 
 ## Getting Help
 
-- Check [Known Issues](dev_guide/known_issues.md) for common problems
 - Report bugs via [GitHub Issues](https://github.com/aws-neuron/nkipy/issues)
 - See the [README FAQ](https://github.com/aws-neuron/nkipy/blob/main/README.md#frequently-asked-questions) for common questions

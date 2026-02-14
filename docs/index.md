@@ -43,7 +43,6 @@ user_guide/tracing_architecture
 
 dev_guide/extending_language
 dev_guide/testing
-dev_guide/known_issues
 dev_guide/building_docs
 api/index
 ```
