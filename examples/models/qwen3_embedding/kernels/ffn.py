@@ -30,8 +30,7 @@ def feedforward_kernel(
         mm_gup = mm_gup + gate_up_bias
 
     # Split into gate and up components
-    split_axis = mm_gup.ndim - 1
-    xg, x_up = np.split(mm_gup, 2, axis=split_axis)
+    xg, x_up = np.split(mm_gup, 2, axis=-1)
 
     # SwiGLU: silu(gate) * up
     swish = silu(xg)

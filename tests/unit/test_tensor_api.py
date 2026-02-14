@@ -255,6 +255,42 @@ def test_contract(trace_mode, np_fn, lhs_shape, rhs_shape, out_shape):
         trace_and_compile(kernel, trace_mode, in0, in1)
 
 
+@pytest.mark.parametrize(
+    "lhs_shape,rhs_shape",
+    [
+        # 1D x 3D: (K,) @ (B, K, M) -> (B, M)
+        ((64,), (2, 64, 32)),
+        # 3D x 1D: (B, M, K) @ (K,) -> (B, M)
+        ((2, 32, 64), (64,)),
+        # 1D x 4D: (K,) @ (B1, B2, K, M) -> (B1, B2, M)
+        ((64,), (2, 3, 64, 32)),
+        # 4D x 1D: (B1, B2, M, K) @ (K,) -> (B1, B2, M)
+        ((2, 3, 32, 64), (64,)),
+    ],
+)
+def test_matmul_1d_promotion(trace_mode, lhs_shape, rhs_shape):
+    """Test matmul with 1D inputs against higher-dimensional operands.
+
+    Numpy promotes 1D inputs: a 1D left operand gets a prepended dim,
+    a 1D right operand gets an appended dim, and the extra dim is removed
+    from the result.
+    """
+
+    def kernel(a, b):
+        return np.matmul(a, b)
+
+    in0 = np.random.random_sample(lhs_shape).astype(np.float32)
+    in1 = np.random.random_sample(rhs_shape).astype(np.float32)
+
+    expected = kernel(in0, in1)
+
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0, in1)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0, in1)
+
+
 @pytest.mark.parametrize("np_fn", [np.mean, np.max, np.min, np.sum])
 @pytest.mark.parametrize(
     "shape,dtype,axis",

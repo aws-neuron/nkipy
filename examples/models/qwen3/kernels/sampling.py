@@ -124,7 +124,7 @@ def greedy_sampling(
     else:
         h = rmsnorm_kernel(h, norm_weight, configs.norm_eps)
 
-    logits = h[:, h.shape[1] - 1, :] @ lm_head_weight
+    logits = h[:, -1, :] @ lm_head_weight
 
     logits, next_id = tensor_apis.topk(logits, k=1, axis=1)
     logits_all = cc.all_gather(
@@ -139,7 +139,7 @@ def greedy_sampling(
 
     vocab_per_device = lm_head_weight.shape[1]
     for b in range(configs.max_batch_size):
-        device_idx = np.copy(top_index[b])
+        device_idx = top_index[b]
         local_idx = next_id_all[b, device_idx]
         global_idx = device_idx * vocab_per_device + local_idx
         final_next_id[b] = global_idx
