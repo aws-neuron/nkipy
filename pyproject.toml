@@ -36,6 +36,7 @@ examples = [
     "argparse",
     "safetensors",
     "accelerate",
+    "boto3>=1.34",
 ]
 docs = [
     "sphinx",
