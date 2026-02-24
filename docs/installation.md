@@ -100,12 +100,14 @@ pip config set global.extra-index-url https://pip.repos.neuron.amazonaws.com
 
 ### Install Packages
 
+NKIPy and Spike are not published on PyPI and must be installed from source using the local directory paths:
+
 ```bash
 # Install both packages in editable mode
-pip install -e nkipy -e spike
+pip install -e ./nkipy -e ./spike
 
 # Or install without editable mode
-pip install nkipy spike
+pip install ./nkipy ./spike
 ```
 
 ### Building Wheels with pip
