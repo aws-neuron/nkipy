@@ -4,7 +4,7 @@
 
 import numpy as np
 
-from nkipy.core.backend.hlo import HLOTraceContext
+from nkipy.core.backend.hlo import get_hlo_context
 from nkipy.core.ops._registry import Op
 from nkipy.core.tensor import NKIPyTensorRef
 
@@ -33,8 +33,7 @@ def _all_gather_cpu(data, all_gather_dim, replica_groups, **kwargs):
 
 @all_gather.impl("hlo")
 def _all_gather_hlo(data, all_gather_dim, replica_groups, **kwargs):
-    ctx = HLOTraceContext._global_ctx
-    assert ctx is not None, "HLO context is not initialized"
+    ctx = get_hlo_context()
 
     rank = len(replica_groups[0])
     out_shape = list(data.shape)
@@ -87,8 +86,7 @@ def _all_reduce_cpu(data, replica_groups, reduce_op=np.add, **kwargs):
 
 @all_reduce.impl("hlo")
 def _all_reduce_hlo(data, replica_groups, reduce_op=np.add, **kwargs):
-    ctx = HLOTraceContext._global_ctx
-    assert ctx is not None, "HLO context is not initialized"
+    ctx = get_hlo_context()
 
     # Map reduce_op to string for HLO
     reduce_op_map = {
@@ -151,8 +149,7 @@ def _reduce_scatter_cpu(
 def _reduce_scatter_hlo(
     data, reduce_scatter_dim: int, replica_groups, reduce_op=np.add, **kwargs
 ):
-    ctx = HLOTraceContext._global_ctx
-    assert ctx is not None, "HLO context is not initialized"
+    ctx = get_hlo_context()
     rank = len(replica_groups[0])
     out_shape = list(data.shape)
     if out_shape:
@@ -221,8 +218,7 @@ def _all_to_all_cpu(
 def _all_to_all_hlo(
     data, split_dimension: int, concat_dimension: int, replica_groups, **kwargs
 ):
-    ctx = HLOTraceContext._global_ctx
-    assert ctx is not None, "HLO context is not initialized"
+    ctx = get_hlo_context()
     result_tensor = ctx.build_op(
         "all-to-all",
         [data.backend_tensor],

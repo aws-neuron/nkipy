@@ -24,8 +24,8 @@ from typing import Callable, Iterable, Optional, Tuple
 
 import numpy as np
 
-from nkipy.core.backend.hlo import HLOTraceContext
-from nkipy.core.ops._registry import get_backend
+from nkipy.core.backend import get_backend
+from nkipy.core.backend.hlo import get_hlo_context
 from nkipy.core.tensor import NKIPyTensorRef
 
 # Conditional imports for both frontends
@@ -131,11 +131,7 @@ def _build_hlo_custom_call(config, operands):
     if get_backend() != "hlo":
         raise NotImplementedError("Modes other than HLO are not implemented yet")
 
-    ctx = HLOTraceContext._global_ctx
-    if ctx is None:
-        raise RuntimeError(
-            "NKI custom-call generation requires an active HLO tracing context"
-        )
+    ctx = get_hlo_context()
 
     # Build HLO operands: user inputs + constants
     hlo_operands = [
@@ -233,7 +229,7 @@ if LEGACY_NKI_AVAILABLE:
 
     def _patched_legacy_generic_kernel_call(self, *args, **kwargs):
         """Patched __call__ that intercepts calls during NKIPy tracing."""
-        if HLOTraceContext._global_ctx is not None:
+        if get_backend() != "cpu":
             return _generate_nki_custom_call(self, *args, **kwargs)
         return _original_legacy_generic_kernel_call(self, *args, **kwargs)
 
@@ -245,7 +241,7 @@ if BETA2_NKI_AVAILABLE:
 
     def _patched_beta2_generic_kernel_call(self, *args, **kwargs):
         """Patched __call__ that intercepts calls during NKIPy tracing."""
-        if HLOTraceContext._global_ctx is not None:
+        if get_backend() != "cpu":
             # Note: Create a disposable copy of a GenericKernel for NKI tracing.
 
             # This is requried only for Beta2. The frontend.Kernel (kernel.kernel)

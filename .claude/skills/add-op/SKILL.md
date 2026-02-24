@@ -33,7 +33,8 @@ Operations live in `nkipy/src/nkipy/core/ops/<category>.py`. Choose from:
 In the chosen category file, follow this pattern:
 
 ```python
-from nkipy.core.ops._registry import Op, get_context
+from nkipy.core.backend.hlo import get_hlo_context
+from nkipy.core.ops._registry import Op
 
 # Create the dispatcher
 my_op = Op('my_op')
@@ -41,7 +42,7 @@ my_op = Op('my_op')
 @my_op.impl('hlo')
 def _my_op_hlo(arg1, arg2, ...):
     """HLO tracing implementation."""
-    ctx = get_context()
+    ctx = get_hlo_context()
     # Build HLO operation using ctx
     # Return NKIPyTensorRef
     ...
@@ -55,7 +56,7 @@ def _my_op_cpu(arg1, arg2, ...):
 ```
 
 Key rules:
-- The `hlo` impl builds HLO IR nodes via the trace context (`get_context()`)
+- The `hlo` impl builds HLO IR nodes via the trace context (`get_hlo_context()` from `nkipy.core.backend.hlo`)
 - The `cpu` impl uses pure NumPy and returns numpy arrays
 - Both implementations must accept the same signature and produce equivalent results
 - Both backends are **required** — every op needs `hlo` and `cpu`

@@ -42,7 +42,7 @@ def _set_source_location(location):
 
     This is a lazy import to avoid circular dependencies.
     """
-    from nkipy.core.ops._registry import set_source_location
+    from nkipy.core.backend import set_source_location
 
     set_source_location(location)
 

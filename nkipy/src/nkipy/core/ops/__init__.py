@@ -6,15 +6,11 @@ This module provides a unified interface for tensor operations that dispatch
 to the appropriate backend (IR or HLO) based on the current tracing context.
 """
 
-from nkipy.core.ops._registry import (
-    Op,
+from nkipy.core.backend import (
     get_backend,
-    get_context,
-    get_source_location,
-    set_backend,
-    set_context,
     set_source_location,
 )
+from nkipy.core.ops._registry import Op
 
 # -----------------------------------------------------------------------------
 # Binary operations
@@ -153,14 +149,10 @@ from nkipy.core.ops.unary import (
 )
 
 __all__ = [
-    # Registry
+    # Registry & backend
     "Op",
-    "set_backend",
     "get_backend",
-    "set_context",
-    "get_context",
     "set_source_location",
-    "get_source_location",
     # Binary
     "add",
     "subtract",
