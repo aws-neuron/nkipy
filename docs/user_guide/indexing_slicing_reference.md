@@ -16,6 +16,7 @@ NKIPy tensors support a subset of NumPy's indexing and slicing operations, optim
 | Scalar indexing | `tensor[scalar_tensor]` | Use 0D tensor as index |
 | Assignment | `tensor[0:3, :] = value` | Slice assignment |
 | Chained slicing | `tensor[0:10, :][2:5, 3:8]` | Multiple slice operations |
+| Ellipsis | `tensor[..., 0:3]` | Auto-expand `...` to full slices |
 
 ## Unsupported Operations
 
@@ -23,7 +24,6 @@ NKIPy tensors support a subset of NumPy's indexing and slicing operations, optim
 |-----------|---------|------------|
 | Multiple dynamic indices | `tensor[idx1, idx2, :]` | Use separate operations |
 | Boolean indexing | `tensor[tensor > 0]` | Use `np.where()` |
-| Ellipsis | `tensor[..., 0:3]` | Use explicit slicing |
 | newaxis/None | `tensor[:, None, :]` | Use `np.expand_dims()` |
 
 ## Limitations
@@ -87,3 +87,22 @@ def select_expert(top_k_indices, expert_weights):
 top_k_indices = np.array([1, 0, 2], dtype=np.int32)
 expert_weights = np.array([[0.8, 0.6], [0.4, 0.7], [0.5, 0.9]])
 result = select_expert(top_k_indices, expert_weights)  # Shape: (2,)
+```
+
+### Ellipsis Indexing
+```python
+# Ellipsis (...) expands to as many full slices as needed to cover
+# all remaining dimensions. Useful when the number of leading
+# dimensions varies.
+
+tensor = np.random.randn(4, 8, 12)  # [batch, seq, hidden]
+
+# These are equivalent:
+result = tensor[..., 0:3]          # last dim slice
+result = tensor[:, :, 0:3]         # explicit full slices
+
+# Leading integer + ellipsis:
+result = tensor[0, ...]            # first batch, all remaining dims
+
+# Middle ellipsis:
+result = tensor[0, ..., 0:3]       # first batch, last dim slice

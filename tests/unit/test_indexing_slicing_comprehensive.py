@@ -400,9 +400,92 @@ class TestIndexingSlicingAdvanced:
             return view
 
         a = sample_tensors["small_3d"]
+        expected = kernel(a)
 
-        with pytest.raises((NotImplementedError, ValueError, TypeError)):
-            trace_and_compile(kernel, trace_mode, a)
+        trace_and_compile(kernel, trace_mode, a)
+
+        if NEURON_AVAILABLE:
+            out_baremetal = on_device_test(kernel, trace_mode, a)
+            baremetal_assert_allclose(expected, out_baremetal)
+
+    def test_ellipsis_identity(self, trace_mode, sample_tensors):
+        def kernel(a):
+            return a[...]
+
+        a = sample_tensors["small_3d"]
+        expected = kernel(a)
+
+        trace_and_compile(kernel, trace_mode, a)
+
+        if NEURON_AVAILABLE:
+            out_baremetal = on_device_test(kernel, trace_mode, a)
+            baremetal_assert_allclose(expected, out_baremetal)
+
+    def test_ellipsis_leading_int(self, trace_mode, sample_tensors):
+        def kernel(a):
+            return a[0, ...]
+
+        a = sample_tensors["small_3d"]
+        expected = kernel(a)
+
+        trace_and_compile(kernel, trace_mode, a)
+
+        if NEURON_AVAILABLE:
+            out_baremetal = on_device_test(kernel, trace_mode, a)
+            baremetal_assert_allclose(expected, out_baremetal)
+
+    def test_ellipsis_middle(self, trace_mode, sample_tensors):
+        def kernel(a):
+            return a[0, ..., 0:3]
+
+        a = sample_tensors["small_3d"]
+        expected = kernel(a)
+
+        trace_and_compile(kernel, trace_mode, a)
+
+        if NEURON_AVAILABLE:
+            out_baremetal = on_device_test(kernel, trace_mode, a)
+            baremetal_assert_allclose(expected, out_baremetal)
+
+    def test_ellipsis_with_dynamic_index(self, trace_mode, sample_tensors):
+        def kernel(a):
+            return a[..., np.array([0, 2, 4])]
+
+        a = sample_tensors["small_3d"]
+        expected = kernel(a)
+
+        trace_and_compile(kernel, trace_mode, a)
+
+        if NEURON_AVAILABLE:
+            out_baremetal = on_device_test(kernel, trace_mode, a)
+            baremetal_assert_allclose(expected, out_baremetal)
+
+    def test_ellipsis_2d_tensor(self, trace_mode, sample_tensors):
+        def kernel(a):
+            return a[..., 0:4]
+
+        a = sample_tensors["small_2d"]
+        expected = kernel(a)
+
+        trace_and_compile(kernel, trace_mode, a)
+
+        if NEURON_AVAILABLE:
+            out_baremetal = on_device_test(kernel, trace_mode, a)
+            baremetal_assert_allclose(expected, out_baremetal)
+
+    def test_ellipsis_setitem(self, trace_mode, sample_tensors):
+        def kernel(a):
+            a[..., 0:3] = np.zeros((4, 8, 3), dtype=np.float32)
+            return a
+
+        a = sample_tensors["small_3d"]
+        expected = kernel(a.copy())
+
+        trace_and_compile(kernel, trace_mode, a.copy())
+
+        if NEURON_AVAILABLE:
+            out_baremetal = on_device_test(kernel, trace_mode, a.copy())
+            baremetal_assert_allclose(expected, out_baremetal)
 
     def test_newaxis_support(self, trace_mode, sample_tensors):
         def kernel(a):
@@ -505,6 +588,18 @@ class TestIndexingSlicingErrorHandling:
             "small_2d": np.random.randn(8, 16).astype(np.float32),
             "batch_seq": np.random.randn(4, 32, 64).astype(np.float32),
         }
+
+    def test_multiple_ellipsis_error(self, trace_mode, sample_tensors):
+        def kernel(a):
+            return a[(Ellipsis, Ellipsis, slice(0, 3))]
+
+        a = sample_tensors["batch_seq"]
+
+        with pytest.raises(IndexError, match="single ellipsis"):
+            if NEURON_AVAILABLE:
+                on_device_test(kernel, trace_mode, a)
+            else:
+                trace_and_compile(kernel, trace_mode, a)
 
     def test_multi_axis_gather_limitation(self, trace_mode, sample_tensors):
         def kernel(a):

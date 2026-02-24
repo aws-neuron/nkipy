@@ -210,6 +210,29 @@ class TensorOperationMixin:
         return nkipy_ops.astype(self, dtype=dtype)
 
 
+def _expand_ellipsis(indices: tuple, ndim: int) -> tuple:
+    """Expand ``...`` into the correct number of ``slice(None)``."""
+    ellipsis_count = sum(1 for idx in indices if idx is Ellipsis)
+    if ellipsis_count == 0:
+        return indices
+    if ellipsis_count > 1:
+        raise IndexError("an index can only have a single ellipsis (...)")
+    num_non_ellipsis = len(indices) - 1
+    num_expand = ndim - num_non_ellipsis
+    if num_expand < 0:
+        raise IndexError(
+            f"too many indices for tensor: tensor is {ndim}-dimensional, "
+            f"but {num_non_ellipsis} non-ellipsis indices were given"
+        )
+    new_indices = ()
+    for idx in indices:
+        if idx is Ellipsis:
+            new_indices += (slice(None),) * num_expand
+        else:
+            new_indices += (idx,)
+    return new_indices
+
+
 class NKIPyTensorRef(TensorArithmeticMixin, TensorOperationMixin):
     """
     NKIPy Tensor Reference
@@ -327,6 +350,8 @@ class NKIPyTensorRef(TensorArithmeticMixin, TensorOperationMixin):
             if not isinstance(indices, tuple):
                 indices = (indices,)
 
+            indices = _expand_ellipsis(indices, len(self.shape))
+
             # Pad with full slices if needed
             while len(indices) < len(self.shape):
                 indices = indices + (slice(None),)
@@ -427,6 +452,8 @@ class NKIPyTensorRef(TensorArithmeticMixin, TensorOperationMixin):
             # Normalize indices to a tuple
             if not isinstance(indices, tuple):
                 indices = (indices,)
+
+            indices = _expand_ellipsis(indices, len(self.shape))
 
             # Pad with full slices if needed
             while len(indices) < len(self.shape):
