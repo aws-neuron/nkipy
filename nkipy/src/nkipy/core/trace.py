@@ -11,8 +11,8 @@ import numpy as np
 
 import nkipy.core.typing as nt
 from nkipy.core._numpy_dispatch import register_all_numpy_apis
-from nkipy.core.backend.hlo import HLOModule, HLOTraceContext
-from nkipy.core.ops._registry import set_backend
+from nkipy.core.backend import tracing
+from nkipy.core.backend.hlo import HLOModule, HLOTraceContext, get_hlo_context
 from nkipy.core.tensor import NKIPyTensorRef
 
 # Register numpy APIs to use ops module implementations
@@ -71,7 +71,7 @@ class NKIPyKernel:
 
     def _create_parameter_hlo(self, shape, dtype, name=""):
         """Create an HLO parameter tensor"""
-        ctx = HLOTraceContext._global_ctx
+        ctx = get_hlo_context()
         hlo_tensor = ctx.module.add_parameter(shape, dtype, name=name)
         return NKIPyTensorRef(hlo_tensor, name=name)
 
@@ -79,66 +79,63 @@ class NKIPyKernel:
         """Trace the kernel with specific arguments"""
 
         code = HLOModule(name=self.func.__name__)
-        ctx = HLOTraceContext(code)
-        HLOTraceContext._global_ctx = ctx
-        set_backend("hlo", ctx)
 
-        # 4. Bind arguments
-        sig = inspect.signature(self.func)
-        boundargs = sig.bind(*args, **kwargs)
-        boundargs.apply_defaults()
+        with tracing(HLOTraceContext(code)):
+            # Bind arguments
+            sig = inspect.signature(self.func)
+            boundargs = sig.bind(*args, **kwargs)
+            boundargs.apply_defaults()
 
-        # 5. Convert numpy arrays to tensor references
-        converted_args = []
-        converted_kwargs = {}
+            # Convert numpy arrays to tensor references
+            converted_args = []
+            converted_kwargs = {}
 
-        for name, arg in boundargs.arguments.items():
-            param = sig.parameters[name]
+            for name, arg in boundargs.arguments.items():
+                param = sig.parameters[name]
 
-            if isinstance(arg, np.ndarray):
-                arg = _sanitize_array_dtype(arg, name)
-                tensor_ref = self._create_parameter_hlo(arg.shape, arg.dtype, name)
-                converted_value = tensor_ref
-            else:
-                converted_value = arg
-
-            # Determine if this should be positional or keyword
-            if param.kind in (param.POSITIONAL_ONLY, param.POSITIONAL_OR_KEYWORD):
-                converted_args.append(converted_value)
-            elif param.kind == param.KEYWORD_ONLY:
-                converted_kwargs[name] = converted_value
-            elif param.kind == param.VAR_POSITIONAL:
-                if isinstance(arg, (list, tuple)):
-                    for item in arg:
-                        if isinstance(item, np.ndarray):
-                            item = _sanitize_array_dtype(item, f"{name}_item")
-                            converted_args.append(
-                                self._create_parameter_hlo(
-                                    item.shape, item.dtype, f"{name}_item"
-                                )
-                            )
-                        else:
-                            converted_args.append(item)
+                if isinstance(arg, np.ndarray):
+                    arg = _sanitize_array_dtype(arg, name)
+                    tensor_ref = self._create_parameter_hlo(arg.shape, arg.dtype, name)
+                    converted_value = tensor_ref
                 else:
+                    converted_value = arg
+
+                # Determine if this should be positional or keyword
+                if param.kind in (param.POSITIONAL_ONLY, param.POSITIONAL_OR_KEYWORD):
                     converted_args.append(converted_value)
-            elif param.kind == param.VAR_KEYWORD:
-                if isinstance(arg, dict):
-                    for k, v in arg.items():
-                        if isinstance(v, np.ndarray):
-                            v = _sanitize_array_dtype(v, k)
-                            converted_kwargs[k] = self._create_parameter_hlo(
-                                v.shape, v.dtype, k
-                            )
-                        else:
-                            converted_kwargs[k] = v
+                elif param.kind == param.KEYWORD_ONLY:
+                    converted_kwargs[name] = converted_value
+                elif param.kind == param.VAR_POSITIONAL:
+                    if isinstance(arg, (list, tuple)):
+                        for item in arg:
+                            if isinstance(item, np.ndarray):
+                                item = _sanitize_array_dtype(item, f"{name}_item")
+                                converted_args.append(
+                                    self._create_parameter_hlo(
+                                        item.shape, item.dtype, f"{name}_item"
+                                    )
+                                )
+                            else:
+                                converted_args.append(item)
+                    else:
+                        converted_args.append(converted_value)
+                elif param.kind == param.VAR_KEYWORD:
+                    if isinstance(arg, dict):
+                        for k, v in arg.items():
+                            if isinstance(v, np.ndarray):
+                                v = _sanitize_array_dtype(v, k)
+                                converted_kwargs[k] = self._create_parameter_hlo(
+                                    v.shape, v.dtype, k
+                                )
+                            else:
+                                converted_kwargs[k] = v
 
-        # 6. Execute function
-        ret = self.func(*converted_args, **converted_kwargs)
+            # Execute function
+            ret = self.func(*converted_args, **converted_kwargs)
 
-        # 7. Mark outputs
-        self._mark_hlo_outputs(code, ret)
-        self._code = code
-        set_backend(None)
+            # Mark outputs
+            self._mark_hlo_outputs(code, ret)
+            self._code = code
 
         return code
 
@@ -206,7 +203,7 @@ class NKIPyKernel:
             # outputs that are raw parameter references because inputs and outputs
             # occupy separate memory regions on device.
             ret = list(ret)
-            ctx = HLOTraceContext._global_ctx
+            ctx = get_hlo_context()
             for i, r in enumerate(ret):
                 if not isinstance(r, NKIPyTensorRef):
                     continue

@@ -1372,8 +1372,10 @@ def get_hlo_context() -> HLOTraceContext:
     Raises:
         RuntimeError: If no HLO context is available.
     """
-    ctx = HLOTraceContext._global_ctx
-    if ctx is None:
+    from nkipy.core.backend import _active_ctx
+
+    ctx = _active_ctx
+    if not isinstance(ctx, HLOTraceContext):
         raise RuntimeError("No HLO context available.")
     return ctx
 
@@ -1497,12 +1499,9 @@ def broadcast_operands_hlo(
 
 
 class HLOTraceContext:
-    """Trace Context for building HLO operations.
+    """Trace context for building HLO operations."""
 
-    Implements the TraceContext interface for HLO backend tracing.
-    """
-
-    _global_ctx: Optional[HLOTraceContext] = None
+    backend_name: str = "hlo"
 
     def __init__(self, module: HLOModule) -> None:
         self.module = module
