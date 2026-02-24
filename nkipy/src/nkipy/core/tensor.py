@@ -8,6 +8,7 @@ the ops module which dispatches to the appropriate backend.
 """
 
 import inspect
+import math
 from typing import Tuple, Union
 
 import numpy as np
@@ -293,6 +294,14 @@ class NKIPyTensorRef(TensorArithmeticMixin, TensorOperationMixin):
     @property
     def ndim(self) -> int:
         return len(self._shape)
+
+    @property
+    def T(self):
+        return self.transpose()
+
+    @property
+    def size(self) -> int:
+        return math.prod(self._shape)
 
     def __repr__(self):
         return (
