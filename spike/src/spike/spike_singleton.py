@@ -21,6 +21,7 @@ from .logger import get_logger
 logger = get_logger()
 
 _runtime: Optional[_Spike] = None
+_debug_client = None
 _lock = threading.Lock()
 
 
@@ -44,7 +45,7 @@ def _set_visible_cores(visible_cores: Iterable[int]) -> None:
     for core in cores_list:
         if not isinstance(core, int):
             raise TypeError(
-                f"visible_cores must contain integers, got {type(core)}: {core}"
+                f"visible_cores must contain integers, got {type(core).__name__}: {core}"
             )
         if core < 0:
             raise ValueError(f"Core ID must be non-negative, got {core}")
@@ -105,7 +106,7 @@ def reset() -> None:
         >>> spike.configure(visible_cores=[2, 3])  # Optional: change cores
         >>> tensor2 = SpikeTensor(...)  # Uses cores 2, 3
     """
-    global _runtime
+    global _runtime, _debug_client
 
     with _lock:
         if _runtime is not None:
@@ -115,6 +116,7 @@ def reset() -> None:
                 UserWarning,
                 stacklevel=2,
             )
+            _stop_debug_client()
             _runtime.close()
             _runtime = None
             logger.info("Spike Runtime closed")
@@ -144,16 +146,51 @@ def get_spike_singleton() -> _Spike:
             logger.info("Initializing Spike Runtime")
             _runtime = _Spike()  # Constructor does nrt_init via RAII
             logger.info("Spike Runtime initialized")
+            _start_debug_client_if_configured()
         return _runtime
+
+
+def _start_debug_client_if_configured() -> None:
+    """Start the debug handler if NEURON_RT_DEBUG_OUTPUT_DIR is set.
+
+    Must be called under _lock after NRT is initialized.
+    """
+    global _debug_client
+    debug_dir = os.environ.get("NEURON_RT_DEBUG_OUTPUT_DIR")
+    if not debug_dir:
+        return
+    try:
+        from ._spike import DebugHandler
+
+        _debug_client = DebugHandler(debug_dir)
+        _debug_client.connect()
+        _debug_client.start()
+        logger.info("Debug handler started, output dir: %s", debug_dir)
+    except Exception:
+        logger.warning("Failed to start debug handler", exc_info=True)
+        _debug_client = None
+
+
+def _stop_debug_client() -> None:
+    """Stop the debug client if running. Must be called under _lock."""
+    global _debug_client
+    if _debug_client is not None:
+        try:
+            _debug_client.stop()
+        except Exception:
+            logger.warning("Error stopping debug client", exc_info=True)
+        _debug_client = None
 
 
 def _cleanup() -> None:
     """Cleanup function called at program exit."""
     global _runtime
-    # Note: Spike object from nanobind is RAII and Python GC managed, so no need
-    # to call `.close()` explicitly. However, we do want to set the global to
-    # None to make sure it does before nanobind ref leak check.
-    _runtime = None
+    with _lock:
+        _stop_debug_client()
+        # Note: Spike object from nanobind is RAII and Python GC managed, so no need
+        # to call `.close()` explicitly. However, we do want to set the global to
+        # None to make sure it does before nanobind ref leak check.
+        _runtime = None
 
 
 atexit.register(_cleanup)

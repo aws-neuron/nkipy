@@ -142,3 +142,16 @@ class Spike:
 
     def get_tensor_info(self, model: NrtModel) -> ModelTensorInfo:
         """Get tensor information for a model"""
+
+class DebugHandler:
+    def __init__(self, output_dir: str) -> None:
+        """Create a debug handler writing to the given directory"""
+
+    def connect(self) -> None:
+        """Connect to NRT debug streams for all visible cores"""
+
+    def start(self) -> None:
+        """Start the background consumer thread"""
+
+    def stop(self) -> None:
+        """Stop the consumer thread and close all streams"""

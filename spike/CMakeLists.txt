@@ -46,6 +46,7 @@ set(SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/model.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/spike.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/sys_trace.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/debug_handler.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/python_bindings.cpp
 )
 

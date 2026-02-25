@@ -11,6 +11,7 @@
 #include <iostream>
 #include <sstream>
 
+#include "debug_handler.h"
 #include "model.h"
 #include "spike.h"
 #include "sys_trace.h"
@@ -23,10 +24,12 @@ using namespace spike;
 NB_MODULE(_spike, m) {
   m.doc() = "NKIPy Spike Runtime C++ bindings";
 
-  // Exception types
+  // Exception types - nanobind registers exceptions via constructor side effect
   nb::exception<SpikeRuntimeError> nkipy_runtime_error(m, "SpikeRuntimeError",
                                                        PyExc_RuntimeError);
+  // NOLINTNEXTLINE(bugprone-unused-raii)
   nb::exception<SpikeError>(m, "SpikeError", nkipy_runtime_error);
+  // NOLINTNEXTLINE(bugprone-unused-raii)
   nb::exception<NrtError>(m, "NrtError", nkipy_runtime_error);
   // TODO: figure out a way to expose error_code to Python...
   // below is an attempt but failed
@@ -216,4 +219,15 @@ NB_MODULE(_spike, m) {
       // Model introspection
       .def("get_tensor_info", &Spike::get_tensor_info, "model"_a,
            "Get tensor information for a model");
+
+  // DebugHandler class
+  nb::class_<DebugHandler>(m, "DebugHandler")
+      .def(nb::init<std::string>(), "output_dir"_a,
+           "Create a debug handler writing to the given directory")
+      .def("connect", &DebugHandler::connect,
+           "Connect to NRT debug streams for all visible cores")
+      .def("start", &DebugHandler::start,
+           "Start the background consumer thread")
+      .def("stop", &DebugHandler::stop,
+           "Stop the consumer thread and close all streams");
 }
