@@ -8,6 +8,7 @@ the ops module which dispatches to the appropriate backend.
 """
 
 import inspect
+import math
 from typing import Tuple, Union
 
 import numpy as np
@@ -210,6 +211,46 @@ class TensorOperationMixin:
         return nkipy_ops.astype(self, dtype=dtype)
 
 
+def _expand_ellipsis(indices: tuple, ndim: int) -> tuple:
+    """Expand ``...`` into the correct number of ``slice(None)``."""
+    ellipsis_count = sum(1 for idx in indices if idx is Ellipsis)
+    if ellipsis_count == 0:
+        return indices
+    if ellipsis_count > 1:
+        raise IndexError("an index can only have a single ellipsis (...)")
+    num_real = sum(1 for idx in indices if idx is not None and idx is not Ellipsis)
+    num_expand = ndim - num_real
+    if num_expand < 0:
+        raise IndexError(
+            f"too many indices for tensor: tensor is {ndim}-dimensional, "
+            f"but {num_real} non-ellipsis indices were given"
+        )
+    new_indices = ()
+    for idx in indices:
+        if idx is Ellipsis:
+            new_indices += (slice(None),) * num_expand
+        else:
+            new_indices += (idx,)
+    return new_indices
+
+
+def _strip_newaxis(indices: tuple) -> tuple:
+    """Remove None (np.newaxis) from indices; return cleaned indices and expand axes."""
+    cleaned = []
+    newaxis_axes = []
+    output_pos = 0
+    for idx in indices:
+        if idx is None:
+            newaxis_axes.append(output_pos)
+            output_pos += 1
+        elif isinstance(idx, int):
+            cleaned.append(idx)  # int consumes a dim but produces no output dim
+        else:
+            cleaned.append(idx)  # slice / tensor / list → produces an output dim
+            output_pos += 1
+    return tuple(cleaned), newaxis_axes
+
+
 class NKIPyTensorRef(TensorArithmeticMixin, TensorOperationMixin):
     """
     NKIPy Tensor Reference
@@ -253,6 +294,14 @@ class NKIPyTensorRef(TensorArithmeticMixin, TensorOperationMixin):
     @property
     def ndim(self) -> int:
         return len(self._shape)
+
+    @property
+    def T(self):
+        return self.transpose()
+
+    @property
+    def size(self) -> int:
+        return math.prod(self._shape)
 
     def __repr__(self):
         return (
@@ -327,6 +376,9 @@ class NKIPyTensorRef(TensorArithmeticMixin, TensorOperationMixin):
             if not isinstance(indices, tuple):
                 indices = (indices,)
 
+            indices = _expand_ellipsis(indices, len(self.shape))
+            indices, newaxis_axes = _strip_newaxis(indices)
+
             # Pad with full slices if needed
             while len(indices) < len(self.shape):
                 indices = indices + (slice(None),)
@@ -395,17 +447,21 @@ class NKIPyTensorRef(TensorArithmeticMixin, TensorOperationMixin):
                     adjusted_dim = dynamic_index_dim - dims_removed_before
 
                     # Use np.take for dynamic indexing (dispatches to ops.take)
-                    return nkipy_ops.take(
+                    result = nkipy_ops.take(
                         sliced_tensor, dynamic_index_value, axis=adjusted_dim
                     )
                 else:
                     # No static slicing needed, just dynamic indexing
-                    return nkipy_ops.take(
+                    result = nkipy_ops.take(
                         self, dynamic_index_value, axis=dynamic_index_dim
                     )
             else:
                 # Pure static indexing
-                return self._do_static_slice(indices)
+                result = self._do_static_slice(indices)
+
+            if newaxis_axes:
+                result = nkipy_ops.expand_dims(result, axis=newaxis_axes)
+            return result
         finally:
             _set_source_location(None)
 
@@ -427,6 +483,14 @@ class NKIPyTensorRef(TensorArithmeticMixin, TensorOperationMixin):
             # Normalize indices to a tuple
             if not isinstance(indices, tuple):
                 indices = (indices,)
+
+            if any(idx is None for idx in indices):
+                raise IndexError(
+                    "cannot use a newaxis (None) in a setitem expression. "
+                    "Use np.expand_dims() on the value instead."
+                )
+
+            indices = _expand_ellipsis(indices, len(self.shape))
 
             # Pad with full slices if needed
             while len(indices) < len(self.shape):

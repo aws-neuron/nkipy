@@ -16,6 +16,8 @@ NKIPy tensors support a subset of NumPy's indexing and slicing operations, optim
 | Scalar indexing | `tensor[scalar_tensor]` | Use 0D tensor as index |
 | Assignment | `tensor[0:3, :] = value` | Slice assignment |
 | Chained slicing | `tensor[0:10, :][2:5, 3:8]` | Multiple slice operations |
+| Ellipsis | `tensor[..., 0:3]` | Auto-expand `...` to full slices |
+| newaxis/None | `tensor[:, None, :]` | Insert size-1 dimension |
 
 ## Unsupported Operations
 
@@ -23,8 +25,6 @@ NKIPy tensors support a subset of NumPy's indexing and slicing operations, optim
 |-----------|---------|------------|
 | Multiple dynamic indices | `tensor[idx1, idx2, :]` | Use separate operations |
 | Boolean indexing | `tensor[tensor > 0]` | Use `np.where()` |
-| Ellipsis | `tensor[..., 0:3]` | Use explicit slicing |
-| newaxis/None | `tensor[:, None, :]` | Use `np.expand_dims()` |
 
 ## Limitations
 
@@ -87,3 +87,52 @@ def select_expert(top_k_indices, expert_weights):
 top_k_indices = np.array([1, 0, 2], dtype=np.int32)
 expert_weights = np.array([[0.8, 0.6], [0.4, 0.7], [0.5, 0.9]])
 result = select_expert(top_k_indices, expert_weights)  # Shape: (2,)
+```
+
+### Ellipsis Indexing
+```python
+# Ellipsis (...) expands to as many full slices as needed to cover
+# all remaining dimensions. Useful when the number of leading
+# dimensions varies.
+
+tensor = np.random.randn(4, 8, 12)  # [batch, seq, hidden]
+
+# These are equivalent:
+result = tensor[..., 0:3]          # last dim slice
+result = tensor[:, :, 0:3]         # explicit full slices
+
+# Leading integer + ellipsis:
+result = tensor[0, ...]            # first batch, all remaining dims
+
+# Middle ellipsis:
+result = tensor[0, ..., 0:3]       # first batch, last dim slice
+```
+
+### Newaxis (None) Indexing
+```python
+# None (np.newaxis) inserts a size-1 dimension at the specified position.
+# This is useful for broadcasting in ML computations.
+
+tensor = np.random.randn(8, 16)  # [rows, cols]
+
+# Add dimension in the middle:
+result = tensor[:, None, :]        # Shape: (8, 1, 16)
+
+# Add leading dimension:
+result = tensor[None, :, :]        # Shape: (1, 8, 16)
+
+# Add trailing dimension:
+result = tensor[:, :, None]        # Shape: (8, 16, 1)
+
+# Multiple newaxis insertions:
+result = tensor[None, :, None, :, None]  # Shape: (1, 8, 1, 16, 1)
+
+# Combined with integer indexing:
+result = tensor[0, None, :]        # Shape: (1, 16)
+
+# Combined with ellipsis:
+tensor_3d = np.random.randn(4, 8, 12)
+result = tensor_3d[None, ..., None]  # Shape: (1, 4, 8, 12, 1)
+
+# Note: newaxis in assignment (setitem) is not supported.
+# Use np.expand_dims() on the value instead.
