@@ -20,6 +20,7 @@ Supports two NKI frontends:
 """
 
 import dataclasses
+import inspect
 from typing import Callable, Iterable, Optional, Tuple
 
 import numpy as np
@@ -217,7 +218,17 @@ def _generate_nki_custom_call(kernel, *args, **kwargs):
     with kernel.bind_arguments(*numpy_args, **numpy_kwargs) as boundargs:
         config = kernel.dump_config_with_boundargs(boundargs)
 
-    operands = [arg for arg in args if isinstance(arg, (NKIPyTensorRef, np.ndarray))]
+    # Collect tensor operands in parameter order (matching the traced config).
+    # Using inspect.signature to bind args/kwargs ensures correct ordering even
+    # when tensors are passed as keyword arguments.
+    func = getattr(kernel, 'func', kernel)
+    sig = inspect.signature(func)
+    bound = sig.bind(*args, **kwargs)
+    bound.apply_defaults()
+    operands = [
+        v for v in bound.arguments.values()
+        if isinstance(v, (NKIPyTensorRef, np.ndarray))
+    ]
     if get_backend() == "cpu":
         raise NotImplementedError("CPU execution is not supported for NKI custom ops")
     return _build_hlo_custom_call(config, operands)
