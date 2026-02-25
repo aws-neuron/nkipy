@@ -1,5 +1,3 @@
-# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
-# SPDX-License-Identifier: Apache-2.0
 """Spike runtime singleton management.
 
 This module provides the singleton pattern for the Spike runtime, ensuring

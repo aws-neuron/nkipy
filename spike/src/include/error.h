@@ -1,5 +1,3 @@
-// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
-// SPDX-License-Identifier: Apache-2.0
 #ifndef SPIKE_SRC_INCLUDE_ERROR_H
 #define SPIKE_SRC_INCLUDE_ERROR_H
 
@@ -25,7 +23,7 @@ public:
 class NrtError : public SpikeRuntimeError {
 public:
   NrtError(NRT_STATUS error_code, std::string message = "")
-      : error_code_(error_code), SpikeRuntimeError([error_code, &message]() {
+      : SpikeRuntimeError([error_code, &message]() {
           std::ostringstream oss;
           oss << "NRT Error " << nrt_get_status_as_str(error_code) << "("
               << error_code << ")";
@@ -35,7 +33,8 @@ public:
           }
 
           return oss.str();
-        }()) {}
+        }()),
+        error_code_(error_code) {}
 
   NRT_STATUS error_code() const { return error_code_; }
 

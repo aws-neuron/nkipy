@@ -1,5 +1,3 @@
-// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
-// SPDX-License-Identifier: Apache-2.0
 #include "tensor.h"
 #include "nrt_wrapper.h"
 #include "spike.h"
@@ -10,7 +8,7 @@ namespace spike {
 // NrtTensor implementation
 NrtTensor::NrtTensor(nrt_tensor_placement_t placement, uint32_t core_id,
                      size_t size, const std::string &name, const Spike *spike)
-    : ptr_(nullptr), core_id_(core_id), name_(name), size_(size),
+    : ptr_(nullptr), core_id_(core_id), size_(size), name_(name),
       spike_(spike) {
 
   NRT_STATUS status =
@@ -23,7 +21,7 @@ NrtTensor::NrtTensor(nrt_tensor_placement_t placement, uint32_t core_id,
 
 NrtTensor::NrtTensor(const NrtTensor &source, size_t offset, size_t size,
                      const std::string &name)
-    : ptr_(nullptr), core_id_(source.core_id_), name_(name), size_(size),
+    : ptr_(nullptr), core_id_(source.core_id_), size_(size), name_(name),
       spike_(source.spike_) {
   if (source.is_freed()) {
     throw SpikeError(
@@ -42,8 +40,8 @@ NrtTensor::NrtTensor(const NrtTensor &source, size_t offset, size_t size,
 NrtTensor::~NrtTensor() { free(); }
 
 NrtTensor::NrtTensor(NrtTensor &&other) noexcept
-    : ptr_(other.ptr_), core_id_(other.core_id_), name_(std::move(other.name_)),
-      size_(other.size_), spike_(other.spike_) {
+    : ptr_(other.ptr_), core_id_(other.core_id_), size_(other.size_),
+      name_(std::move(other.name_)), spike_(other.spike_) {
   other.ptr_ = nullptr;
 }
 

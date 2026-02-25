@@ -1,0 +1,5 @@
+InheritParentConfig: true
+# runtime doesn't link LLVM, so can't use llvm:: algorithms
+Checks: >
+  -readability-identifier-naming,
+  -llvm-use-ranges

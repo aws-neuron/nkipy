@@ -47,7 +47,7 @@ docs = [
 
 [tool.ruff]
 line-length = 88
-exclude = ["build", "third-party"]
+exclude = ["build", "third-party", "spike/src/spike/_spike.pyi"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]
