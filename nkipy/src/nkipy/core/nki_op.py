@@ -20,6 +20,7 @@ Supports two NKI frontends:
 """
 
 import dataclasses
+import inspect
 from typing import Callable, Iterable, Optional, Tuple
 
 import numpy as np
@@ -195,29 +196,31 @@ def _generate_nki_custom_call(kernel, *args, **kwargs):
     """Generate HLO custom-call for an NKI kernel during NKIPy tracing."""
     _patch_nkipy_methods(kernel)
 
+    # Bind original args/kwargs to the kernel signature to get parameter-ordered
+    # arguments. This is used both for NKI specialization and to collect tensor
+    # operands in the correct order for the HLO custom call.
+    func = getattr(kernel, "func", kernel)
+    sig = inspect.signature(func)
+    bound = sig.bind(*args, **kwargs)
+    bound.apply_defaults()
+
     # Convert NKIPyTensorRef to empty numpy arrays for NKI specialization
     # Especially important for NKI Beta2 frontend
     # which doesn't support NKIPyTensorRef during specialize
-    numpy_args = []
-    for arg in args:
-        if isinstance(arg, NKIPyTensorRef):
-            # Create empty numpy array with same shape/dtype
-            numpy_args.append(np.empty(arg.shape, dtype=arg.dtype))
-        else:
-            # Maybe numpy or non-tensor args
-            numpy_args.append(arg)
+    numpy_bound = {
+        k: np.empty(v.shape, dtype=v.dtype) if isinstance(v, NKIPyTensorRef) else v
+        for k, v in bound.arguments.items()
+    }
 
-    numpy_kwargs = {}
-    for key, value in kwargs.items():
-        if isinstance(value, NKIPyTensorRef):
-            numpy_kwargs[key] = np.empty(value.shape, dtype=value.dtype)
-        else:
-            numpy_kwargs[key] = value
-
-    with kernel.bind_arguments(*numpy_args, **numpy_kwargs) as boundargs:
+    with kernel.bind_arguments(**numpy_bound) as boundargs:
         config = kernel.dump_config_with_boundargs(boundargs)
 
-    operands = [arg for arg in args if isinstance(arg, (NKIPyTensorRef, np.ndarray))]
+    # Collect tensor operands in parameter order (matching the traced config).
+    operands = [
+        v
+        for v in bound.arguments.values()
+        if isinstance(v, (NKIPyTensorRef, np.ndarray))
+    ]
     if get_backend() == "cpu":
         raise NotImplementedError("CPU execution is not supported for NKI custom ops")
     return _build_hlo_custom_call(config, operands)

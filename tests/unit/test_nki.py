@@ -363,6 +363,37 @@ def test_nki_mutable_tensor(trace_mode):
         baremetal_assert_allclose(t_a.numpy(), ref)
 
 
+@pytest.mark.skipif(
+    not BETA2_NKI_AVAILABLE, reason="Beta 2 NKI frontend (nki) not available"
+)
+def test_nki_direct_jit_beta2_kwargs_operand_order():
+    """Tensor operands passed as kwargs must be collected in parameter order."""
+
+    @nki_beta2.jit(platform_target="trn2")
+    def nki_add_kernel(a_input, b_input):
+        a_tile = sbuf.view(dtype=a_input.dtype, shape=a_input.shape)  # noqa: F821
+        nisa_beta2.dma_copy(dst=a_tile, src=a_input)
+        b_tile = sbuf.view(dtype=b_input.dtype, shape=b_input.shape)  # noqa: F821
+        nisa_beta2.dma_copy(dst=b_tile, src=b_input)
+        c_tile = sbuf.view(dtype=a_input.dtype, shape=a_input.shape)  # noqa: F821
+        nisa_beta2.tensor_tensor(
+            dst=c_tile, data1=a_tile, data2=b_tile, op=nl_beta2.add
+        )
+        c_output = hbm.view(dtype=a_input.dtype, shape=a_input.shape)  # noqa: F821
+        nisa_beta2.dma_copy(dst=c_output, src=c_tile)
+        return c_output
+
+    a = np.random.rand(128, 512).astype(np.float32)
+    b = np.random.rand(128, 512).astype(np.float32)
+
+    # Pass both tensors as kwargs (b before a) — must still trace correctly
+    def test_func(a, b):
+        return nki_add_kernel(b_input=b, a_input=a)
+
+    traced = NKIPyKernel.trace(test_func, backend="hlo")
+    traced.specialize(a, b)
+
+
 if __name__ == "__main__":
     # Allow running the test file directly
     pytest.main([__file__])
