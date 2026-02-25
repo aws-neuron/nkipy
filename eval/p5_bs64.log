@@ -1,0 +1,38 @@
+$ python3 -m sglang.bench_one_batch_server --model openai/gpt-oss-120b --base-url http://localhost:30000 --batch-size 64 --input-len 1024 --output-len 512 --show-report
+/home/ubuntu/zhenyus/sglang/.venv/lib/python3.12/site-packages/torch/cuda/__init__.py:63: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+Warning: Missing operations: ['set_num_sms', 'get_num_sms', 'set_tc_util', 'get_tc_util', 'fp8_gemm_nt', 'fp8_gemm_nn', 'fp8_gemm_tn', 'fp8_gemm_tt', 'm_grouped_fp8_gemm_nt_contiguous', 'm_grouped_fp8_gemm_nn_contiguous', 'm_grouped_fp8_gemm_nt_masked', 'k_grouped_fp8_gemm_tn_contiguous', 'transform_sf_into_required_layout']
+W1006 18:59:19.811000 3037638 .venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2425] TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+W1006 18:59:19.811000 3037638 .venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:2425] If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'] to specific architectures.
+WARNING:sglang.srt.configs.model_config:mxfp4 quantization is not fully optimized yet. The speed can be slower than non-quantized models.
+WARNING:sglang.srt.server_args:Detected GPT-OSS model, enabling triton_kernels MOE kernel.
+======== Warmup Begin ========
+#Input tokens: 16384
+#Output tokens: 256
+batch size: 16
+input_len: 1024
+output_len: 16
+latency: 0.37 s
+ttft: 0.27 s
+last generation throughput: 0.00 tok/s
+input throughput: 59992.31 tok/s
+output throughput: 2738.34 tok/s
+======== Warmup End   ========
+
+#Input tokens: 65536
+#Output tokens: 32768
+batch size: 64
+input_len: 1024
+output_len: 512
+latency: 4.81 s
+ttft: 0.68 s
+last generation throughput: 7890.09 tok/s
+input throughput: 96737.70 tok/s
+output throughput: 7921.53 tok/s
+
+Results are saved to result.jsonl
+
+Input lens: (1024,). Output lens: (512,).
+|   batch size |   latency (s) |   input throughput (tok/s) |   output throughput (tok/s) | acc length   |   ITL (ms) |   input cost ($/1M) |   output cost ($/1M) |
+|--------------|---------------|----------------------------|-----------------------------|--------------|------------|---------------------|----------------------|
+|           64 |          4.81 |                   96737.70 |                     7921.53 | n/a          |       8.08 |                0.01 |                 0.07 |

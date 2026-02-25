@@ -1,0 +1,14 @@
+__pycache__
+.vscode
+tmp*
+build
+profile
+*.pftrace
+chat.log
+*.md
+.stfolder
+.stignore
+reference*.json
+*egg-info*
+*.npy
+.claude/settings.local.json

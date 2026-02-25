@@ -1,0 +1,3 @@
+# Ruff configuration
+[tool.ruff]
+line-length = 140

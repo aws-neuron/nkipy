@@ -1,0 +1,17 @@
+#Input tokens: 32768
+#Output tokens: 16384
+batch size: 32
+input_len: 1024
+output_len: 512
+latency: 3.74 s
+ttft: 0.34 s
+last generation throughput: 4834.07 tok/s
+input throughput: 95860.29 tok/s
+output throughput: 4823.81 tok/s
+
+Results are saved to result.jsonl
+
+Input lens: (1024,). Output lens: (512,).
+|   batch size |   latency (s) |   input throughput (tok/s) |   output throughput (tok/s) | acc length   |   ITL (ms) |   input cost ($/1M) |   output cost ($/1M) |
+|--------------|---------------|----------------------------|-----------------------------|--------------|------------|---------------------|----------------------|
+|           32 |          3.74 |                   95860.29 |                     4823.81 | n/a          |       6.63 |                0.01 |                 0.12 |

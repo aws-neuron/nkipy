@@ -1,0 +1,11 @@
+blobfile
+numpy
+safetensors
+torch
+pybind11
+transformers
+pytest
+debugpy # for debugging
+accelerate
+plotly # for debugging
+pytest-xdist
