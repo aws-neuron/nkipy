@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Execution wrappers for NKIPy kernels"""
 
+import inspect
 import os
 import shutil
 
@@ -19,20 +20,18 @@ except ImportError:
     _RUNTIME_AVAILABLE = False
 
 
-def baremetal_run_traced_kernel(
+def _compile_kernel(
     kernel,
     *args,
     artifacts_dir=None,
-    save_trace=False,
     additional_compiler_args="",
     target=compile.CompilationTarget.DEFAULT,
     **kwargs,
 ):
-    if not _RUNTIME_AVAILABLE:
-        raise RuntimeError(
-            "Runtime is not available. Please install Spike to use this function."
-        )
+    """Specialize and compile a traced kernel to NEFF.
 
+    Returns (neff_path, kernel_name, ir, boundargs).
+    """
     # Sanitize unsupported dtypes (float64/int64/uint64) before tracing
     args = tuple(
         _sanitize_array_dtype(a, f"arg{i}") if isinstance(a, np.ndarray) else a
@@ -48,8 +47,6 @@ def baremetal_run_traced_kernel(
     ir = kernel._code
 
     # Bind arguments for input/output mapping
-    import inspect
-
     sig = inspect.signature(kernel.func)
     boundargs = sig.bind(*args, **kwargs)
     boundargs.apply_defaults()
@@ -67,9 +64,8 @@ def baremetal_run_traced_kernel(
             compile.nkipy_compiler_args + " " + additional_compiler_args
         )
     else:
-        # assume is NKI
         additional_compiler_args = (
-            compile.nki_compiler_args + " " + additional_compiler_args
+            compile.DEFAULT_ADDITIONAL_COMPILER_ARGS + " " + additional_compiler_args
         )
 
     # always clean the build dir in baremetal mode
@@ -84,6 +80,19 @@ def baremetal_run_traced_kernel(
         additional_compiler_args=additional_compiler_args,
         target=target,
     )
+
+    return neff, name, ir, boundargs
+
+
+def _execute_neff(neff, name, ir, boundargs, save_trace=False):
+    """Load a compiled NEFF and run it on hardware.
+
+    Returns output numpy array(s).
+    """
+    if not _RUNTIME_AVAILABLE:
+        raise RuntimeError(
+            "Runtime is not available. Please install Spike to use this function."
+        )
 
     device_kernel = DeviceKernel.load_from_neff(neff, name)
 
@@ -114,3 +123,24 @@ def baremetal_run_traced_kernel(
     elif len(ir.outputs) > 1:
         return tuple(boundargs.arguments[out.name] for out in ir.outputs)
     return None
+
+
+def baremetal_run_traced_kernel(
+    kernel,
+    *args,
+    artifacts_dir=None,
+    save_trace=False,
+    additional_compiler_args="",
+    target=compile.CompilationTarget.DEFAULT,
+    **kwargs,
+):
+    """Compile and run a traced kernel on hardware."""
+    neff, name, ir, boundargs = _compile_kernel(
+        kernel,
+        *args,
+        artifacts_dir=artifacts_dir,
+        additional_compiler_args=additional_compiler_args,
+        target=target,
+        **kwargs,
+    )
+    return _execute_neff(neff, name, ir, boundargs, save_trace=save_trace)
