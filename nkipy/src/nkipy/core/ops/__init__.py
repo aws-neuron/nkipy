@@ -84,7 +84,7 @@ from nkipy.core.ops.indexing import (
 # -----------------------------------------------------------------------------
 # Linear algebra operations
 # -----------------------------------------------------------------------------
-from nkipy.core.ops.linalg import matmul
+from nkipy.core.ops.linalg import dot, matmul
 
 # -----------------------------------------------------------------------------
 # Neural network operations
@@ -104,6 +104,7 @@ from nkipy.core.ops.reduce import (
     mean,
     min,
     sum,
+    var,
 )
 
 # -----------------------------------------------------------------------------
@@ -203,6 +204,7 @@ __all__ = [
     "empty_like",
     "full_like",
     # Linalg
+    "dot",
     "matmul",
     # Reduction
     "sum",
@@ -210,6 +212,7 @@ __all__ = [
     "min",
     "mean",
     "any",
+    "var",
     # Transform
     "reshape",
     "transpose",
