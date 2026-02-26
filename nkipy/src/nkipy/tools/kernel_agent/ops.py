@@ -84,11 +84,7 @@ TARGET_OPS = {
 }
 
 # Ops requiring special handling
-BINARY_OPS = set(
-    TARGET_OPS["binary"]
-    + TARGET_OPS["comparison"]
-    + ["logical_and", "logical_or", "logical_xor"]
-)
+BINARY_OPS = set(TARGET_OPS["binary"] + TARGET_OPS["comparison"])
 INTEGER_OPS = {"bitwise_and", "bitwise_or", "bitwise_xor", "floor_divide", "mod"}
 POSITIVE_INPUT_OPS = {"log", "sqrt"}
 
@@ -176,12 +172,17 @@ def make_inputs(
 
     # Use deterministic values
     size = int(np.prod(shape))
-    base = np.linspace(0.1, 1.0, size).reshape(shape).astype(np_dtype)
+    if np.issubdtype(np_dtype, np.integer):
+        base = np.arange(1, size + 1).reshape(shape).astype(np_dtype)
+    else:
+        base = np.linspace(0.1, 1.0, size).reshape(shape).astype(np_dtype)
 
     if op_name in POSITIVE_INPUT_OPS:
         base = np.abs(base) + 0.1
 
     if op_name in BINARY_OPS:
+        if np.issubdtype(np_dtype, np.integer):
+            return {"a": base, "b": base // 2 + 1}
         return {"a": base, "b": base * 0.5 + 0.1}
     elif op_name == "where":
         cond = (base > 0.5).astype(np.bool_)

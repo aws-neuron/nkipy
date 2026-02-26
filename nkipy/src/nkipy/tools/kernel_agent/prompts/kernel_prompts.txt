@@ -1,0 +1,62 @@
+# ML activations / norms
+softmax along the last axis
+layer normalization with learnable scale and shift
+GELU activation function
+ReLU activation function
+sigmoid activation function
+SiLU (swish) activation function
+RMS normalization along the last axis
+batch normalization using precomputed mean and variance
+softplus activation function
+hard sigmoid activation function
+
+# Linear algebra
+matrix multiply followed by bias addition
+outer product of two vectors
+Frobenius norm of a matrix
+linear projection: y = x @ W + b
+cosine similarity between two matrices row-wise
+pairwise L2 distance between rows of two matrices
+bilinear form: x^T A y for batched vectors and matrix
+
+# Statistics
+compute mean and variance along axis 1
+standardize a matrix to zero mean and unit variance per row
+log-sum-exp along the last axis (numerically stable)
+weighted average along axis 0 given a weight vector
+coefficient of variation per column
+exponential moving average along axis 0 with alpha=0.1
+
+# Signal / transform
+1D convolution-like: sliding dot product with a small filter
+low-pass filter: average each element with its neighbors
+polynomial evaluation using Horner's method (vectorized)
+scaled dot-product attention scores (Q @ K^T / sqrt(d))
+exponential moving average of rows
+cross-correlation between two 1D signals via dot products
+
+# Array manipulation
+tile a vector and multiply element-wise with a matrix
+concatenate two matrices along axis 1 then square each element
+reverse a matrix along the last axis
+repeat each row of a matrix k times
+create a diagonal mask matrix and apply it element-wise
+broadcast-add a row vector to every row of a matrix
+transpose a matrix and multiply with original
+stack two matrices and compute mean along the new axis
+
+# Reductions
+sum along axis 1 then broadcast-subtract from original
+argmax along axis 1 then gather those elements
+cumulative sum along the last axis
+max-normalize each row to have max value 1
+count elements above a threshold per row
+top-k approximation: zero out elements below the k-th largest per row
+
+# Complex multi-op
+single attention head: softmax(Q @ K^T / sqrt(d)) @ V
+MLP block: x @ W1 + b1 then GELU then @ W2 + b2
+residual connection followed by layer normalization
+simple RNN cell: h_new = tanh(x @ W_x + h @ W_h + b)
+cross-entropy loss from logits and one-hot labels
+mixture-of-experts gating: softmax gate scores times expert outputs

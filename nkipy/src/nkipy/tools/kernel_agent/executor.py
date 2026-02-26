@@ -55,9 +55,16 @@ def run_kernel(
     """Run kernel through numpy → compile → hardware pipeline."""
     result = ExecutionResult()
 
-    # Get args from function signature
+    # Get args from function signature, skipping params with defaults
+    # that aren't in inputs (e.g. eps=1e-5)
     sig = inspect.signature(kernel_fn)
-    args = [inputs[p] for p in sig.parameters]
+    args = []
+    for name, param in sig.parameters.items():
+        if name in inputs:
+            args.append(inputs[name])
+        elif param.default is inspect.Parameter.empty:
+            raise KeyError(f"Missing required input: '{name}'")
+        # else: has default value, function will use it
 
     # Stage 1: Pure NumPy
     try:
@@ -67,33 +74,31 @@ def run_kernel(
         result.numpy = StageResult(success=False, error=str(e))
         return result
 
-    # Stage 2: Trace + simulate
+    # Stage 2: Compilation (trace + specialize + compile to NEFF)
     try:
         from nkipy.core.trace import NKIPyKernel
-        from nkipy.runtime.execute import simulate_traced_kernel
+        from nkipy.runtime.execute import _compile_kernel
 
         traced = NKIPyKernel.trace(kernel_fn)
-        out = simulate_traced_kernel(traced, *args)
-        result.compile = StageResult(success=True, output=np.asarray(out))
+        neff, kname, ir, boundargs = _compile_kernel(
+            traced, *args, artifacts_dir=artifacts_dir
+        )
+        result.compile = StageResult(success=True)
     except Exception as e:
         result.compile = StageResult(success=False, error=str(e))
         return result
 
-    # Stage 3: Hardware
     if run_hardware:
+        # Stage 3: Hardware execution (load NEFF + run on device)
         try:
-            from nkipy.core.trace import NKIPyKernel
-            from nkipy.runtime.execute import baremetal_run_traced_kernel
+            from nkipy.runtime.execute import _execute_neff
 
-            traced = NKIPyKernel.trace(kernel_fn)
-            out = baremetal_run_traced_kernel(
-                traced, *args, artifacts_dir=artifacts_dir
-            )
+            out = _execute_neff(neff, kname, ir, boundargs)
             result.hardware = StageResult(success=True, output=np.asarray(out))
         except Exception as e:
             result.hardware = StageResult(success=False, error=str(e))
     else:
-        result.hardware = StageResult(success=True, output=result.compile.output)
+        result.hardware = StageResult(success=False, error="Skipped")
 
     return result
 
@@ -108,8 +113,11 @@ def compare_outputs(result: ExecutionResult) -> Dict[str, Any]:
     np_out = result.numpy.output
     hw_out = result.hardware.output
 
+    if np_out.shape != hw_out.shape:
+        return {"shapes_match": False, "max_diff": float("inf"), "allclose": False}
+
     return {
-        "shapes_match": np_out.shape == hw_out.shape,
+        "shapes_match": True,
         "max_diff": float(np.max(np.abs(np_out - hw_out))),
         "allclose": bool(np.allclose(np_out, hw_out, rtol=1e-4, atol=1e-4)),
     }
