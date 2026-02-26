@@ -5,10 +5,7 @@
 import nkipy.distributed.collectives as cc
 import numpy as np
 import pytest
-from utils import (
-    trace_and_compile,
-    trace_mode,  # noqa: F401 - pytest fixture
-)
+from utils import trace_and_compile
 
 
 def test_all_reduce(trace_mode):
@@ -135,6 +132,166 @@ def test_all_to_all(trace_mode):
         "All-to-all should split columns and stack rows"
     )
     print(f"✓ all_to_all {trace_mode.upper()} test passed")
+
+
+def test_all_reduce_max(trace_mode):
+    """Test all_reduce with reduce_op=np.maximum"""
+
+    def kernel(input_data):
+        result = cc.all_reduce(
+            input_data, replica_groups=[[0, 1]], reduce_op=np.maximum
+        )
+        return result
+
+    input_data = np.random.rand(128, 256).astype(np.float32)
+
+    trace_and_compile(kernel, trace_mode, input_data)
+
+    # CPU: max of identical data is the data itself
+    output = kernel(input_data)
+    assert np.allclose(output, input_data), (
+        "All-reduce max with identical data should return original data"
+    )
+
+
+def test_all_reduce_min(trace_mode):
+    """Test all_reduce with reduce_op=np.minimum"""
+
+    def kernel(input_data):
+        result = cc.all_reduce(
+            input_data, replica_groups=[[0, 1]], reduce_op=np.minimum
+        )
+        return result
+
+    input_data = np.random.rand(128, 256).astype(np.float32)
+
+    trace_and_compile(kernel, trace_mode, input_data)
+
+    # CPU: min of identical data is the data itself
+    output = kernel(input_data)
+    assert np.allclose(output, input_data), (
+        "All-reduce min with identical data should return original data"
+    )
+
+
+@pytest.mark.xfail(
+    reason="Compiler does not support multiply for all-reduce collectives"
+)
+def test_all_reduce_multiply(trace_mode):
+    """Test all_reduce with reduce_op=np.multiply"""
+
+    def kernel(input_data):
+        result = cc.all_reduce(
+            input_data, replica_groups=[[0, 1]], reduce_op=np.multiply
+        )
+        return result
+
+    input_data = np.random.rand(128, 256).astype(np.float32)
+
+    trace_and_compile(kernel, trace_mode, input_data)
+
+    # CPU: multiply across 2 ranks => data ** 2
+    output = kernel(input_data)
+    expected = input_data**2
+    assert np.allclose(output, expected), (
+        "All-reduce multiply with 2 devices should return data**2"
+    )
+
+
+def test_reduce_scatter_max(trace_mode):
+    """Test reduce_scatter with reduce_op=np.maximum"""
+
+    def kernel(input_data):
+        result = cc.reduce_scatter(
+            input_data,
+            reduce_scatter_dim=0,
+            replica_groups=[[0, 1]],
+            reduce_op=np.maximum,
+        )
+        return result
+
+    input_data = np.random.rand(128, 256).astype(np.float32)
+
+    trace_and_compile(kernel, trace_mode, input_data)
+
+    # CPU: max of identical data, then take first half
+    output = kernel(input_data)
+    expected = input_data[:64, :]
+    assert output.shape == (64, 256)
+    assert np.allclose(output, expected), (
+        "Reduce-scatter max should return first chunk of data"
+    )
+
+
+@pytest.mark.xfail(
+    reason="Compiler does not support multiply for reduce-scatter collectives"
+)
+def test_reduce_scatter_multiply(trace_mode):
+    """Test reduce_scatter with reduce_op=np.multiply"""
+
+    def kernel(input_data):
+        result = cc.reduce_scatter(
+            input_data,
+            reduce_scatter_dim=0,
+            replica_groups=[[0, 1]],
+            reduce_op=np.multiply,
+        )
+        return result
+
+    input_data = np.random.rand(128, 256).astype(np.float32)
+
+    trace_and_compile(kernel, trace_mode, input_data)
+
+    # CPU: multiply across 2 ranks => data**2, then take first half
+    output = kernel(input_data)
+    expected = (input_data**2)[:64, :]
+    assert output.shape == (64, 256)
+    assert np.allclose(output, expected), (
+        "Reduce-scatter multiply should return first chunk of data**2"
+    )
+
+
+def test_all_reduce_multiply_cpu():
+    """CPU-only: all_reduce with np.multiply returns data**world_size."""
+    data = np.random.rand(64, 128).astype(np.float32)
+    output = cc.all_reduce(data, replica_groups=[[0, 1]], reduce_op=np.multiply)
+    expected = data**2
+    assert np.allclose(output, expected)
+
+
+def test_all_reduce_default_cpu():
+    """CPU-only: all_reduce with unrecognized reduce_op returns data.copy()."""
+    data = np.random.rand(64, 128).astype(np.float32)
+    output = cc.all_reduce(data, replica_groups=[[0, 1]], reduce_op=np.subtract)
+    np.testing.assert_array_equal(output, data)
+
+
+def test_reduce_scatter_multiply_cpu():
+    """CPU-only: reduce_scatter with np.multiply."""
+    data = np.random.rand(128, 256).astype(np.float32)
+    output = cc.reduce_scatter(
+        data,
+        reduce_scatter_dim=0,
+        replica_groups=[[0, 1]],
+        reduce_op=np.multiply,
+    )
+    expected = (data**2)[:64, :]
+    assert output.shape == (64, 256)
+    assert np.allclose(output, expected)
+
+
+def test_reduce_scatter_default_cpu():
+    """CPU-only: reduce_scatter with unrecognized reduce_op."""
+    data = np.random.rand(128, 256).astype(np.float32)
+    output = cc.reduce_scatter(
+        data,
+        reduce_scatter_dim=0,
+        replica_groups=[[0, 1]],
+        reduce_op=np.subtract,
+    )
+    expected = data[:64, :]
+    assert output.shape == (64, 256)
+    np.testing.assert_array_equal(output, expected)
 
 
 def test_combined_ops(trace_mode):

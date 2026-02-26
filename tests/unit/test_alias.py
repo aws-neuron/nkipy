@@ -16,7 +16,6 @@ from utils import (
     baremetal_assert_allclose,
     cpu_assert_allclose,
     trace_and_compile,
-    trace_mode,  # noqa: F401 - pytest fixture
 )
 
 

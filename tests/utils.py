@@ -8,7 +8,6 @@ import tempfile
 from functools import partial
 
 import numpy as np
-import pytest
 from nkipy.core import compile
 from nkipy.core.trace import NKIPyKernel
 from nkipy.runtime import is_neuron_compatible
@@ -28,13 +27,6 @@ baremetal_assert_allclose = partial(
 
 # Hardware availability check
 NEURON_AVAILABLE = is_neuron_compatible()
-
-
-# Trace mode fixture - tests will run with HLO tracing
-@pytest.fixture(params=["hlo"])
-def trace_mode(request):
-    """Fixture to run tests with HLO tracing mode"""
-    return request.param
 
 
 def trace_and_compile(kernel_fn, trace_mode, *args, **kwargs):

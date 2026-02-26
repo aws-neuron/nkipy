@@ -36,7 +36,6 @@ from utils import (
     NEURON_AVAILABLE,
     on_device_test,
     trace_and_compile,
-    trace_mode,  # noqa: F401 - pytest fixture
 )
 
 
