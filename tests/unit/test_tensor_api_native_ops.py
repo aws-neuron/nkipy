@@ -9,7 +9,6 @@ from utils import (
     baremetal_assert_allclose,
     on_device_test,
     trace_and_compile,
-    trace_mode,  # noqa: F401 - pytest fixture
 )
 
 

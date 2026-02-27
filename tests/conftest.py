@@ -4,8 +4,16 @@ import os
 import sys
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+
+
+# Trace mode fixture - tests will run with HLO tracing
+@pytest.fixture(params=["hlo"])
+def trace_mode(request):
+    """Fixture to run tests with HLO tracing mode"""
+    return request.param
 
 
 def _num_visible_core():

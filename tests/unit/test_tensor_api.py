@@ -24,7 +24,6 @@ from utils import (
     cpu_assert_allclose,
     on_device_test,
     trace_and_compile,
-    trace_mode,  # noqa: F401 - pytest fixture
 )
 
 
@@ -82,7 +81,47 @@ def test_expand_dims_0(trace_mode):
 
     in0 = np.random.uniform(high=1.0, low=0.0, size=shape).astype(dtype)
 
-    expected = np.expand_dims(in0, axis=axis)
+    expected = kernel(in0)
+
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_expand_dims_list_axes(trace_mode):
+    """Test expand_dims with a list of axes including negatives."""
+
+    def kernel(a):
+        return np.expand_dims(a, axis=[0, -1])
+
+    shape = (64, 64)
+    dtype = np.float32
+
+    in0 = np.random.uniform(high=1.0, low=0.0, size=shape).astype(dtype)
+
+    expected = kernel(in0)
+
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_expand_dims_negative_axis(trace_mode):
+    """Test expand_dims with a single negative axis."""
+
+    def kernel(a):
+        return np.expand_dims(a, axis=-2)
+
+    shape = (64, 64)
+    dtype = np.float32
+
+    in0 = np.random.uniform(high=1.0, low=0.0, size=shape).astype(dtype)
+
+    expected = kernel(in0)
 
     if NEURON_AVAILABLE:
         out_device = on_device_test(kernel, trace_mode, in0)
@@ -291,6 +330,24 @@ def test_matmul_1d_promotion(trace_mode, lhs_shape, rhs_shape):
         trace_and_compile(kernel, trace_mode, in0, in1)
 
 
+def test_matmul_1d_dot(trace_mode):
+    """np.matmul(a, b) with 1D vectors — dot product path."""
+
+    def kernel(a, b):
+        return np.matmul(a, b)
+
+    in0 = np.random.random_sample((64,)).astype(np.float32)
+    in1 = np.random.random_sample((64,)).astype(np.float32)
+
+    expected = kernel(in0, in1)
+
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0, in1)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0, in1)
+
+
 @pytest.mark.parametrize("np_fn", [np.mean, np.max, np.min, np.sum])
 @pytest.mark.parametrize(
     "shape,dtype,axis",
@@ -394,6 +451,45 @@ def test_reduction_axis_none_keepdims(trace_mode, np_fn, shape, dtype, keepdims)
         trace_and_compile(kernel, trace_mode, in0)
 
 
+def test_mean_axis(trace_mode):
+    """Test np.mean with an explicit axis."""
+
+    def kernel(a):
+        return np.mean(a, axis=1)
+
+    shape = (64, 64)
+    dtype = np.float32
+
+    in0 = np.random.random_sample(shape).astype(dtype)
+
+    expected = kernel(in0)
+
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_any_reduction(trace_mode):
+    """Test np.any with an explicit axis."""
+
+    def kernel(a):
+        return np.any(a, axis=0)
+
+    shape = (32, 64)
+    dtype = np.float32
+
+    in0 = np.random.random_sample(shape).astype(dtype)
+    expected = kernel(in0)
+
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
 @pytest.mark.parametrize(
     "src_shape,dst_shape",
     [
@@ -429,6 +525,48 @@ def test_broadcast_to(trace_mode, src_shape, dst_shape):
         baremetal_assert_allclose(expected, out_device)
     else:
         trace_and_compile(kernel, trace_mode, in0, dst_shape)
+
+
+def test_broadcast_to_same_shape(trace_mode):
+    """np.broadcast_to(x, x.shape) — copy path when shapes match."""
+    target_shape = (4, 8)
+
+    def kernel(a, shape):
+        return np.broadcast_to(a, shape=shape)
+
+    in0 = np.random.random_sample(target_shape).astype(np.float32)
+
+    expected = kernel(in0, target_shape)
+
+    if NEURON_AVAILABLE:
+
+        def kernel_fixed(a):
+            return np.broadcast_to(a, shape=target_shape)
+
+        out_device = on_device_test(kernel_fixed, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0, target_shape)
+
+
+def test_copy(trace_mode):
+    """np.copy(x) inside kernel exercises copy HLO path."""
+
+    def kernel(a):
+        return np.copy(a)
+
+    shape = (8, 8)
+    dtype = np.float32
+
+    in0 = np.random.random_sample(shape).astype(dtype)
+
+    expected = kernel(in0)
+
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
 
 
 @pytest.mark.parametrize(
@@ -476,6 +614,26 @@ def test_repeat(trace_mode, shape, repeats, axis):
 
     def kernel(a):
         return np.repeat(a, repeats=repeats, axis=axis)
+
+    in0 = np.random.random_sample(shape).astype(dtype)
+
+    expected = kernel(in0)
+
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_repeat_negative_axis(trace_mode):
+    """np.repeat with negative axis."""
+
+    def kernel(a):
+        return np.repeat(a, 2, axis=-1)
+
+    shape = (4, 8)
+    dtype = np.float32
 
     in0 = np.random.random_sample(shape).astype(dtype)
 
@@ -850,6 +1008,39 @@ def test_where_ndarray_cond_dim2(trace_mode, shape):
         trace_and_compile(kernel, trace_mode, in0, in1)
 
 
+def test_where_with_scalar_values(trace_mode):
+    """np.where with scalar x or y."""
+    shape = (4, 4)
+    dtype = np.float32
+
+    def kernel_scalar_y(cond, a):
+        return np.where(cond, a, 0.0)
+
+    def kernel_scalar_x(cond, a):
+        return np.where(cond, 1.0, a)
+
+    cond = np.random.choice([True, False], size=shape).astype(np.uint8)
+    in0 = np.random.random_sample(shape).astype(dtype)
+
+    # Test scalar y
+    expected_sy = kernel_scalar_y(cond, in0)
+
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel_scalar_y, trace_mode, cond, in0)
+        baremetal_assert_allclose(expected_sy, out_device)
+    else:
+        trace_and_compile(kernel_scalar_y, trace_mode, cond, in0)
+
+    # Test scalar x
+    expected_sx = kernel_scalar_x(cond, in0)
+
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel_scalar_x, trace_mode, cond, in0)
+        baremetal_assert_allclose(expected_sx, out_device)
+    else:
+        trace_and_compile(kernel_scalar_x, trace_mode, cond, in0)
+
+
 @pytest.mark.parametrize(
     "shape,idx_size",
     [((5, 10, 15), 3), ((10, 20, 30), 5), ((15, 25, 35), 7)],
@@ -974,6 +1165,40 @@ def test_topk(trace_mode, shape, top_k, axis):
 
     a_torch = torch.from_numpy(a)
     values_gt, indices_gt = torch.topk(a_torch, k=top_k, dim=axis)
+    values_gt = values_gt.numpy()
+    indices_gt = indices_gt.numpy()
+
+    values_cpu, indices_cpu = kernel(a)
+    cpu_assert_allclose(values_cpu, values_gt)
+    cpu_assert_allclose(indices_cpu, indices_gt)
+
+    if NEURON_AVAILABLE:
+        values, indices = on_device_test(kernel, trace_mode, a)
+        baremetal_assert_allclose(values, values_gt)
+        baremetal_assert_allclose(indices, indices_gt)
+    else:
+        trace_and_compile(kernel, trace_mode, a)
+
+
+@pytest.mark.skipif(not TORCH_AVAILABLE, reason="PyTorch not installed")
+@pytest.mark.parametrize(
+    "shape,top_k,axis",
+    [
+        ((10,), 3, -1),
+        ((5, 10), 2, -1),
+    ],
+)
+def test_topk_ascending(trace_mode, shape, top_k, axis):
+    """Test topk with is_ascend=True (find k smallest)."""
+
+    def kernel(a):
+        values, indices = tensor_apis.topk(a, k=top_k, axis=axis, is_ascend=True)
+        return values, indices
+
+    a = np.random.random_sample(shape).astype(np.float32)
+
+    a_torch = torch.from_numpy(a)
+    values_gt, indices_gt = torch.topk(a_torch, k=top_k, dim=axis, largest=False)
     values_gt = values_gt.numpy()
     indices_gt = indices_gt.numpy()
 
@@ -1487,6 +1712,191 @@ def test_like_functions_various_shapes(trace_mode, shape, input_dtype, output_dt
             )
         else:
             trace_and_compile(kernel_fn, trace_mode, in0)
+
+
+def test_zeros_standalone(trace_mode):
+    """Test np.zeros(shape, dtype) as a kernel operation."""
+
+    def kernel(a):
+        z = np.zeros((64, 64), dtype=np.float32)
+        return np.add(a, z)
+
+    in0 = np.random.random_sample((64, 64)).astype(np.float32)
+
+    expected = in0.copy()
+
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_full_standalone(trace_mode):
+    """Test np.full(shape, fill_value, dtype) as a kernel operation."""
+
+    def kernel(a):
+        f = np.full((64, 64), 2.0, dtype=np.float32)
+        return np.multiply(a, f)
+
+    in0 = np.random.random_sample((64, 64)).astype(np.float32)
+
+    expected = kernel(in0)
+
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_concatenate(trace_mode):
+    """Test np.concatenate along an axis."""
+
+    def kernel(a, b):
+        return np.concatenate([a, b], axis=0)
+
+    shape = (32, 64)
+    dtype = np.float32
+
+    in0 = np.random.random_sample(shape).astype(dtype)
+    in1 = np.random.random_sample(shape).astype(dtype)
+
+    expected = kernel(in0, in1)
+
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0, in1)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0, in1)
+
+
+def test_concatenate_single_tensor(trace_mode):
+    """Test np.concatenate with a single tensor."""
+
+    def kernel(a):
+        return np.concatenate([a], axis=0)
+
+    shape = (32, 64)
+    dtype = np.float32
+
+    in0 = np.random.random_sample(shape).astype(dtype)
+
+    expected = in0.copy()
+
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_concatenate_negative_axis(trace_mode):
+    """np.concatenate with negative axis."""
+
+    def kernel(a, b):
+        return np.concatenate([a, b], axis=-1)
+
+    shape = (32, 32)
+    dtype = np.float32
+
+    in0 = np.random.random_sample(shape).astype(dtype)
+    in1 = np.random.random_sample(shape).astype(dtype)
+
+    expected = kernel(in0, in1)
+
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0, in1)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0, in1)
+
+
+def test_split_equal(trace_mode):
+    """Test np.split with integer sections (equal division)."""
+
+    def kernel(a):
+        parts = np.split(a, 2, axis=0)
+        return parts[0], parts[1]
+
+    shape = (64, 64)
+    dtype = np.float32
+
+    in0 = np.random.random_sample(shape).astype(dtype)
+
+    expected_0, expected_1 = kernel(in0)
+
+    if NEURON_AVAILABLE:
+        out0, out1 = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected_0, out0)
+        baremetal_assert_allclose(expected_1, out1)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_split_indices(trace_mode):
+    """Test np.split with a list of indices."""
+
+    def kernel(a):
+        parts = np.split(a, [16, 48], axis=0)
+        return parts[0], parts[1], parts[2]
+
+    shape = (64, 64)
+    dtype = np.float32
+
+    in0 = np.random.random_sample(shape).astype(dtype)
+
+    expected_0, expected_1, expected_2 = kernel(in0)
+
+    if NEURON_AVAILABLE:
+        out0, out1, out2 = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected_0, out0)
+        baremetal_assert_allclose(expected_1, out1)
+        baremetal_assert_allclose(expected_2, out2)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_split_negative_axis(trace_mode):
+    """np.split with negative axis."""
+
+    def kernel(a):
+        parts = np.split(a, 2, axis=-1)
+        return parts[0], parts[1]
+
+    shape = (32, 64)
+    dtype = np.float32
+
+    in0 = np.random.random_sample(shape).astype(dtype)
+
+    expected_0, expected_1 = kernel(in0)
+
+    if NEURON_AVAILABLE:
+        out0, out1 = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected_0, out0)
+        baremetal_assert_allclose(expected_1, out1)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_reshape_infer_dim(trace_mode):
+    """Test reshape with -1 to infer one dimension."""
+
+    def kernel(a):
+        return np.reshape(a, (16, -1))
+
+    shape = (64, 64)
+    dtype = np.float32
+
+    in0 = np.random.random_sample(shape).astype(dtype)
+
+    expected = kernel(in0)
+
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
 
 
 @pytest.mark.parametrize(

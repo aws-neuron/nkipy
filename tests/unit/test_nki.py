@@ -11,7 +11,6 @@ from utils import (
     NEURON_AVAILABLE,
     baremetal_assert_allclose,
     on_device_test,
-    trace_mode,  # noqa: F401 - pytest fixture
 )
 
 # Import legacy frontend for existing tests
