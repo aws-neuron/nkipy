@@ -3,16 +3,52 @@
 """LLM-based kernel generation using AWS Bedrock."""
 
 import functools
-import json
-import re
 from importlib.resources import files as _resource_files
 from typing import Dict, List, Optional, Tuple
 
 import boto3
+import ml_dtypes  # noqa: F401 — registers bfloat16 etc. with numpy
 import numpy as np
 
 DEFAULT_MODEL_ID = "global.anthropic.claude-sonnet-4-6"
 DEFAULT_REGION = "us-west-2"
+
+_KERNEL_TOOL = {
+    "toolSpec": {
+        "name": "submit_kernel",
+        "description": (
+            "Submit the generated kernel code, its name, and input specifications."
+        ),
+        "inputSchema": {
+            "json": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Function name"},
+                    "code": {
+                        "type": "string",
+                        "description": "Python source code of the kernel function",
+                    },
+                    "inputs": {
+                        "type": "object",
+                        "description": ("Map of input name to {shape, dtype} spec"),
+                        "additionalProperties": {
+                            "type": "object",
+                            "properties": {
+                                "shape": {
+                                    "type": "array",
+                                    "items": {"type": "integer"},
+                                },
+                                "dtype": {"type": "string"},
+                            },
+                            "required": ["shape", "dtype"],
+                        },
+                    },
+                },
+                "required": ["name", "code", "inputs"],
+            }
+        },
+    }
+}
 
 
 @functools.cache
@@ -25,43 +61,33 @@ def load_prompt(filename: str) -> str:
     )
 
 
-def _parse_llm_response(raw: str) -> Tuple[str, str, Dict[str, np.ndarray]]:
-    """Parse LLM JSON response into (name, code, inputs).
+def _build_inputs(input_specs: Dict) -> Dict[str, np.ndarray]:
+    """Generate random numpy arrays matching declared input specs.
 
-    Extracts JSON from markdown code fences or raw text, then generates
-    random numpy arrays matching the declared input specs.
+    Args:
+        input_specs: Map of input name to ``{"shape": [...], "dtype": "..."}``
+            spec dicts.
+
+    Returns:
+        Dict mapping input names to numpy arrays.
     """
-    json_match = re.search(r"```(?:json)?\s*(.*?)```", raw, re.DOTALL)
-    json_str = json_match.group(1) if json_match else raw.strip()
-    try:
-        data = json.loads(json_str)
-    except json.JSONDecodeError as e:
-        raise ValueError(
-            f"Failed to parse LLM response as JSON: {e}. "
-            f"Raw response (truncated): {raw[:200]}"
-        ) from e
-
-    name = data.get("name", "generated_kernel")
-    code = data.get("code", "")
-    input_specs = data.get("inputs", {})
-
     inputs = {}
     for inp_name, spec in input_specs.items():
-        shape = tuple(spec.get("shape", [32, 32]))
-        dtype = spec.get("dtype", "float32")
-        np_dtype = getattr(np, dtype, np.float32)
+        shape = tuple(spec["shape"])
+        np_dtype = np.dtype(spec["dtype"])
         if np.issubdtype(np_dtype, np.integer):
             info = np.iinfo(np_dtype)
             lo = max(info.min, -100)
             hi = min(info.max, 100)
-            inputs[inp_name] = np.random.randint(lo, hi + 1, size=shape).astype(dtype)
+            inputs[inp_name] = np.random.randint(lo, hi + 1, size=shape).astype(
+                np_dtype
+            )
         else:
             size = int(np.prod(shape))
             inputs[inp_name] = (
-                np.random.uniform(-1, 1, size).reshape(shape).astype(dtype)
+                np.random.uniform(-1, 1, size).reshape(shape).astype(np_dtype)
             )
-
-    return name, code, inputs
+    return inputs
 
 
 def generate_kernel(
@@ -109,10 +135,22 @@ def generate_kernel(
         messages=[{"role": "user", "content": [{"text": user_prompt}]}],
         system=[{"text": system_prompt}],
         inferenceConfig={"maxTokens": 2048, "temperature": 0.7},
+        toolConfig={"tools": [_KERNEL_TOOL]},
     )
 
-    raw = response["output"]["message"]["content"][0]["text"]
-    return _parse_llm_response(raw)
+    content_blocks = response["output"]["message"]["content"]
+
+    for block in content_blocks:
+        if "toolUse" in block:
+            tool_input = block["toolUse"]["input"]
+            name = tool_input["name"]
+            code = tool_input["code"]
+            return name, code, _build_inputs(tool_input["inputs"])
+
+    raise ValueError(
+        "Model did not return a toolUse response block. "
+        f"Got: {[list(b.keys()) for b in content_blocks]}"
+    )
 
 
 def compile_code(code: str):
