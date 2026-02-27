@@ -2,6 +2,7 @@
 
 from collections.abc import Mapping
 
+
 class SpikeRuntimeError(RuntimeError):
     pass
 
@@ -29,6 +30,7 @@ class SystemTraceSession:
         """Discard events in the buffer"""
 
     def __enter__(self) -> SystemTraceSession: ...
+
     def __exit__(self, *args) -> None: ...
 
 class TensorMetadata:
@@ -104,37 +106,19 @@ class Spike:
     def close(self) -> int:
         """Close the NRT runtime"""
 
-    def load_model(
-        self,
-        neff_file: str,
-        core_id: int = 0,
-        cc_enabled: bool = False,
-        rank_id: int = 0,
-        world_size: int = 1,
-    ) -> NrtModel:
+    def load_model(self, neff_file: str, core_id: int = 0, cc_enabled: bool = False, rank_id: int = 0, world_size: int = 1) -> NrtModel:
         """Load a model from NEFF file"""
 
     def unload_model(self, model: NrtModel) -> None:
         """Unload a model"""
 
-    def execute(
-        self,
-        model: NrtModel,
-        inputs: Mapping[str, NrtTensor],
-        outputs: Mapping[str, NrtTensor],
-        ntff_name: str | None = None,
-        save_trace: bool | None = False,
-    ) -> None:
+    def execute(self, model: NrtModel, inputs: Mapping[str, NrtTensor], outputs: Mapping[str, NrtTensor], ntff_name: str | None = None, save_trace: bool = False) -> None:
         """Execute a model with given inputs and outputs"""
 
-    def allocate_tensor(
-        self, size: int, core_id: int = 0, name: str | None = None
-    ) -> NrtTensor:
+    def allocate_tensor(self, size: int, core_id: int = 0, name: str | None = None) -> NrtTensor:
         """Allocate a tensor on device"""
 
-    def slice_from_tensor(
-        self, source: NrtTensor, offset: int = 0, size: int = 0, name: str | None = None
-    ) -> NrtTensor:
+    def slice_from_tensor(self, source: NrtTensor, offset: int = 0, size: int = 0, name: str | None = None) -> NrtTensor:
         """Create a tensor slice from another tensor"""
 
     def free_tensor(self, tensor: NrtTensor) -> None:
@@ -146,16 +130,12 @@ class Spike:
     def tensor_read(self, tensor: NrtTensor, offset: int = 0, size: int = 0) -> bytes:
         """Read data from tensor as bytes"""
 
-    def tensor_write_from_pybuffer(
-        self, tensor: NrtTensor, buffer: object, offset: int = 0
-    ) -> None:
+    def tensor_write_from_pybuffer(self, tensor: NrtTensor, buffer: object, offset: int = 0) -> None:
         """
         Write data from Python buffer protocol object (bytes, bytearray, memoryview, etc.) to tensor
         """
 
-    def tensor_read_to_pybuffer(
-        self, tensor: NrtTensor, buffer: object, offset: int = 0, size: int = 0
-    ) -> None:
+    def tensor_read_to_pybuffer(self, tensor: NrtTensor, buffer: object, offset: int = 0, size: int = 0) -> None:
         """
         Read data from tensor to Python buffer protocol object (bytearray, memoryview, etc.)
         """

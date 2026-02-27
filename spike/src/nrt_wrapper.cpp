@@ -1,5 +1,3 @@
-// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
-// SPDX-License-Identifier: Apache-2.0
 #include "nrt_wrapper.h"
 #include "tensor_set.h"
 #include <cstring>

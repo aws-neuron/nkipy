@@ -1,5 +1,3 @@
-// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
-// SPDX-License-Identifier: Apache-2.0
 #ifndef SPIKE_SRC_INCLUDE_SYS_TRACE_H
 #define SPIKE_SRC_INCLUDE_SYS_TRACE_H
 
