@@ -1,1 +1,2 @@
 recursive-include src/nkipy/third_party *.proto
+recursive-include src/nkipy/tools/kernel_agent/prompts *.txt
