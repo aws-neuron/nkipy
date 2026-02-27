@@ -87,9 +87,11 @@ def register_all_numpy_apis():
     _register_numpy_api(np.min, ops.min)
     _register_numpy_api(np.mean, ops.mean)
     _register_numpy_api(np.any, ops.any)
+    _register_numpy_api(np.var, ops.var)
 
     # Linear algebra
     _register_numpy_api(np.matmul, ops.matmul)
+    _register_numpy_api(np.dot, ops.dot)
 
     # Transform operations
     _register_numpy_api(np.reshape, ops.reshape)

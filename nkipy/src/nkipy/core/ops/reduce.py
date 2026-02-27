@@ -1,6 +1,6 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Reduction operations: sum, max, min, mean"""
+"""Reduction operations: sum, max, min, mean, var"""
 
 import numpy as np
 
@@ -169,3 +169,23 @@ def _any_hlo(x, axis=None, out=None, dtype=None, keepdims=False):
     summed = sum(non_zero_i32, axis=axis, keepdims=keepdims)
 
     return not_equal(summed, 0)
+
+
+# -----------------------------------------------------------------------------
+# var - variance: mean((x - mean(x))^2)
+# -----------------------------------------------------------------------------
+var = Op("var")
+
+
+@var.impl("hlo")
+def _var_hlo(x, axis=None, out=None, dtype=None, keepdims=False):
+    """Variance operation: mean((x - mean(x))^2)."""
+    from nkipy.core.ops.binary import multiply, subtract
+
+    # Compute mean with keepdims=True so it broadcasts back against x
+    mean_x = mean(x, axis=axis, keepdims=True)
+
+    centered = subtract(x, mean_x)
+    squared = multiply(centered, centered)
+
+    return mean(squared, axis=axis, keepdims=keepdims)

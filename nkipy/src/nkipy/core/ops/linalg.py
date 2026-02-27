@@ -1,6 +1,6 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Linear algebra operations: matmul"""
+"""Linear algebra operations: matmul, dot"""
 
 import numpy as np
 
@@ -121,5 +121,73 @@ def _matmul_hlo(x, y, out=None, dtype=None):
         result_tensor = ctx.build_op(
             "reshape", [result_tensor], final_shape, result_dtype
         )
+
+    return NKIPyTensorRef(result_tensor)
+
+
+# -----------------------------------------------------------------------------
+# dot
+# -----------------------------------------------------------------------------
+dot = Op("dot")
+
+
+@dot.impl("hlo")
+def _dot_hlo(x, y, out=None):
+    """Dot product (HLO).
+
+    Follows numpy.dot semantics:
+    - 1D x 1D: scalar inner product.
+    - 2D x 2D: matrix multiplication.
+    - N-D x 1D: sum product over the last axis of *x* and *y*.
+    - N-D x M-D (M>=2): sum product over the last axis of *x* and the
+      second-to-last axis of *y*.  Non-contracted dimensions are
+      outer-producted (NOT broadcast like matmul).
+    """
+    from nkipy.core.backend.hlo import (
+        find_common_type_hlo,
+        get_hlo_context,
+    )
+    from nkipy.core.tensor import NKIPyTensorRef
+
+    ctx = get_hlo_context()
+
+    result_dtype = find_common_type_hlo(x, y)
+
+    if isinstance(x, NKIPyTensorRef):
+        x = x.backend_tensor
+    if isinstance(y, NKIPyTensorRef):
+        y = y.backend_tensor
+
+    assert len(x.shape) >= 1 and len(y.shape) >= 1, "dot requires at least 1D arrays"
+
+    # Contracting dimensions: last of x, second-to-last of y (or 0 if y is 1D)
+    lhs_contracting_dims = [len(x.shape) - 1]
+    rhs_contracting_dims = [max(0, len(y.shape) - 2)]
+
+    assert x.shape[lhs_contracting_dims[0]] == y.shape[rhs_contracting_dims[0]], (
+        f"shapes {x.shape} and {y.shape} not aligned"
+    )
+
+    # No batch dimensions for dot – remaining dims are outer-producted.
+    lhs_batch_dims = []
+    rhs_batch_dims = []
+
+    # Result shape: non-contracted dims from x, then non-contracted dims from y
+    result_shape = tuple(
+        s for i, s in enumerate(x.shape) if i not in lhs_contracting_dims
+    ) + tuple(s for i, s in enumerate(y.shape) if i not in rhs_contracting_dims)
+
+    result_tensor = ctx.build_op(
+        "dot",
+        [x, y],
+        result_shape,
+        result_dtype,
+        {
+            "lhs_contracting_dimensions": lhs_contracting_dims,
+            "rhs_contracting_dimensions": rhs_contracting_dims,
+            "lhs_batch_dimensions": lhs_batch_dims,
+            "rhs_batch_dimensions": rhs_batch_dims,
+        },
+    )
 
     return NKIPyTensorRef(result_tensor)

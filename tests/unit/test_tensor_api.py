@@ -1988,5 +1988,77 @@ def test_passthrough_with_compute(trace_mode):
         trace_and_compile(kernel, trace_mode, a, b)
 
 
+@pytest.mark.parametrize(
+    "lhs_shape,rhs_shape",
+    [
+        # 1D x 1D: vector inner product -> scalar
+        ((128,), (128,)),
+        # 2D x 2D: matrix multiply
+        ((64, 128), (128, 64)),
+        # 1D x 2D: vector-matrix
+        ((128,), (128, 64)),
+        # 2D x 1D: matrix-vector
+        ((64, 128), (128,)),
+        # N-D x 1D: sum product over last axis
+        ((2, 64, 128), (128,)),
+        # N-D x M-D: outer product of batch dims
+        ((2, 64, 128), (3, 128, 32)),
+    ],
+)
+def test_dot(trace_mode, lhs_shape, rhs_shape):
+    def kernel(a, b):
+        return np.dot(a, b)
+
+    in0 = np.random.random_sample(lhs_shape).astype(np.float32)
+    in1 = np.random.random_sample(rhs_shape).astype(np.float32)
+
+    expected = kernel(in0, in1)
+
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0, in1)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0, in1)
+
+
+@pytest.mark.parametrize(
+    "shape,axis",
+    [
+        ((128, 128), None),
+        ((128, 128), -1),
+        ((128, 128), 0),
+        ((64, 32, 16), (0, 2)),
+    ],
+)
+def test_var(trace_mode, shape, axis):
+    def kernel(a):
+        return np.var(a, axis=axis)
+
+    in0 = np.random.random_sample(shape).astype(np.float32)
+
+    expected = kernel(in0)
+
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_var_keepdims(trace_mode):
+    def kernel(a):
+        return np.var(a, axis=-1, keepdims=True)
+
+    in0 = np.random.random_sample((128, 128)).astype(np.float32)
+
+    expected = kernel(in0)
+
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
