@@ -153,4 +153,4 @@ def attention_kernel(
         reduce_op=np.add,
     )
 
-    return output, cache_k, cache_v
+    return output
