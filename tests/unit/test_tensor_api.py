@@ -2060,5 +2060,776 @@ def test_var_keepdims(trace_mode):
         trace_and_compile(kernel, trace_mode, in0)
 
 
+# =============================================================================
+# Tests for newly added operations
+# =============================================================================
+
+
+def test_clip(trace_mode):
+    def kernel(a):
+        return np.clip(a, 0.2, 0.8)
+
+    shape = (64, 64)
+    dtype = np.float32
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(dtype)
+    expected = kernel(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_clip_no_min(trace_mode):
+    def kernel(a):
+        return np.clip(a, None, 0.5)
+
+    shape = (64, 64)
+    dtype = np.float32
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(dtype)
+    expected = kernel(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_log1p(trace_mode):
+    def kernel(a):
+        return np.log1p(a)
+
+    shape = (64, 64)
+    dtype = np.float32
+    in0 = np.random.uniform(0.0, 10.0, size=shape).astype(dtype)
+    expected = kernel(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_std(trace_mode):
+    def kernel(a):
+        return np.std(a, axis=-1, keepdims=True)
+
+    shape = (64, 64)
+    dtype = np.float32
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(dtype)
+    expected = kernel(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_std_axis0(trace_mode):
+    def kernel(a):
+        return np.std(a, axis=0)
+
+    shape = (64, 64)
+    dtype = np.float32
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(dtype)
+    expected = kernel(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_squeeze(trace_mode):
+    def kernel(a):
+        b = np.expand_dims(a, axis=-1)
+        return np.squeeze(b, axis=-1)
+
+    shape = (64, 64)
+    dtype = np.float32
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(dtype)
+    expected = kernel(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_squeeze_method(trace_mode):
+    def kernel(a):
+        x_max = np.max(a, axis=-1, keepdims=True)
+        return x_max.squeeze(axis=-1)
+
+    shape = (64, 64)
+    dtype = np.float32
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(dtype)
+    expected = kernel(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_linalg_norm(trace_mode):
+    def kernel(a):
+        return np.linalg.norm(a, axis=1)
+
+    shape = (64, 64)
+    dtype = np.float32
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(dtype)
+    expected = kernel(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_linalg_norm_keepdims(trace_mode):
+    def kernel(a):
+        return np.linalg.norm(a, axis=-1, keepdims=True)
+
+    shape = (64, 64)
+    dtype = np.float32
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(dtype)
+    expected = kernel(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_argmax(trace_mode):
+    def kernel(a):
+        return np.argmax(a, axis=1)
+
+    shape = (64, 64)
+    dtype = np.float32
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(dtype)
+    expected = kernel(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_argmax_axis0(trace_mode):
+    def kernel(a):
+        return np.argmax(a, axis=0)
+
+    shape = (64, 64)
+    dtype = np.float32
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(dtype)
+    expected = kernel(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_cumsum(trace_mode):
+    def kernel(a):
+        return np.cumsum(a, axis=-1)
+
+    shape = (64, 64)
+    dtype = np.float32
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(dtype)
+    expected = kernel(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_cumsum_axis0(trace_mode):
+    def kernel(a):
+        return np.cumsum(a, axis=0)
+
+    shape = (64, 64)
+    dtype = np.float32
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(dtype)
+    expected = kernel(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_pad_constant(trace_mode):
+    def kernel(a):
+        return np.pad(a, pad_width=1, mode="constant", constant_values=0)
+
+    shape = (64, 64)
+    dtype = np.float32
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(dtype)
+    expected = kernel(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_pad_edge(trace_mode):
+    def kernel(a):
+        return np.pad(a, pad_width=1, mode="edge")
+
+    shape = (64, 64)
+    dtype = np.float32
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(dtype)
+    expected = kernel(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_tensor_mean_method(trace_mode):
+    def kernel(a):
+        return a.mean(axis=-1, keepdims=True)
+
+    shape = (64, 64)
+    dtype = np.float32
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(dtype)
+    expected = kernel(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_tensor_sum_method(trace_mode):
+    def kernel(a):
+        return a.sum(axis=-1, keepdims=True)
+
+    shape = (64, 64)
+    dtype = np.float32
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(dtype)
+    expected = kernel(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_tensor_var_method(trace_mode):
+    def kernel(a):
+        return a.var(axis=-1, keepdims=True)
+
+    shape = (64, 64)
+    dtype = np.float32
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(dtype)
+    expected = kernel(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_tensor_std_method(trace_mode):
+    def kernel(a):
+        return a.std(axis=-1, keepdims=True)
+
+    shape = (64, 64)
+    dtype = np.float32
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(dtype)
+    expected = kernel(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_tensor_len(trace_mode):
+    def kernel(a):
+        n = len(a)
+        return a + n
+
+    shape = (64, 64)
+    dtype = np.float32
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(dtype)
+    expected = kernel(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_tensor_strides(trace_mode):
+    def kernel(a):
+        s = a.strides
+        # For (64, 64) float32: strides should be (256, 4)
+        assert s == (256, 4), f"Expected (256, 4), got {s}"
+        return a + 1.0
+
+    shape = (64, 64)
+    dtype = np.float32
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(dtype)
+    expected = kernel(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_repeat_numpy_int(trace_mode):
+    """Test that np.repeat works with numpy integer types."""
+
+    def kernel(a):
+        return np.repeat(a, np.int64(3), axis=0)
+
+    shape = (16, 64)
+    dtype = np.float32
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(dtype)
+    expected = kernel(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_hard_sigmoid_clip(trace_mode):
+    """End-to-end test from errors.txt: hard_sigmoid using clip."""
+
+    def hard_sigmoid(x):
+        return np.clip(x * 0.2 + 0.5, 0.0, 1.0)
+
+    shape = (64, 64)
+    dtype = np.float32
+    in0 = np.random.uniform(-5.0, 5.0, size=shape).astype(dtype)
+    expected = hard_sigmoid(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(hard_sigmoid, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(hard_sigmoid, trace_mode, in0)
+
+
+def test_softplus_log1p(trace_mode):
+    """End-to-end test from errors.txt: softplus using log1p."""
+
+    def softplus(x):
+        return np.log1p(np.exp(x))
+
+    shape = (64, 64)
+    dtype = np.float32
+    # Use small values to avoid overflow in exp
+    in0 = np.random.uniform(-3.0, 3.0, size=shape).astype(dtype)
+    expected = softplus(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(softplus, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(softplus, trace_mode, in0)
+
+
+def test_log_sum_exp_squeeze(trace_mode):
+    """End-to-end test from errors.txt: log_sum_exp using squeeze."""
+
+    def log_sum_exp(x):
+        x_max = np.max(x, axis=-1, keepdims=True)
+        out = np.log(np.sum(np.exp(x - x_max), axis=-1)) + x_max.squeeze(axis=-1)
+        return out
+
+    shape = (64, 64)
+    dtype = np.float32
+    in0 = np.random.uniform(0.0, 5.0, size=shape).astype(dtype)
+    expected = log_sum_exp(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(log_sum_exp, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(log_sum_exp, trace_mode, in0)
+
+
+def test_cosine_similarity_norm(trace_mode):
+    """End-to-end test from errors.txt: cosine_similarity using linalg.norm."""
+
+    def cosine_similarity_rowwise(A, B):
+        dot_products = np.sum(A * B, axis=1)
+        norm_A = np.linalg.norm(A, axis=1)
+        norm_B = np.linalg.norm(B, axis=1)
+        denom = norm_A * norm_B
+        denom = np.where(denom == 0, 1e-10, denom)
+        return dot_products / denom
+
+    shape = (64, 64)
+    dtype = np.float32
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(dtype)
+    in1 = np.random.uniform(0.0, 1.0, size=shape).astype(dtype)
+    expected = cosine_similarity_rowwise(in0, in1)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(cosine_similarity_rowwise, trace_mode, in0, in1)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(cosine_similarity_rowwise, trace_mode, in0, in1)
+
+
+def test_row_standardize(trace_mode):
+    """End-to-end test from errors.txt: row_standardize using .mean() and .std()."""
+
+    def row_standardize(x):
+        mean = x.mean(axis=1, keepdims=True)
+        std = x.std(axis=1, keepdims=True)
+        return (x - mean) / (std + 1e-8)
+
+    shape = (64, 64)
+    dtype = np.float32
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(dtype)
+    expected = row_standardize(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(row_standardize, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(row_standardize, trace_mode, in0)
+
+
+def test_coeff_of_variation_std(trace_mode):
+    """End-to-end test from errors.txt: coefficient_of_variation using np.std."""
+
+    def coefficient_of_variation(x):
+        m = np.mean(x, axis=0)
+        s = np.std(x, axis=0)
+        return s / m
+
+    shape = (64, 64)
+    dtype = np.float32
+    in0 = np.random.uniform(0.1, 1.0, size=shape).astype(dtype)
+    expected = coefficient_of_variation(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(coefficient_of_variation, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(coefficient_of_variation, trace_mode, in0)
+
+
+def test_weighted_average_sum_method(trace_mode):
+    """End-to-end test from errors.txt: weighted average using .sum()."""
+
+    def weighted_average_axis0(x, w):
+        w_norm = w / w.sum()
+        return w_norm @ x
+
+    shape = (64, 64)
+    dtype = np.float32
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(dtype)
+    in1 = np.random.uniform(0.1, 1.0, size=(64,)).astype(dtype)
+    expected = weighted_average_axis0(in0, in1)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(weighted_average_axis0, trace_mode, in0, in1)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(weighted_average_axis0, trace_mode, in0, in1)
+
+
+def test_low_pass_filter_pad(trace_mode):
+    """End-to-end test from errors.txt: low_pass_filter using np.pad."""
+
+    def low_pass_filter(x):
+        padded = np.pad(x, pad_width=1, mode="edge")
+        result = (
+            padded[0:-2, 0:-2]
+            + padded[0:-2, 1:-1]
+            + padded[0:-2, 2:]
+            + padded[1:-1, 0:-2]
+            + padded[1:-1, 1:-1]
+            + padded[1:-1, 2:]
+            + padded[2:, 0:-2]
+            + padded[2:, 1:-1]
+            + padded[2:, 2:]
+        ) / 9.0
+        return result
+
+    shape = (64, 64)
+    dtype = np.float32
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(dtype)
+    expected = low_pass_filter(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(low_pass_filter, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(low_pass_filter, trace_mode, in0)
+
+
+def test_cumsum_axis_none(trace_mode):
+    """Test np.cumsum with axis=None (flatten then cumsum)."""
+
+    def kernel(a):
+        return np.cumsum(a)
+
+    shape = (16, 32)
+    dtype = np.float32
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(dtype)
+    expected = kernel(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_argmax_axis_none(trace_mode):
+    """Test np.argmax with axis=None (flatten then argmax)."""
+
+    def kernel(a):
+        return np.argmax(a)
+
+    shape = (16, 32)
+    dtype = np.float32
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(dtype)
+    expected = kernel(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_squeeze_axis_none(trace_mode):
+    """Test np.squeeze with axis=None removes all size-1 dims."""
+
+    def kernel(a):
+        b = np.expand_dims(a, axis=(0, -1))  # (1, 16, 32, 1)
+        return np.squeeze(b)
+
+    shape = (16, 32)
+    dtype = np.float32
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(dtype)
+    expected = kernel(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_pad_asymmetric(trace_mode):
+    """Test np.pad with asymmetric padding per dimension."""
+
+    def kernel(a):
+        return np.pad(a, ((1, 2), (0, 3)), mode="constant")
+
+    shape = (16, 32)
+    dtype = np.float32
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(dtype)
+    expected = kernel(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_squeeze_error(trace_mode):
+    """Test that squeezing a non-size-1 dim raises ValueError."""
+
+    def kernel(a):
+        return np.squeeze(a, axis=0)
+
+    shape = (16, 32)
+    dtype = np.float32
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(dtype)
+    with pytest.raises(ValueError, match="cannot select an axis to squeeze out"):
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_std_axis_none(trace_mode):
+    """Test np.std with axis=None (flatten then compute std)."""
+
+    def kernel(a):
+        return np.std(a)
+
+    shape = (32, 64)
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(np.float32)
+    expected = kernel(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_linalg_norm_axis_none(trace_mode):
+    """Test np.linalg.norm with no axis (Frobenius/L2 over all elements)."""
+
+    def kernel(a):
+        return np.linalg.norm(a)
+
+    shape = (32, 64)
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(np.float32)
+    expected = kernel(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_diagonal_gather(trace_mode):
+    """Test a[np.arange(N), idx] diagonal gather pattern."""
+
+    def kernel(a, idx):
+        return a[np.arange(a.shape[0]), idx]
+
+    N, M = 32, 64
+    in0 = np.random.uniform(0.0, 1.0, size=(N, M)).astype(np.float32)
+    idx = np.random.randint(0, M, size=(N,)).astype(np.int32)
+    expected = kernel(in0, idx)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0, idx)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0, idx)
+
+
+def test_cumsum_middle_axis(trace_mode):
+    """Test np.cumsum on a middle axis of a 3D tensor (transpose-based path)."""
+
+    def kernel(a):
+        return np.cumsum(a, axis=1)
+
+    shape = (4, 32, 64)
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(np.float32)
+    expected = kernel(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_pad_edge_asymmetric(trace_mode):
+    """Test np.pad with asymmetric edge-mode padding."""
+
+    def kernel(a):
+        return np.pad(a, ((2, 1), (0, 3)), mode="edge")
+
+    shape = (16, 32)
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(np.float32)
+    expected = kernel(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_argmax_keepdims(trace_mode):
+    """Test np.argmax with keepdims=True preserves dimensions."""
+
+    def kernel(a):
+        return np.argmax(a, axis=1, keepdims=True)
+
+    shape = (32, 64)
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(np.float32)
+    expected = kernel(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_linalg_norm_invalid_ord(trace_mode):
+    """norm with unsupported ord raises NotImplementedError."""
+
+    def kernel(a):
+        return np.linalg.norm(a, ord=1)
+
+    shape = (32, 64)
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(np.float32)
+    with pytest.raises(NotImplementedError, match="ord=None or 'fro'"):
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_clip_no_max(trace_mode):
+    """Test np.clip with only a_min (no max)."""
+
+    def kernel(a):
+        return np.clip(a, 0.5, None)
+
+    shape = (64, 64)
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(np.float32)
+    expected = kernel(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_argmax_keepdims_axis_none(trace_mode):
+    """Test argmax with keepdims=True and axis=None returns (1,)*ndim shape."""
+
+    def kernel(a):
+        return np.argmax(a, axis=None, keepdims=True)
+
+    shape = (32, 64)
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(np.float32)
+    expected = kernel(in0)
+    assert expected.shape == (1, 1), f"Expected (1, 1), got {expected.shape}"
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_linalg_norm_fro_1d_error(trace_mode):
+    """norm with ord='fro' on 1D input raises ValueError."""
+
+    def kernel(a):
+        return np.linalg.norm(a, ord="fro")
+
+    shape = (64,)
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(np.float32)
+    with pytest.raises(ValueError, match="Invalid norm order 'fro' for vectors"):
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_linalg_norm_fro_single_axis_error(trace_mode):
+    """norm with ord='fro' and single axis raises ValueError."""
+
+    def kernel(a):
+        return np.linalg.norm(a, ord="fro", axis=0)
+
+    shape = (32, 64)
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(np.float32)
+    with pytest.raises(ValueError, match="Invalid norm order 'fro' for vectors"):
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_var_dtype(trace_mode):
+    """Test that np.var(x, dtype=...) casts input before computing."""
+
+    def kernel(a):
+        # Input is float16; requesting float32 should upcast before computing
+        return np.var(a, axis=-1, dtype=np.float32)
+
+    shape = (32, 64)
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(np.float16)
+    expected = kernel(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

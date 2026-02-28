@@ -210,6 +210,21 @@ class TensorOperationMixin:
 
         return nkipy_ops.astype(self, dtype=dtype)
 
+    def mean(self, axis=None, keepdims=False, **kwargs):
+        return np.mean(self, axis=axis, keepdims=keepdims, **kwargs)
+
+    def sum(self, axis=None, keepdims=False, **kwargs):
+        return np.sum(self, axis=axis, keepdims=keepdims, **kwargs)
+
+    def var(self, axis=None, keepdims=False, **kwargs):
+        return np.var(self, axis=axis, keepdims=keepdims, **kwargs)
+
+    def std(self, axis=None, keepdims=False, **kwargs):
+        return np.std(self, axis=axis, keepdims=keepdims, **kwargs)
+
+    def squeeze(self, axis=None):
+        return np.squeeze(self, axis=axis)
+
 
 def _expand_ellipsis(indices: tuple, ndim: int) -> tuple:
     """Expand ``...`` into the correct number of ``slice(None)``."""
@@ -302,6 +317,30 @@ class NKIPyTensorRef(TensorArithmeticMixin, TensorOperationMixin):
     @property
     def size(self) -> int:
         return math.prod(self._shape)
+
+    @property
+    def strides(self) -> Tuple[int, ...]:
+        """C-contiguous strides computed from shape and dtype itemsize."""
+        itemsize = self._dtype.itemsize
+        strides = []
+        stride = itemsize
+        for s in reversed(self._shape):
+            strides.append(stride)
+            stride *= s
+        return tuple(reversed(strides))
+
+    def __len__(self) -> int:
+        if len(self._shape) == 0:
+            raise TypeError("len() of unsized object")
+        return self._shape[0]
+
+    def __array__(self, dtype=None):
+        raise TypeError(
+            "NKIPyTensorRef cannot be converted to a numpy array. "
+            "This tensor exists only as a traced computation graph node. "
+            "Operations like np.array(tensor) or np.asarray(tensor) are not "
+            "supported during tracing."
+        )
 
     def __repr__(self):
         return (
@@ -408,6 +447,24 @@ class NKIPyTensorRef(TensorArithmeticMixin, TensorOperationMixin):
                 # 1. Slice to get a[0:2, :, :]
                 # 2. Then apply dynamic indexing on the result
 
+                # Collect all tensor/array indices
+                tensor_indices = [
+                    (dim, idx)
+                    for dim, idx in enumerate(indices)
+                    if isinstance(idx, (NKIPyTensorRef, np.ndarray, list))
+                ]
+
+                # Handle diagonal gather: a[np.arange(N), tensor_idx]
+                # When one index is an identity arange, convert to take_along_axis
+                if len(tensor_indices) == 2:
+                    result = self._try_diagonal_gather(
+                        indices, tensor_indices, nkipy_ops
+                    )
+                    if result is not None:
+                        if newaxis_axes:
+                            result = nkipy_ops.expand_dims(result, axis=newaxis_axes)
+                        return result
+
                 # Separate static and dynamic indices
                 static_indices = []
                 dynamic_index_dim = None
@@ -464,6 +521,49 @@ class NKIPyTensorRef(TensorArithmeticMixin, TensorOperationMixin):
             return result
         finally:
             _set_source_location(None)
+
+    @staticmethod
+    def _is_identity_arange(idx, dim_size):
+        """Check if idx is a concrete np.arange(dim_size)."""
+        if not isinstance(idx, np.ndarray):
+            return False
+        if idx.ndim != 1 or len(idx) != dim_size:
+            return False
+        return np.array_equal(idx, np.arange(dim_size))
+
+    def _try_diagonal_gather(self, indices, tensor_indices, nkipy_ops):
+        """Handle a[np.arange(N), tensor_idx] diagonal gather pattern.
+
+        When one index is an identity arange (e.g. np.arange(N) on a dim of
+        size N), the combined indexing selects one element per position along
+        the other dimension.  This is equivalent to take_along_axis.
+
+        Example: a[np.arange(N), idx]  (a shape (N,M), idx shape (N,))
+          → take_along_axis(a, idx[:,None], axis=1).squeeze(1)
+
+        Returns the result tensor, or None if the pattern doesn't match.
+        """
+        (dim1, idx1), (dim2, idx2) = tensor_indices
+
+        if self._is_identity_arange(idx1, self.shape[dim1]):
+            arange_dim, gather_dim, tensor_idx = dim1, dim2, idx2
+        elif self._is_identity_arange(idx2, self.shape[dim2]):
+            arange_dim, gather_dim, tensor_idx = dim2, dim1, idx1
+        else:
+            return None  # Not the arange pattern
+
+        # Build the index array for take_along_axis:
+        # same ndim as self, size 1 on gather_dim, matching size on arange_dim
+        idx_shape = [1] * self.ndim
+        idx_shape[arange_dim] = self.shape[arange_dim]
+
+        if isinstance(tensor_idx, NKIPyTensorRef):
+            idx_for_take = nkipy_ops.reshape(tensor_idx, tuple(idx_shape))
+        else:
+            idx_for_take = np.asarray(tensor_idx).reshape(idx_shape)
+
+        result = nkipy_ops.take_along_axis(self, idx_for_take, axis=gather_dim)
+        return nkipy_ops.squeeze(result, axis=gather_dim)
 
     def __setitem__(self, indices, value):
         """
