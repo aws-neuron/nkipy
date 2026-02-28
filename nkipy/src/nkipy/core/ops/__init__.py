@@ -74,6 +74,7 @@ from nkipy.core.ops.creation import (
 from nkipy.core.ops.indexing import (
     dynamic_update_slice,
     put_along_axis,
+    scatter_along_axis,
     scatter_strided,
     static_slice,
     take,
@@ -236,6 +237,7 @@ __all__ = [
     "take",
     "take_along_axis",
     "put_along_axis",
+    "scatter_along_axis",
     "static_slice",
     "dynamic_update_slice",
     "scatter_strided",

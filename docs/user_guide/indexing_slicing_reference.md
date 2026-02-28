@@ -136,3 +136,19 @@ result = tensor_3d[None, ..., None]  # Shape: (1, 4, 8, 12, 1)
 
 # Note: newaxis in assignment (setitem) is not supported.
 # Use np.expand_dims() on the value instead.
+```
+
+## View Aliasing Limitation
+
+Mutations through **views** are not tracked by NKIPy's alias detection. If you extract a sub-tensor with `__getitem__` and then mutate it, the change will **not** propagate back to the original tensor.
+
+```python
+# ❌ Mutation through a view — NOT detected
+b = a[0]        # b is a new tensor, not a view of a
+b[0:3] = value  # only b is mutated; a is unchanged
+
+# ✅ Mutate the original tensor directly
+a[0, 0:3] = value
+```
+
+This is a consequence of NKIPy's SSA-based computation graph: `__getitem__` creates a new `NKIPyTensorRef` with no link back to its parent. This is consistent with the behavior of JAX and XLA.

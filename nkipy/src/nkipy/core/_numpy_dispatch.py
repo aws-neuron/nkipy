@@ -111,7 +111,19 @@ def register_all_numpy_apis():
     _register_numpy_api(np.where, ops.where)
     _register_numpy_api(np.take, ops.take)
     _register_numpy_api(np.take_along_axis, ops.take_along_axis)
-    _register_numpy_api(np.put_along_axis, ops.put_along_axis)
+
+    # np.put_along_axis mutates arr in-place and returns None.
+    # We need a custom wrapper that writes back into the original tensor ref
+    # so that mutation-based alias detection can track the change.
+    def _put_along_axis_inplace(arr, indices, values, axis):
+        result = ops.put_along_axis(arr, indices, values, axis)
+        if isinstance(arr, NKIPyTensorRef) and result is not None:
+            arr.backend_tensor = result.backend_tensor
+            arr._shape = result.shape
+            arr._dtype = result.dtype
+            arr._is_mutated = True
+
+    NKIPyTensorRef._tensor_apis[np.put_along_axis] = _put_along_axis_inplace
 
     # Broadcast and copy operations
     _register_numpy_api(np.broadcast_to, ops.broadcast_to)

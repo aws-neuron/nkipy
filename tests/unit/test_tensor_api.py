@@ -755,19 +755,11 @@ def test_take_scalar(trace_mode, a, indices, axis):
     ],
 )
 def test_put_along_axis(trace_mode, a, indices, values, axis):
-    # FIXME: support put_along_axis with proper doc
-    if trace_mode == "hlo":
-        pytest.skip("put_along_axis not yet supported in HLO mode")
-
     dtype = np.float32
 
-    def kernel(a, indices, values, axis, is_hardware=False):
+    def kernel(a, indices, values, axis):
         b = np.copy(a)
-        if trace_mode == "hlo" and is_hardware:
-            b = np.put_along_axis(b, indices=indices, values=values, axis=axis)
-        else:
-            np.put_along_axis(b, indices=indices, values=values, axis=axis)
-
+        np.put_along_axis(b, indices=indices, values=values, axis=axis)
         return b
 
     in0 = np.random.random_sample(a).astype(dtype)
@@ -778,7 +770,7 @@ def test_put_along_axis(trace_mode, a, indices, values, axis):
     expected = kernel(in0, in1, in2, in3)
 
     if NEURON_AVAILABLE:
-        out_device = on_device_test(kernel, trace_mode, in0, in1, in2, in3, True)
+        out_device = on_device_test(kernel, trace_mode, in0, in1, in2, in3)
         baremetal_assert_allclose(expected, out_device)
     else:
         trace_and_compile(kernel, trace_mode, in0, in1, in2, in3)
@@ -793,19 +785,11 @@ def test_put_along_axis(trace_mode, a, indices, values, axis):
     ],
 )
 def test_put_along_axis_scalar_value(trace_mode, a, indices, values, axis):
-    # FIXME: support put_along_axis with proper doc
-    if trace_mode == "hlo":
-        pytest.skip("put_along_axis not yet supported in HLO mode")
-
     dtype = np.float32
 
-    def kernel(a, indices, values, axis, is_hardware=False):
+    def kernel(a, indices, values, axis):
         b = np.copy(a)
-        if trace_mode == "hlo" and is_hardware:
-            b = np.put_along_axis(b, indices=indices, values=values, axis=axis)
-        else:
-            np.put_along_axis(b, indices=indices, values=values, axis=axis)
-
+        np.put_along_axis(b, indices=indices, values=values, axis=axis)
         return b
 
     in0 = np.random.random_sample(a).astype(dtype)
@@ -816,10 +800,10 @@ def test_put_along_axis_scalar_value(trace_mode, a, indices, values, axis):
     expected = kernel(in0, in1, in2, in3)
 
     if NEURON_AVAILABLE:
-        out_device = on_device_test(kernel, trace_mode, in0, in1, in2, in3, True)
+        out_device = on_device_test(kernel, trace_mode, in0, in1, in2, in3)
         baremetal_assert_allclose(expected, out_device)
     else:
-        trace_and_compile(kernel, trace_mode, in0, in1, in2, in3, False)
+        trace_and_compile(kernel, trace_mode, in0, in1, in2, in3)
 
 
 @pytest.mark.parametrize(

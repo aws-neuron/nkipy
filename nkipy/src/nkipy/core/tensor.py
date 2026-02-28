@@ -487,6 +487,11 @@ class NKIPyTensorRef(TensorArithmeticMixin, TensorOperationMixin):
         we update self.backend_tensor to point to the new tensor. This maintains
         the illusion of in-place mutation while actually creating a new tensor
         in the computation graph.
+
+        Note on view aliasing: Mutations through views are NOT tracked. If you
+        write ``b = a[0]; b[x] = y``, the mutation to ``b`` will not propagate
+        back to ``a`` because ``__getitem__`` creates a new NKIPyTensorRef with
+        no parent link. Use ``a[0, x] = y`` instead.
         """
         _set_source_location(find_source_loc())
         try:
@@ -584,10 +589,10 @@ class NKIPyTensorRef(TensorArithmeticMixin, TensorOperationMixin):
                 tensor_idx_dim = dim
                 tensor_idx_value = idx
 
-        # Use put_along_axis to scatter values
+        # Use scatter_along_axis (window-level scatter with 1D indices)
         from nkipy.core import ops as nkipy_ops
 
-        result = nkipy_ops.put_along_axis(
+        result = nkipy_ops.scatter_along_axis(
             self, tensor_idx_value, value, axis=tensor_idx_dim
         )
 

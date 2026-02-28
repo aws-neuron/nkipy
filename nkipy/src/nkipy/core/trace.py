@@ -151,6 +151,10 @@ class NKIPyKernel:
         Detects aliasing by checking which parameter tensor refs were mutated
         (had __setitem__ called on them) during kernel execution.
 
+        Note: Only direct mutations on the original parameter tensor refs are
+        detected. View aliasing (e.g. ``b = a[0]; b[x] = y``) is not tracked
+        because ``__getitem__`` creates a new tensor ref with no parent link.
+
         Args:
             code: The HLOModule being built
             ret: The return value(s) from the kernel function
