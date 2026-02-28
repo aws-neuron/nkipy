@@ -80,6 +80,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Per-iteration timeout in seconds (default: 120)",
     )
 
+    # rerun command
+    rr = sub.add_parser("rerun", help="Rerun kernels from a previous sweep JSONL")
+    rr.add_argument("source", help="Path to source JSONL file from a previous sweep")
+    rr.add_argument("--no-hardware", action="store_true", help="Skip hardware tests")
+    rr.add_argument("--output-dir", default="sweep_results", help="Output directory")
+    rr.add_argument(
+        "--timeout",
+        type=int,
+        default=120,
+        help="Per-iteration timeout in seconds (default: 120)",
+    )
+    rr.add_argument(
+        "--summary-interval",
+        type=int,
+        default=10,
+        help="Print summary every N iterations",
+    )
+
     args = parser.parse_args(argv)
 
     if args.cmd == "discover":
@@ -92,6 +110,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return cmd_list_ops()
     elif args.cmd == "sweep":
         return cmd_sweep(args)
+    elif args.cmd == "rerun":
+        return cmd_rerun(args)
     else:
         parser.print_help()
         return 0
@@ -191,9 +211,9 @@ def cmd_list_ops() -> int:
 
 
 def cmd_sweep(args) -> int:
-    from nkipy.tools.kernel_agent.sweep import run_sweep
+    from nkipy.tools.kernel_agent import sweep
 
-    run_sweep(
+    sweep.run_sweep(
         model_id=args.model,
         region=args.region,
         run_hardware=not args.no_hardware,
@@ -202,6 +222,19 @@ def cmd_sweep(args) -> int:
         delay=args.delay,
         summary_interval=args.summary_interval,
         timeout=args.timeout,
+    )
+    return 0
+
+
+def cmd_rerun(args) -> int:
+    from nkipy.tools.kernel_agent import sweep
+
+    sweep.run_rerun(
+        source_path=args.source,
+        run_hardware=not args.no_hardware,
+        output_dir=args.output_dir,
+        timeout=args.timeout,
+        summary_interval=args.summary_interval,
     )
     return 0
 

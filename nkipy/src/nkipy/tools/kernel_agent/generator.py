@@ -61,7 +61,7 @@ def load_prompt(filename: str) -> str:
     )
 
 
-def _build_inputs(input_specs: Dict) -> Dict[str, np.ndarray]:
+def build_inputs(input_specs: Dict) -> Dict[str, np.ndarray]:
     """Generate random numpy arrays matching declared input specs.
 
     Args:
@@ -145,7 +145,7 @@ def generate_kernel(
             tool_input = block["toolUse"]["input"]
             name = tool_input["name"]
             code = tool_input["code"]
-            return name, code, _build_inputs(tool_input["inputs"])
+            return name, code, build_inputs(tool_input["inputs"])
 
     raise ValueError(
         "Model did not return a toolUse response block. "

@@ -7,10 +7,12 @@ Usage:
     python -m nkipy.tools.kernel_agent test --ops add,exp
     python -m nkipy.tools.kernel_agent generate --prompt "softmax"
     python -m nkipy.tools.kernel_agent sweep
+    python -m nkipy.tools.kernel_agent rerun <jsonl_path>
 """
 
 from nkipy.tools.kernel_agent.executor import ExecutionResult, StageResult, run_kernel
 from nkipy.tools.kernel_agent.generator import (
+    build_inputs,
     compile_code,
     generate_kernel,
 )
@@ -21,7 +23,12 @@ from nkipy.tools.kernel_agent.ops import (
     make_kernel,
     test_op,
 )
-from nkipy.tools.kernel_agent.sweep import SweepRecord, get_kernel_prompts, run_sweep
+from nkipy.tools.kernel_agent.sweep import (
+    SweepRecord,
+    get_kernel_prompts,
+    run_rerun,
+    run_sweep,
+)
 
 KERNEL_PROMPTS = get_kernel_prompts()
 
@@ -35,8 +42,10 @@ __all__ = [
     "discover_ops",
     "make_kernel",
     "generate_kernel",
+    "build_inputs",
     "compile_code",
     "run_sweep",
+    "run_rerun",
     "SweepRecord",
     "get_kernel_prompts",
     "KERNEL_PROMPTS",

@@ -7,26 +7,26 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 from nkipy.tools.kernel_agent.generator import (
-    _build_inputs,
+    build_inputs,
     generate_kernel,
 )
 
 # ---------------------------------------------------------------------------
-# _build_inputs
+# build_inputs
 # ---------------------------------------------------------------------------
 
 
 class TestBuildInputs:
     def test_float_input(self):
         specs = {"x": {"shape": [2, 3], "dtype": "float32"}}
-        result = _build_inputs(specs)
+        result = build_inputs(specs)
         assert "x" in result
         assert result["x"].shape == (2, 3)
         assert result["x"].dtype == np.float32
 
     def test_integer_input(self):
         specs = {"idx": {"shape": [4], "dtype": "int32"}}
-        result = _build_inputs(specs)
+        result = build_inputs(specs)
         assert result["idx"].shape == (4,)
         assert result["idx"].dtype == np.int32
 
@@ -35,7 +35,7 @@ class TestBuildInputs:
             "a": {"shape": [8, 8], "dtype": "float16"},
             "b": {"shape": [8, 8], "dtype": "float16"},
         }
-        result = _build_inputs(specs)
+        result = build_inputs(specs)
         assert len(result) == 2
         assert result["a"].shape == (8, 8)
         assert result["b"].dtype == np.float16
@@ -43,26 +43,26 @@ class TestBuildInputs:
     def test_missing_shape_raises(self):
         specs = {"x": {"dtype": "float32"}}
         with pytest.raises(KeyError):
-            _build_inputs(specs)
+            build_inputs(specs)
 
     def test_missing_dtype_raises(self):
         specs = {"x": {"shape": [2]}}
         with pytest.raises(KeyError):
-            _build_inputs(specs)
+            build_inputs(specs)
 
     def test_bfloat16_input(self):
         specs = {"x": {"shape": [4, 4], "dtype": "bfloat16"}}
-        result = _build_inputs(specs)
+        result = build_inputs(specs)
         assert result["x"].shape == (4, 4)
         assert result["x"].dtype == np.dtype("bfloat16")
 
     def test_invalid_dtype_raises(self):
         specs = {"x": {"shape": [2], "dtype": "not_a_real_dtype"}}
         with pytest.raises(TypeError):
-            _build_inputs(specs)
+            build_inputs(specs)
 
     def test_empty_specs(self):
-        assert _build_inputs({}) == {}
+        assert build_inputs({}) == {}
 
 
 # ---------------------------------------------------------------------------
