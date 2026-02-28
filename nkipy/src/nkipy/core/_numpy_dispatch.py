@@ -77,6 +77,8 @@ def register_all_numpy_apis():
     _register_numpy_api(np.invert, ops.invert)
     _register_numpy_api(np.bitwise_not, ops.bitwise_not)
     _register_numpy_api(np.logical_not, ops.logical_not)
+    _register_numpy_api(np.clip, ops.clip)
+    _register_numpy_api(np.log1p, ops.log1p)
     # NOT SUPPORTED:
     # np.positive - not supported, use np.copy for "y = +x" operation
     # np.round - not a supported activation
@@ -88,10 +90,14 @@ def register_all_numpy_apis():
     _register_numpy_api(np.mean, ops.mean)
     _register_numpy_api(np.any, ops.any)
     _register_numpy_api(np.var, ops.var)
+    _register_numpy_api(np.std, ops.std)
+    _register_numpy_api(np.argmax, ops.argmax)
+    _register_numpy_api(np.cumsum, ops.cumsum)
 
     # Linear algebra
     _register_numpy_api(np.matmul, ops.matmul)
     _register_numpy_api(np.dot, ops.dot)
+    _register_numpy_api(np.linalg.norm, ops.norm)
 
     # Transform operations
     _register_numpy_api(np.reshape, ops.reshape)
@@ -101,6 +107,8 @@ def register_all_numpy_apis():
     _register_numpy_api(np.split, ops.split)
     _register_numpy_api(np.copy, ops.copy)
     _register_numpy_api(np.repeat, ops.repeat)
+    _register_numpy_api(np.squeeze, ops.squeeze)
+    _register_numpy_api(np.pad, ops.pad)
 
     # Creation operations
     _register_numpy_api(np.zeros_like, ops.zeros_like)

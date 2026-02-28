@@ -84,7 +84,7 @@ from nkipy.core.ops.indexing import (
 # -----------------------------------------------------------------------------
 # Linear algebra operations
 # -----------------------------------------------------------------------------
-from nkipy.core.ops.linalg import dot, matmul
+from nkipy.core.ops.linalg import dot, matmul, norm
 
 # -----------------------------------------------------------------------------
 # Neural network operations
@@ -100,9 +100,12 @@ from nkipy.core.ops.nn import (
 # -----------------------------------------------------------------------------
 from nkipy.core.ops.reduce import (
     any,
+    argmax,
+    cumsum,
     max,
     mean,
     min,
+    std,
     sum,
     var,
 )
@@ -117,9 +120,11 @@ from nkipy.core.ops.transform import (
     copy,
     copyto,
     expand_dims,
+    pad,
     repeat,
     reshape,
     split,
+    squeeze,
     transpose,
 )
 
@@ -131,11 +136,13 @@ from nkipy.core.ops.unary import (
     arctan,
     bitwise_not,
     ceil,
+    clip,
     cos,
     exp,
     floor,
     invert,
     log,
+    log1p,
     logical_not,
     negative,
     reciprocal,
@@ -195,6 +202,8 @@ __all__ = [
     "invert",
     "bitwise_not",
     "logical_not",
+    "clip",
+    "log1p",
     # Creation
     "constant",
     "zeros",
@@ -206,6 +215,7 @@ __all__ = [
     # Linalg
     "dot",
     "matmul",
+    "norm",
     # Reduction
     "sum",
     "max",
@@ -213,6 +223,9 @@ __all__ = [
     "mean",
     "any",
     "var",
+    "std",
+    "argmax",
+    "cumsum",
     # Transform
     "reshape",
     "transpose",
@@ -224,6 +237,8 @@ __all__ = [
     "broadcast_to",
     "copyto",
     "astype",
+    "squeeze",
+    "pad",
     # NN
     "softmax",
     "topk",

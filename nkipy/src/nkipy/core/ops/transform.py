@@ -121,7 +121,7 @@ def _expand_dims_hlo(x, axis):
         axes = sorted(axes)
 
         new_shape = list(x.shape)
-        for _, ax in enumerate(axes):
+        for ax in axes:
             new_shape.insert(ax, 1)
         new_shape = tuple(new_shape)
     else:
@@ -160,6 +160,12 @@ def _concatenate_hlo(tensors, axis=0):
     for t in tensors:
         if isinstance(t, NKIPyTensorRef):
             hlo_tensors.append(t.backend_tensor)
+        elif isinstance(t, np.ndarray):
+            # Convert concrete np.ndarray to HLO constant
+            from nkipy.core.ops.creation import constant
+
+            const_ref = constant(t)
+            hlo_tensors.append(const_ref.backend_tensor)
         else:
             hlo_tensors.append(t)
 
@@ -320,7 +326,12 @@ def _repeat_hlo(x, repeats, axis=None):
     if axis < 0:
         axis = len(x.shape) + axis
 
-    assert isinstance(repeats, int), "Only support int repeats"
+    if not isinstance(repeats, (int, np.integer)):
+        raise TypeError(
+            f"Only compile-time-known integer repeats are supported, got {type(repeats).__name__}. "
+            "Dynamic tensor repeats are not supported in tracing."
+        )
+    repeats = int(repeats)
 
     # Calculate output shape
     new_shape = list(x.shape)
@@ -391,6 +402,42 @@ copyto = Op("copyto")
 
 
 # -----------------------------------------------------------------------------
+# squeeze
+# -----------------------------------------------------------------------------
+squeeze = Op("squeeze")
+
+
+@squeeze.impl("hlo")
+def _squeeze_hlo(x, axis=None):
+    """Remove size-1 dimensions from tensor."""
+    x_shape = x.shape
+    ndim = len(x_shape)
+
+    if axis is None:
+        # Remove all size-1 dimensions
+        new_shape = tuple(s for s in x_shape if s != 1)
+        if not new_shape:
+            new_shape = ()
+    else:
+        if isinstance(axis, int):
+            axis = (axis,)
+        # Normalize negative axes
+        axes = tuple(a if a >= 0 else ndim + a for a in axis)
+        # Validate
+        for a in axes:
+            if x_shape[a] != 1:
+                raise ValueError(
+                    f"cannot select an axis to squeeze out which has size "
+                    f"not equal to one, got shape[{a}] = {x_shape[a]}"
+                )
+        new_shape = tuple(s for i, s in enumerate(x_shape) if i not in axes)
+
+    if new_shape == x_shape:
+        return x
+    return reshape(x, new_shape)
+
+
+# -----------------------------------------------------------------------------
 # astype
 # -----------------------------------------------------------------------------
 astype = Op("astype")
@@ -414,3 +461,151 @@ def _astype_hlo(x, dtype):
         result_tensor = ctx.build_op("convert", [x], x.shape, dtype)
 
     return NKIPyTensorRef(result_tensor)
+
+
+# -----------------------------------------------------------------------------
+# pad
+# -----------------------------------------------------------------------------
+pad = Op("pad")
+
+
+@pad.impl("hlo")
+def _pad_hlo(x, pad_width, mode="constant", constant_values=0, **kwargs):
+    """Pad tensor with various modes.
+
+    Supports:
+    - mode='constant': Uses native HLO pad instruction
+    - mode='edge': Composes from slice + concatenate
+    """
+    from nkipy.core.backend.hlo import as_hlo_tensor, get_hlo_context
+    from nkipy.core.tensor import NKIPyTensorRef
+
+    ctx = get_hlo_context()
+
+    if isinstance(x, NKIPyTensorRef):
+        x_shape = x.shape
+        x_dtype = x.dtype
+        x_bt = x.backend_tensor
+    else:
+        x_shape = x.shape
+        x_dtype = x.dtype
+        x_bt = x
+
+    ndim = len(x_shape)
+
+    # Normalize pad_width to list of (before, after) tuples
+    pad_width = np.asarray(pad_width)
+    if pad_width.ndim == 0:
+        pad_width = np.broadcast_to(pad_width, (ndim, 2))
+    elif pad_width.ndim == 1:
+        if len(pad_width) == 2:
+            pad_width = np.broadcast_to(pad_width, (ndim, 2))
+        else:
+            pad_width = np.array([[p, p] for p in pad_width])
+            if len(pad_width) != ndim:
+                raise ValueError(
+                    f"pad_width must have length {ndim} to match array dimensions, "
+                    f"got {len(pad_width)}"
+                )
+    # Broadcast short 2D pad_width to all dims (e.g. np.pad(a_2d, ((1,2),)))
+    if pad_width.ndim == 2 and len(pad_width) == 1:
+        pad_width = np.broadcast_to(pad_width, (ndim, 2))
+    pad_width = [(int(pad_width[i, 0]), int(pad_width[i, 1])) for i in range(ndim)]
+
+    if mode == "constant":
+        # Use native HLO pad instruction
+        # Build padding_config: list of (low, high, interior) per dim
+        padding_config = [(low, high, 0) for low, high in pad_width]
+
+        # Calculate output shape
+        result_shape = tuple(
+            s + low + high for s, (low, high) in zip(x_shape, pad_width)
+        )
+
+        # Create padding value scalar
+        pad_value_tensor = as_hlo_tensor(ctx, constant_values, x_dtype)
+
+        result_tensor = ctx.build_op(
+            "pad",
+            [x_bt, pad_value_tensor],
+            result_shape,
+            x_dtype,
+            {"padding_config": padding_config},
+        )
+        return NKIPyTensorRef(result_tensor)
+
+    elif mode == "edge":
+        # Compose from slice + concatenate for each dimension
+        result = NKIPyTensorRef(x_bt) if not isinstance(x, NKIPyTensorRef) else x
+        for dim in range(ndim):
+            before, after = pad_width[dim]
+            if before == 0 and after == 0:
+                continue
+
+            parts = []
+            if before > 0:
+                # Slice the first element along this dim and repeat
+                edge_slice = _slice_single(result, dim, 0)
+                edge_expanded = expand_dims(edge_slice, axis=dim)
+                edge_repeated = repeat(edge_expanded, before, axis=dim)
+                parts.append(edge_repeated)
+
+            parts.append(result)
+
+            if after > 0:
+                # Slice the last element along this dim and repeat
+                last_idx = result.shape[dim] - 1
+                edge_slice = _slice_single(result, dim, last_idx)
+                edge_expanded = expand_dims(edge_slice, axis=dim)
+                edge_repeated = repeat(edge_expanded, after, axis=dim)
+                parts.append(edge_repeated)
+
+            result = concatenate(parts, axis=dim)
+
+        return result
+
+    else:
+        raise NotImplementedError(
+            f"Pad mode '{mode}' is not supported. Only 'constant' and 'edge' modes are available."
+        )
+
+
+def _slice_single(x, dim, index):
+    """Slice a single element along a dimension, removing that dim."""
+    from nkipy.core.backend.hlo import get_hlo_context
+    from nkipy.core.tensor import NKIPyTensorRef
+
+    ctx = get_hlo_context()
+
+    if isinstance(x, NKIPyTensorRef):
+        x_bt = x.backend_tensor
+    else:
+        x_bt = x
+
+    ndim = len(x_bt.shape)
+    start_indices = [0] * ndim
+    limit_indices = list(x_bt.shape)
+    strides_list = [1] * ndim
+
+    start_indices[dim] = index
+    limit_indices[dim] = index + 1
+
+    slice_shape = list(x_bt.shape)
+    slice_shape[dim] = 1
+
+    sliced = ctx.build_op(
+        "slice",
+        [x_bt],
+        tuple(slice_shape),
+        x_bt.dtype,
+        {
+            "start_indices": start_indices,
+            "limit_indices": limit_indices,
+            "strides": strides_list,
+        },
+    )
+
+    # Remove the sliced dimension
+    result_shape = tuple(s for i, s in enumerate(x_bt.shape) if i != dim)
+    result = ctx.build_op("reshape", [sliced], result_shape, x_bt.dtype)
+    return NKIPyTensorRef(result)

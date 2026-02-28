@@ -204,3 +204,35 @@ def _logical_not_hlo(x, out=None, dtype=None):
     from nkipy.core.ops.binary import equal
 
     return equal(x, 0)
+
+
+# -----------------------------------------------------------------------------
+# clip: clamp values between a_min and a_max
+# -----------------------------------------------------------------------------
+clip = Op("clip")
+
+
+@clip.impl("hlo")
+def _clip_hlo(x, a_min=None, a_max=None, out=None):
+    from nkipy.core.ops.binary import maximum, minimum
+
+    result = x
+    if a_min is not None:
+        result = maximum(result, a_min)
+    if a_max is not None:
+        result = minimum(result, a_max)
+    return result
+
+
+# -----------------------------------------------------------------------------
+# log1p: log(1 + x)
+# -----------------------------------------------------------------------------
+log1p = Op("log1p")
+
+
+@log1p.impl("hlo")
+def _log1p_hlo(x, out=None, dtype=None):
+    """log(1+x). Note: uses log(1+x) decomposition; loses precision for |x| << 1."""
+    from nkipy.core.ops.binary import add
+
+    return log(add(x, 1.0))

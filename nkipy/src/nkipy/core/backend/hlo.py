@@ -656,6 +656,8 @@ class HLOModule:
             "all-reduce": self._handle_all_reduce,
             "reduce-scatter": self._handle_reduce_scatter,
             "all-to-all": self._handle_all_to_all,
+            "iota": self._handle_iota,
+            "pad": self._handle_pad,
         }
 
         handler = handlers.get(op.op_name)
@@ -908,6 +910,19 @@ class HLOModule:
         for group in op.attributes.get("replica_groups", [[0]]):
             replica_group = instr.replica_groups.add()
             replica_group.replica_ids.extend(group)
+
+    def _handle_iota(self, instr, op: HLOOp, _) -> None:
+        """Handle iota operation."""
+        instr.dimensions.append(op.attributes.get("iota_dimension", 0))
+
+    def _handle_pad(self, instr, op: HLOOp, _) -> None:
+        """Handle pad operation."""
+        padding_config = op.attributes.get("padding_config", [])
+        for low, high, interior in padding_config:
+            dim = instr.padding_config.dimensions.add()
+            dim.edge_padding_low = int(low)
+            dim.edge_padding_high = int(high)
+            dim.interior_padding = int(interior)
 
     def _emit_root(
         self, computation, instr_id_map: Dict[str, int], next_instr_id: int
