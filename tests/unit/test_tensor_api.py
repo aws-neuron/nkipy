@@ -2060,5 +2060,332 @@ def test_var_keepdims(trace_mode):
         trace_and_compile(kernel, trace_mode, in0)
 
 
+@pytest.mark.parametrize(
+    "shape_a,shape_b",
+    [
+        ((32, 64), (64, 48)),
+        ((128, 256), (256, 512)),
+        ((256, 512), (512, 1024)),
+        ((1, 128), (128, 256)),
+        ((256, 128), (128, 1)),
+    ],
+)
+def test_einsum_matmul(sim_mode, shape_a, shape_b):
+    """Test einsum matrix multiplication: ij,jk->ik"""
+
+    def kernel(a, b):
+        return np.einsum("ij,jk->ik", a, b)
+
+    dtype = np.float32
+    np.random.seed(0)
+    in0 = np.random.uniform(high=1.0, low=0.0, size=shape_a).astype(dtype)
+    in1 = np.random.uniform(high=1.0, low=0.0, size=shape_b).astype(dtype)
+
+    expected = np.einsum("ij,jk->ik", in0, in1)
+    out = simulate_kernel_unified(kernel, sim_mode, in0, in1)
+    simulate_assert_allclose(out, expected)
+
+    if NEURON_AVAILABLE:
+        out_baremetal = baremetal_run_kernel_unified(kernel, sim_mode, in0, in1)
+        baremetal_assert_allclose(expected, out_baremetal)
+
+
+@pytest.mark.parametrize(
+    "shape_a,shape_b",
+    [
+        ((2, 32, 64), (2, 64, 48)),
+        ((4, 128, 256), (4, 256, 128)),
+        ((8, 64, 128), (8, 128, 64)),
+        ((1, 128, 256), (1, 256, 128)),
+    ],
+)
+def test_einsum_batch_matmul(sim_mode, shape_a, shape_b):
+    """Test einsum batch matrix multiplication: bij,bjk->bik"""
+
+    def kernel(a, b):
+        return np.einsum("bij,bjk->bik", a, b)
+
+    dtype = np.float32
+    np.random.seed(0)
+    in0 = np.random.uniform(high=1.0, low=0.0, size=shape_a).astype(dtype)
+    in1 = np.random.uniform(high=1.0, low=0.0, size=shape_b).astype(dtype)
+
+    expected = np.einsum("bij,bjk->bik", in0, in1)
+    out = simulate_kernel_unified(kernel, sim_mode, in0, in1)
+    simulate_assert_allclose(out, expected)
+
+    if NEURON_AVAILABLE:
+        out_baremetal = baremetal_run_kernel_unified(kernel, sim_mode, in0, in1)
+        baremetal_assert_allclose(expected, out_baremetal)
+
+
+@pytest.mark.parametrize(
+    "shape_a,shape_b",
+    [
+        ((128,), (128,)),
+        ((256,), (256,)),
+        ((512,), (512,)),
+        ((1024,), (1024,)),
+    ],
+)
+def test_einsum_dot_product(sim_mode, shape_a, shape_b):
+    """Test einsum dot product: i,i->"""
+
+    def kernel(a, b):
+        return np.einsum("i,i->", a, b)
+
+    dtype = np.float32
+    np.random.seed(0)
+    in0 = np.random.uniform(high=1.0, low=0.0, size=shape_a).astype(dtype)
+    in1 = np.random.uniform(high=1.0, low=0.0, size=shape_b).astype(dtype)
+
+    expected = np.einsum("i,i->", in0, in1)
+    out = simulate_kernel_unified(kernel, sim_mode, in0, in1)
+    simulate_assert_allclose(out, expected)
+
+    if NEURON_AVAILABLE:
+        out_baremetal = baremetal_run_kernel_unified(kernel, sim_mode, in0, in1)
+        baremetal_assert_allclose(expected, out_baremetal)
+
+
+@pytest.mark.parametrize(
+    "shape_a,shape_b",
+    [
+        ((32,), (64,)),
+        ((64,), (128,)),
+        ((128,), (256,)),
+        ((16,), (32,)),
+    ],
+)
+def test_einsum_outer_product(sim_mode, shape_a, shape_b):
+    """Test einsum outer product: i,j->ij"""
+
+    def kernel(a, b):
+        return np.einsum("i,j->ij", a, b)
+
+    dtype = np.float32
+    np.random.seed(0)
+    in0 = np.random.uniform(high=1.0, low=0.0, size=shape_a).astype(dtype)
+    in1 = np.random.uniform(high=1.0, low=0.0, size=shape_b).astype(dtype)
+
+    expected = np.einsum("i,j->ij", in0, in1)
+    out = simulate_kernel_unified(kernel, sim_mode, in0, in1)
+    simulate_assert_allclose(out, expected)
+
+    if NEURON_AVAILABLE:
+        out_baremetal = baremetal_run_kernel_unified(kernel, sim_mode, in0, in1)
+        baremetal_assert_allclose(expected, out_baremetal)
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (32, 64),
+        (128, 256),
+        (256, 512),
+        (512, 1024),
+    ],
+)
+def test_einsum_transpose(sim_mode, shape):
+    """Test einsum transpose: ij->ji"""
+
+    def kernel(a):
+        return np.einsum("ij->ji", a)
+
+    dtype = np.float32
+    np.random.seed(0)
+    in0 = np.random.uniform(high=1.0, low=0.0, size=shape).astype(dtype)
+
+    expected = np.einsum("ij->ji", in0)
+    out = simulate_kernel_unified(kernel, sim_mode, in0)
+    simulate_assert_allclose(out, expected)
+
+    if NEURON_AVAILABLE:
+        out_baremetal = baremetal_run_kernel_unified(kernel, sim_mode, in0)
+        baremetal_assert_allclose(expected, out_baremetal)
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (32, 64),
+        (128, 256),
+        (256, 512),
+    ],
+)
+def test_einsum_sum_axis(sim_mode, shape):
+    """Test einsum sum along axis: ij->i"""
+
+    def kernel(a):
+        return np.einsum("ij->i", a)
+
+    dtype = np.float32
+    np.random.seed(0)
+    in0 = np.random.uniform(high=1.0, low=0.0, size=shape).astype(dtype)
+
+    expected = np.einsum("ij->i", in0)
+    out = simulate_kernel_unified(kernel, sim_mode, in0)
+    simulate_assert_allclose(out, expected)
+
+    if NEURON_AVAILABLE:
+        out_baremetal = baremetal_run_kernel_unified(kernel, sim_mode, in0)
+        baremetal_assert_allclose(expected, out_baremetal)
+
+
+@pytest.mark.parametrize(
+    "shape_a,shape_b",
+    [
+        ((32, 64), (32, 64)),
+        ((128, 256), (128, 256)),
+        ((256, 512), (256, 512)),
+    ],
+)
+def test_einsum_hadamard_sum(sim_mode, shape_a, shape_b):
+    """Test einsum element-wise multiply and sum: ij,ij->"""
+
+    def kernel(a, b):
+        return np.einsum("ij,ij->", a, b)
+
+    dtype = np.float32
+    np.random.seed(0)
+    in0 = np.random.uniform(high=1.0, low=0.0, size=shape_a).astype(dtype)
+    in1 = np.random.uniform(high=1.0, low=0.0, size=shape_b).astype(dtype)
+
+    expected = np.einsum("ij,ij->", in0, in1)
+    out = simulate_kernel_unified(kernel, sim_mode, in0, in1)
+    simulate_assert_allclose(out, expected)
+
+    if NEURON_AVAILABLE:
+        out_baremetal = baremetal_run_kernel_unified(kernel, sim_mode, in0, in1)
+        baremetal_assert_allclose(expected, out_baremetal)
+
+
+@pytest.mark.parametrize(
+    "shape_a,shape_b",
+    [
+        ((4, 128), (4, 128)),
+        ((8, 256), (8, 256)),
+        ((16, 512), (16, 512)),
+    ],
+)
+def test_einsum_batch_dot(sim_mode, shape_a, shape_b):
+    """Test einsum batched dot product: bi,bi->b"""
+
+    def kernel(a, b):
+        return np.einsum("bi,bi->b", a, b)
+
+    dtype = np.float32
+    np.random.seed(0)
+    in0 = np.random.uniform(high=1.0, low=0.0, size=shape_a).astype(dtype)
+    in1 = np.random.uniform(high=1.0, low=0.0, size=shape_b).astype(dtype)
+
+    expected = np.einsum("bi,bi->b", in0, in1)
+    out = simulate_kernel_unified(kernel, sim_mode, in0, in1)
+    simulate_assert_allclose(out, expected)
+
+    if NEURON_AVAILABLE:
+        out_baremetal = baremetal_run_kernel_unified(kernel, sim_mode, in0, in1)
+        baremetal_assert_allclose(expected, out_baremetal)
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (2, 3, 4),
+        (4, 8, 16),
+        (8, 16, 32),
+    ],
+)
+def test_einsum_permute_3d(sim_mode, shape):
+    """Test einsum 3D permutation: ijk->kij"""
+
+    def kernel(a):
+        return np.einsum("ijk->kij", a)
+
+    dtype = np.float32
+    np.random.seed(0)
+    in0 = np.random.uniform(high=1.0, low=0.0, size=shape).astype(dtype)
+
+    expected = np.einsum("ijk->kij", in0)
+    out = simulate_kernel_unified(kernel, sim_mode, in0)
+    simulate_assert_allclose(out, expected)
+
+    if NEURON_AVAILABLE:
+        out_baremetal = baremetal_run_kernel_unified(kernel, sim_mode, in0)
+        baremetal_assert_allclose(expected, out_baremetal)
+
+
+def test_einsum_implicit_output(sim_mode):
+    """Test einsum with implicit output specification"""
+
+    def kernel(a, b):
+        return np.einsum("ik,kj", a, b)  # Implicit: -> 'ij'
+
+    shape_a = (32, 64)
+    shape_b = (64, 48)
+    dtype = np.float32
+
+    np.random.seed(0)
+    in0 = np.random.uniform(high=1.0, low=0.0, size=shape_a).astype(dtype)
+    in1 = np.random.uniform(high=1.0, low=0.0, size=shape_b).astype(dtype)
+
+    expected = np.einsum("ik,kj", in0, in1)
+    out = simulate_kernel_unified(kernel, sim_mode, in0, in1)
+    simulate_assert_allclose(out, expected)
+
+    if NEURON_AVAILABLE:
+        out_baremetal = baremetal_run_kernel_unified(kernel, sim_mode, in0, in1)
+        baremetal_assert_allclose(expected, out_baremetal)
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float16])
+def test_einsum_dtypes(sim_mode, dtype):
+    """Test einsum with different data types"""
+
+    def kernel(a, b):
+        return np.einsum("ij,jk->ik", a, b)
+
+    shape_a = (64, 128)
+    shape_b = (128, 64)
+
+    np.random.seed(0)
+    in0 = np.random.uniform(high=1.0, low=0.0, size=shape_a).astype(dtype)
+    in1 = np.random.uniform(high=1.0, low=0.0, size=shape_b).astype(dtype)
+
+    expected = np.einsum("ij,jk->ik", in0, in1)
+    out = simulate_kernel_unified(kernel, sim_mode, in0, in1)
+
+    # Use relaxed tolerance for float16
+    rtol = 1e-2 if dtype == np.float16 else 1e-5
+    simulate_assert_allclose(out, expected, rtol=rtol)
+
+    if NEURON_AVAILABLE:
+        out_baremetal = baremetal_run_kernel_unified(kernel, sim_mode, in0, in1)
+        baremetal_assert_allclose(expected, out_baremetal, rtol=rtol)
+
+
+def test_einsum_tensor_contraction(sim_mode):
+    """Test einsum tensor contraction: ijk,jkl->il"""
+
+    def kernel(a, b):
+        return np.einsum("ijk,jkl->il", a, b)
+
+    shape_a = (2, 3, 4)
+    shape_b = (3, 4, 5)
+    dtype = np.float32
+
+    np.random.seed(0)
+    in0 = np.random.uniform(high=1.0, low=0.0, size=shape_a).astype(dtype)
+    in1 = np.random.uniform(high=1.0, low=0.0, size=shape_b).astype(dtype)
+
+    expected = np.einsum("ijk,jkl->il", in0, in1)
+    out = simulate_kernel_unified(kernel, sim_mode, in0, in1)
+    simulate_assert_allclose(out, expected)
+
+    if NEURON_AVAILABLE:
+        out_baremetal = baremetal_run_kernel_unified(kernel, sim_mode, in0, in1)
+        baremetal_assert_allclose(expected, out_baremetal)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

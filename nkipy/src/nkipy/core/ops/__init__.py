@@ -87,6 +87,11 @@ from nkipy.core.ops.indexing import (
 from nkipy.core.ops.linalg import dot, matmul
 
 # -----------------------------------------------------------------------------
+# Einstein summation
+# -----------------------------------------------------------------------------
+from nkipy.core.ops.einsum import einsum
+
+# -----------------------------------------------------------------------------
 # Neural network operations
 # -----------------------------------------------------------------------------
 from nkipy.core.ops.nn import (
@@ -206,6 +211,8 @@ __all__ = [
     # Linalg
     "dot",
     "matmul",
+    # Einsum
+    "einsum",
     # Reduction
     "sum",
     "max",
