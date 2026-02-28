@@ -320,6 +320,18 @@ class TensorPlaceholder:
     dtype: np.dtype
 
 
+@dataclass(frozen=True)
+class AliasInfo:
+    """One input-output alias pair."""
+
+    output_index: int  # Position in HLO output tuple
+    param_index: int  # Position in HLO parameter list
+    param_name: str  # Original parameter name (e.g., "a")
+    is_user_returned: (
+        bool  # False = auto-added output, True = user explicitly returned it
+    )
+
+
 # =============================================================================
 # HLO Module
 # =============================================================================
@@ -333,8 +345,18 @@ class HLOModule:
         self.parameters: List[HLOTensor] = []
         self.operations: List[HLOOp] = []
         self.results: List[HLOTensor] = []
-        self.input_output_alias: Dict[int, int] = {}
+        self.aliases: List[AliasInfo] = []
         self._next_id = 0
+
+    @property
+    def input_output_alias(self) -> Dict[int, int]:
+        """Derived from self.aliases for proto generation."""
+        return {a.output_index: a.param_index for a in self.aliases}
+
+    @property
+    def auto_aliased_indices(self) -> set[int]:
+        """Output indices that were auto-added (not user-returned)."""
+        return {a.output_index for a in self.aliases if not a.is_user_returned}
 
     @property
     def inputs(self) -> List[TensorPlaceholder]:

@@ -3,11 +3,10 @@
 """
 Unit tests for tensor aliasing functionality.
 
-Tests the mutable_tensor aliasing mechanism which allows in-place modifications
-of input tensors, essential for memory-efficient operations.
+Tests the automatic mutation-based aliasing mechanism which detects in-place
+modifications of input tensors via __setitem__ during tracing.
 """
 
-import nkipy.core.typing as nt
 import numpy as np
 import pytest
 from nkipy.core.trace import NKIPyKernel
@@ -19,19 +18,28 @@ from utils import (
 )
 
 
-def nkipy_kernel_single_alias(a_input: nt.mutable_tensor, b_input):
-    """Kernel with single alias - modifies a_input in place"""
+def nkipy_kernel_single_alias(a_input, b_input):
+    """Kernel with single alias - modifies a_input in place and returns it"""
     a_input[0, :] = b_input[1, :]
     return a_input
 
 
-def nkipy_kernel_multi_alias(
-    a_input: nt.mutable_tensor, b_input, c_input: nt.mutable_tensor
-):
+def nkipy_kernel_multi_alias(a_input, b_input, c_input):
     """Kernel with multiple alias pairs - modifies both a_input and c_input in place"""
     a_input[0:1, :] = b_input[0:1, :]
     c_input[2:3, :] = b_input[2:3, :]
     return a_input, c_input
+
+
+def nkipy_kernel_no_return(a_input, b_input):
+    """Kernel that mutates a_input but does not return anything."""
+    a_input[0, :] = b_input[1, :]
+
+
+def nkipy_kernel_mixed_return(a_input, b_input):
+    """Kernel that mutates a_input and returns a different computed value."""
+    a_input[0, :] = b_input[1, :]
+    return a_input + b_input
 
 
 def test_single_alias(trace_mode):
@@ -133,6 +141,67 @@ def test_multi_alias(trace_mode):
         baremetal_assert_allclose(output1.numpy(), expected_C)
     else:
         trace_and_compile(nkipy_kernel_multi_alias, trace_mode, A.copy(), B, C.copy())
+
+
+def test_no_return_alias(trace_mode):
+    """Test mutation-only kernel (no return statement).
+
+    The mutated parameter should be auto-appended to outputs and aliased.
+    """
+    A = ((np.random.rand(128, 512) - 0.5) * 2).astype(np.float16)
+    B = ((np.random.rand(128, 512) - 0.5) * 2).astype(np.float16)
+
+    expected = A.copy()
+    expected[0, :] = B[1, :]
+
+    # CPU execution: function mutates A in place, returns None
+    A_copy = A.copy()
+    result = nkipy_kernel_no_return(A_copy, B)
+    assert result is None
+    cpu_assert_allclose(A_copy, expected)
+
+    # Verify tracing: should have 1 alias (auto-added), 0 user-returned outputs
+    traced_kernel = NKIPyKernel.trace(nkipy_kernel_no_return, backend="hlo")
+    ir = traced_kernel.specialize(A.copy(), B)
+    assert len(ir.aliases) == 1
+    assert ir.aliases[0].param_name == "a_input"
+    assert ir.aliases[0].is_user_returned is False
+    assert len(ir.auto_aliased_indices) == 1
+
+    if not NEURON_AVAILABLE:
+        trace_and_compile(nkipy_kernel_no_return, trace_mode, A.copy(), B)
+
+
+def test_mixed_return_alias(trace_mode):
+    """Test kernel that mutates a parameter and returns a different value.
+
+    a_input is mutated (aliased) but the user returns a_input + b_input.
+    """
+    A = ((np.random.rand(128, 512) - 0.5) * 2).astype(np.float16)
+    B = ((np.random.rand(128, 512) - 0.5) * 2).astype(np.float16)
+
+    expected_A = A.copy()
+    expected_A[0, :] = B[1, :]
+    expected_sum = expected_A + B
+
+    # CPU execution
+    A_copy = A.copy()
+    result = nkipy_kernel_mixed_return(A_copy, B)
+    cpu_assert_allclose(result, expected_sum)
+
+    # Verify tracing: should have 1 alias (auto-added, not user-returned)
+    # plus 1 user-returned output (the sum)
+    traced_kernel = NKIPyKernel.trace(nkipy_kernel_mixed_return, backend="hlo")
+    ir = traced_kernel.specialize(A.copy(), B)
+    assert len(ir.aliases) == 1
+    assert ir.aliases[0].param_name == "a_input"
+    assert ir.aliases[0].is_user_returned is False
+    # 2 outputs total: the sum (user) + a_input (auto-aliased)
+    assert len(ir.outputs) == 2
+    assert len(ir.auto_aliased_indices) == 1
+
+    if not NEURON_AVAILABLE:
+        trace_and_compile(nkipy_kernel_mixed_return, trace_mode, A.copy(), B)
 
 
 if __name__ == "__main__":

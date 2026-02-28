@@ -263,7 +263,14 @@ class NKIPyTensorRef(TensorArithmeticMixin, TensorOperationMixin):
     module which dispatches to the appropriate backend implementation.
     """
 
-    __slots__ = ("backend_tensor", "_shape", "_dtype", "_name")
+    __slots__ = (
+        "backend_tensor",
+        "_shape",
+        "_dtype",
+        "_name",
+        "_original_parameter",
+        "_is_mutated",
+    )
     _tensor_apis = {}
 
     def __init__(self, backend_tensor, name: str = None):
@@ -278,6 +285,9 @@ class NKIPyTensorRef(TensorArithmeticMixin, TensorOperationMixin):
         self._shape = backend_tensor.shape
         self._dtype = backend_tensor.dtype
         self._name = name
+        # Kept for debugging: stores the original HLO parameter before mutations
+        self._original_parameter = None
+        self._is_mutated = False
 
     @property
     def name(self):
@@ -500,9 +510,11 @@ class NKIPyTensorRef(TensorArithmeticMixin, TensorOperationMixin):
             has_tensor_index = any(isinstance(idx, NKIPyTensorRef) for idx in indices)
 
             if has_tensor_index:
+                self._is_mutated = True
                 # Use scatter for dynamic indexing via put_along_axis
                 self._do_scatter_indexing(indices, value)
             else:
+                self._is_mutated = True
                 # Use static slice assignment
                 self._do_static_slice_assignment(indices, value)
         finally:

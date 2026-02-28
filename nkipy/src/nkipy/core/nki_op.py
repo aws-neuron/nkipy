@@ -134,10 +134,11 @@ def _build_hlo_custom_call(config, operands):
 
     ctx = get_hlo_context()
 
+    # Collect tensor operands (preserving order) for alias resolution
+    tensor_operands = [op for op in operands if isinstance(op, NKIPyTensorRef)]
+
     # Build HLO operands: user inputs + constants
-    hlo_operands = [
-        op.backend_tensor for op in operands if isinstance(op, NKIPyTensorRef)
-    ]
+    hlo_operands = [op.backend_tensor for op in tensor_operands]
 
     for const in config.constant_values:
         const_tensor = ctx.build_op(
@@ -160,8 +161,12 @@ def _build_hlo_custom_call(config, operands):
     if config.has_collectives:
         custom_call_attrs["has_collectives"] = True
 
-    if config.operand_output_aliases:
-        custom_call_attrs["operand_output_aliases"] = config.operand_output_aliases
+    # NKI alias map: {input_operand_idx: output_idx}
+    alias_map = config.operand_output_aliases or {}
+    if alias_map:
+        custom_call_attrs["operand_output_aliases"] = alias_map
+    # Invert to output_idx -> input_operand_idx for result construction
+    output_alias_map = {out_idx: in_idx for in_idx, out_idx in alias_map.items()}
 
     # Single output vs tuple output
     if len(output_shapes) == 1 and not config.result_is_sequence:
@@ -172,6 +177,13 @@ def _build_hlo_custom_call(config, operands):
             output_dtypes[0],
             custom_call_attrs,
         )
+        if 0 in output_alias_map:
+            original = tensor_operands[output_alias_map[0]]
+            original._is_mutated = True
+            original.backend_tensor = result_tensor
+            original._shape = result_tensor.shape
+            original._dtype = result_tensor.dtype
+            return original
         return NKIPyTensorRef(result_tensor)
     else:
         custom_call_attrs["is_tuple"] = True
@@ -188,7 +200,15 @@ def _build_hlo_custom_call(config, operands):
                 output_dtypes[i],
                 {"tuple_index": i},
             )
-            results.append(NKIPyTensorRef(element_tensor))
+            if i in output_alias_map:
+                original = tensor_operands[output_alias_map[i]]
+                original._is_mutated = True
+                original.backend_tensor = element_tensor
+                original._shape = element_tensor.shape
+                original._dtype = element_tensor.dtype
+                results.append(original)
+            else:
+                results.append(NKIPyTensorRef(element_tensor))
         return tuple(results)
 
 

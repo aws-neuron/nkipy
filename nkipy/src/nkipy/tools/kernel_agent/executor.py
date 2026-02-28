@@ -80,7 +80,7 @@ def run_kernel(
         from nkipy.runtime.execute import _compile_kernel
 
         traced = NKIPyKernel.trace(kernel_fn)
-        neff, kname, ir, boundargs = _compile_kernel(
+        neff, kname, ir, boundargs, original_inputs = _compile_kernel(
             traced, *args, artifacts_dir=artifacts_dir
         )
         result.compile = StageResult(success=True)
@@ -93,7 +93,7 @@ def run_kernel(
         try:
             from nkipy.runtime.execute import _execute_neff
 
-            out = _execute_neff(neff, kname, ir, boundargs)
+            out = _execute_neff(neff, kname, ir, boundargs, original_inputs)
             result.hardware = StageResult(success=True, output=np.asarray(out))
         except Exception as e:
             result.hardware = StageResult(success=False, error=str(e))

@@ -2,17 +2,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """Trace wrappers to lower NKIPy kernels"""
 
-import ast
 import inspect
-import textwrap
 import warnings
 
 import numpy as np
 
-import nkipy.core.typing as nt
 from nkipy.core._numpy_dispatch import register_all_numpy_apis
 from nkipy.core.backend import tracing
-from nkipy.core.backend.hlo import HLOModule, HLOTraceContext, get_hlo_context
+from nkipy.core.backend.hlo import (
+    AliasInfo,
+    HLOModule,
+    HLOTraceContext,
+    get_hlo_context,
+)
 from nkipy.core.tensor import NKIPyTensorRef
 
 # Register numpy APIs to use ops module implementations
@@ -89,6 +91,8 @@ class NKIPyKernel:
             # Convert numpy arrays to tensor references
             converted_args = []
             converted_kwargs = {}
+            # Track parameter tensor refs: list of (param_name, tensor_ref) for arrays
+            param_tensor_refs = []
 
             for name, arg in boundargs.arguments.items():
                 param = sig.parameters[name]
@@ -96,7 +100,9 @@ class NKIPyKernel:
                 if isinstance(arg, np.ndarray):
                     arg = _sanitize_array_dtype(arg, name)
                     tensor_ref = self._create_parameter_hlo(arg.shape, arg.dtype, name)
+                    tensor_ref._original_parameter = tensor_ref.backend_tensor
                     converted_value = tensor_ref
+                    param_tensor_refs.append((name, tensor_ref))
                 else:
                     converted_value = arg
 
@@ -134,122 +140,103 @@ class NKIPyKernel:
             ret = self.func(*converted_args, **converted_kwargs)
 
             # Mark outputs
-            self._mark_hlo_outputs(code, ret)
+            self._mark_hlo_outputs(code, ret, param_tensor_refs)
             self._code = code
 
         return code
 
-    def _mark_hlo_outputs(self, code: HLOModule, ret):
-        """Mark HLO outputs"""
+    def _mark_hlo_outputs(self, code: HLOModule, ret, param_tensor_refs):
+        """Mark HLO outputs using mutation tracking.
 
-        if ret is not None:
-            if not isinstance(ret, (list, tuple)):
-                ret = [ret]
+        Detects aliasing by checking which parameter tensor refs were mutated
+        (had __setitem__ called on them) during kernel execution.
 
-            # Detect mutable_tensor parameters by inspecting function signature
-            sig = inspect.signature(self.func)
-            mutable_params = {}
-            for param_name, param in sig.parameters.items():
-                # Check if the annotation has the mutable modifier
-                # This handles both nt.mutable_tensor and tensor[mutable, dtype, shape]
-                is_mutable = False
-                if (
-                    hasattr(param.annotation, "modifier")
-                    and param.annotation.modifier is nt.mutable
-                ):
-                    # Check for modifier attribute (works for tensor[nt.mutable])
-                    is_mutable = True
-                elif param.annotation == nt.mutable_tensor:
-                    # Fallback for direct mutable_tensor annotation
-                    is_mutable = True
+        Args:
+            code: The HLOModule being built
+            ret: The return value(s) from the kernel function
+            param_tensor_refs: List of (param_name, tensor_ref) for array parameters
+        """
+        # Normalize return value to a list (may be None for mutation-only kernels)
+        if ret is None:
+            ret = []
+        elif not isinstance(ret, (list, tuple)):
+            ret = [ret]
+        ret = list(ret)
+        user_return_len = len(ret)
 
-                if is_mutable:
-                    # Find the corresponding parameter in code.parameters
-                    for hlo_param in code.parameters:
-                        if hlo_param.name == param_name:
-                            mutable_params[param_name] = (
-                                hlo_param.parameter_id,
-                                hlo_param,
-                            )
-                            # Rename the parameter to include .must_alias_input suffix
-                            hlo_param.name = f"{param_name}.must_alias_input"
-                            break
+        ctx = get_hlo_context()
 
-            # Extract returned variable names from function source using AST
-            returned_var_names = []
-            try:
-                source = inspect.getsource(self.func)
-                tree = ast.parse(textwrap.dedent(source))
+        # Step 1: For each mutated param, rename HLO parameter.
+        # Check if user returned it; if not, auto-append to output list.
+        aliased_return_positions = {}  # output_index -> (param_name, param_index)
+        for name, tr in param_tensor_refs:
+            if not tr._is_mutated:
+                continue
 
-                # Find return statement(s) and extract variable names
-                for node in ast.walk(tree):
-                    if isinstance(node, ast.Return) and node.value:
-                        if isinstance(node.value, ast.Name):
-                            # Single return: return x
-                            returned_var_names.append(node.value.id)
-                        elif isinstance(node.value, ast.Tuple):
-                            # Multiple return: return x, y, z
-                            for elt in node.value.elts:
-                                if isinstance(elt, ast.Name):
-                                    returned_var_names.append(elt.id)
-            except Exception as e:
-                # If AST parsing fails, fall back to empty list
-                # This means no aliasing will be detected
-                print(f"Failed to parse function source for aliasing detection: {e}")
-                returned_var_names = []
+            # Rename HLO parameter for compiler convention
+            param_index = None
+            for hlo_param in code.parameters:
+                if hlo_param.name == name:
+                    hlo_param.name = f"{name}.must_alias_input"
+                    param_index = hlo_param.parameter_id
+                    break
 
-            # Insert explicit copy for pass-through outputs (outputs that are
-            # unmodified input parameters). The Neuron compiler cannot handle
-            # outputs that are raw parameter references because inputs and outputs
-            # occupy separate memory regions on device.
-            ret = list(ret)
-            ctx = get_hlo_context()
+            if param_index is None:
+                raise RuntimeError(
+                    f"Mutated parameter '{name}' not found in HLO parameters"
+                )
+
+            # Check if this mutated param is in the user's return values (identity check)
+            found_at = None
             for i, r in enumerate(ret):
-                if not isinstance(r, NKIPyTensorRef):
-                    continue
-                bt = r.backend_tensor
-                if bt.is_parameter:
-                    # Skip mutable aliases — those are handled via input_output_alias
-                    var_name = (
-                        returned_var_names[i] if i < len(returned_var_names) else None
-                    )
-                    if var_name not in mutable_params:
-                        copy_tensor = ctx.build_op("copy", [bt], bt.shape, bt.dtype)
-                        ret[i] = NKIPyTensorRef(copy_tensor, name="")
+                if isinstance(r, NKIPyTensorRef) and r is tr:
+                    found_at = i
+                    break
 
-            idx = 0
-            for r in ret:
-                if not isinstance(r, NKIPyTensorRef):
-                    raise RuntimeError(f"Unexpected return value type: {type(r)}")
-
-                # Check if this output should alias with a mutable input parameter
-                # Use the variable name from the return statement
-                if idx < len(returned_var_names):
-                    var_name = returned_var_names[idx]
-                    if var_name in mutable_params:
-                        param_id, _ = mutable_params[var_name]
-                        # Record aliasing: output index -> input parameter number
-                        code.input_output_alias[idx] = param_id
-
-                        # FIXME: Also override the name
-                        r.backend_tensor.name = var_name
-
-                # N.B.: the name "output{idx}" is specific
-                # it avoids variable folding in HLO lowering in Neuron Compiler
-                if not r.backend_tensor.name:
-                    r.backend_tensor.name = f"output{idx}"
-
-                idx += 1
-            result_tensors = [r.backend_tensor for r in ret]
-
-            # If there are multiple results, create a tuple result
-            if len(result_tensors) > 1:
-                # For multiple outputs, we need to create a tuple in HLO
-                # This is done by setting multiple results
-                code.set_results(result_tensors)
+            if found_at is not None:
+                aliased_return_positions[found_at] = (name, param_index)
             else:
-                # Single output
-                code.set_results(result_tensors)
+                # Auto-append to output list
+                ret.append(tr)
+                aliased_return_positions[len(ret) - 1] = (name, param_index)
+
+        # Step 2: Insert explicit copy for unmutated pass-through outputs.
+        # The Neuron compiler cannot handle outputs that are raw parameter
+        # references because inputs and outputs occupy separate memory regions.
+        for i, r in enumerate(ret):
+            if not isinstance(r, NKIPyTensorRef):
+                continue
+            if i in aliased_return_positions:
+                continue
+            bt = r.backend_tensor
+            if bt.is_parameter:
+                copy_tensor = ctx.build_op("copy", [bt], bt.shape, bt.dtype)
+                ret[i] = NKIPyTensorRef(copy_tensor, name="")
+
+        # Step 3: Assign output names and build AliasInfo list
+        for idx, r in enumerate(ret):
+            if not isinstance(r, NKIPyTensorRef):
+                raise RuntimeError(f"Unexpected return value type: {type(r)}")
+
+            if idx in aliased_return_positions:
+                param_name, param_index = aliased_return_positions[idx]
+                code.aliases.append(
+                    AliasInfo(
+                        output_index=idx,
+                        param_index=param_index,
+                        param_name=param_name,
+                        is_user_returned=idx < user_return_len,
+                    )
+                )
+                r.backend_tensor.name = param_name
+
+            # N.B.: the name "output{idx}" is specific
+            # it avoids variable folding in HLO lowering in Neuron Compiler
+            if not r.backend_tensor.name:
+                r.backend_tensor.name = f"output{idx}"
+
+        result_tensors = [r.backend_tensor for r in ret]
+        code.set_results(result_tensors)
 
     @classmethod
     def trace(cls, func=None, backend="hlo", **kwargs):
