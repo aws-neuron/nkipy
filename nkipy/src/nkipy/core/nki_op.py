@@ -245,14 +245,9 @@ if BETA2_NKI_AVAILABLE:
     def _patched_beta2_generic_kernel_call(self, *args, **kwargs):
         """Patched __call__ that intercepts calls during NKIPy tracing."""
         if get_backend() != "cpu":
-            # Note: Create a disposable copy of a GenericKernel for NKI tracing.
-
-            # This is requried only for Beta2. The frontend.Kernel (kernel.kernel)
-            # accumulates state during specialize/trace and cannot be reused.
-            fresh = self
-            fresh.kernel = type(self.kernel)(self.func)
-
-            return _generate_nki_custom_call(fresh, *args, **kwargs)
+            # No longer need disposable GenericKernel copy:
+            # fixed in nki 2.28.0 release
+            return _generate_nki_custom_call(self, *args, **kwargs)
         return _original_beta2_generic_kernel_call(self, *args, **kwargs)
 
     Beta2GenericKernel.__call__ = _patched_beta2_generic_kernel_call
