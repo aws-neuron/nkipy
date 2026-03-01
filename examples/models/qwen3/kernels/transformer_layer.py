@@ -1,4 +1,3 @@
-import nkipy.core.typing as nt
 import nkipy.distributed.collectives as cc
 import numpy as np
 import torch.distributed as dist
@@ -24,8 +23,8 @@ def transformer_layer(
     q_norm_weight,
     k_norm_weight,
     # kv cache
-    cache_k: nt.mutable_tensor,
-    cache_v: nt.mutable_tensor,
+    cache_k,
+    cache_v,
     post_attention_weight,
     router_weight,
     gate_up_weight,
@@ -42,7 +41,7 @@ def transformer_layer(
     norm_x = rmsnorm_kernel(x, input_weight, configs.norm_eps)
 
     # Attention
-    h1, cache_k, cache_v = attention_kernel(
+    h1 = attention_kernel(
         norm_x,
         qkv_weight,
         q_norm_weight,
@@ -118,4 +117,4 @@ def transformer_layer(
     # Add residual connection
     final_output = z + output
 
-    return final_output, cache_k, cache_v
+    return final_output

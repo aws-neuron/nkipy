@@ -347,14 +347,23 @@ def _take_along_axis_hlo(x, indices, axis):
 
 
 # -----------------------------------------------------------------------------
-# put_along_axis
+# scatter_along_axis (internal) - Window-level scatter with 1D indices
 # -----------------------------------------------------------------------------
-put_along_axis = Op("put_along_axis")
+# Used by _do_scatter_indexing (__setitem__ with tensor indices).
+# NOT the same as np.put_along_axis: this scatters entire rows/columns
+# (1D indices, update_window_dims covers non-axis dims), while numpy's
+# put_along_axis does element-level scatter (indices same ndim as array).
+scatter_along_axis = Op("scatter_along_axis")
 
 
-@put_along_axis.impl("hlo")
-def _put_along_axis_hlo(x, indices, values, axis):
-    """Put values into the destination array by matching 1d index and data slices."""
+@scatter_along_axis.impl("hlo")
+def _scatter_along_axis_hlo(x, indices, values, axis):
+    """Scatter whole slices along an axis using 1D indices.
+
+    For a 2D array with axis=1 and indices [2, 0]:
+      a[:, 2] = values[:, 0]
+      a[:, 0] = values[:, 1]
+    """
     from nkipy.core.backend.hlo import HLOOp, as_hlo_tensor, get_hlo_context
     from nkipy.core.tensor import NKIPyTensorRef
 
@@ -363,23 +372,102 @@ def _put_along_axis_hlo(x, indices, values, axis):
     if isinstance(x, NKIPyTensorRef):
         x = x.backend_tensor
 
-    # First create a copy of the input array
     x_copy = ctx.build_op("copy", [x], x.shape, x.dtype)
 
-    # Handle axis=None case
-    if axis is None:
-        flattened_shape = (int(np.prod(x.shape)),)
-        x_copy = ctx.build_op("reshape", [x_copy], flattened_shape, x.dtype)
-        axis = 0
-        original_shape = x.shape
-    else:
-        original_shape = None
-
-    # Normalize negative axis
     if axis < 0:
-        axis = len(x_copy.shape) + axis
+        axis = len(x.shape) + axis
 
     # Convert indices to HLO tensor
+    if isinstance(indices, NKIPyTensorRef):
+        indices_tensor = indices.backend_tensor
+    elif isinstance(indices, np.ndarray):
+        indices_np = indices.astype(np.int32)
+        const_op = HLOOp(
+            "constant",
+            [],
+            result_shape=indices_np.shape,
+            result_dtype=np.dtype(np.int32),
+            attributes={"value": indices_np},
+        )
+        indices_tensor = ctx.module.add_operation(const_op)
+    else:
+        raise ValueError("scatter_along_axis requires TensorRef or np.ndarray indices")
+
+    # Convert values to HLO tensor
+    if isinstance(values, NKIPyTensorRef):
+        values_tensor = values.backend_tensor
+    elif isinstance(values, np.ndarray):
+        values_np = values.astype(x.dtype)
+        const_op = HLOOp(
+            "constant",
+            [],
+            result_shape=values_np.shape,
+            result_dtype=x.dtype,
+            attributes={"value": values_np},
+        )
+        values_tensor = ctx.module.add_operation(const_op)
+    else:
+        values_tensor = as_hlo_tensor(ctx, values, x.dtype)
+
+    # Window-level scatter: update_window_dims covers all non-axis dims
+    update_window_dims = [i for i in range(len(x_copy.shape)) if i != axis]
+    scattered_tensor = ctx.build_op(
+        "scatter",
+        [x_copy, indices_tensor, values_tensor],
+        x_copy.shape,
+        x.dtype,
+        {
+            "update_window_dims": update_window_dims,
+            "inserted_window_dims": [axis],
+            "scatter_dims_to_operand_dims": [axis],
+            "index_vector_dim": len(indices_tensor.shape),
+            "update_computation": "assign",
+            "indices_are_sorted": False,
+            "unique_indices": False,
+        },
+    )
+
+    return NKIPyTensorRef(scattered_tensor)
+
+
+# -----------------------------------------------------------------------------
+# put_along_axis - numpy-compatible element-level scatter
+# -----------------------------------------------------------------------------
+put_along_axis = Op("put_along_axis")
+
+
+@put_along_axis.impl("hlo")
+def _put_along_axis_hlo(x, indices, values, axis):
+    """Element-level scatter matching np.put_along_axis semantics.
+
+    For each position (i, j, ...) in indices:
+      arr[..., indices[i,j,...], ...] = values[i,j,...]
+    where the index value replaces the coordinate along ``axis``.
+
+    Lowered to a flat 1D scatter for Neuron compiler compatibility.
+    """
+    from nkipy.core.backend.hlo import HLOOp, as_hlo_tensor, get_hlo_context
+    from nkipy.core.tensor import NKIPyTensorRef
+
+    ctx = get_hlo_context()
+
+    if isinstance(x, NKIPyTensorRef):
+        x = x.backend_tensor
+
+    x_shape = x.shape
+    x_dtype = x.dtype
+    x_copy = ctx.build_op("copy", [x], x_shape, x_dtype)
+
+    # Normalize axis
+    if axis is None:
+        axis = 0
+        effective_shape = (int(np.prod(x_shape)),)
+    else:
+        if axis < 0:
+            axis = len(x_shape) + axis
+        effective_shape = x_shape
+
+    # --- Convert indices to HLO tensor ---
     if isinstance(indices, NKIPyTensorRef):
         indices_tensor = indices.backend_tensor
     elif isinstance(indices, np.ndarray):
@@ -397,21 +485,23 @@ def _put_along_axis_hlo(x, indices, values, axis):
             "put_along_axis only supports TensorRef or np.ndarray as indices!"
         )
 
-    # Handle values
-    if np.isscalar(values):
-        scalar_tensor = as_hlo_tensor(ctx, values, x.dtype)
-        expected_values_shape = list(x_copy.shape)
-        expected_values_shape[axis] = (
-            indices_tensor.shape[0] if indices_tensor.shape else 1
+    # Ensure int32 for arithmetic (indices may be uint32 from user code)
+    if indices_tensor.dtype != np.dtype(np.int32):
+        indices_tensor = ctx.build_op(
+            "convert", [indices_tensor], indices_tensor.shape, np.dtype(np.int32)
         )
-        expected_values_shape = tuple(expected_values_shape)
 
-        if expected_values_shape:
+    idx_shape = indices_tensor.shape
+
+    # --- Convert values to HLO tensor ---
+    if np.isscalar(values):
+        scalar_tensor = as_hlo_tensor(ctx, values, x_dtype)
+        if idx_shape:
             values_tensor = ctx.build_op(
                 "broadcast",
                 [scalar_tensor],
-                expected_values_shape,
-                x.dtype,
+                idx_shape,
+                x_dtype,
                 {"broadcast_dimensions": []},
             )
         else:
@@ -419,12 +509,12 @@ def _put_along_axis_hlo(x, indices, values, axis):
     elif isinstance(values, NKIPyTensorRef):
         values_tensor = values.backend_tensor
     elif isinstance(values, np.ndarray):
-        values_np = values.astype(x.dtype)
+        values_np = values.astype(x_dtype)
         const_op = HLOOp(
             "constant",
             [],
             result_shape=values_np.shape,
-            result_dtype=x.dtype,
+            result_dtype=x_dtype,
             attributes={"value": values_np},
         )
         values_tensor = ctx.module.add_operation(const_op)
@@ -433,36 +523,97 @@ def _put_along_axis_hlo(x, indices, values, axis):
             "put_along_axis only supports scalar, TensorRef, or np.ndarray as values!"
         )
 
-    # Configure scatter dimension numbers
-    update_window_dims = [i for i in range(len(x_copy.shape)) if i != axis]
-    inserted_window_dims = [axis]
-    scatter_dims_to_operand_dims = [axis]
-    index_vector_dim = len(indices_tensor.shape)
+    if values_tensor.shape != idx_shape:
+        values_tensor = ctx.build_op(
+            "reshape", [values_tensor], idx_shape, values_tensor.dtype
+        )
 
-    scattered_tensor = ctx.build_op(
+    # --- Compute flat 1D scatter indices ---
+    # Row-major strides of the effective shape.
+    ndim = len(effective_shape)
+    strides = [1] * ndim
+    for d in range(ndim - 2, -1, -1):
+        strides[d] = strides[d + 1] * effective_shape[d + 1]
+
+    # Static offset: for each position in idx_shape, the flat contribution
+    # from all non-axis dimensions (known at trace time).
+    offset_np = np.zeros(idx_shape, dtype=np.int32)
+    for d in range(ndim):
+        if d == axis:
+            continue
+        coord = np.arange(idx_shape[d], dtype=np.int32)
+        bcast = [1] * len(idx_shape)
+        bcast[d] = idx_shape[d]
+        offset_np = offset_np + coord.reshape(bcast) * strides[d]
+
+    offset_const = ctx.build_op(
+        "constant", [], idx_shape, np.dtype(np.int32), {"value": offset_np}
+    )
+
+    # flat_indices = indices * stride[axis] + offset
+    axis_stride_scalar = ctx.build_op(
+        "constant",
+        [],
+        (),
+        np.dtype(np.int32),
+        {"value": np.int32(strides[axis])},
+    )
+    axis_stride = ctx.build_op(
+        "broadcast",
+        [axis_stride_scalar],
+        idx_shape,
+        np.dtype(np.int32),
+        {"broadcast_dimensions": []},
+    )
+    scaled = ctx.build_op(
+        "multiply",
+        [indices_tensor, axis_stride],
+        idx_shape,
+        np.dtype(np.int32),
+    )
+    flat_indices = ctx.build_op(
+        "add",
+        [scaled, offset_const],
+        idx_shape,
+        np.dtype(np.int32),
+    )
+
+    # --- Flatten and scatter ---
+    flat_size = int(np.prod(effective_shape))
+    num_elements = int(np.prod(idx_shape))
+
+    x_flat = ctx.build_op("reshape", [x_copy], (flat_size,), x_dtype)
+    flat_indices_1d = ctx.build_op(
+        "reshape",
+        [flat_indices],
+        (num_elements,),
+        np.dtype(np.int32),
+    )
+    flat_values_1d = ctx.build_op(
+        "reshape",
+        [values_tensor],
+        (num_elements,),
+        x_dtype,
+    )
+
+    scattered = ctx.build_op(
         "scatter",
-        [x_copy, indices_tensor, values_tensor],
-        x_copy.shape,
-        x.dtype,
+        [x_flat, flat_indices_1d, flat_values_1d],
+        (flat_size,),
+        x_dtype,
         {
-            "update_window_dims": update_window_dims,
-            "inserted_window_dims": inserted_window_dims,
-            "scatter_dims_to_operand_dims": scatter_dims_to_operand_dims,
-            "index_vector_dim": index_vector_dim,
+            "update_window_dims": [],
+            "inserted_window_dims": [0],
+            "scatter_dims_to_operand_dims": [0],
+            "index_vector_dim": 1,
             "update_computation": "assign",
             "indices_are_sorted": False,
             "unique_indices": False,
         },
     )
 
-    # If we flattened the array, reshape back
-    if original_shape is not None:
-        result_tensor = ctx.build_op(
-            "reshape", [scattered_tensor], original_shape, x.dtype
-        )
-    else:
-        result_tensor = scattered_tensor
-
+    # Reshape back to original x shape
+    result_tensor = ctx.build_op("reshape", [scattered], x_shape, x_dtype)
     return NKIPyTensorRef(result_tensor)
 
 

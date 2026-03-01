@@ -7,6 +7,8 @@ import logging
 import os
 from typing import Dict, Optional, Tuple
 
+import numpy as np
+
 from nkipy.runtime.device_kernel import DeviceKernel
 from nkipy.runtime.device_tensor import DeviceTensor
 
@@ -45,7 +47,7 @@ class BaremetalExecutor:
         device_kernel: DeviceKernel,
         *args,
         **kwargs,
-    ) -> Tuple[Dict[str, DeviceTensor], Dict[str, DeviceTensor]]:
+    ) -> Tuple[Dict[str, DeviceTensor], Dict[str, DeviceTensor], Dict[str, np.ndarray]]:
         """Prepare input and output tensors for kernel execution.
 
         Args:
@@ -54,12 +56,19 @@ class BaremetalExecutor:
             *args, **kwargs: Arguments to pass to the kernel
 
         Returns:
-            Tuple of (inputs_dict, outputs_dict)
+            Tuple of (inputs_dict, outputs_dict, original_inputs)
         """
         # Bind arguments manually using inspect
         sig = inspect.signature(compiled_kernel.traced_kernel.func)
         boundargs = sig.bind(*args, **kwargs)
         boundargs.apply_defaults()
+
+        # Save original input arrays for alias write-back
+        original_inputs = {
+            name: arr
+            for name, arr in boundargs.arguments.items()
+            if isinstance(arr, np.ndarray)
+        }
 
         # Prepare inputs using DeviceTensor
         inputs = {}
@@ -69,14 +78,21 @@ class BaremetalExecutor:
                 if ".must_alias_input" in intensor.name
                 else intensor.name
             )
-            np_tensor = boundargs.arguments[real_name]
+            np_tensor = original_inputs.get(real_name, boundargs.arguments[real_name])
             inputs[intensor.name] = DeviceTensor.from_numpy(np_tensor)
 
-        # Prepare outputs
+        # Prepare outputs — aliased outputs share the input device buffer
         outputs = device_kernel.allocate_output_tensors()
         outputs_dict = {t.name: t for t in outputs}
 
-        return inputs, outputs_dict
+        alias_by_output = {a.output_index: a for a in compiled_kernel.ir.aliases}
+        for i, outtensor in enumerate(compiled_kernel.ir.outputs):
+            if i in alias_by_output:
+                alias = alias_by_output[i]
+                input_name = f"{alias.param_name}.must_alias_input"
+                outputs_dict[outtensor.name] = inputs[input_name]
+
+        return inputs, outputs_dict, original_inputs
 
     def benchmark(
         self,
@@ -109,7 +125,7 @@ class BaremetalExecutor:
         )
 
         # Prepare inputs/outputs
-        inputs, outputs = self._prepare_io_tensors(
+        inputs, outputs, _ = self._prepare_io_tensors(
             compiled_kernel, device_kernel, *args, **kwargs
         )
 
@@ -150,7 +166,7 @@ class BaremetalExecutor:
         )
 
         # Prepare inputs/outputs
-        inputs, outputs = self._prepare_io_tensors(
+        inputs, outputs, original_inputs = self._prepare_io_tensors(
             compiled_kernel, device_kernel, *args, **kwargs
         )
 
@@ -164,6 +180,23 @@ class BaremetalExecutor:
             inputs=inputs, outputs=outputs, save_trace=save_trace, ntff_name=ntff_name
         )
 
-        # Convert outputs back to numpy
-        result = [outputs[t.name].numpy() for t in compiled_kernel.ir.outputs]
-        return result[0] if len(result) == 1 else result
+        ir = compiled_kernel.ir
+
+        # Write back aliased outputs to original input arrays
+        for alias in ir.aliases:
+            output_data = outputs[ir.outputs[alias.output_index].name].numpy()
+            np.copyto(dst=original_inputs[alias.param_name], src=output_data)
+
+        # Filter out auto-aliased outputs (not user-returned)
+        auto_indices = ir.auto_aliased_indices
+        user_outputs = [
+            outputs[t.name].numpy()
+            for i, t in enumerate(ir.outputs)
+            if i not in auto_indices
+        ]
+
+        if len(user_outputs) == 1:
+            return user_outputs[0]
+        elif len(user_outputs) > 1:
+            return tuple(user_outputs)
+        return None

@@ -51,6 +51,13 @@ def _compile_kernel(
     boundargs = sig.bind(*args, **kwargs)
     boundargs.apply_defaults()
 
+    # Save original input arrays before output allocation may overwrite them
+    original_inputs = {
+        name: arr
+        for name, arr in boundargs.arguments.items()
+        if isinstance(arr, np.ndarray)
+    }
+
     # Allocate output tensors based on IR outputs
     for outtensor in ir.outputs:
         output_array = np.empty(outtensor.shape, dtype=outtensor.dtype)
@@ -81,13 +88,14 @@ def _compile_kernel(
         target=target,
     )
 
-    return neff, name, ir, boundargs
+    return neff, name, ir, boundargs, original_inputs
 
 
-def _execute_neff(neff, name, ir, boundargs, save_trace=False):
+def _execute_neff(neff, name, ir, boundargs, original_inputs, save_trace=False):
     """Load a compiled NEFF and run it on hardware.
 
-    Returns output numpy array(s).
+    Returns output numpy array(s), with auto-aliased outputs filtered out.
+    Aliased output data is written back to the original input arrays.
     """
     if not _RUNTIME_AVAILABLE:
         raise RuntimeError(
@@ -96,32 +104,54 @@ def _execute_neff(neff, name, ir, boundargs, save_trace=False):
 
     device_kernel = DeviceKernel.load_from_neff(neff, name)
 
+    # Build alias lookup: output_index -> AliasInfo
+    alias_by_output = {a.output_index: a for a in ir.aliases}
+
     device_inputs = {}
     for intensor in ir.inputs:
         if "must_alias_input" in intensor.name:
             base_name = intensor.name.split(".must_alias_input")[0]
-            np_tensor = boundargs.arguments[base_name]
+            np_tensor = original_inputs[base_name]
         else:
             np_tensor = boundargs.arguments[intensor.name]
         device_inputs[intensor.name] = DeviceTensor.from_numpy(np_tensor)
 
     device_outputs = {}
-    for outtensor in ir.outputs:
-        np_output = np.zeros(outtensor.shape, dtype=outtensor.dtype)
-        device_outputs[outtensor.name] = DeviceTensor.from_numpy(np_output)
+    for i, outtensor in enumerate(ir.outputs):
+        if i in alias_by_output:
+            # Aliased output shares the same device buffer as the input
+            alias = alias_by_output[i]
+            input_name = f"{alias.param_name}.must_alias_input"
+            device_outputs[outtensor.name] = device_inputs[input_name]
+        else:
+            np_output = np.zeros(outtensor.shape, dtype=outtensor.dtype)
+            device_outputs[outtensor.name] = DeviceTensor.from_numpy(np_output)
 
     device_kernel(inputs=device_inputs, outputs=device_outputs, save_trace=save_trace)
 
-    for outtensor in ir.outputs:
+    for i, outtensor in enumerate(ir.outputs):
         result = device_outputs[outtensor.name].numpy()
-        dst = boundargs.arguments[outtensor.name]
-        np.copyto(dst=dst, src=result)
+        if i in alias_by_output:
+            alias = alias_by_output[i]
+            np.copyto(dst=original_inputs[alias.param_name], src=result)
+            # Point boundargs at the same array so the return logic can find it
+            boundargs.arguments[outtensor.name] = original_inputs[alias.param_name]
+        else:
+            dst = boundargs.arguments[outtensor.name]
+            np.copyto(dst=dst, src=result)
 
-    # Return the output(s)
-    if len(ir.outputs) == 1:
-        return boundargs.arguments[ir.outputs[0].name]
-    elif len(ir.outputs) > 1:
-        return tuple(boundargs.arguments[out.name] for out in ir.outputs)
+    # Filter out auto-aliased outputs (not user-returned)
+    auto_indices = ir.auto_aliased_indices
+    user_outputs = [
+        boundargs.arguments[out.name]
+        for i, out in enumerate(ir.outputs)
+        if i not in auto_indices
+    ]
+
+    if len(user_outputs) == 1:
+        return user_outputs[0]
+    elif len(user_outputs) > 1:
+        return tuple(user_outputs)
     return None
 
 
@@ -135,7 +165,7 @@ def baremetal_run_traced_kernel(
     **kwargs,
 ):
     """Compile and run a traced kernel on hardware."""
-    neff, name, ir, boundargs = _compile_kernel(
+    neff, name, ir, boundargs, original_inputs = _compile_kernel(
         kernel,
         *args,
         artifacts_dir=artifacts_dir,
@@ -143,4 +173,6 @@ def baremetal_run_traced_kernel(
         target=target,
         **kwargs,
     )
-    return _execute_neff(neff, name, ir, boundargs, save_trace=save_trace)
+    return _execute_neff(
+        neff, name, ir, boundargs, original_inputs, save_trace=save_trace
+    )

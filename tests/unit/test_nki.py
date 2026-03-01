@@ -338,8 +338,9 @@ def test_nki_mutable_tensor(trace_mode):
         nki_tensor_add_kernel_, [a, b], is_nki_beta_2_version=False
     )
 
-    # Hook it up with another op
-    def test_func(a_input: nt_legacy.mutable_tensor, b_input):
+    # Hook it up with another op — no annotation needed on the NKIPy wrapper,
+    # aliasing is detected automatically via NKI's operand_output_aliases.
+    def test_func(a_input, b_input):
         a_input = nki_op(a_input, b_input)
         return a_input
 
