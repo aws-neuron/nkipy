@@ -1,11 +1,11 @@
 #!/bin/bash
-# Test script for Qwen3-30B-A3B on Trainium
+# Test script for Llama3 on Trainium
 # Usage: bash test.sh
 
 set -e
 
 echo "=========================================="
-echo "Qwen3-30B-A3B Test Script"
+echo "Llama3 Test Script"
 echo "=========================================="
 
 # Step 1: Clean compilation cache
@@ -18,14 +18,13 @@ echo "✓ Cache cleaned"
 echo ""
 echo "[2/3] Checking weights..."
 
-# WEIGHTS_PATH="./tmp_qwen3-30b-a3b"
-MODEL_NAME="Qwen3-30b-a3b"
-WEIGHTS_PATH="./tmp_${MODEL_NAME}"
-TP_DEGREE=32 # Tensor parallelism
+MODEL_NAME="TinyLlama-1.1B-Chat-v1.0"
+WEIGHTS_PATH="./tmp_tinyllama_TP8"
+TP_DEGREE=8 # Tensor parallelism
 
 if [ ! -d "$WEIGHTS_PATH" ]; then
     echo "Weights not found. Downloading and converting..."
-    python tensor_preparation.py --model-name Qwen/${MODEL_NAME} --world-size "$TP_DEGREE" --head-dim 128 --output-dir="$WEIGHTS_PATH"
+    python tensor_preparation.py --model-name TinyLlama/${MODEL_NAME} --world-size "$TP_DEGREE" --head-dim 64 --output-dir="$WEIGHTS_PATH"
     echo "✓ Weights prepared"
 else
     echo "✓ Weights found at $WEIGHTS_PATH"
@@ -33,13 +32,12 @@ fi
 
 # Step 3: Run example
 echo ""
-echo "[3/3] Running Qwen3 inference..."
+echo "[3/3] Running Llama3 inference..."
 echo "=========================================="
 
 # Enable async to improve performance
 export NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS=16
-# export NEURON_LOGICAL_NC_CONFIG=1
-torchrun --nproc-per-node "$TP_DEGREE" qwen3.py -n 500 --checkpoint "$WEIGHTS_PATH" --model Qwen/${MODEL_NAME}
+torchrun --nproc-per-node "$TP_DEGREE" llama3.py -n 500 --checkpoint "$WEIGHTS_PATH" --model TinyLlama/${MODEL_NAME}
 
 echo ""
 echo "=========================================="

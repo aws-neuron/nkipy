@@ -2,15 +2,13 @@ import nkipy.distributed.collectives as cc
 import numpy as np
 import torch.distributed as dist
 
-# Import config from parent directory
-from config import Config
+from common.config import Config
+from common.kernels.feedforward import feedforward_kernel
+from common.kernels.rmsnorm import rmsnorm_kernel
+from common.kernels.softmax import softmax_kernel
 from nkipy.core import tensor_apis
 
-# Import kernels from the kernels directory
 from .attention import attention_kernel
-from .feedforward import feedforward_kernel
-from .rmsnorm import rmsnorm_kernel
-from .softmax import softmax_kernel
 
 
 def transformer_layer(

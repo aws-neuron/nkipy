@@ -1,4 +1,4 @@
-"""Evaluate NKIPy Qwen3: benchmark, validate, or generate baseline."""
+"""Evaluate NKIPy Llama3: benchmark, validate, or generate baseline."""
 
 import os
 import sys
@@ -21,13 +21,13 @@ if __name__ == "__main__":
     import torch
 
     parser = argparse.ArgumentParser(
-        description="Evaluate NKIPy Qwen3: benchmark, validate, or generate baseline"
+        description="Evaluate NKIPy Llama3: benchmark, validate, or generate baseline"
     )
 
     parser.add_argument("-n", "--max-new-tokens", type=int, default=16)
     parser.add_argument("prompt", nargs="?", default="The capital of France is")
-    parser.add_argument("--checkpoint", default="/kaena/qwen3_shards_30B_A3B_TP8")
-    parser.add_argument("--model", default="Qwen/Qwen3-30B-A3B")
+    parser.add_argument("--checkpoint", default="/kaena/tinyllama_shards_TP8")
+    parser.add_argument("--model", default="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--benchmark", action="store_true")
@@ -64,10 +64,10 @@ if __name__ == "__main__":
     else:
         import torch.distributed as dist
 
-        from qwen3 import Qwen3Model
+        from llama3 import Llama3Model
         from common.model import load_model
 
-        model, _, _, _, input_ids = load_model(Qwen3Model, args)
+        model, _, _, _, input_ids = load_model(Llama3Model, args)
 
         if args.benchmark:
             dist.barrier()
