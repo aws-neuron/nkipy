@@ -223,3 +223,94 @@ def _norm_hlo(x, ord=None, axis=None, keepdims=False):
     squared = multiply(x, x)
     sum_squared = sum(squared, axis=axis, keepdims=keepdims)
     return sqrt(sum_squared)
+
+
+# -----------------------------------------------------------------------------
+# outer - outer product of two vectors
+# -----------------------------------------------------------------------------
+outer = Op("outer")
+
+
+@outer.impl("hlo")
+def _outer_hlo(a, b, out=None):
+    """Outer product: reshape a to (n, 1), b to (1, m), multiply."""
+    from nkipy.core.ops.binary import multiply
+    from nkipy.core.ops.transform import reshape
+
+    a_flat = reshape(a, (-1, 1))
+    b_flat = reshape(b, (1, -1))
+    return multiply(a_flat, b_flat)
+
+
+# -----------------------------------------------------------------------------
+# trace - sum of diagonal elements
+# -----------------------------------------------------------------------------
+trace = Op("trace")
+
+
+@trace.impl("hlo")
+def _trace_hlo(a, offset=0, axis1=0, axis2=1, dtype=None):
+    """Sum of diagonal elements using iota indices.
+
+    Create iota for rows and cols, compare for equality (diagonal mask),
+    multiply with input, sum.
+    """
+    from nkipy.core.backend.hlo import get_hlo_context
+    from nkipy.core.ops.binary import equal, multiply
+    from nkipy.core.ops.indexing import where
+    from nkipy.core.ops.reduce import sum
+    from nkipy.core.tensor import NKIPyTensorRef
+
+    ctx = get_hlo_context()
+
+    if isinstance(a, NKIPyTensorRef):
+        a_bt = a.backend_tensor
+    else:
+        a_bt = a
+
+    # For 2D: create iota for rows and cols, mask diagonal, sum
+    shape = a_bt.shape
+    ndim = len(shape)
+
+    # Normalize negative axes
+    if axis1 < 0:
+        axis1 += ndim
+    if axis2 < 0:
+        axis2 += ndim
+
+    # Create iota along axis1 (row indices)
+    row_iota = ctx.build_op(
+        "iota", [], shape, np.dtype(np.int32), {"iota_dimension": axis1}
+    )
+    row_ref = NKIPyTensorRef(row_iota)
+
+    # Create iota along axis2 (col indices) and add offset
+    col_iota = ctx.build_op(
+        "iota", [], shape, np.dtype(np.int32), {"iota_dimension": axis2}
+    )
+    col_ref = NKIPyTensorRef(col_iota)
+
+    if offset != 0:
+        from nkipy.core.ops.binary import subtract
+
+        col_ref = subtract(col_ref, offset)
+
+    # Diagonal mask: row == col (with offset)
+    diag_mask = equal(row_ref, col_ref)
+
+    # Apply mask: where diagonal, use a; else 0
+    masked = where(diag_mask, a, 0.0)
+
+    # Sum along both matrix axes
+    # Sum axis2 first (higher index), then axis1
+    axes_to_reduce = sorted([axis1, axis2], reverse=True)
+    result = masked
+    for ax in axes_to_reduce:
+        result = sum(result, axis=ax)
+
+    if dtype is not None:
+        from nkipy.core.ops.transform import astype
+
+        result = astype(result, np.dtype(dtype))
+
+    return result

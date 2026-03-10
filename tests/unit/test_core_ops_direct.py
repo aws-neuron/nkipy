@@ -344,7 +344,7 @@ class TestReduceErrors:
         def kernel(x):
             from nkipy.core.ops.reduce import _build_reduction_hlo
 
-            return _build_reduction_hlo(x, np.prod)
+            return _build_reduction_hlo(x, np.cumsum)
 
         in0 = np.ones((4, 4), dtype=np.float32)
         with pytest.raises(NotImplementedError, match="not yet supported"):

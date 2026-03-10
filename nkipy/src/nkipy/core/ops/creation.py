@@ -2,9 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Array creation operations: zeros, full, zeros_like, empty_like, full_like, ones_like"""
 
+import builtins
+
 import numpy as np
 
 from nkipy.core.ops._registry import Op
+
+builtins_min = builtins.min
 
 # -----------------------------------------------------------------------------
 # zeros
@@ -378,3 +382,222 @@ def _constant_hlo(value, dtype=None):
 
     hlo_tensor = as_hlo_tensor(ctx, value, target_dtype)
     return NKIPyTensorRef(hlo_tensor)
+
+
+# -----------------------------------------------------------------------------
+# tril - lower triangle of an array
+# -----------------------------------------------------------------------------
+tril = Op("tril")
+
+
+@tril.impl("hlo")
+def _tril_hlo(x, k=0):
+    """Lower triangle: where(row >= col - k, x, 0)."""
+    from nkipy.core.backend.hlo import get_hlo_context
+    from nkipy.core.ops.binary import greater_equal, subtract
+    from nkipy.core.ops.indexing import where
+    from nkipy.core.tensor import NKIPyTensorRef
+
+    ctx = get_hlo_context()
+
+    if isinstance(x, NKIPyTensorRef):
+        x_bt = x.backend_tensor
+    else:
+        x_bt = x
+
+    shape = x_bt.shape
+    ndim = len(shape)
+
+    # Create iota for row indices (second-to-last dim)
+    row_iota = ctx.build_op(
+        "iota", [], shape, np.dtype(np.int32), {"iota_dimension": ndim - 2}
+    )
+    row_ref = NKIPyTensorRef(row_iota)
+
+    # Create iota for col indices (last dim)
+    col_iota = ctx.build_op(
+        "iota", [], shape, np.dtype(np.int32), {"iota_dimension": ndim - 1}
+    )
+    col_ref = NKIPyTensorRef(col_iota)
+
+    # Mask: row >= col - k  →  row + k >= col  →  row - (col - k) >= 0
+    if k != 0:
+        col_ref = subtract(col_ref, k)
+    mask = greater_equal(row_ref, col_ref)
+
+    return where(mask, x, 0.0)
+
+
+# -----------------------------------------------------------------------------
+# triu - upper triangle of an array
+# -----------------------------------------------------------------------------
+triu = Op("triu")
+
+
+@triu.impl("hlo")
+def _triu_hlo(x, k=0):
+    """Upper triangle: where(row <= col - k, x, 0)."""
+    from nkipy.core.backend.hlo import get_hlo_context
+    from nkipy.core.ops.binary import less_equal, subtract
+    from nkipy.core.ops.indexing import where
+    from nkipy.core.tensor import NKIPyTensorRef
+
+    ctx = get_hlo_context()
+
+    if isinstance(x, NKIPyTensorRef):
+        x_bt = x.backend_tensor
+    else:
+        x_bt = x
+
+    shape = x_bt.shape
+    ndim = len(shape)
+
+    # Create iota for row indices (second-to-last dim)
+    row_iota = ctx.build_op(
+        "iota", [], shape, np.dtype(np.int32), {"iota_dimension": ndim - 2}
+    )
+    row_ref = NKIPyTensorRef(row_iota)
+
+    # Create iota for col indices (last dim)
+    col_iota = ctx.build_op(
+        "iota", [], shape, np.dtype(np.int32), {"iota_dimension": ndim - 1}
+    )
+    col_ref = NKIPyTensorRef(col_iota)
+
+    # Mask: row <= col - k
+    if k != 0:
+        col_ref = subtract(col_ref, k)
+    mask = less_equal(row_ref, col_ref)
+
+    return where(mask, x, 0.0)
+
+
+# -----------------------------------------------------------------------------
+# diag - extract diagonal or construct diagonal matrix
+# -----------------------------------------------------------------------------
+diag = Op("diag")
+
+
+@diag.impl("hlo")
+def _diag_hlo(v, k=0):
+    """Extract diagonal from 2D → 1D, or create diagonal matrix from 1D → 2D."""
+    from nkipy.core.backend.hlo import get_hlo_context
+    from nkipy.core.ops.binary import equal, subtract
+    from nkipy.core.ops.indexing import where
+    from nkipy.core.ops.reduce import sum
+    from nkipy.core.ops.transform import broadcast_to, reshape
+    from nkipy.core.tensor import NKIPyTensorRef
+
+    ctx = get_hlo_context()
+
+    if isinstance(v, NKIPyTensorRef):
+        v_bt = v.backend_tensor
+    else:
+        v_bt = v
+
+    ndim = len(v_bt.shape)
+
+    if ndim == 1:
+        # 1D → 2D: construct diagonal matrix
+        n = v_bt.shape[0] + abs(k)
+        shape_2d = (n, n)
+
+        # Create row and col iota
+        row_iota = ctx.build_op(
+            "iota", [], shape_2d, np.dtype(np.int32), {"iota_dimension": 0}
+        )
+        row_ref = NKIPyTensorRef(row_iota)
+        col_iota = ctx.build_op(
+            "iota", [], shape_2d, np.dtype(np.int32), {"iota_dimension": 1}
+        )
+        col_ref = NKIPyTensorRef(col_iota)
+
+        if k != 0:
+            col_ref = subtract(col_ref, k)
+
+        diag_mask = equal(row_ref, col_ref)
+
+        # Broadcast v to (n, n): put v along the diagonal
+        # v has length v_bt.shape[0], we need to gather it at the right positions
+        # Use iota as gather index: for each (i, j) on the diagonal, take v[i] (or v[j-k])
+        if k >= 0:
+            # Diagonal starts at column k: row index gives position in v
+            idx_ref = row_ref
+        else:
+            # Diagonal starts at row -k: col index (after offset) gives position in v
+            idx_ref = col_ref
+
+        # Use take to gather v values at idx positions, then mask
+        from nkipy.core.ops.indexing import take
+
+        v_gathered = take(v, idx_ref, axis=0)
+        return where(diag_mask, v_gathered, 0.0)
+
+    elif ndim == 2:
+        # 2D → 1D: extract diagonal
+        rows, cols = v_bt.shape
+        if k >= 0:
+            diag_len = builtins_min(rows, cols - k)
+        else:
+            diag_len = builtins_min(rows + k, cols)
+
+        if diag_len <= 0:
+            # Return empty-ish result — use shape (0,) but HLO needs >= 1
+            # Just return a size-1 zero as a fallback
+            return zeros((0,), v_bt.dtype)
+
+        # Create indices for the diagonal
+        diag_indices = np.arange(diag_len, dtype=np.int32)
+        if k >= 0:
+            row_indices = diag_indices
+            col_indices = diag_indices + k
+        else:
+            row_indices = diag_indices - k
+            col_indices = diag_indices
+
+        # Create the 2D mask approach: iota == expected diagonal position
+        shape_2d = v_bt.shape
+        row_iota = ctx.build_op(
+            "iota", [], shape_2d, np.dtype(np.int32), {"iota_dimension": 0}
+        )
+        row_ref = NKIPyTensorRef(row_iota)
+        col_iota = ctx.build_op(
+            "iota", [], shape_2d, np.dtype(np.int32), {"iota_dimension": 1}
+        )
+        col_ref = NKIPyTensorRef(col_iota)
+
+        if k != 0:
+            col_ref = subtract(col_ref, k)
+
+        diag_mask = equal(row_ref, col_ref)
+
+        # Mask and sum along cols to extract diagonal
+        masked = where(diag_mask, v, 0.0)
+
+        # Sum along the appropriate axis to collapse to 1D
+        if k >= 0:
+            # Sum along columns, then slice to diag_len
+            result = sum(masked, axis=1)
+        else:
+            # Sum along rows, then slice to diag_len
+            result = sum(masked, axis=0)
+
+        # Slice to the correct diagonal length
+        from nkipy.core.ops.transform import astype as astype_op
+
+        result_shape = result.shape
+        if result_shape[0] != diag_len:
+            from nkipy.core.ops.indexing import static_slice
+
+            result = static_slice(
+                result,
+                [0],
+                [diag_len],
+                [1],
+                [],
+            )
+
+        return result
+
+    else:
+        raise ValueError(f"Input must be 1-D or 2-D, got {ndim}-D")

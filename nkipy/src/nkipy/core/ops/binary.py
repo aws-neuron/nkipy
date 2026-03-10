@@ -291,3 +291,41 @@ less_equal = _make_comparison_op("less_equal", np.less_equal)
 logical_and = _make_logical_op("logical_and", "and")
 logical_or = _make_logical_op("logical_or", "or")
 logical_xor = _make_logical_op("logical_xor", "xor")
+
+
+# -----------------------------------------------------------------------------
+# Composed binary operations
+# -----------------------------------------------------------------------------
+
+# logaddexp: log(exp(x) + exp(y)), numerically stable via max trick
+logaddexp = Op("logaddexp")
+
+
+@logaddexp.impl("hlo")
+def _logaddexp_hlo(x, y):
+    from nkipy.core.ops.unary import exp, log
+
+    m = maximum(x, y)
+    return add(m, log(add(exp(subtract(x, m)), exp(subtract(y, m)))))
+
+
+# remainder: a - b * floor(a / b)
+remainder = Op("remainder")
+
+
+@remainder.impl("hlo")
+def _remainder_hlo(x, y):
+    from nkipy.core.ops.unary import floor
+
+    return subtract(x, multiply(y, floor(divide(x, y))))
+
+
+# floor_divide: floor(a / b)
+floor_divide = Op("floor_divide")
+
+
+@floor_divide.impl("hlo")
+def _floor_divide_hlo(x, y):
+    from nkipy.core.ops.unary import floor
+
+    return floor(divide(x, y))

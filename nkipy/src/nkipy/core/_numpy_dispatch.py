@@ -39,11 +39,12 @@ def register_all_numpy_apis():
     _register_numpy_api(np.bitwise_and, ops.bitwise_and)
     _register_numpy_api(np.bitwise_or, ops.bitwise_or)
     _register_numpy_api(np.bitwise_xor, ops.bitwise_xor)
+    _register_numpy_api(np.logaddexp, ops.logaddexp)
+    _register_numpy_api(np.remainder, ops.remainder)
+    _register_numpy_api(np.mod, ops.remainder)
+    _register_numpy_api(np.floor_divide, ops.floor_divide)
     # NOT SUPPORTED:
     # np.arctan2 - not supported on hardware
-    # np.floor_divide - not supported
-    # np.mod / np.remainder - hardware doesn't support it
-    #   (workaround: a % b = a - b * floor(a/b))
 
     # Comparison operations
     _register_numpy_api(np.equal, ops.equal)
@@ -79,9 +80,14 @@ def register_all_numpy_apis():
     _register_numpy_api(np.logical_not, ops.logical_not)
     _register_numpy_api(np.clip, ops.clip)
     _register_numpy_api(np.log1p, ops.log1p)
+    _register_numpy_api(np.log2, ops.log2)
+    _register_numpy_api(np.expm1, ops.expm1)
+    _register_numpy_api(np.round, ops.round_)
+    _register_numpy_api(np.around, ops.round_)
+    _register_numpy_api(np.isnan, ops.isnan)
+    _register_numpy_api(np.isfinite, ops.isfinite)
     # NOT SUPPORTED:
     # np.positive - not supported, use np.copy for "y = +x" operation
-    # np.round - not a supported activation
 
     # Reduction operations
     _register_numpy_api(np.sum, ops.sum)
@@ -92,12 +98,17 @@ def register_all_numpy_apis():
     _register_numpy_api(np.var, ops.var)
     _register_numpy_api(np.std, ops.std)
     _register_numpy_api(np.argmax, ops.argmax)
+    _register_numpy_api(np.argmin, ops.argmin)
     _register_numpy_api(np.cumsum, ops.cumsum)
+    _register_numpy_api(np.prod, ops.prod)
+    _register_numpy_api(np.count_nonzero, ops.count_nonzero)
 
     # Linear algebra
     _register_numpy_api(np.matmul, ops.matmul)
     _register_numpy_api(np.dot, ops.dot)
     _register_numpy_api(np.linalg.norm, ops.norm)
+    _register_numpy_api(np.outer, ops.outer)
+    _register_numpy_api(np.trace, ops.trace)
 
     # Transform operations
     _register_numpy_api(np.reshape, ops.reshape)
@@ -111,6 +122,13 @@ def register_all_numpy_apis():
     _register_numpy_api(np.pad, ops.pad)
     _register_numpy_api(np.swapaxes, ops.swapaxes)
     _register_numpy_api(np.stack, ops.stack)
+    _register_numpy_api(np.diff, ops.diff)
+    _register_numpy_api(np.flip, ops.flip)
+    _register_numpy_api(np.tile, ops.tile)
+    _register_numpy_api(np.roll, ops.roll)
+    _register_numpy_api(np.tril, ops.tril)
+    _register_numpy_api(np.triu, ops.triu)
+    _register_numpy_api(np.diag, ops.diag)
 
     # Creation operations
     _register_numpy_api(np.zeros_like, ops.zeros_like)

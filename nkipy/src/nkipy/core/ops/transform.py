@@ -604,6 +604,237 @@ def _pad_hlo(x, pad_width, mode="constant", constant_values=0, **kwargs):
         )
 
 
+# -----------------------------------------------------------------------------
+# diff
+# -----------------------------------------------------------------------------
+diff = Op("diff")
+
+
+@diff.impl("hlo")
+def _diff_hlo(a, n=1, axis=-1, prepend=None, append=None):
+    """Compute the n-th discrete difference along the given axis."""
+    from nkipy.core.backend.hlo import get_hlo_context
+    from nkipy.core.ops.binary import subtract
+    from nkipy.core.tensor import NKIPyTensorRef
+
+    ctx = get_hlo_context()
+
+    ndim = len(a.shape)
+    if axis < 0:
+        axis += ndim
+
+    result = a
+    for _ in range(n):
+        if isinstance(result, NKIPyTensorRef):
+            r_bt = result.backend_tensor
+        else:
+            r_bt = result
+
+        axis_size = r_bt.shape[axis]
+
+        # Slice for a[..., 1:] along axis
+        start1 = [0] * ndim
+        limit1 = list(r_bt.shape)
+        start1[axis] = 1
+        shape1 = list(r_bt.shape)
+        shape1[axis] = axis_size - 1
+
+        t1 = ctx.build_op(
+            "slice",
+            [r_bt],
+            tuple(shape1),
+            r_bt.dtype,
+            {"start_indices": start1, "limit_indices": limit1, "strides": [1] * ndim},
+        )
+
+        # Slice for a[..., :-1] along axis
+        start0 = [0] * ndim
+        limit0 = list(r_bt.shape)
+        limit0[axis] = axis_size - 1
+        shape0 = list(r_bt.shape)
+        shape0[axis] = axis_size - 1
+
+        t0 = ctx.build_op(
+            "slice",
+            [r_bt],
+            tuple(shape0),
+            r_bt.dtype,
+            {"start_indices": start0, "limit_indices": limit0, "strides": [1] * ndim},
+        )
+
+        result = subtract(NKIPyTensorRef(t1), NKIPyTensorRef(t0))
+
+    return result
+
+
+# -----------------------------------------------------------------------------
+# flip
+# -----------------------------------------------------------------------------
+flip = Op("flip")
+
+
+@flip.impl("hlo")
+def _flip_hlo(x, axis=None):
+    """Reverse elements along one or more axes using reversed gather indices."""
+    from nkipy.core.ops.indexing import take
+
+    ndim = len(x.shape)
+
+    if axis is None:
+        axes = list(range(ndim))
+    elif isinstance(axis, int):
+        axes = [axis if axis >= 0 else axis + ndim]
+    else:
+        axes = [a if a >= 0 else a + ndim for a in axis]
+
+    result = x
+    for ax in axes:
+        n = result.shape[ax]
+        reversed_indices = np.arange(n - 1, -1, -1, dtype=np.int32)
+        result = take(result, reversed_indices, axis=ax)
+
+    return result
+
+
+# -----------------------------------------------------------------------------
+# tile
+# -----------------------------------------------------------------------------
+tile = Op("tile")
+
+
+@tile.impl("hlo")
+def _tile_hlo(x, reps):
+    """Tile tensor by repeating it along each axis.
+
+    Strategy: reshape to interleave rep dims, broadcast, reshape to merge.
+    For shape (A, B) with reps (r0, r1):
+      reshape to (1, A, 1, B) → broadcast to (r0, A, r1, B) → reshape to (r0*A, r1*B)
+    """
+    if isinstance(reps, int):
+        reps = (reps,)
+    reps = tuple(reps)
+
+    x_shape = x.shape
+    ndim = len(x_shape)
+
+    # Pad reps or shape if they have different lengths (numpy behavior)
+    if len(reps) < ndim:
+        reps = (1,) * (ndim - len(reps)) + reps
+    elif len(reps) > ndim:
+        x = reshape(x, (1,) * (len(reps) - ndim) + x_shape)
+        x_shape = x.shape
+        ndim = len(x_shape)
+
+    # If all reps are 1, just return a copy
+    if all(r == 1 for r in reps):
+        return copy(x)
+
+    # Build interleaved shape: (r0, s0, r1, s1, ...)
+    interleaved = []
+    for r, s in zip(reps, x_shape):
+        interleaved.append(1)
+        interleaved.append(s)
+    result = reshape(x, tuple(interleaved))
+
+    # Broadcast rep dims: (r0, s0, r1, s1, ...)
+    bcast_shape = list(result.shape)
+    for i, r in enumerate(reps):
+        bcast_shape[i * 2] = r
+    result = broadcast_to(result, tuple(bcast_shape))
+
+    # Merge pairs: (r0*s0, r1*s1, ...)
+    final_shape = tuple(r * s for r, s in zip(reps, x_shape))
+    return reshape(result, final_shape)
+
+
+# -----------------------------------------------------------------------------
+# roll
+# -----------------------------------------------------------------------------
+roll = Op("roll")
+
+
+@roll.impl("hlo")
+def _roll_hlo(x, shift, axis=None):
+    """Roll tensor elements along a given axis."""
+    x_shape = x.shape
+    ndim = len(x_shape)
+
+    if axis is None:
+        # Flatten, roll, reshape back
+        total = int(np.prod(x_shape))
+        flat = reshape(x, (total,))
+        rolled = _roll_single_axis(flat, shift, 0)
+        return reshape(rolled, x_shape)
+
+    if isinstance(shift, (list, tuple)):
+        if not isinstance(axis, (list, tuple)):
+            raise ValueError("If shift is a tuple, axis must also be a tuple")
+        result = x
+        for s, a in zip(shift, axis):
+            result = _roll_single_axis(result, s, a if a >= 0 else a + ndim)
+        return result
+
+    if axis < 0:
+        axis += ndim
+    return _roll_single_axis(x, shift, axis)
+
+
+def _roll_single_axis(x, shift, axis):
+    """Roll along a single axis: concatenate(x[shift:], x[:shift])."""
+    from nkipy.core.backend.hlo import get_hlo_context
+    from nkipy.core.tensor import NKIPyTensorRef
+
+    ctx = get_hlo_context()
+
+    if isinstance(x, NKIPyTensorRef):
+        x_bt = x.backend_tensor
+    else:
+        x_bt = x
+
+    axis_size = x_bt.shape[axis]
+    ndim = len(x_bt.shape)
+
+    # Normalize shift to positive
+    shift = shift % axis_size
+    if shift == 0:
+        return NKIPyTensorRef(x_bt) if not isinstance(x, NKIPyTensorRef) else x
+
+    # Split point: we want elements from (axis_size - shift) onward first
+    split_point = axis_size - shift
+
+    # First slice: x[split_point:] along axis
+    start1 = [0] * ndim
+    limit1 = list(x_bt.shape)
+    start1[axis] = split_point
+    shape1 = list(x_bt.shape)
+    shape1[axis] = shift
+
+    t1 = ctx.build_op(
+        "slice",
+        [x_bt],
+        tuple(shape1),
+        x_bt.dtype,
+        {"start_indices": start1, "limit_indices": limit1, "strides": [1] * ndim},
+    )
+
+    # Second slice: x[:split_point] along axis
+    start0 = [0] * ndim
+    limit0 = list(x_bt.shape)
+    limit0[axis] = split_point
+    shape0 = list(x_bt.shape)
+    shape0[axis] = split_point
+
+    t0 = ctx.build_op(
+        "slice",
+        [x_bt],
+        tuple(shape0),
+        x_bt.dtype,
+        {"start_indices": start0, "limit_indices": limit0, "strides": [1] * ndim},
+    )
+
+    return concatenate([NKIPyTensorRef(t1), NKIPyTensorRef(t0)], axis=axis)
+
+
 def _slice_single(x, dim, index):
     """Slice a single element along a dimension, removing that dim."""
     from nkipy.core.backend.hlo import get_hlo_context

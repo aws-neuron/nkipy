@@ -22,10 +22,12 @@ from nkipy.core.ops.binary import (
     bitwise_xor,
     divide,
     equal,
+    floor_divide,
     greater,
     greater_equal,
     less,
     less_equal,
+    logaddexp,
     logical_and,
     logical_or,
     logical_xor,
@@ -34,6 +36,7 @@ from nkipy.core.ops.binary import (
     multiply,
     not_equal,
     power,
+    remainder,
     subtract,
 )
 
@@ -60,10 +63,13 @@ from nkipy.core.ops.conv import (
 # -----------------------------------------------------------------------------
 from nkipy.core.ops.creation import (
     constant,
+    diag,
     empty_like,
     full,
     full_like,
     ones_like,
+    tril,
+    triu,
     zeros,
     zeros_like,
 )
@@ -85,7 +91,7 @@ from nkipy.core.ops.indexing import (
 # -----------------------------------------------------------------------------
 # Linear algebra operations
 # -----------------------------------------------------------------------------
-from nkipy.core.ops.linalg import dot, matmul, norm
+from nkipy.core.ops.linalg import dot, matmul, norm, outer, trace
 
 # -----------------------------------------------------------------------------
 # Neural network operations
@@ -102,10 +108,13 @@ from nkipy.core.ops.nn import (
 from nkipy.core.ops.reduce import (
     any,
     argmax,
+    argmin,
+    count_nonzero,
     cumsum,
     max,
     mean,
     min,
+    prod,
     std,
     sum,
     var,
@@ -120,14 +129,18 @@ from nkipy.core.ops.transform import (
     concatenate,
     copy,
     copyto,
+    diff,
     expand_dims,
+    flip,
     pad,
     repeat,
     reshape,
+    roll,
     split,
     squeeze,
     stack,
     swapaxes,
+    tile,
     transpose,
 )
 
@@ -142,14 +155,19 @@ from nkipy.core.ops.unary import (
     clip,
     cos,
     exp,
+    expm1,
     floor,
     invert,
+    isfinite,
+    isnan,
     log,
     log1p,
+    log2,
     logical_not,
     negative,
     reciprocal,
     rint,
+    round_,
     sign,
     sin,
     sqrt,
@@ -184,6 +202,9 @@ __all__ = [
     "logical_and",
     "logical_or",
     "logical_xor",
+    "logaddexp",
+    "remainder",
+    "floor_divide",
     # Unary
     "abs",
     "exp",
@@ -207,6 +228,11 @@ __all__ = [
     "logical_not",
     "clip",
     "log1p",
+    "log2",
+    "expm1",
+    "round_",
+    "isnan",
+    "isfinite",
     # Creation
     "constant",
     "zeros",
@@ -215,10 +241,15 @@ __all__ = [
     "ones_like",
     "empty_like",
     "full_like",
+    "tril",
+    "triu",
+    "diag",
     # Linalg
     "dot",
     "matmul",
     "norm",
+    "outer",
+    "trace",
     # Reduction
     "sum",
     "max",
@@ -228,7 +259,10 @@ __all__ = [
     "var",
     "std",
     "argmax",
+    "argmin",
     "cumsum",
+    "prod",
+    "count_nonzero",
     # Transform
     "reshape",
     "transpose",
@@ -244,6 +278,10 @@ __all__ = [
     "pad",
     "swapaxes",
     "stack",
+    "diff",
+    "flip",
+    "tile",
+    "roll",
     # NN
     "softmax",
     "topk",

@@ -236,3 +236,71 @@ def _log1p_hlo(x, out=None, dtype=None):
     from nkipy.core.ops.binary import add
 
     return log(add(x, 1.0))
+
+
+# -----------------------------------------------------------------------------
+# log2: log(x) / log(2)
+# -----------------------------------------------------------------------------
+log2 = Op("log2")
+
+
+@log2.impl("hlo")
+def _log2_hlo(x, out=None, dtype=None):
+    from nkipy.core.ops.binary import divide
+
+    return divide(log(x), float(np.log(2.0)))
+
+
+# -----------------------------------------------------------------------------
+# expm1: exp(x) - 1
+# -----------------------------------------------------------------------------
+expm1 = Op("expm1")
+
+
+@expm1.impl("hlo")
+def _expm1_hlo(x, out=None, dtype=None):
+    from nkipy.core.ops.binary import subtract
+
+    return subtract(exp(x), 1.0)
+
+
+# -----------------------------------------------------------------------------
+# round: round to given number of decimals
+# -----------------------------------------------------------------------------
+round_ = Op("round")
+
+
+@round_.impl("hlo")
+def _round_hlo(x, decimals=0, out=None):
+    if decimals == 0:
+        return rint(x)
+    from nkipy.core.ops.binary import divide, multiply
+
+    scale = float(10**decimals)
+    return divide(rint(multiply(x, scale)), scale)
+
+
+# -----------------------------------------------------------------------------
+# isnan: x != x (NaN is the only value not equal to itself)
+# -----------------------------------------------------------------------------
+isnan = Op("isnan")
+
+
+@isnan.impl("hlo")
+def _isnan_hlo(x, out=None, dtype=None):
+    from nkipy.core.ops.binary import not_equal
+
+    return not_equal(x, x)
+
+
+# -----------------------------------------------------------------------------
+# isfinite: (x - x) == 0 (both NaN and Inf fail this)
+# -----------------------------------------------------------------------------
+isfinite = Op("isfinite")
+
+
+@isfinite.impl("hlo")
+def _isfinite_hlo(x, out=None, dtype=None):
+    from nkipy.core.ops.binary import equal, subtract
+
+    return equal(subtract(x, x), 0.0)

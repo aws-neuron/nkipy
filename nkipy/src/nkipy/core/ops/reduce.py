@@ -28,6 +28,7 @@ def _build_reduction_hlo(
         np.sum: "add",
         np.max: "maximum",
         np.min: "minimum",
+        np.prod: "multiply",
     }
 
     if np_op not in reduce_op_map:
@@ -60,6 +61,7 @@ def _build_reduction_hlo(
         "add": 0.0,
         "maximum": float("-inf"),
         "minimum": float("inf"),
+        "multiply": 1.0,
     }
     init_value = init_values[hlo_op]
 
@@ -133,6 +135,7 @@ def _make_reduction_op(name: str, np_op) -> Op:
 sum = _make_reduction_op("sum", np.sum)
 max = _make_reduction_op("max", np.max)
 min = _make_reduction_op("min", np.min)
+prod = _make_reduction_op("prod", np.prod)
 
 # mean: sum / count - simplified using ops
 mean = Op("mean")
@@ -380,3 +383,104 @@ def _cumsum_hlo(x, axis=None, dtype=None):
         result = astype(result, np.dtype(dtype))
 
     return result
+
+
+# -----------------------------------------------------------------------------
+# argmin - index of minimum value along an axis
+# -----------------------------------------------------------------------------
+argmin = Op("argmin")
+
+
+@argmin.impl("hlo")
+def _argmin_hlo(x, axis=None, out=None, keepdims=False):
+    """Argmin: find index of minimum value along axis.
+
+    Strategy: min_val → mask where equal → create iota indices → where(mask, iota, large) → min
+    """
+    from nkipy.core.backend.hlo import get_hlo_context
+    from nkipy.core.tensor import NKIPyTensorRef
+
+    ctx = get_hlo_context()
+
+    if isinstance(x, NKIPyTensorRef):
+        x_ref = x
+        x_bt = x.backend_tensor
+    else:
+        x_ref = NKIPyTensorRef(x)
+        x_bt = x
+
+    original_axis = axis
+    x_ref_original_shape = x_ref.shape
+
+    if axis is None:
+        from nkipy.core.ops.transform import reshape
+
+        total = int(np.prod(x_ref.shape))
+        x_ref = reshape(x_ref, (total,))
+        x_bt = x_ref.backend_tensor
+        axis = 0
+
+    ndim = len(x_bt.shape)
+    if axis < 0:
+        axis = ndim + axis
+
+    # Step 1: Get min value along axis (keepdims for broadcasting)
+    min_val = min(x_ref, axis=axis, keepdims=True)
+
+    # Step 2: Create boolean mask where x == min_val
+    from nkipy.core.ops.binary import equal
+
+    mask = equal(x_ref, min_val)
+
+    # Step 3: Create iota indices along the target axis as float
+    iota_tensor = ctx.build_op(
+        "iota",
+        [],
+        x_bt.shape,
+        np.dtype(np.float32),
+        {"iota_dimension": axis},
+    )
+    iota_ref = NKIPyTensorRef(iota_tensor)
+
+    # Step 4: Where mask is true, use iota index; else use large float value
+    large_val = float(x_bt.shape[axis] + 1)
+    from nkipy.core.ops.indexing import where
+
+    masked_indices = where(mask, iota_ref, large_val)
+
+    # Step 5: Min along axis to find the first occurrence
+    result_float = min(masked_indices, axis=axis)
+
+    from nkipy.core.ops.transform import astype
+
+    result = astype(result_float, np.dtype(np.int32))
+
+    if keepdims:
+        from nkipy.core.ops.transform import reshape
+
+        if original_axis is not None:
+            keepdims_shape = list(x_ref_original_shape)
+            keepdims_shape[original_axis] = 1
+            result = reshape(result, tuple(keepdims_shape))
+        else:
+            keepdims_shape = tuple(1 for _ in x_ref_original_shape)
+            result = reshape(result, keepdims_shape)
+
+    return result
+
+
+# -----------------------------------------------------------------------------
+# count_nonzero - count non-zero elements along an axis
+# -----------------------------------------------------------------------------
+count_nonzero = Op("count_nonzero")
+
+
+@count_nonzero.impl("hlo")
+def _count_nonzero_hlo(x, axis=None, keepdims=False):
+    """Count non-zero elements: sum(x != 0)."""
+    from nkipy.core.ops.binary import not_equal
+    from nkipy.core.ops.transform import astype
+
+    non_zero = not_equal(x, 0)
+    non_zero_i32 = astype(non_zero, np.dtype(np.int32))
+    return sum(non_zero_i32, axis=axis, keepdims=keepdims)

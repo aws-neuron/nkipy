@@ -265,6 +265,15 @@ class TensorOperationMixin:
     def swapaxes(self, axis1, axis2):
         return np.swapaxes(self, axis1, axis2)
 
+    def prod(self, axis=None, keepdims=False, **kwargs):
+        return np.prod(self, axis=axis, keepdims=keepdims, **kwargs)
+
+    def argmin(self, axis=None, **kwargs):
+        return np.argmin(self, axis=axis, **kwargs)
+
+    def argmax(self, axis=None, **kwargs):
+        return np.argmax(self, axis=axis, **kwargs)
+
 
 def _expand_ellipsis(indices: tuple, ndim: int) -> tuple:
     """Expand ``...`` into the correct number of ``slice(None)``."""

@@ -168,10 +168,10 @@ binary_kernels = [
     (kernel_rmul, "rmul", False),
     (kernel_truediv, "truediv", False),
     (kernel_rtruediv, "rtruediv", False),
-    (kernel_floordiv, "floordiv", True),  # floor_divide not supported
-    (kernel_rfloordiv, "rfloordiv", True),  # floor_divide not supported
-    (kernel_mod, "mod", True),  # mod not supported
-    (kernel_rmod, "rmod", True),  # mod not supported
+    (kernel_floordiv, "floordiv", False),
+    (kernel_rfloordiv, "rfloordiv", False),
+    (kernel_mod, "mod", False),
+    (kernel_rmod, "rmod", False),
     (kernel_pow, "pow", False),
     (kernel_rpow, "rpow", False),
 ]
@@ -192,8 +192,8 @@ inplace_kernels = [
     (kernel_isub, "isub", False),
     (kernel_imul, "imul", False),
     (kernel_itruediv, "itruediv", False),
-    (kernel_ifloordiv, "ifloordiv", True),  # floor_divide not supported
-    (kernel_imod, "imod", True),  # mod not supported
+    (kernel_ifloordiv, "ifloordiv", False),
+    (kernel_imod, "imod", False),
     (kernel_ipow, "ipow", False),
     (kernel_imatmul, "imatmul", False),
 ]
