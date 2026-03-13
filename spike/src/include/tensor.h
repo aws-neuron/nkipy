@@ -16,6 +16,9 @@ public:
   // This constructor creates an NrtTensor that owns the tensor
   NrtTensor(nrt_tensor_placement_t placement, uint32_t core_id, size_t size,
             const std::string &name, const Spike *spike);
+  // This constructor creates an NrtTensor that references an existing tensor
+  NrtTensor(nrt_tensor_t *ptr, uint32_t core_id, uint64_t size,
+            const std::string &name, const Spike *spike);
   NrtTensor(const NrtTensor &source, size_t offset, size_t size,
             const std::string &name);
   ~NrtTensor();
