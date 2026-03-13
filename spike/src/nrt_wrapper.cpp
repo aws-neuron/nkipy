@@ -74,4 +74,13 @@ uint32_t NrtRuntime::get_visible_nc_count() {
   return count;
 }
 
+uint32_t NrtRuntime::get_total_nc_count() {
+    uint32_t count = 0;
+    NRT_STATUS status = nrt_get_total_nc_count(&count);
+    if (status != 0) {
+        throw NrtError(status, "Failed to get total NC count");
+    }
+    return count;
+}
+
 } // namespace spike
