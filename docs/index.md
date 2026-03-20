@@ -35,6 +35,7 @@ tutorials/index
 
 user_guide/indexing_slicing_reference
 user_guide/tracing_architecture
+user_guide/distributed_execution
 ```
 
 ```{toctree}
