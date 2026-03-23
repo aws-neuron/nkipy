@@ -1,6 +1,9 @@
 """NKIPy Spike Runtime C++ bindings"""
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from typing import overload
+
+from numpy.typing import NDArray
 
 
 class SpikeRuntimeError(RuntimeError):
@@ -95,6 +98,33 @@ class NrtModel:
 
     def __repr__(self) -> str: ...
 
+class NrtTensorSet:
+    pass
+
+class NonBlockTensorReadResult:
+    @property
+    def id(self) -> int: ...
+
+    @property
+    def data(self) -> bytes | NDArray: ...
+
+    @property
+    def err(self) -> "spike::SpikeError" | "spike::NrtError" | None: ...
+
+class NonBlockTensorWriteResult:
+    @property
+    def id(self) -> int: ...
+
+    @property
+    def err(self) -> "spike::SpikeError" | "spike::NrtError" | None: ...
+
+class NonBlockExecResult:
+    @property
+    def id(self) -> int: ...
+
+    @property
+    def err(self) -> "spike::SpikeError" | "spike::NrtError" | None: ...
+
 class Spike:
     def __init__(self, verbose_level: int = 0) -> None:
         """Initialize Spike with verbose level"""
@@ -139,6 +169,59 @@ class Spike:
         """
         Read data from tensor to Python buffer protocol object (bytearray, memoryview, etc.)
         """
+
+    def init_nonblock(self) -> None:
+        """Initialize for nonblocking operations"""
+
+    @overload
+    def tensor_read_nonblock(self, tensor: NrtTensor, offset: int = 0, size: int = 0) -> int:
+        """Read data from tensor as bytes nonblockingly"""
+
+    @overload
+    def tensor_read_nonblock(self, tensor: NrtTensor, dest: NDArray, offset: int = 0, size: int = 0) -> int:
+        """Read data from tensor into the provided destination nonblockingly"""
+
+    @overload
+    def tensor_write_nonblock(self, tensor: NrtTensor, data: bytes, offset: int = 0) -> int:
+        """Write bytes data to tensor nonblockingly"""
+
+    @overload
+    def tensor_write_nonblock(self, tensor: NrtTensor, data: NDArray, offset: int = 0) -> int:
+        """Write ndarray data to tensor nonblockingly"""
+
+    @overload
+    def tensor_write_nonblock(self, tensor: NrtTensor, data: int, size: int, offset: int = 0) -> int:
+        """Write raw pointer data to tensor nonblockingly"""
+
+    def tensor_write_nonblock_batched_prepare(self, tensors: Sequence[NrtTensor], data_objs: Sequence[NDArray], offsets: Sequence[int] | None = None) -> int:
+        """Prepare a batched tensor write"""
+
+    def tensor_write_nonblock_batched_start(self, batch_id: int) -> int:
+        """Start a prepared batched tensor write"""
+
+    def tensor_read_nonblock_batched_prepare(self, tensors: Sequence[NrtTensor], dests: Sequence[NDArray], offsets: Sequence[int] | None = None, sizes: Sequence[int] | None = None) -> int:
+        """Prepare a batched tensor read"""
+
+    def tensor_read_nonblock_batched_start(self, batch_id: int) -> int:
+        """Start a prepared batched tensor read"""
+
+    def execute_nonblock(self, model: NrtModel, inputs: NrtTensorSet, outputs: NrtTensorSet, ntff_name: str | None = None, save_trace: bool = False) -> int:
+        """Execute a model with given inputs and outputs nonblockingly"""
+
+    def try_poll(self) -> NonBlockTensorReadResult | NonBlockTensorWriteResult | NonBlockExecResult | None:
+        """Try to poll for nonblocking results"""
+
+    def create_tensor_set(self, tensors: Mapping[str, NrtTensor]) -> NrtTensorSet:
+        """Create a tensor set with the tensors"""
+
+    def wrap_model(self, ptr: int) -> NrtModel:
+        """Wrap an existing NRT model pointer"""
+
+    def wrap_tensor(self, ptr: int) -> NrtTensor:
+        """Wrap an existing NRT tensor pointer"""
+
+    def wrap_tensor_set(self, ptr: int) -> NrtTensorSet:
+        """Wrap an existing NRT tensor set pointer"""
 
     def get_tensor_info(self, model: NrtModel) -> ModelTensorInfo:
         """Get tensor information for a model"""

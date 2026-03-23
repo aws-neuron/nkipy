@@ -19,6 +19,20 @@ NrtTensor::NrtTensor(nrt_tensor_placement_t placement, uint32_t core_id,
   }
 }
 
+NrtTensor::NrtTensor(nrt_tensor_t *ptr, uint32_t core_id, uint64_t size,
+                     const std::string &name, const Spike *spike)
+    : ptr_(nullptr), core_id_(core_id), size_(size), name_(name),
+      spike_(spike) {
+  // Wrap an existing tensor by creating a slice
+  NRT_STATUS status =
+      nrt_tensor_allocate_slice(ptr, 0, size, name.c_str(), &ptr_);
+  if (status != 0) {
+    ptr_ = nullptr;
+    throw NrtError(status,
+                   "Failed to wrap a raw tensor by allocating a tensor slice");
+  }
+}
+
 NrtTensor::NrtTensor(const NrtTensor &source, size_t offset, size_t size,
                      const std::string &name)
     : ptr_(nullptr), core_id_(source.core_id_), size_(size), name_(name),

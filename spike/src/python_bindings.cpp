@@ -3,8 +3,10 @@
 #include <nanobind/operators.h>
 #include <nanobind/stl/bind_map.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/unordered_map.h>
+#include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
 
 #include <cstring>
@@ -94,6 +96,23 @@ NB_MODULE(_spike, m) {
       .def_prop_ro("is_collective", &NrtModel::get_is_collective,
                    "Is collective model")
       .def("__repr__", &NrtModel::to_string);
+
+  // NrtTensorSet class
+  nb::class_<NrtTensorSet>(m, "NrtTensorSet");
+
+  // NonBlock result structures
+  nb::class_<NonBlockTensorReadResult>(m, "NonBlockTensorReadResult")
+      .def_ro("id", &NonBlockTensorReadResult::id)
+      .def_ro("data", &NonBlockTensorReadResult::data)
+      .def_ro("err", &NonBlockTensorReadResult::err);
+
+  nb::class_<NonBlockTensorWriteResult>(m, "NonBlockTensorWriteResult")
+      .def_ro("id", &NonBlockTensorWriteResult::id)
+      .def_ro("err", &NonBlockTensorWriteResult::err);
+
+  nb::class_<NonBlockExecResult>(m, "NonBlockExecResult")
+      .def_ro("id", &NonBlockExecResult::id)
+      .def_ro("err", &NonBlockExecResult::err);
 
   // Spike class - uses keep_alive for safe shared ownership with tensors/models
   nb::class_<Spike>(m, "Spike")
@@ -212,6 +231,117 @@ NB_MODULE(_spike, m) {
           "tensor"_a, "buffer"_a, "offset"_a = 0, "size"_a = 0,
           "Read data from tensor to Python buffer protocol object (bytearray, "
           "memoryview, etc.)")
+
+      // Nonblocking operations
+      .def("init_nonblock", &Spike::init_nonblock,
+           "Initialize for nonblocking operations")
+
+      .def(
+          "tensor_read_nonblock",
+          [](Spike &self, std::shared_ptr<const NrtTensor> tensor,
+             size_t offset, size_t size) {
+            return self.tensor_read_nonblock(std::move(tensor), offset, size);
+          },
+          "tensor"_a, "offset"_a = 0, "size"_a = 0,
+          "Read data from tensor as bytes nonblockingly")
+
+      .def(
+          "tensor_read_nonblock",
+          [](Spike &self, std::shared_ptr<const NrtTensor> tensor,
+             nb::ndarray<> dest, size_t offset, size_t size) {
+            return self.tensor_read_nonblock(std::move(tensor), std::move(dest),
+                                             offset, size);
+          },
+          "tensor"_a, "dest"_a, "offset"_a = 0, "size"_a = 0,
+          "Read data from tensor into the provided destination nonblockingly")
+
+      .def(
+          "tensor_write_nonblock",
+          [](Spike &self, std::shared_ptr<NrtTensor> tensor, nb::bytes data_obj,
+             size_t offset) {
+            return self.tensor_write_nonblock(std::move(tensor),
+                                              std::move(data_obj), offset);
+          },
+          "tensor"_a, "data"_a, "offset"_a = 0,
+          "Write bytes data to tensor nonblockingly")
+
+      .def(
+          "tensor_write_nonblock",
+          [](Spike &self, std::shared_ptr<NrtTensor> tensor,
+             nb::ndarray<> data_obj, size_t offset) {
+            return self.tensor_write_nonblock(std::move(tensor),
+                                              std::move(data_obj), offset);
+          },
+          "tensor"_a, "data"_a, "offset"_a = 0,
+          "Write ndarray data to tensor nonblockingly")
+
+      .def(
+          "tensor_write_nonblock",
+          [](Spike &self, std::shared_ptr<NrtTensor> tensor, int64_t data,
+             size_t size, size_t offset) {
+            return self.tensor_write_nonblock(
+                std::move(tensor), reinterpret_cast<const void *>(data), size,
+                offset);
+          },
+          "tensor"_a, "data"_a, "size"_a, "offset"_a = 0,
+          "Write raw pointer data to tensor nonblockingly")
+
+      .def("tensor_write_nonblock_batched_prepare",
+           &Spike::tensor_write_nonblock_batched_prepare, "tensors"_a,
+           "data_objs"_a, "offsets"_a = std::nullopt,
+           "Prepare a batched tensor write")
+
+      .def("tensor_write_nonblock_batched_start",
+           &Spike::tensor_write_nonblock_batched_start, "batch_id"_a,
+           "Start a prepared batched tensor write")
+
+      .def("tensor_read_nonblock_batched_prepare",
+           &Spike::tensor_read_nonblock_batched_prepare, "tensors"_a, "dests"_a,
+           "offsets"_a = std::nullopt, "sizes"_a = std::nullopt,
+           "Prepare a batched tensor read")
+
+      .def("tensor_read_nonblock_batched_start",
+           &Spike::tensor_read_nonblock_batched_start, "batch_id"_a,
+           "Start a prepared batched tensor read")
+
+      .def("execute_nonblock", &Spike::execute_nonblock, "model"_a, "inputs"_a,
+           "outputs"_a, nb::arg("ntff_name") = nb::none(),
+           "save_trace"_a = false,
+           "Execute a model with given inputs and outputs nonblockingly")
+
+      .def("try_poll", &Spike::try_poll, "Try to poll for nonblocking results")
+
+      .def(
+          "create_tensor_set",
+          [](Spike &self,
+             const std::unordered_map<
+                 std::string, std::shared_ptr<const NrtTensor>> &tensor_map) {
+            return self.create_tensor_set(tensor_map);
+          },
+          "tensors"_a, "Create a tensor set with the tensors")
+
+      // Wrap existing NRT objects (for interop with external code)
+      .def(
+          "wrap_model",
+          [](Spike &self, int64_t ptr) {
+            return self.wrap_model(reinterpret_cast<nrt_model_t *>(ptr));
+          },
+          "ptr"_a, "Wrap an existing NRT model pointer")
+
+      .def(
+          "wrap_tensor",
+          [](Spike &self, int64_t ptr) {
+            return self.wrap_tensor(reinterpret_cast<nrt_tensor_t *>(ptr));
+          },
+          "ptr"_a, "Wrap an existing NRT tensor pointer")
+
+      .def(
+          "wrap_tensor_set",
+          [](Spike &self, int64_t ptr) {
+            return self.wrap_tensor_set(
+                reinterpret_cast<nrt_tensor_set_t *>(ptr));
+          },
+          "ptr"_a, "Wrap an existing NRT tensor set pointer")
 
       // Model introspection
       .def("get_tensor_info", &Spike::get_tensor_info, "model"_a,
