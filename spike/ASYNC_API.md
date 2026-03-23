@@ -11,6 +11,158 @@ The Spike runtime supports two levels of asynchronous operation:
 
 **Most users should use the high-level Async API**, which provides a cleaner interface and automatic dependency management.
 
+## When to Use SpikeAsync
+
+### Overlapping Operations for Better Hardware Utilization
+
+A typical inference task follows a sequential pattern: **tensor write → execute → tensor read**. Done naively, each step blocks the next, leaving hardware idle.
+
+SpikeAsync lets you overlap these stages across iterations so that, while one iteration is executing on the device, the next is writing its inputs and the previous is reading its outputs:
+
+```
+tensor_write -> execute -> tensor_read
+               tensor_write -> execute -> tensor_read
+                              tensor_write -> execute -> tensor_read
+```
+
+A more advanced example is **dynamic multi-LoRA**, where you can overlap loading an adapter from host memory with the execution of the current request — hiding the adapter load latency entirely.
+
+With SpikeAsync, this looks like natural sequential code:
+
+```python
+async def inference(model, input_data, input_tensor, output_tensor):
+    await spike_async.tensor_write(input_tensor, input_data)
+    await spike_async.execute(model, input_set, output_set)
+    return await spike_async.tensor_read(output_tensor)
+
+for i in range(n):
+    spike_async.submit(inference(model, data[i], in_tensor[i], out_tensor[i]))
+```
+
+### Why Not Just Use Stream APIs?
+
+You may wonder whether CUDA-style stream APIs already solve this. They do provide asynchronous dispatch, but two problems make them awkward for this pattern.
+
+#### Problem 1: CPU Work Cannot Overlap Naturally
+
+Streams sequence GPU/device operations, but inserting CPU logic between async operations breaks the overlap. Consider a loop that runs a matmul on device, copies the result to host, then runs a CPU function on it:
+
+```cpp
+// Attempt with CUDA streams
+for (int i = 0; i < n; ++i) {
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+
+    matmul<<<..., stream>>>(dev_out[i], dev_in[i]);
+    cudaMemcpyAsync(host_out[i], dev_out[i], stream);
+    cpu_function(host_out[i]);  // WRONG: runs before matmul/copy finish
+}
+```
+
+Adding `cudaStreamSynchronize` fixes correctness but kills overlap — the CPU waits for each iteration before the next begins:
+
+```
+Matmul -> Copy -> CPU
+                      Matmul -> Copy -> CPU
+                                            Matmul -> Copy -> CPU
+```
+
+Pulling the CPU work out after a `cudaDeviceSynchronize` improves device overlap, but all CPU work is serialized at the end — you cannot overlap CPU work with device work:
+
+```
+Matmul -> Copy
+          Matmul -> Copy
+                    Matmul -> Copy
+                                    CPU -> CPU -> CPU
+```
+
+The core issue is that **stream APIs have no mechanism to resume CPU-side logic precisely when a specific prior operation completes**, without callbacks or restructuring the program into a state machine.
+
+SpikeAsync achieves the fully-overlapped target pipeline naturally:
+
+```
+Matmul -> Copy -> CPU
+          Matmul -> Copy -> CPU
+                    Matmul -> Copy -> CPU
+```
+
+```python
+async def pipeline(dev_in, dev_out):
+    await spike_async.execute(matmul_model, dev_in, dev_out)
+    host_out = await spike_async.tensor_read(dev_out)
+    cpu_function(host_out)
+
+for i in range(n):
+    spike_async.submit(pipeline(dev_in[i], dev_out[i]))
+```
+
+Each `await` suspends only that coroutine until the awaited operation finishes, while other submitted coroutines continue to make progress — including their CPU work.
+
+#### Problem 2: Fine-Grained Dependency Control Is Unnatural
+
+Stream APIs model dependencies coarsely: all operations in a stream are ordered, and cross-stream synchronization requires explicit events between streams. Consider this dependency graph, which arises naturally when two independent models feed into a third, while a fourth model only needs the second:
+
+```
+model_a ──┐
+          ├──► model_c
+model_b ──┘
+   │
+   └─────────► model_d
+```
+
+With CUDA streams, you must manually create streams, record events, and wire up waits:
+
+```cpp
+cudaStream_t s1, s2, s3, s4;
+cudaStreamCreate(&s1);
+cudaStreamCreate(&s2);
+cudaStreamCreate(&s3);
+cudaStreamCreate(&s4);
+
+// Run model_a and model_b in parallel
+run_model<<<..., s1>>>(model_a, ...);
+run_model<<<..., s2>>>(model_b, ...);
+
+// Record events to mark completion
+cudaEvent_t event_a, event_b;
+cudaEventCreate(&event_a);
+cudaEventCreate(&event_b);
+cudaEventRecord(event_a, s1);
+cudaEventRecord(event_b, s2);
+
+// model_c waits for both a and b
+cudaStreamWaitEvent(s3, event_a);
+cudaStreamWaitEvent(s3, event_b);
+run_model<<<..., s3>>>(model_c, ...);
+
+// model_d waits only for b — easy to accidentally add event_a here too
+cudaStreamWaitEvent(s4, event_b);
+run_model<<<..., s4>>>(model_d, ...);
+
+// Cleanup
+cudaEventDestroy(event_a);
+cudaEventDestroy(event_b);
+cudaStreamDestroy(s1); cudaStreamDestroy(s2);
+cudaStreamDestroy(s3); cudaStreamDestroy(s4);
+```
+
+The dependency structure is buried in scattered `cudaStreamWaitEvent` calls. A misplaced wait or a forgotten event silently introduces wrong ordering or unnecessary serialization.
+
+With SpikeAsync's `deps=` parameter, the same graph is expressed directly:
+
+```python
+fut_a = spike_async.execute(model_a, in_a, out_a)
+fut_b = spike_async.execute(model_b, in_b, out_b)
+
+# model_c starts only after both a and b finish
+fut_c = spike_async.execute(model_c, in_c, out_c, deps=[fut_a, fut_b])
+
+# model_d starts as soon as b finishes, independent of a or c
+fut_d = spike_async.execute(model_d, in_d, out_d, deps=[fut_b])
+```
+
+Each operation declares exactly what it depends on, co-located with the operation itself. There are no streams to create, no events to record, and no risk of accidentally over-constraining or under-constraining the graph.
+
 ## High-Level Async API
 
 The high-level API provides an asyncio-like interface with automatic dependency tracking and stream support.
