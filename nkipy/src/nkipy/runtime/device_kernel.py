@@ -139,7 +139,11 @@ class DeviceKernel(SpikeModel):
 
         # Load the compiled NEFF
         if distributed:
+            t_barrier = time.time()
             dist.barrier()
+            t_barrier = time.time() - t_barrier
+
+            t_load = time.time()
             device_kernel = cls.load_from_neff(
                 neff_path,
                 name=name,
@@ -147,11 +151,60 @@ class DeviceKernel(SpikeModel):
                 rank_id=dist.get_rank(),
                 world_size=dist.get_world_size(),
             )
-        else:
-            device_kernel = cls.load_from_neff(neff_path, name=name)
+            t_load = time.time() - t_load
 
+            logger.info(
+                f"[Rank {dist.get_rank()}] Kernel '{name}': "
+                f"barrier={t_barrier:.3f}s, "
+                f"load_from_neff(cc_enabled=True)={t_load:.3f}s"
+            )
+        else:
+            t_load = time.time()
+            device_kernel = cls.load_from_neff(neff_path, name=name)
+            t_load = time.time() - t_load
+            logger.info(f"Kernel '{name}': load_from_neff={t_load:.3f}s")
+
+        device_kernel.cache_key = cache_key
         if use_cached_if_exists:
             _LOADED_KERNELS[cache_key] = device_kernel
+        return device_kernel
+
+    @classmethod
+    def load_with_cache_key(cls, neff_path, cache_key, name=None):
+        """Load a kernel from a known NEFF path and cache key, skipping trace/compile.
+
+        Useful for reloading kernels after a device reset (e.g. sleep/wake_up)
+        when the NEFF is already on disk and the cache key is known.
+        """
+        if cache_key in _LOADED_KERNELS:
+            logger.info(f"Using loaded kernel: {name} (cache_key={cache_key})")
+            return _LOADED_KERNELS[cache_key]
+
+        distributed = _is_distributed()
+        if distributed:
+            t_load = time.time()
+            device_kernel = cls.load_from_neff(
+                neff_path,
+                name=name,
+                cc_enabled=True,
+                rank_id=dist.get_rank(),
+                world_size=dist.get_world_size(),
+            )
+            t_load = time.time() - t_load
+
+            # logger.info(
+            print(
+                f"[Rank {dist.get_rank()}] Kernel '{name}' (reload): "
+                f"load_from_neff(cc_enabled=True)={t_load:.3f}s"
+            )
+        else:
+            t_load = time.time()
+            device_kernel = cls.load_from_neff(neff_path, name=name)
+            t_load = time.time() - t_load
+            # logger.info(f"Kernel '{name}' (reload): load_from_neff={t_load:.3f}s")
+            print(f"Kernel '{name}' (reload): load_from_neff={t_load:.3f}s")
+
+        _LOADED_KERNELS[cache_key] = device_kernel
         return device_kernel
 
     @classmethod

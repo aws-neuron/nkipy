@@ -110,7 +110,7 @@ class ModelState:
         self.weights = None
         self.config = None
         self.sleeping = False
-        self.kernel_neff_paths = None  # saved during sleep for fast wake_up
+        self.kernel_cache = None  # saved during sleep: {name: (neff_path, cache_key)}
         self._lock = asyncio.Lock()
 
     def is_ready(self):
@@ -182,17 +182,12 @@ def run_sleep():
     model = state.model
     spike = get_spike_singleton()
 
-    # Save kernel NEFF paths for fast reload on wake_up
-    state.kernel_neff_paths = {
-        name: getattr(kernel, "neff_path", None)
-        for name, kernel in [
-            ("kernel_cte", model.kernel_cte),
-            ("kernel_tkg", model.kernel_tkg),
-            ("kernel_cte_greedy_sampling", model.kernel_cte_greedy_sampling),
-            ("kernel_tkg_greedy_sampling", model.kernel_tkg_greedy_sampling),
-        ]
-        if kernel is not None
-    }
+    # Save kernel (neff_path, cache_key) for fast reload on wake_up
+    state.kernel_cache = {}
+    for name in ("kernel_cte", "kernel_tkg", "kernel_cte_greedy_sampling", "kernel_tkg_greedy_sampling"):
+        kernel = getattr(model, name, None)
+        if kernel is not None:
+            state.kernel_cache[name] = (kernel.neff_path, kernel.cache_key)
 
     for layer in model.layer_tensors:
         for t in layer.values():
@@ -205,57 +200,36 @@ def run_sleep():
                    model.kernel_cte_greedy_sampling, model.kernel_tkg_greedy_sampling):
         if kernel is not None:
             spike.unload_model(kernel.model_ref)
-    _LOADED_KERNELS.clear()
 
     state.model = None
+    _LOADED_KERNELS.clear()
     gc.collect()
 
     # Release Neuron cores (calls nrt_close) so another engine can use them
     spike_reset()
-
+    dist.barrier()
     state.sleeping = True
     print_log(f"Sleep completed in {time.time() - t0:.2f}s")
 
 
-def _load_kernels_from_neff(neff_paths):
-    from nkipy.runtime import DeviceKernel
-
-    distributed = dist.is_initialized() and dist.get_world_size() > 1
-    kernels = {}
-    for name, neff_path in neff_paths.items():
-        if distributed:
-            dist.barrier()
-            kernels[name] = DeviceKernel.load_from_neff(
-                neff_path,
-                name=name,
-                cc_enabled=True,
-                rank_id=dist.get_rank(),
-                world_size=dist.get_world_size(),
-            )
-        else:
-            kernels[name] = DeviceKernel.load_from_neff(neff_path, name=name)
-    return kernels
-
-
 def run_wake_up():
     from spike import get_spike_singleton
-
+    from nkipy.runtime import DeviceKernel
+    print_log(f"Waking up the model ...")
+    dist.barrier()
     t0 = time.time()
-
     # Re-acquire Neuron cores (lazy nrt_init via get_spike_singleton)
     get_spike_singleton()
-
-    # Build model but skip kernel compilation — we'll inject cached kernels
+    dist.barrier()
+    print_log(f"--> get_spike_singleton() in {time.time() - t0:.2f}s")
+    # Build model, skip kernel trace/compile — reload from cached NEFFs
     model = ModelClass(state.weights, state.config, skip_kernels=True)
 
-    # Reload kernels directly from saved NEFF paths
     t_neff = time.time()
-    kernels = _load_kernels_from_neff(state.kernel_neff_paths)
-    print_log(f"--> _load_kernels_from_neff completed in {time.time() - t_neff:.2f}s")
-    model.kernel_cte = kernels.get("kernel_cte")
-    model.kernel_tkg = kernels.get("kernel_tkg")
-    model.kernel_cte_greedy_sampling = kernels.get("kernel_cte_greedy_sampling")
-    model.kernel_tkg_greedy_sampling = kernels.get("kernel_tkg_greedy_sampling")
+    for name, (neff_path, cache_key) in state.kernel_cache.items():
+        setattr(model, name, DeviceKernel.load_with_cache_key(neff_path, cache_key, name=name))
+    dist.barrier()
+    print_log(f"--> Kernel reload from NEFF completed in {time.time() - t_neff:.2f}s")
 
     # Warmup
     dummy_ids = pad_input_ids(
