@@ -7,7 +7,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from config import Config, get_config
-from kernels.sampling import greedy_sampling
+from kernels.sampling import greedy_sampling, greedy_sampling_with_embedding
 from kernels.transformer_layer import transformer_layer
 from nkipy.runtime import DeviceKernel, DeviceTensor
 from safetensors.torch import load_file
@@ -29,11 +29,14 @@ class Qwen3Model:
         # Initialize kernels to None - will be loaded lazily
         self.kernel_cte = None
         self.kernel_cte_greedy_sampling = None
+        self.kernel_cte_greedy_sampling_embed = None
         self.kernel_tkg = None
         self.kernel_tkg_greedy_sampling = None
+        self.kernel_tkg_greedy_sampling_embed = None
 
         self.norm_weight = None
         self.lm_head_weight = None
+        self.tok_embedding_device = None
 
         # Prepare model resources
         self._prepare_tensors(model_weights)
@@ -125,6 +128,11 @@ class Qwen3Model:
         # Create shared tensors as separate class members using DeviceTensor.from_torch for weights and from_numpy for computed arrays
         self.norm_weight = DeviceTensor.from_torch(norm_weight, "norm_weight")
         self.lm_head_weight = DeviceTensor.from_torch(lm_head_weight, "lm_head_weight")
+
+        # Load embedding table on device for fused greedy sampling + embedding lookup
+        self.tok_embedding_device = DeviceTensor.from_torch(
+            self.tok_embedding, "tok_embedding"
+        )
 
         print_log(f"--> Finished Preparing Tensors in {time.time() - t:.2f}s")
 
@@ -221,30 +229,58 @@ class Qwen3Model:
             additional_compiler_args=self.config.additional_compiler_args_nkipy,
         )
 
+        # Fused greedy sampling + embedding lookup kernels (for double-buffered decode)
+        self.kernel_tkg_greedy_sampling_embed = DeviceKernel.compile_and_load(
+            greedy_sampling_with_embedding,
+            name="tkg_greedy_sampling_embed",
+            h=x_token,
+            norm_weight=self.norm_weight,
+            lm_head_weight=self.lm_head_weight,
+            tok_embedding=self.tok_embedding_device,
+            configs=self.config,
+            use_nki_rmsnorm=USE_NKI_RMSNORM,
+            build_dir=BUILD_DIR,
+            additional_compiler_args=self.config.additional_compiler_args_nkipy,
+        )
+        self.kernel_cte_greedy_sampling_embed = DeviceKernel.compile_and_load(
+            greedy_sampling_with_embedding,
+            name="cte_greedy_sampling_embed",
+            h=x_context,
+            norm_weight=self.norm_weight,
+            lm_head_weight=self.lm_head_weight,
+            tok_embedding=self.tok_embedding_device,
+            configs=self.config,
+            use_nki_rmsnorm=USE_NKI_RMSNORM,
+            build_dir=BUILD_DIR,
+            additional_compiler_args=self.config.additional_compiler_args_nkipy,
+        )
+
         print_log(
             f"--> Finished Kernel Compilation and Loading in {time.time() - t:.2f}s"
         )
 
-    def generate(self, input_ids):
-        """Run inference and generate tokens with tensor parallelism (collectives inside kernels)"""
+    def generate(self, input_ids, double_buffering=True):
+        """Run inference and generate tokens.
+
+        Args:
+            input_ids: Tokenized input IDs.
+            double_buffering: When True (default), uses fused greedy-sampling +
+                on-device embedding lookup with double-buffered next_id so D2H
+                overlaps with compute.  When False, falls back to the original
+                path that round-trips through the host for the embedding lookup.
+        """
         context_len = self.config.context_len
+        B = self.config.max_batch_size
 
         hidden_states = DeviceTensor.from_torch(
             self.tok_embedding[input_ids], "hidden_states"
         )
 
-        # Initial position - next_id tensor for storing generated tokens
-        next_id = DeviceTensor.from_numpy(np.array([[0]], dtype=np.uint32), "next_id")
-        t_start_pos = DeviceTensor.from_numpy(
-            np.array([0], dtype=np.int32), "start_pos"
-        )
-
-        # Process through all layers (context phase)
+        # ── Context encoding phase (shared by both paths) ──
         for i in range(self.config.num_layers):
             self.kernel_cte(
                 inputs={
                     "x": hidden_states,
-                    # Layer i weights
                     "qkv_weight": self.layer_tensors[i]["qkv_weight"],
                     "o_weight": self.layer_tensors[i]["o_weight"],
                     "input_weight": self.layer_tensors[i]["input_weight"],
@@ -265,7 +301,109 @@ class Qwen3Model:
                     "cache_v": self.layer_tensors[i]["cache_v"],
                 },
             )
-        # Generate next token
+
+        if double_buffering:
+            yield from self._generate_double_buffered(hidden_states)
+        else:
+            yield from self._generate_baseline(hidden_states)
+
+    # ── Double-buffered decode (fused sampling + on-device embedding) ──────
+
+    def _generate_double_buffered(self, hidden_states):
+        context_len = self.config.context_len
+        B = self.config.max_batch_size
+
+        next_id_bufs = [
+            DeviceTensor.from_numpy(np.array([[0]], dtype=np.uint32), "next_id_0"),
+            DeviceTensor.from_numpy(np.array([[0]], dtype=np.uint32), "next_id_1"),
+        ]
+        decode_hidden = DeviceTensor.from_numpy(
+            np.empty(
+                shape=(B, 1, self.config.hidden_size),
+                dtype=self.config.dtype,
+            ),
+            "decode_hidden",
+        )
+
+        # First token: fused greedy sampling + embedding lookup
+        cur_buf = 0
+        self.kernel_cte_greedy_sampling_embed(
+            inputs={
+                "h": hidden_states,
+                "norm_weight": self.norm_weight,
+                "lm_head_weight": self.lm_head_weight,
+                "tok_embedding": self.tok_embedding_device,
+            },
+            outputs={
+                "output0": next_id_bufs[cur_buf],
+                "output1": decode_hidden,
+            },
+        )
+
+        # Token generation with double buffering
+        for pos in range(context_len, context_len + self.config.max_new_tokens):
+            prev_buf = cur_buf
+            cur_buf = 1 - cur_buf
+
+            t_start_pos = DeviceTensor.from_numpy(np.array([pos], dtype=np.int32))
+
+            for i in range(self.config.num_layers):
+                self.kernel_tkg(
+                    inputs={
+                        "x": decode_hidden,
+                        "start_pos": t_start_pos,
+                        "qkv_weight": self.layer_tensors[i]["qkv_weight"],
+                        "o_weight": self.layer_tensors[i]["o_weight"],
+                        "input_weight": self.layer_tensors[i]["input_weight"],
+                        "q_norm_weight": self.layer_tensors[i]["q_norm_weight"],
+                        "k_norm_weight": self.layer_tensors[i]["k_norm_weight"],
+                        "cache_k.must_alias_input": self.layer_tensors[i]["cache_k"],
+                        "cache_v.must_alias_input": self.layer_tensors[i]["cache_v"],
+                        "post_attention_weight": self.layer_tensors[i][
+                            "post_attention_weight"
+                        ],
+                        "router_weight": self.layer_tensors[i]["router_weight"],
+                        "gate_up_weight": self.layer_tensors[i]["gate_up_weight"],
+                        "down_weight": self.layer_tensors[i]["down_weight"],
+                    },
+                    outputs={
+                        "output0": decode_hidden,
+                        "cache_k": self.layer_tensors[i]["cache_k"],
+                        "cache_v": self.layer_tensors[i]["cache_v"],
+                    },
+                )
+
+            self.kernel_tkg_greedy_sampling_embed(
+                inputs={
+                    "h": decode_hidden,
+                    "norm_weight": self.norm_weight,
+                    "lm_head_weight": self.lm_head_weight,
+                    "tok_embedding": self.tok_embedding_device,
+                },
+                outputs={
+                    "output0": next_id_bufs[cur_buf],
+                    "output1": decode_hidden,
+                },
+            )
+
+            # D2H the *previous* buffer while this iteration's kernels are in flight
+            next_id_torch = (
+                next_id_bufs[prev_buf].torch().reshape(B, 1).to(dtype=torch.int)
+            )
+            yield next_id_torch
+
+        # Yield the final token
+        next_id_torch = next_id_bufs[cur_buf].torch().reshape(B, 1).to(dtype=torch.int)
+        yield next_id_torch
+
+    # ── Baseline decode (host embedding lookup, no double buffering) ──────
+
+    def _generate_baseline(self, hidden_states):
+        context_len = self.config.context_len
+        B = self.config.max_batch_size
+
+        next_id = DeviceTensor.from_numpy(np.array([[0]], dtype=np.uint32), "next_id")
+
         self.kernel_cte_greedy_sampling(
             inputs={
                 "h": hidden_states,
@@ -274,27 +412,22 @@ class Qwen3Model:
             },
             outputs={"output0": next_id},
         )
-        next_id_torch = (
-            next_id.torch().reshape(self.config.max_batch_size, 1).to(dtype=torch.int)
-        )
+        next_id_torch = next_id.torch().reshape(B, 1).to(dtype=torch.int)
         yield next_id_torch
 
-        # Generation phase (token by token)
         for pos in range(context_len, context_len + self.config.max_new_tokens):
-            # Update the start position for this iteration
             t_start_pos = DeviceTensor.from_numpy(np.array([pos], dtype=np.int32))
 
             hidden_states = DeviceTensor.from_torch(
                 self.tok_embedding[next_id_torch], "h0/res1"
             )
-            t_res1 = hidden_states  # Output becomes next layer's input
+            t_res1 = hidden_states
 
-            for i in range(0, self.config.num_layers):
+            for i in range(self.config.num_layers):
                 self.kernel_tkg(
                     inputs={
                         "x": hidden_states,
                         "start_pos": t_start_pos,
-                        # Layer i weights
                         "qkv_weight": self.layer_tensors[i]["qkv_weight"],
                         "o_weight": self.layer_tensors[i]["o_weight"],
                         "input_weight": self.layer_tensors[i]["input_weight"],
@@ -325,12 +458,7 @@ class Qwen3Model:
                 outputs={"output0": next_id},
             )
 
-            next_id_torch = (
-                next_id.torch()
-                .reshape(self.config.max_batch_size, 1)
-                .to(dtype=torch.int)
-            )
-
+            next_id_torch = next_id.torch().reshape(B, 1).to(dtype=torch.int)
             yield next_id_torch
 
 
@@ -363,13 +491,15 @@ def load_model(args):
     shard_path = os.path.join(args.checkpoint, f"shard_{dist.get_rank()}.safetensors")
     weights = load_file(shard_path, device="cpu")
 
+    double_buffering = getattr(args, "double_buffering", True)
+
     model = Qwen3Model(weights, config)
 
     # warming
     start = time.time()
     print_log("Warming model")
     t = 0
-    for id in model.generate(input_ids):
+    for id in model.generate(input_ids, double_buffering=double_buffering):
         if t == 1:
             break
         t += 1
@@ -384,7 +514,13 @@ def main():
     parser.add_argument("prompt", nargs="?", default="The capital of France is")
     parser.add_argument("--checkpoint", default="/kaena/qwen3_shards_30B_A3B_TP8")
     parser.add_argument("--model", default="Qwen/Qwen3-30B-A3B")
+    parser.add_argument(
+        "--no-double-buffering",
+        action="store_true",
+        help="Disable fused embedding + double-buffered decoding (for perf comparison)",
+    )
     args = parser.parse_args()
+    args.double_buffering = not args.no_double_buffering
 
     model, input_ids, tokenizer = load_model(args)
 
@@ -394,7 +530,7 @@ def main():
     t = 0
     if dist.get_rank() == 0:
         print(f"\n{args.prompt}", end="")
-    for id in model.generate(input_ids):
+    for id in model.generate(input_ids, double_buffering=args.double_buffering):
         if t == 0:
             first_token_time = time.time()
         t += 1
