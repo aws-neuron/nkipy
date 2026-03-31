@@ -80,10 +80,11 @@ kernel = DeviceKernel.compile_and_load(my_kernel, input_a, cc_enabled=False)
 
 ## Build Directory Isolation
 
-In MPMD mode (`is_spmd=False`), when `rank_id` is provided, the build
-directory is automatically namespaced by rank (e.g. `build_dir/rank_0/`,
-`build_dir/rank_1/`) to prevent concurrent writes when different ranks
-produce the same content hash.
+In MPMD mode (`is_spmd=False`), the build directory is automatically
+namespaced by rank (e.g. `build_dir/rank_0/`, `build_dir/rank_1/`) to
+prevent concurrent writes when different ranks produce the same content hash.
+The rank is taken from the explicit `rank_id` parameter, or auto-detected
+from `torch.distributed` when available.
 
 ## Caching
 

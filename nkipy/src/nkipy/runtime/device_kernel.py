@@ -123,10 +123,16 @@ class DeviceKernel(SpikeModel):
 
         # In MPMD mode, namespace build dir by rank to avoid concurrent writes
         # when different ranks produce the same content hash.
-        if not is_spmd and rank_id is not None:
-            compile_build_dir = os.path.join(
-                build_dir or _get_build_dir(), f"rank_{rank_id}"
+        if not is_spmd:
+            effective_rank = rank_id if rank_id is not None else (
+                dist.get_rank() if distributed else None
             )
+            if effective_rank is not None:
+                compile_build_dir = os.path.join(
+                    build_dir or _get_build_dir(), f"rank_{effective_rank}"
+                )
+            else:
+                compile_build_dir = build_dir
         else:
             compile_build_dir = build_dir
 
@@ -176,8 +182,14 @@ class DeviceKernel(SpikeModel):
             else (dist.get_world_size() if distributed else None)
         )
 
+        if resolved_cc and (resolved_rank is None or resolved_world is None):
+            raise ValueError(
+                "rank_id and world_size are required when cc_enabled=True "
+                "and torch.distributed is not available for auto-detection"
+            )
+
         # Barrier only needed in SPMD mode (rank 0 compiled for everyone)
-        if is_spmd and distributed and cc_enabled is None:
+        if is_spmd and distributed:
             dist.barrier()
 
         # --- 3. Load the compiled NEFF ---

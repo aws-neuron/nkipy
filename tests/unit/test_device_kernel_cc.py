@@ -40,11 +40,22 @@ def mock_load_from_neff():
 
 @pytest.fixture
 def mock_dist():
-    """Mock torch.distributed as initialized with world_size=2."""
+    """Mock torch.distributed as initialized with world_size=2, rank=0."""
     with patch("nkipy.runtime.device_kernel._is_distributed", return_value=True), patch(
         "nkipy.runtime.device_kernel.dist", create=True
     ) as mock_d:
         mock_d.get_rank.return_value = 0
+        mock_d.get_world_size.return_value = 2
+        yield mock_d
+
+
+@pytest.fixture
+def mock_dist_rank1():
+    """Mock torch.distributed as initialized with world_size=2, rank=1."""
+    with patch("nkipy.runtime.device_kernel._is_distributed", return_value=True), patch(
+        "nkipy.runtime.device_kernel.dist", create=True
+    ) as mock_d:
+        mock_d.get_rank.return_value = 1
         mock_d.get_world_size.return_value = 2
         yield mock_d
 
@@ -83,13 +94,23 @@ class TestSPMDMode:
             world_size=2,
         )
 
-    def test_spmd_no_barrier_when_cc_explicit(
+    def test_spmd_barrier_still_fires_when_cc_explicit(
         self, mock_trace_and_compile, mock_load_from_neff, mock_dist
     ):
-        """SPMD with explicit cc_enabled skips barrier."""
+        """SPMD barrier fires even with explicit cc_enabled (filesystem visibility)."""
         DeviceKernel.compile_and_load(_dummy_kernel, cc_enabled=True)
 
-        mock_dist.barrier.assert_not_called()
+        mock_dist.barrier.assert_called_once()
+
+    def test_spmd_rank1_receives_broadcast(
+        self, mock_trace_and_compile, mock_load_from_neff, mock_dist_rank1
+    ):
+        """Non-rank-0 SPMD worker receives via broadcast, does not compile."""
+        DeviceKernel.compile_and_load(_dummy_kernel)
+
+        # Rank 1 should NOT call _trace_and_compile (receives via broadcast)
+        mock_trace_and_compile.assert_not_called()
+        mock_dist_rank1.broadcast_object_list.assert_called_once()
 
 
 class TestMPMDMode:
@@ -135,7 +156,7 @@ class TestMPMDMode:
     def test_mpmd_namespaces_build_dir_by_rank(
         self, mock_trace_and_compile, mock_load_from_neff, mock_dist
     ):
-        """MPMD namespaces the build dir by rank to avoid collisions."""
+        """MPMD namespaces the build dir by explicit rank."""
         DeviceKernel.compile_and_load(
             _dummy_kernel, is_spmd=False, cc_enabled=True, rank_id=1, world_size=2
         )
@@ -146,6 +167,19 @@ class TestMPMDMode:
         )
         assert build_dir is not None
         assert build_dir.endswith("/rank_1")
+
+    def test_mpmd_auto_namespaces_build_dir_from_dist(
+        self, mock_trace_and_compile, mock_load_from_neff, mock_dist
+    ):
+        """MPMD with no explicit rank_id auto-detects rank for build dir namespace."""
+        DeviceKernel.compile_and_load(_dummy_kernel, is_spmd=False)
+
+        call_kwargs = mock_trace_and_compile.call_args
+        build_dir = call_kwargs.kwargs.get("build_dir") or call_kwargs[1].get(
+            "build_dir"
+        )
+        assert build_dir is not None
+        assert build_dir.endswith("/rank_0")
 
     def test_mpmd_auto_detects_cc_from_dist(
         self, mock_trace_and_compile, mock_load_from_neff, mock_dist
@@ -184,7 +218,6 @@ class TestExplicitCCOverride:
         mock_load_from_neff.assert_called_once_with(
             "/tmp/test/kernel.neff", name="_dummy_kernel"
         )
-        mock_dist.barrier.assert_not_called()
 
     def test_explicit_rank_overrides_dist(
         self, mock_trace_and_compile, mock_load_from_neff, mock_dist
@@ -201,6 +234,32 @@ class TestExplicitCCOverride:
             rank_id=5,
             world_size=16,
         )
+
+
+class TestValidation:
+    """Tests for parameter validation."""
+
+    def test_cc_enabled_without_rank_raises(
+        self, mock_trace_and_compile, mock_load_from_neff
+    ):
+        """cc_enabled=True without rank_id/world_size and no dist raises ValueError."""
+        with patch(
+            "nkipy.runtime.device_kernel._is_distributed", return_value=False
+        ):
+            with pytest.raises(ValueError, match="rank_id and world_size are required"):
+                DeviceKernel.compile_and_load(_dummy_kernel, cc_enabled=True)
+
+    def test_cc_enabled_without_world_size_raises(
+        self, mock_trace_and_compile, mock_load_from_neff
+    ):
+        """cc_enabled=True with rank_id but no world_size and no dist raises."""
+        with patch(
+            "nkipy.runtime.device_kernel._is_distributed", return_value=False
+        ):
+            with pytest.raises(ValueError, match="rank_id and world_size are required"):
+                DeviceKernel.compile_and_load(
+                    _dummy_kernel, cc_enabled=True, rank_id=0
+                )
 
 
 class TestNonDistributed:
