@@ -164,34 +164,9 @@ def greedy_sampling_with_embedding(
     Returns:
         (final_next_id, embedded): The selected token ID and its embedding, both on device.
     """
-
-    B, S, H = h.shape
-    if use_nki_rmsnorm:
-        h = h.reshape(-1, H)
-        h = nki_rmsnorm_kernel(h, norm_weight, configs.norm_eps)
-        h = h.reshape(B, S, H)
-    else:
-        h = rmsnorm_kernel(h, norm_weight, configs.norm_eps)
-
-    logits = h[:, -1, :] @ lm_head_weight
-
-    logits, next_id = tensor_apis.topk(logits, k=1, axis=1)
-    logits_all = cc.all_gather(
-        logits, all_gather_dim=1, replica_groups=[list(range(dist.get_world_size()))]
+    final_next_id = greedy_sampling(
+        h, norm_weight, lm_head_weight, configs, use_nki_rmsnorm
     )
-    next_id_all = cc.all_gather(
-        next_id, all_gather_dim=1, replica_groups=[list(range(dist.get_world_size()))]
-    )
-
-    _, top_index = tensor_apis.topk(logits_all, k=1, axis=1)
-    final_next_id = np.empty_like(next_id)
-
-    vocab_per_device = lm_head_weight.shape[1]
-    for b in range(configs.max_batch_size):
-        device_idx = top_index[b]
-        local_idx = next_id_all[b, device_idx]
-        global_idx = device_idx * vocab_per_device + local_idx
-        final_next_id[b] = global_idx
 
     # On-device embedding lookup: gather rows from tok_embedding using selected token IDs
     # final_next_id shape: (B, 1) -> embedded shape: (B, 1, hidden_size)

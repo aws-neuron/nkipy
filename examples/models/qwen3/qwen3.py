@@ -307,6 +307,34 @@ class Qwen3Model:
         else:
             yield from self._generate_baseline(hidden_states)
 
+    def _run_tkg_layers(self, hidden_states, start_pos):
+        """Run all token-generation transformer layers."""
+        for i in range(self.config.num_layers):
+            self.kernel_tkg(
+                inputs={
+                    "x": hidden_states,
+                    "start_pos": start_pos,
+                    "qkv_weight": self.layer_tensors[i]["qkv_weight"],
+                    "o_weight": self.layer_tensors[i]["o_weight"],
+                    "input_weight": self.layer_tensors[i]["input_weight"],
+                    "q_norm_weight": self.layer_tensors[i]["q_norm_weight"],
+                    "k_norm_weight": self.layer_tensors[i]["k_norm_weight"],
+                    "cache_k.must_alias_input": self.layer_tensors[i]["cache_k"],
+                    "cache_v.must_alias_input": self.layer_tensors[i]["cache_v"],
+                    "post_attention_weight": self.layer_tensors[i][
+                        "post_attention_weight"
+                    ],
+                    "router_weight": self.layer_tensors[i]["router_weight"],
+                    "gate_up_weight": self.layer_tensors[i]["gate_up_weight"],
+                    "down_weight": self.layer_tensors[i]["down_weight"],
+                },
+                outputs={
+                    "output0": hidden_states,
+                    "cache_k": self.layer_tensors[i]["cache_k"],
+                    "cache_v": self.layer_tensors[i]["cache_v"],
+                },
+            )
+
     # ── Double-buffered decode (fused sampling + on-device embedding) ──────
 
     def _generate_double_buffered(self, hidden_states):
@@ -346,32 +374,7 @@ class Qwen3Model:
             cur_buf = 1 - cur_buf
 
             t_start_pos = DeviceTensor.from_numpy(np.array([pos], dtype=np.int32))
-
-            for i in range(self.config.num_layers):
-                self.kernel_tkg(
-                    inputs={
-                        "x": decode_hidden,
-                        "start_pos": t_start_pos,
-                        "qkv_weight": self.layer_tensors[i]["qkv_weight"],
-                        "o_weight": self.layer_tensors[i]["o_weight"],
-                        "input_weight": self.layer_tensors[i]["input_weight"],
-                        "q_norm_weight": self.layer_tensors[i]["q_norm_weight"],
-                        "k_norm_weight": self.layer_tensors[i]["k_norm_weight"],
-                        "cache_k.must_alias_input": self.layer_tensors[i]["cache_k"],
-                        "cache_v.must_alias_input": self.layer_tensors[i]["cache_v"],
-                        "post_attention_weight": self.layer_tensors[i][
-                            "post_attention_weight"
-                        ],
-                        "router_weight": self.layer_tensors[i]["router_weight"],
-                        "gate_up_weight": self.layer_tensors[i]["gate_up_weight"],
-                        "down_weight": self.layer_tensors[i]["down_weight"],
-                    },
-                    outputs={
-                        "output0": decode_hidden,
-                        "cache_k": self.layer_tensors[i]["cache_k"],
-                        "cache_v": self.layer_tensors[i]["cache_v"],
-                    },
-                )
+            self._run_tkg_layers(decode_hidden, t_start_pos)
 
             self.kernel_tkg_greedy_sampling_embed(
                 inputs={
@@ -421,37 +424,12 @@ class Qwen3Model:
             hidden_states = DeviceTensor.from_torch(
                 self.tok_embedding[next_id_torch], "h0/res1"
             )
-            t_res1 = hidden_states
 
-            for i in range(self.config.num_layers):
-                self.kernel_tkg(
-                    inputs={
-                        "x": hidden_states,
-                        "start_pos": t_start_pos,
-                        "qkv_weight": self.layer_tensors[i]["qkv_weight"],
-                        "o_weight": self.layer_tensors[i]["o_weight"],
-                        "input_weight": self.layer_tensors[i]["input_weight"],
-                        "q_norm_weight": self.layer_tensors[i]["q_norm_weight"],
-                        "k_norm_weight": self.layer_tensors[i]["k_norm_weight"],
-                        "cache_k.must_alias_input": self.layer_tensors[i]["cache_k"],
-                        "cache_v.must_alias_input": self.layer_tensors[i]["cache_v"],
-                        "post_attention_weight": self.layer_tensors[i][
-                            "post_attention_weight"
-                        ],
-                        "router_weight": self.layer_tensors[i]["router_weight"],
-                        "gate_up_weight": self.layer_tensors[i]["gate_up_weight"],
-                        "down_weight": self.layer_tensors[i]["down_weight"],
-                    },
-                    outputs={
-                        "output0": t_res1,
-                        "cache_k": self.layer_tensors[i]["cache_k"],
-                        "cache_v": self.layer_tensors[i]["cache_v"],
-                    },
-                )
+            self._run_tkg_layers(hidden_states, t_start_pos)
 
             self.kernel_tkg_greedy_sampling(
                 inputs={
-                    "h": t_res1,
+                    "h": hidden_states,
                     "norm_weight": self.norm_weight,
                     "lm_head_weight": self.lm_head_weight,
                 },
