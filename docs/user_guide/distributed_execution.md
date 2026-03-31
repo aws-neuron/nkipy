@@ -6,45 +6,43 @@ execution patterns and when to use each.
 
 ## Execution Patterns
 
-### 1. Auto-detected SPMD (default with torch.distributed)
+### 1. SPMD (default)
 
-When `torch.distributed` is initialized and no explicit CC parameters are
-passed, NKIPy automatically enters **SPMD mode**: rank 0 traces and compiles
-the kernel, then broadcasts the NEFF path to all workers. All ranks load the
-same NEFF with CC enabled.
+When `torch.distributed` is initialized and `is_spmd=True` (the default),
+rank 0 traces and compiles the kernel, then broadcasts the NEFF path to all
+workers. All ranks load the same NEFF with CC enabled.
 
 ```python
 import torch.distributed as dist
 
-# torch.distributed must be initialized before compile_and_load
 dist.init_process_group(...)
 
 kernel = DeviceKernel.compile_and_load(my_kernel, input_a, input_b)
 ```
 
-This is the simplest path — no extra parameters needed. Use this when every
-rank runs the **same kernel** with the **same input shapes**.
+Use this when every rank runs the **same kernel** with the **same input shapes**.
 
-### 2. Explicit CC (MPMD)
+### 2. MPMD (`is_spmd=False`)
 
-Pass `cc_enabled=True` with `rank_id` and `world_size` to enable CC while
-letting **every rank trace and compile independently**. This is required for
-MPMD workloads where different ranks run different kernels or different input
-shapes.
+Set `is_spmd=False` so every rank traces and compiles independently. This is
+required when different ranks run different kernels or different input shapes.
 
 ```python
+# With torch.distributed (CC auto-detected)
 kernel = DeviceKernel.compile_and_load(
-    my_kernel,
-    input_a,
-    input_b,
+    my_kernel, input_a, input_b,
+    is_spmd=False,
+)
+
+# Without torch.distributed (explicit CC)
+kernel = DeviceKernel.compile_and_load(
+    my_kernel, input_a, input_b,
+    is_spmd=False,
     cc_enabled=True,
     rank_id=my_rank,
     world_size=total_workers,
 )
 ```
-
-This also works for runtimes that manage their own ranks without
-`torch.distributed`.
 
 ### 3. No CC (single device or explicit opt-out)
 
@@ -60,23 +58,32 @@ kernel = DeviceKernel.compile_and_load(my_kernel, input_a)
 kernel = DeviceKernel.compile_and_load(my_kernel, input_a, cc_enabled=False)
 ```
 
+## Parameter Reference
+
+| Parameter    | Controls           | Values                                        |
+|--------------|--------------------|-----------------------------------------------|
+| `is_spmd`    | Compilation        | `True` = rank-0 broadcast, `False` = all rank |
+| `cc_enabled` | CC at load time    | `None` = auto, `True` = on, `False` = off     |
+| `rank_id`    | Rank for CC load   | `None` = auto from dist, or explicit `int`    |
+| `world_size` | World size for CC  | `None` = auto from dist, or explicit `int`    |
+
 ## Comparison
 
-| Parameter           | Auto SPMD               | Explicit CC (MPMD)   | No CC         |
-|---------------------|-------------------------|----------------------|---------------|
-| `cc_enabled`        | `None` (default)        | `True`               | `False`/`None`|
-| `torch.distributed` | Required                | Optional             | N/A           |
-| Compilation         | Rank 0 only + broadcast | Every rank           | Every rank    |
-| Barrier             | Yes                     | No                   | No            |
-| Use case            | Same kernel, all ranks  | Per-rank kernels     | Single device |
+| Setting                 | SPMD (default)          | MPMD                 | No CC         |
+|-------------------------|-------------------------|----------------------|---------------|
+| `is_spmd`               | `True`                  | `False`              | Either        |
+| `cc_enabled`            | `None` (auto)           | `None`/`True`        | `False`/`None`|
+| `torch.distributed`     | Required                | Optional             | N/A           |
+| Compilation             | Rank 0 only + broadcast | Every rank           | Every rank    |
+| Barrier                 | Yes                     | No                   | No            |
+| Use case                | Same kernel, all ranks  | Per-rank kernels     | Single device |
 
 ## Build Directory Isolation
 
-In explicit CC (MPMD) mode, each rank compiles independently. When `rank_id`
-is provided, the build directory is automatically namespaced by rank
-(e.g. `build_dir/rank_0/`, `build_dir/rank_1/`) to prevent concurrent writes
-when different ranks produce the same content hash. This is transparent —
-no extra configuration needed.
+In MPMD mode (`is_spmd=False`), when `rank_id` is provided, the build
+directory is automatically namespaced by rank (e.g. `build_dir/rank_0/`,
+`build_dir/rank_1/`) to prevent concurrent writes when different ranks
+produce the same content hash.
 
 ## Caching
 

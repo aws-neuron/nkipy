@@ -1,6 +1,6 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for explicit CC parameters in DeviceKernel.compile_and_load."""
+"""Unit tests for CC parameters in DeviceKernel.compile_and_load."""
 
 from unittest.mock import MagicMock, patch
 
@@ -49,38 +49,79 @@ def mock_dist():
         yield mock_d
 
 
-class TestExplicitCC:
-    """Tests for explicit cc_enabled / rank_id / world_size parameters."""
+class TestSPMDMode:
+    """Tests for is_spmd=True (default) with torch.distributed."""
 
-    def test_explicit_cc_skips_broadcast(
+    def test_spmd_uses_broadcast(
         self, mock_trace_and_compile, mock_load_from_neff, mock_dist
     ):
-        """When cc_enabled is explicit, every rank compiles (no broadcast)."""
-        DeviceKernel.compile_and_load(
-            _dummy_kernel, cc_enabled=True, rank_id=0, world_size=2
+        """Default (is_spmd=True) with distributed uses rank-0 broadcast."""
+        DeviceKernel.compile_and_load(_dummy_kernel)
+
+        mock_trace_and_compile.assert_called_once()
+        mock_dist.broadcast_object_list.assert_called_once()
+
+    def test_spmd_uses_barrier(
+        self, mock_trace_and_compile, mock_load_from_neff, mock_dist
+    ):
+        """SPMD mode calls barrier before load."""
+        DeviceKernel.compile_and_load(_dummy_kernel)
+
+        mock_dist.barrier.assert_called_once()
+
+    def test_spmd_resolves_rank_and_world_size(
+        self, mock_trace_and_compile, mock_load_from_neff, mock_dist
+    ):
+        """SPMD auto-detects rank_id and world_size from dist."""
+        DeviceKernel.compile_and_load(_dummy_kernel)
+
+        mock_load_from_neff.assert_called_once_with(
+            "/tmp/test/kernel.neff",
+            name="_dummy_kernel",
+            cc_enabled=True,
+            rank_id=0,
+            world_size=2,
         )
 
-        # _trace_and_compile called directly (not behind rank check)
-        mock_trace_and_compile.assert_called_once()
-        # No broadcast_object_list calls
-        mock_dist.broadcast_object_list.assert_not_called()
-
-    def test_explicit_cc_skips_barrier(
+    def test_spmd_no_barrier_when_cc_explicit(
         self, mock_trace_and_compile, mock_load_from_neff, mock_dist
     ):
-        """When cc_enabled is explicit, barrier is not called."""
+        """SPMD with explicit cc_enabled skips barrier."""
+        DeviceKernel.compile_and_load(_dummy_kernel, cc_enabled=True)
+
+        mock_dist.barrier.assert_not_called()
+
+
+class TestMPMDMode:
+    """Tests for is_spmd=False (MPMD) mode."""
+
+    def test_mpmd_skips_broadcast(
+        self, mock_trace_and_compile, mock_load_from_neff, mock_dist
+    ):
+        """MPMD mode: every rank compiles, no broadcast."""
         DeviceKernel.compile_and_load(
-            _dummy_kernel, cc_enabled=True, rank_id=1, world_size=4
+            _dummy_kernel, is_spmd=False, cc_enabled=True, rank_id=0, world_size=2
+        )
+
+        mock_trace_and_compile.assert_called_once()
+        mock_dist.broadcast_object_list.assert_not_called()
+
+    def test_mpmd_skips_barrier(
+        self, mock_trace_and_compile, mock_load_from_neff, mock_dist
+    ):
+        """MPMD mode does not call barrier."""
+        DeviceKernel.compile_and_load(
+            _dummy_kernel, is_spmd=False, cc_enabled=True, rank_id=1, world_size=4
         )
 
         mock_dist.barrier.assert_not_called()
 
-    def test_explicit_cc_passes_to_load(
+    def test_mpmd_passes_cc_to_load(
         self, mock_trace_and_compile, mock_load_from_neff, mock_dist
     ):
-        """Explicit CC params are forwarded to load_from_neff."""
+        """MPMD explicit CC params are forwarded to load_from_neff."""
         DeviceKernel.compile_and_load(
-            _dummy_kernel, cc_enabled=True, rank_id=3, world_size=8
+            _dummy_kernel, is_spmd=False, cc_enabled=True, rank_id=3, world_size=8
         )
 
         mock_load_from_neff.assert_called_once_with(
@@ -91,15 +132,14 @@ class TestExplicitCC:
             world_size=8,
         )
 
-    def test_explicit_cc_namespaces_build_dir_by_rank(
+    def test_mpmd_namespaces_build_dir_by_rank(
         self, mock_trace_and_compile, mock_load_from_neff, mock_dist
     ):
-        """Explicit CC namespaces the build dir by rank to avoid collisions."""
+        """MPMD namespaces the build dir by rank to avoid collisions."""
         DeviceKernel.compile_and_load(
-            _dummy_kernel, cc_enabled=True, rank_id=1, world_size=2
+            _dummy_kernel, is_spmd=False, cc_enabled=True, rank_id=1, world_size=2
         )
 
-        # Check that _trace_and_compile received a rank-namespaced build_dir
         call_kwargs = mock_trace_and_compile.call_args
         build_dir = call_kwargs.kwargs.get("build_dir") or call_kwargs[1].get(
             "build_dir"
@@ -107,7 +147,35 @@ class TestExplicitCC:
         assert build_dir is not None
         assert build_dir.endswith("/rank_1")
 
-    def test_explicit_cc_false_loads_without_cc(
+    def test_mpmd_auto_detects_cc_from_dist(
+        self, mock_trace_and_compile, mock_load_from_neff, mock_dist
+    ):
+        """MPMD with cc_enabled=None auto-detects from dist."""
+        DeviceKernel.compile_and_load(_dummy_kernel, is_spmd=False)
+
+        mock_load_from_neff.assert_called_once_with(
+            "/tmp/test/kernel.neff",
+            name="_dummy_kernel",
+            cc_enabled=True,
+            rank_id=0,
+            world_size=2,
+        )
+
+    def test_mpmd_cc_false_disables_cc(
+        self, mock_trace_and_compile, mock_load_from_neff, mock_dist
+    ):
+        """MPMD with cc_enabled=False disables CC."""
+        DeviceKernel.compile_and_load(_dummy_kernel, is_spmd=False, cc_enabled=False)
+
+        mock_load_from_neff.assert_called_once_with(
+            "/tmp/test/kernel.neff", name="_dummy_kernel"
+        )
+
+
+class TestExplicitCCOverride:
+    """Tests for cc_enabled overriding auto-detection."""
+
+    def test_cc_false_disables_cc_in_spmd(
         self, mock_trace_and_compile, mock_load_from_neff, mock_dist
     ):
         """cc_enabled=False disables CC even with torch.distributed active."""
@@ -118,40 +186,20 @@ class TestExplicitCC:
         )
         mock_dist.barrier.assert_not_called()
 
-
-class TestAutoDetectedCC:
-    """Tests for auto-detected CC via torch.distributed (cc_enabled=None)."""
-
-    def test_auto_cc_uses_broadcast(
+    def test_explicit_rank_overrides_dist(
         self, mock_trace_and_compile, mock_load_from_neff, mock_dist
     ):
-        """Default (cc_enabled=None) with distributed uses rank-0 broadcast."""
-        DeviceKernel.compile_and_load(_dummy_kernel)
-
-        # Rank 0 compiles and broadcasts
-        mock_trace_and_compile.assert_called_once()
-        mock_dist.broadcast_object_list.assert_called_once()
-
-    def test_auto_cc_uses_barrier(
-        self, mock_trace_and_compile, mock_load_from_neff, mock_dist
-    ):
-        """Default distributed mode calls barrier before load."""
-        DeviceKernel.compile_and_load(_dummy_kernel)
-
-        mock_dist.barrier.assert_called_once()
-
-    def test_auto_cc_resolves_rank_and_world_size(
-        self, mock_trace_and_compile, mock_load_from_neff, mock_dist
-    ):
-        """Auto-detected CC resolves rank_id and world_size from dist."""
-        DeviceKernel.compile_and_load(_dummy_kernel)
+        """Explicit rank_id/world_size override dist values."""
+        DeviceKernel.compile_and_load(
+            _dummy_kernel, cc_enabled=True, rank_id=5, world_size=16
+        )
 
         mock_load_from_neff.assert_called_once_with(
             "/tmp/test/kernel.neff",
             name="_dummy_kernel",
             cc_enabled=True,
-            rank_id=0,
-            world_size=2,
+            rank_id=5,
+            world_size=16,
         )
 
 
@@ -184,6 +232,27 @@ class TestNonDistributed:
             cc_enabled=True,
             rank_id=0,
             world_size=2,
+        )
+
+    def test_no_dist_mpmd(self, mock_trace_and_compile, mock_load_from_neff):
+        """MPMD without torch.distributed works with explicit CC."""
+        with patch(
+            "nkipy.runtime.device_kernel._is_distributed", return_value=False
+        ):
+            DeviceKernel.compile_and_load(
+                _dummy_kernel,
+                is_spmd=False,
+                cc_enabled=True,
+                rank_id=1,
+                world_size=4,
+            )
+
+        mock_load_from_neff.assert_called_once_with(
+            "/tmp/test/kernel.neff",
+            name="_dummy_kernel",
+            cc_enabled=True,
+            rank_id=1,
+            world_size=4,
         )
 
 
