@@ -235,7 +235,8 @@ class NKIPyKernel:
                 copy_tensor = ctx.build_op("copy", [bt], bt.shape, bt.dtype)
                 ret[i] = NKIPyTensorRef(copy_tensor, name="")
 
-        # Assign output names and build AliasInfo list
+        # Assign canonical names and build AliasInfo metadata. Alias outputs
+        # keep the parameter name; every other output uses its tuple position.
         for idx, r in enumerate(ret):
             if not isinstance(r, NKIPyTensorRef):
                 raise RuntimeError(f"Unexpected return value type: {type(r)}")
@@ -251,10 +252,7 @@ class NKIPyKernel:
                     )
                 )
                 r.backend_tensor.name = param_name
-
-            # N.B.: the name "output{idx}" is specific
-            # it avoids variable folding in HLO lowering in Neuron Compiler
-            if not r.backend_tensor.name:
+            else:
                 r.backend_tensor.name = f"output{idx}"
 
         result_tensors = [r.backend_tensor for r in ret]
