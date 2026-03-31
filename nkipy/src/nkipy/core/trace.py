@@ -217,11 +217,20 @@ class NKIPyKernel:
                 copy_tensor = ctx.build_op("copy", [bt], bt.shape, bt.dtype)
                 ret[i] = NKIPyTensorRef(copy_tensor, name="")
 
-        # Step 3: Assign output names and build AliasInfo list
+        # Step 3: Assign output names and build AliasInfo list.
+        #
+        # Aliased outputs keep their parameter name (e.g. "kv_cache") so that
+        # the Neuron compiler + Spike runtime can bind the input and output to
+        # the same device buffer via the ".must_alias_input" convention.
+        #
+        # Non-aliased outputs are *always* renamed to "output{idx}" — even if
+        # they already carry a name from tracing — to prevent the Neuron
+        # compiler from folding (optimizing away) the output variable.
         for idx, r in enumerate(ret):
             if not isinstance(r, NKIPyTensorRef):
                 raise RuntimeError(f"Unexpected return value type: {type(r)}")
 
+            is_alias_output = False
             if idx in aliased_return_positions:
                 param_name, param_index = aliased_return_positions[idx]
                 code.aliases.append(
@@ -233,10 +242,9 @@ class NKIPyKernel:
                     )
                 )
                 r.backend_tensor.name = param_name
+                is_alias_output = True
 
-            # N.B.: the name "output{idx}" is specific
-            # it avoids variable folding in HLO lowering in Neuron Compiler
-            if not r.backend_tensor.name:
+            if not is_alias_output:
                 r.backend_tensor.name = f"output{idx}"
 
         result_tensors = [r.backend_tensor for r in ret]

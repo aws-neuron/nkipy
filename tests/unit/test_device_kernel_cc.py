@@ -41,9 +41,10 @@ def mock_load_from_neff():
 @pytest.fixture
 def mock_dist():
     """Mock torch.distributed as initialized with world_size=2, rank=0."""
-    with patch("nkipy.runtime.device_kernel._is_distributed", return_value=True), patch(
-        "nkipy.runtime.device_kernel.dist", create=True
-    ) as mock_d:
+    with (
+        patch("nkipy.runtime.device_kernel._is_distributed", return_value=True),
+        patch("nkipy.runtime.device_kernel.dist", create=True) as mock_d,
+    ):
         mock_d.get_rank.return_value = 0
         mock_d.get_world_size.return_value = 2
         yield mock_d
@@ -52,9 +53,10 @@ def mock_dist():
 @pytest.fixture
 def mock_dist_rank1():
     """Mock torch.distributed as initialized with world_size=2, rank=1."""
-    with patch("nkipy.runtime.device_kernel._is_distributed", return_value=True), patch(
-        "nkipy.runtime.device_kernel.dist", create=True
-    ) as mock_d:
+    with (
+        patch("nkipy.runtime.device_kernel._is_distributed", return_value=True),
+        patch("nkipy.runtime.device_kernel.dist", create=True) as mock_d,
+    ):
         mock_d.get_rank.return_value = 1
         mock_d.get_world_size.return_value = 2
         yield mock_d
@@ -243,9 +245,7 @@ class TestValidation:
         self, mock_trace_and_compile, mock_load_from_neff
     ):
         """cc_enabled=True without rank_id/world_size and no dist raises ValueError."""
-        with patch(
-            "nkipy.runtime.device_kernel._is_distributed", return_value=False
-        ):
+        with patch("nkipy.runtime.device_kernel._is_distributed", return_value=False):
             with pytest.raises(ValueError, match="rank_id and world_size are required"):
                 DeviceKernel.compile_and_load(_dummy_kernel, cc_enabled=True)
 
@@ -253,13 +253,9 @@ class TestValidation:
         self, mock_trace_and_compile, mock_load_from_neff
     ):
         """cc_enabled=True with rank_id but no world_size and no dist raises."""
-        with patch(
-            "nkipy.runtime.device_kernel._is_distributed", return_value=False
-        ):
+        with patch("nkipy.runtime.device_kernel._is_distributed", return_value=False):
             with pytest.raises(ValueError, match="rank_id and world_size are required"):
-                DeviceKernel.compile_and_load(
-                    _dummy_kernel, cc_enabled=True, rank_id=0
-                )
+                DeviceKernel.compile_and_load(_dummy_kernel, cc_enabled=True, rank_id=0)
 
 
 class TestNonDistributed:
@@ -267,9 +263,7 @@ class TestNonDistributed:
 
     def test_no_dist_no_cc(self, mock_trace_and_compile, mock_load_from_neff):
         """Without distributed, loads without CC by default."""
-        with patch(
-            "nkipy.runtime.device_kernel._is_distributed", return_value=False
-        ):
+        with patch("nkipy.runtime.device_kernel._is_distributed", return_value=False):
             DeviceKernel.compile_and_load(_dummy_kernel)
 
         mock_load_from_neff.assert_called_once_with(
@@ -278,9 +272,7 @@ class TestNonDistributed:
 
     def test_no_dist_explicit_cc(self, mock_trace_and_compile, mock_load_from_neff):
         """Without torch.distributed, explicit CC params still work."""
-        with patch(
-            "nkipy.runtime.device_kernel._is_distributed", return_value=False
-        ):
+        with patch("nkipy.runtime.device_kernel._is_distributed", return_value=False):
             DeviceKernel.compile_and_load(
                 _dummy_kernel, cc_enabled=True, rank_id=0, world_size=2
             )
@@ -295,9 +287,7 @@ class TestNonDistributed:
 
     def test_no_dist_mpmd(self, mock_trace_and_compile, mock_load_from_neff):
         """MPMD without torch.distributed works with explicit CC."""
-        with patch(
-            "nkipy.runtime.device_kernel._is_distributed", return_value=False
-        ):
+        with patch("nkipy.runtime.device_kernel._is_distributed", return_value=False):
             DeviceKernel.compile_and_load(
                 _dummy_kernel,
                 is_spmd=False,
