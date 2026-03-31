@@ -204,6 +204,7 @@ class DeviceKernel(SpikeModel):
             # logger.info(f"Kernel '{name}' (reload): load_from_neff={t_load:.3f}s")
             print(f"Kernel '{name}' (reload): load_from_neff={t_load:.3f}s")
 
+        device_kernel.cache_key = cache_key
         _LOADED_KERNELS[cache_key] = device_kernel
         return device_kernel
 

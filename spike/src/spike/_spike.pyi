@@ -72,6 +72,10 @@ class NrtTensor:
     def name(self) -> str:
         """Tensor name"""
 
+    @property
+    def va(self) -> int:
+        """CPU-accessible virtual address of device HBM memory"""
+
 class NrtModel:
     @property
     def neff_path(self) -> str:

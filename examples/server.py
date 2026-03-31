@@ -33,6 +33,8 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from p2p_weight_transfer import WeightClient, WeightServer
+
 # Add models/ to sys.path so common.* imports work
 _models_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
 sys.path.insert(0, _models_dir)
@@ -111,6 +113,7 @@ class ModelState:
         self.config = None
         self.sleeping = False
         self.kernel_cache = None  # saved during sleep: {name: (neff_path, cache_key)}
+        self.weight_server = None  # WeightServer for P2P transfer (active engine)
         self._lock = asyncio.Lock()
 
     def is_ready(self):
@@ -225,6 +228,17 @@ def run_wake_up():
     # Build model, skip kernel trace/compile — reload from cached NEFFs
     model = ModelClass(state.weights, state.config, skip_kernels=True)
 
+    # P2P weight transfer from peer if available
+    peer_url = getattr(state.args, "p2p_peer_url", None)
+    if peer_url and dist.get_rank() == 0:
+        t_p2p = time.time()
+        client = WeightClient(peer_url)
+        client.fetch_weights(model)
+        dist.barrier()
+        print_log(f"--> P2P weight transfer completed in {time.time() - t_p2p:.2f}s")
+    else:
+        dist.barrier()
+
     t_neff = time.time()
     for name, (neff_path, cache_key) in state.kernel_cache.items():
         setattr(model, name, DeviceKernel.load_with_cache_key(neff_path, cache_key, name=name))
@@ -325,6 +339,10 @@ async def sleep():
         def _sleep():
             broadcast_cmd(CMD_SLEEP)
             run_sleep()
+            # Free P2P weight server resources
+            if state.weight_server is not None:
+                state.weight_server.cleanup()
+                state.weight_server = None
         await loop.run_in_executor(None, _sleep)
         return {"status": "sleeping"}
 
@@ -339,8 +357,38 @@ async def wake_up():
         def _wake_up():
             broadcast_cmd(CMD_WAKEUP)
             run_wake_up()
+            # Re-initialize weight server for P2P after wake
+            if state.model is not None:
+                state.weight_server = WeightServer(state.model)
         await loop.run_in_executor(None, _wake_up)
         return {"status": "awake"}
+
+
+# --- P2P weight transfer endpoints (active engine serves these) ---
+
+@app.get("/weight_info")
+async def weight_info():
+    if state.weight_server is None:
+        raise HTTPException(status_code=503, detail="Weight server not initialized")
+    return state.weight_server.get_weight_info()
+
+
+class PushWeightsRequest(BaseModel):
+    remote_metadata: str
+    remote_descs: str
+
+
+@app.post("/p2p_push_weights")
+async def p2p_push_weights(req: PushWeightsRequest):
+    if state.weight_server is None:
+        raise HTTPException(status_code=503, detail="Weight server not initialized")
+
+    loop = asyncio.get_event_loop()
+    remote_descs_bytes = bytes.fromhex(req.remote_descs)
+    await loop.run_in_executor(
+        None, state.weight_server.push_weights, req.remote_metadata, remote_descs_bytes
+    )
+    return {"status": "done"}
 
 
 # --- Main ---
@@ -353,12 +401,17 @@ def parse_args():
                         help="HuggingFace model name, e.g. Qwen/Qwen3-30B-A3B or TinyLlama/TinyLlama-1.1B-Chat-v1.0")
     parser.add_argument("--checkpoint", required=True,
                         help="Path to pre-sharded safetensors directory.")
-    parser.add_argument("--context-len", type=int, default=32,
+    parser.add_argument("--context-len", type=int, default=64,
                         help="Fixed context length for kernel compilation. Prompts are padded to this.")
-    parser.add_argument("--max-tokens", type=int, default=128)
+    parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--neuron-port", type=int, default=61239)
+    parser.add_argument("--p2p-peer-url", default=None,
+                        help="URL of the active peer engine for P2P weight transfer on wake_up, "
+                             "e.g. http://localhost:8000")
+    parser.add_argument("--core-offset", type=int, default=0,
+                        help="Neuron core offset. Rank i uses core (core_offset + i).")
     return parser.parse_args()
 
 
@@ -373,7 +426,7 @@ if __name__ == "__main__":
     dist.init_process_group()
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
-    os.environ["NEURON_RT_VISIBLE_CORES"] = str(dist.get_rank())
+    os.environ["NEURON_RT_VISIBLE_CORES"] = str(dist.get_rank() + args.core_offset)
 
     # All ranks load model together (kernels may have collectives)
     model, tokenizer, weights, config, _ = load_model(ModelClass, args)
@@ -382,6 +435,10 @@ if __name__ == "__main__":
     state.weights = weights
     state.config = config
     dist.barrier()
+
+    # Initialize weight server for P2P transfer (only rank 0 serves HTTP)
+    if dist.get_rank() == 0:
+        state.weight_server = WeightServer(model)
 
     if dist.get_rank() == 0:
         uvicorn.run(app, host=args.host, port=args.port, log_level="info")
