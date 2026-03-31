@@ -66,6 +66,16 @@ class SpikeTensor:
         get_spike_singleton().tensor_read_to_pybuffer(self.tensor_ref, array)
         return array
 
+    def write_from_numpy(self, array: np.ndarray):
+        """Write new data from a numpy array into this existing device tensor (no reallocation)."""
+        array = np.ascontiguousarray(array)
+        expected = int(np.prod(self.shape)) * np.dtype(self.dtype).itemsize
+        if array.nbytes != expected:
+            raise ValueError(
+                f"Size mismatch: source {array.nbytes} bytes, target {expected} bytes"
+            )
+        get_spike_singleton().tensor_write_from_pybuffer(self.tensor_ref, array)
+
     def __repr__(self) -> str:
         return (
             f"{self.__class__.__name__}"

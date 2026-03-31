@@ -87,3 +87,17 @@ class DeviceTensor(SpikeTensor):
         get_spike_singleton().tensor_read_to_pybuffer(self.tensor_ref, buffer)
 
         return torch.frombuffer(buffer, dtype=torch_dtype).reshape(self.shape)
+
+    def write_from_torch(self, tensor):
+        """Write new data from a torch tensor into this existing device tensor (no reallocation)."""
+        if not _TORCH_ENABLED:
+            raise ImportError("torch is not available")
+        tensor = tensor.cpu().contiguous()
+        expected = int(np.prod(self.shape)) * np.dtype(self.dtype).itemsize
+        if tensor.nbytes != expected:
+            raise ValueError(
+                f"Size mismatch: source {tensor.nbytes} bytes, target {expected} bytes"
+            )
+        c_array = (ctypes.c_ubyte * tensor.nbytes).from_address(tensor.data_ptr())
+        memory_view = memoryview(c_array).cast("B")
+        get_spike_singleton().tensor_write_from_pybuffer(self.tensor_ref, memory_view)

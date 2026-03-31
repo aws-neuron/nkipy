@@ -279,15 +279,19 @@ class Qwen3Model:
         )
         yield next_id_torch
 
+        # Pre-allocate reusable device tensors for the decode loop
+        t_start_pos = DeviceTensor.from_numpy(
+            np.array([context_len], dtype=np.int32), "start_pos"
+        )
+        hidden_states = DeviceTensor.from_torch(
+            self.tok_embedding[next_id_torch], "h0/res1"
+        )
+
         # Generation phase (token by token)
         for pos in range(context_len, context_len + self.config.max_new_tokens):
-            # Update the start position for this iteration
-            t_start_pos = DeviceTensor.from_numpy(np.array([pos], dtype=np.int32))
-
-            hidden_states = DeviceTensor.from_torch(
-                self.tok_embedding[next_id_torch], "h0/res1"
-            )
-            t_res1 = hidden_states  # Output becomes next layer's input
+            # Write new data into pre-allocated tensors (no reallocation)
+            t_start_pos.write_from_numpy(np.array([pos], dtype=np.int32))
+            hidden_states.write_from_torch(self.tok_embedding[next_id_torch])
 
             for i in range(0, self.config.num_layers):
                 self.kernel_tkg(
@@ -310,7 +314,7 @@ class Qwen3Model:
                         "down_weight": self.layer_tensors[i]["down_weight"],
                     },
                     outputs={
-                        "output0": t_res1,
+                        "output0": hidden_states,
                         "cache_k": self.layer_tensors[i]["cache_k"],
                         "cache_v": self.layer_tensors[i]["cache_v"],
                     },
@@ -318,7 +322,7 @@ class Qwen3Model:
 
             self.kernel_tkg_greedy_sampling(
                 inputs={
-                    "h": t_res1,
+                    "h": hidden_states,
                     "norm_weight": self.norm_weight,
                     "lm_head_weight": self.lm_head_weight,
                 },
