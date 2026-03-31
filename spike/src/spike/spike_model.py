@@ -195,8 +195,49 @@ class SpikeModel:
                 f"got {actual_dtype}"
             )
 
+    _ALIAS_SUFFIX = ".must_alias_input"
+
+    def _resolve_alias_inputs(self, inputs):
+        """Auto-remap aliased input names so callers can use original param names.
+
+        NKIPy's tracer renames mutated (aliased) parameters from ``"X"`` to
+        ``"X.must_alias_input"`` in the compiled NEFF.  This method lets
+        callers pass the natural name ``"X"`` and transparently appends the
+        suffix when the NEFF expects it.  Inputs that already carry the
+        suffix or are not aliased are passed through unchanged.
+        """
+        resolved = {}
+        for k, v in inputs.items():
+            if k not in self.input_tensors_info:
+                alias_key = k + self._ALIAS_SUFFIX
+                if alias_key in self.input_tensors_info:
+                    resolved[alias_key] = v
+                    continue
+            resolved[k] = v
+        return resolved
+
     def _validate_io(self, inputs, outputs):
+        """Validate that caller-supplied I/O dicts match the compiled NEFF.
+
+        Checks tensor names, shapes, dtypes, and core placement.  Raises
+        ``ValueError`` with the expected NEFF names on any name mismatch,
+        so callers get actionable diagnostics instead of a bare ``KeyError``.
+        """
         model_core_id = self.model_ref.core_id
+
+        unknown_inputs = set(inputs) - set(self.input_tensors_info)
+        if unknown_inputs:
+            raise ValueError(
+                f"Unknown input(s) {unknown_inputs} for model '{self.name}'. "
+                f"Expected inputs: {list(self.input_tensors_info.keys())}"
+            )
+        unknown_outputs = set(outputs) - set(self.output_tensors_info)
+        if unknown_outputs:
+            raise ValueError(
+                f"Unknown output(s) {unknown_outputs} for model '{self.name}'. "
+                f"Expected outputs: {list(self.output_tensors_info.keys())}"
+            )
+
         for k, v in inputs.items():
             tensor_core_id = v.tensor_ref.core_id
             assert tensor_core_id == model_core_id, (
@@ -245,6 +286,11 @@ class SpikeModel:
             output_tensors = self.allocate_output_tensors()
             outputs = {tensor.name: tensor for tensor in output_tensors}
             auto_allocated = True
+
+        # Auto-resolve alias input naming: if caller passes "X" but the NEFF
+        # expects "X.must_alias_input", remap transparently so callers don't
+        # need to know about the alias suffix convention.
+        inputs = self._resolve_alias_inputs(inputs)
 
         self._validate_io(inputs, outputs)
 

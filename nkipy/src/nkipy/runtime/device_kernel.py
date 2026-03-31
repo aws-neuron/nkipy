@@ -124,8 +124,10 @@ class DeviceKernel(SpikeModel):
         # In MPMD mode, namespace build dir by rank to avoid concurrent writes
         # when different ranks produce the same content hash.
         if not is_spmd:
-            effective_rank = rank_id if rank_id is not None else (
-                dist.get_rank() if distributed else None
+            effective_rank = (
+                rank_id
+                if rank_id is not None
+                else (dist.get_rank() if distributed else None)
             )
             if effective_rank is not None:
                 compile_build_dir = os.path.join(
@@ -174,11 +176,13 @@ class DeviceKernel(SpikeModel):
         # --- 2. Resolve CC parameters for loading ---
         resolved_cc = cc_enabled if cc_enabled is not None else distributed
         resolved_rank = (
-            rank_id if rank_id is not None
+            rank_id
+            if rank_id is not None
             else (dist.get_rank() if distributed else None)
         )
         resolved_world = (
-            world_size if world_size is not None
+            world_size
+            if world_size is not None
             else (dist.get_world_size() if distributed else None)
         )
 
