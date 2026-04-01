@@ -27,9 +27,9 @@ class BaseModel:
 
     LAYER_WEIGHT_KEYS = []  # Override in subclass
 
-    def __init__(self, model_weights, config: Config, skip_kernels=False):
+    def __init__(self, model_weights=None, config: Config = None, skip_kernels=False):
         self.config = config
-        self.tok_embedding = model_weights.get("tok_embedding")
+        self.tok_embedding = model_weights.get("tok_embedding") if model_weights else None
 
         self.kernel_cte = None
         self.kernel_cte_greedy_sampling = None
@@ -38,25 +38,28 @@ class BaseModel:
 
         self.norm_weight = None
         self.lm_head_weight = None
+        self.layer_tensors = []
 
-        self._prepare_tensors(model_weights)
-        if not skip_kernels:
+        if model_weights:
+            self._prepare_tensors(model_weights)
+        if not skip_kernels and model_weights:
             self._prepare_kernels()
 
+    # --- Tensor allocation ---
+
+    def _init_kv_caches(self):
+        """Return zeroed KV cache numpy arrays based on config."""
+        cfg = self.config
+        n_local_kv_heads = max(1, cfg.num_kv_heads // dist.get_world_size())
+        shape = (cfg.max_batch_size, cfg.max_seq_len, n_local_kv_heads, cfg.head_dim)
+        return np.zeros(shape, dtype=cfg.dtype), np.zeros(shape, dtype=cfg.dtype)
+
     def _prepare_tensors(self, weights):
+        """Load weight tensors from a CPU weights dict onto device."""
         t = time.time()
         print_log("Preparing Tensors")
 
-        n_local_kv_heads = max(1, self.config.num_kv_heads // dist.get_world_size())
-
-        cache_shape = (
-            self.config.max_batch_size,
-            self.config.max_seq_len,
-            n_local_kv_heads,
-            self.config.head_dim,
-        )
-        cache_k = np.zeros(cache_shape, dtype=self.config.dtype)
-        cache_v = np.zeros(cache_shape, dtype=self.config.dtype)
+        cache_k, cache_v = self._init_kv_caches()
 
         self.layer_tensors = []
         for layer_id in range(self.config.num_layers):
@@ -73,13 +76,77 @@ class BaseModel:
 
         print_log(f"--> Finished Preparing Tensors in {time.time() - t:.2f}s")
 
+    def _weight_shapes(self):
+        """Return dict of {weight_key: shape} for per-layer weights.
+
+        Shapes are inferred from config and TP degree. Override in subclass
+        if the architecture has non-standard weight layouts.
+        """
+        cfg = self.config
+        tp = dist.get_world_size()
+        n_local_kv_heads = max(1, cfg.num_kv_heads // tp)
+        q_dim = (cfg.num_heads // tp) * cfg.head_dim
+        kv_dim = n_local_kv_heads * cfg.head_dim
+
+        shapes = {
+            "qkv_weight": (cfg.hidden_size, q_dim + 2 * kv_dim),
+            "o_weight": (q_dim, cfg.hidden_size),
+            "input_weight": (cfg.hidden_size,),
+            "post_attention_weight": (cfg.hidden_size,),
+            "q_norm_weight": (cfg.head_dim,),
+            "k_norm_weight": (cfg.head_dim,),
+        }
+
+        if cfg.num_experts is not None:
+            shapes["gate_up_weight"] = (cfg.num_experts, cfg.hidden_size, 2 * cfg.intermediate_size)
+            shapes["down_weight"] = (cfg.num_experts, cfg.intermediate_size, cfg.hidden_size)
+            shapes["router_weight"] = (cfg.hidden_size, cfg.num_experts)
+        else:
+            shapes["gate_up_weight"] = (cfg.hidden_size, 2 * cfg.intermediate_size)
+            shapes["down_weight"] = (cfg.intermediate_size, cfg.hidden_size)
+
+        return shapes
+
+    def _allocate_empty_tensors(self):
+        """Allocate zero-filled device tensors for P2P weight transfer.
+
+        Tensor shapes are inferred from config and TP degree.
+        """
+        t = time.time()
+        print_log("Allocating empty tensors for P2P transfer")
+
+        cfg = self.config
+        cache_k, cache_v = self._init_kv_caches()
+        shapes = self._weight_shapes()
+
+        self.layer_tensors = []
+        for layer_id in range(cfg.num_layers):
+            layer = {}
+            for weight_key, prefix in self.LAYER_WEIGHT_KEYS:
+                buf = np.zeros(shapes[weight_key], dtype=cfg.dtype)
+                layer[weight_key] = DeviceTensor.from_numpy(buf, f"{prefix}_L{layer_id}")
+            layer["cache_k"] = DeviceTensor.from_numpy(cache_k, f"cache_k_L{layer_id}")
+            layer["cache_v"] = DeviceTensor.from_numpy(cache_v, f"cache_v_L{layer_id}")
+            self.layer_tensors.append(layer)
+
+        tp = dist.get_world_size()
+        self.norm_weight = DeviceTensor.from_numpy(
+            np.zeros((cfg.hidden_size,), dtype=cfg.dtype), "norm_weight"
+        )
+        self.lm_head_weight = DeviceTensor.from_numpy(
+            np.zeros((cfg.hidden_size, cfg.vocab_size // tp), dtype=cfg.dtype), "lm_head_weight"
+        )
+
+        print_log(f"--> Finished Allocating Empty Tensors in {time.time() - t:.2f}s")
+
+    # --- Kernel compilation ---
+
     def _kernel_layer_args(self):
         """Return dict of layer-0 tensor args for kernel compilation. Override in subclass."""
         raise NotImplementedError
 
     def _kernel_input_keys(self):
         """Return list of (kernel_input_name, layer_tensor_key) pairs for generate().
-        Keys ending with '.must_alias_input' are cache aliases.
         Override in subclass."""
         raise NotImplementedError
 
@@ -156,8 +223,9 @@ class BaseModel:
 
         print_log(f"--> Finished Kernel Compilation and Loading in {time.time() - t:.2f}s")
 
+    # --- Inference ---
+
     def _build_kernel_inputs(self, layer_idx, hidden_states, start_pos=None):
-        """Build the inputs dict for a kernel call on the given layer."""
         inputs = {"x": hidden_states}
         if start_pos is not None:
             inputs["start_pos"] = start_pos
@@ -166,7 +234,6 @@ class BaseModel:
         return inputs
 
     def _build_kernel_outputs(self, layer_idx, hidden_states):
-        """Build the outputs dict for a kernel call on the given layer."""
         return {
             "output0": hidden_states,
             "cache_k": self.layer_tensors[layer_idx]["cache_k"],
@@ -179,7 +246,6 @@ class BaseModel:
         hidden_states = DeviceTensor.from_torch(
             self.tok_embedding[input_ids], "hidden_states"
         )
-
         next_id = DeviceTensor.from_numpy(np.array([[0]], dtype=np.uint32), "next_id")
 
         # Context phase
@@ -190,25 +256,16 @@ class BaseModel:
             )
 
         self.kernel_cte_greedy_sampling(
-            inputs={
-                "h": hidden_states,
-                "norm_weight": self.norm_weight,
-                "lm_head_weight": self.lm_head_weight,
-            },
+            inputs={"h": hidden_states, "norm_weight": self.norm_weight, "lm_head_weight": self.lm_head_weight},
             outputs={"output0": next_id},
         )
-        next_id_torch = (
-            next_id.torch().reshape(self.config.max_batch_size, 1).to(dtype=torch.int)
-        )
+        next_id_torch = next_id.torch().reshape(self.config.max_batch_size, 1).to(dtype=torch.int)
         yield next_id_torch
 
         # Token generation phase
         for pos in range(context_len, context_len + self.config.max_new_tokens):
             t_start_pos = DeviceTensor.from_numpy(np.array([pos], dtype=np.int32))
-
-            hidden_states = DeviceTensor.from_torch(
-                self.tok_embedding[next_id_torch], "h0/res1"
-            )
+            hidden_states = DeviceTensor.from_torch(self.tok_embedding[next_id_torch], "h0/res1")
             t_res1 = hidden_states
 
             for i in range(self.config.num_layers):
@@ -218,32 +275,48 @@ class BaseModel:
                 )
 
             self.kernel_tkg_greedy_sampling(
-                inputs={
-                    "h": t_res1,
-                    "norm_weight": self.norm_weight,
-                    "lm_head_weight": self.lm_head_weight,
-                },
+                inputs={"h": t_res1, "norm_weight": self.norm_weight, "lm_head_weight": self.lm_head_weight},
                 outputs={"output0": next_id},
             )
-
-            next_id_torch = (
-                next_id.torch()
-                .reshape(self.config.max_batch_size, 1)
-                .to(dtype=torch.int)
-            )
-
+            next_id_torch = next_id.torch().reshape(self.config.max_batch_size, 1).to(dtype=torch.int)
             yield next_id_torch
+
+
+# --- Model loading ---
+
+def _make_warmup_ids(tokenizer, context_len, input_ids=None):
+    """Create padded input IDs for warmup."""
+    if input_ids is not None:
+        return input_ids
+    dummy = tokenizer("Hello", return_tensors="np")["input_ids"]
+    seq_len = dummy.shape[1]
+    if seq_len < context_len:
+        pad = np.full((dummy.shape[0], context_len - seq_len), tokenizer.pad_token_id or 0, dtype=dummy.dtype)
+        dummy = np.concatenate([pad, dummy], axis=1)
+    return dummy
+
+
+def _warmup(model, warmup_ids):
+    """Run two generation steps to warm up compiled kernels."""
+    t0 = time.time()
+    for i, _ in enumerate(model.generate(warmup_ids)):
+        if i == 1:
+            break
+    print_log(f"--> Warmup done in {time.time() - t0:.2f}s")
 
 
 def load_model(model_class, args):
     """Load weights, build model, and warmup.
 
     Expects dist to be already initialized. args must have:
-        .model, .checkpoint, .prompt (or .context_len), .max_new_tokens (or .max_tokens)
+        .model, .checkpoint (or None for P2P), .prompt (or .context_len),
+        .max_new_tokens (or .max_tokens)
+
+    When checkpoint is None, returns a pre-initialized model with empty device
+    tensors and compiled kernels (ready for P2P weight transfer on wake_up).
     """
     tokenizer = AutoTokenizer.from_pretrained(args.model)
 
-    # Support both standalone (prompt-based context_len) and server (explicit context_len)
     context_len = getattr(args, "context_len", None)
     max_new_tokens = getattr(args, "max_new_tokens", None) or getattr(args, "max_tokens", None)
     if context_len is None:
@@ -254,33 +327,25 @@ def load_model(model_class, args):
         input_ids = None
 
     config = get_config(args.model, context_len, max_new_tokens)
+    checkpoint = getattr(args, "checkpoint", None)
 
-    shard_path = os.path.join(args.checkpoint, f"shard_{dist.get_rank()}.safetensors")
-    print_log("Loading model weights")
-    t0 = time.time()
-    weights = load_file(shard_path, device="cpu")
-    print_log(f"--> load_file completed in {time.time() - t0:.2f}s")
+    if checkpoint is not None:
+        shard_path = os.path.join(checkpoint, f"shard_{dist.get_rank()}.safetensors")
+        print_log("Loading model weights")
+        t0 = time.time()
+        weights = load_file(shard_path, device="cpu")
+        print_log(f"--> load_file completed in {time.time() - t0:.2f}s")
 
-    model = model_class(weights, config)
+        model = model_class(weights, config)
 
-    # Warmup
-    print_log("Warming model")
-    if input_ids is None:
-        dummy = tokenizer("Hello", return_tensors="np")
-        warmup_ids = dummy["input_ids"]
-        # Pad to context_len
-        seq_len = warmup_ids.shape[1]
-        if seq_len < context_len:
-            pad = np.full((warmup_ids.shape[0], context_len - seq_len), tokenizer.pad_token_id or 0, dtype=warmup_ids.dtype)
-            warmup_ids = np.concatenate([pad, warmup_ids], axis=1)
+        print_log("Warming model")
+        _warmup(model, _make_warmup_ids(tokenizer, context_len, input_ids))
     else:
-        warmup_ids = input_ids
-
-    t0 = time.time()
-    for i, _ in enumerate(model.generate(warmup_ids)):
-        if i == 1:
-            break
-    print_log(f"--> Warmup done in {time.time() - t0:.2f}s")
+        print_log("No checkpoint, pre-initializing model for P2P transfer")
+        weights = None
+        model = model_class(config=config)
+        model._allocate_empty_tensors()
+        model._prepare_kernels()
 
     return model, tokenizer, weights, config, input_ids
 

@@ -3,8 +3,11 @@ FastAPI server for model inference, with vLLM-style API endpoints.
 Supports both Qwen3 and Llama3 architectures via --arch flag.
 
 Usage:
-    torchrun --nproc_per_node=8 server.py --arch qwen3 --model Qwen/Qwen3-30B-A3B --checkpoint /kaena/qwen3_shards_30B_A3B_TP8
-    torchrun --nproc_per_node=8 server.py --arch llama3 --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --checkpoint ./tmp_tinyllama_TP8
+    # With local checkpoint (Engine A):
+    torchrun --nproc_per_node=8 server.py --arch qwen3 --model Qwen/Qwen3-30B-A3B --checkpoint /path/to/shards
+
+    # Without checkpoint, P2P from peer (Engine B — starts sleeping, activate with /wake_up):
+    torchrun --nproc_per_node=8 server.py --arch qwen3 --model Qwen/Qwen3-30B-A3B
 
 Endpoints:
     POST /completions  - Generate text completions
@@ -12,8 +15,8 @@ Endpoints:
     POST /wake_up      - Reload model onto device
 
 Example curl:
-    curl -X POST http://localhost:8000/completions \
-      -H "Content-Type: application/json" \
+    curl -X POST http://localhost:8000/completions \\
+      -H "Content-Type: application/json" \\
       -d '{"prompt": "The capital of France is", "max_tokens": 32}'
 """
 
@@ -33,13 +36,18 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from p2p_weight_transfer import WeightClient, WeightServer
+from p2p_weight_transfer import (
+    WeightServer,
+    fetch_tok_embedding,
+    push_weights_to_peer,
+    receive_weights,
+)
 
 # Add models/ to sys.path so common.* imports work
 _models_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
 sys.path.insert(0, _models_dir)
 
-from common.model import load_model
+from common.model import load_model, _warmup
 from common.utils import print_log
 
 # These will be set after parsing --arch
@@ -50,6 +58,10 @@ EOS_TOKEN_IDS = set()
 CMD_GENERATE = 0
 CMD_SLEEP = 1
 CMD_WAKEUP = 2
+CMD_P2P_PUSH_WEIGHTS = 3
+
+# Kernel attribute names used for caching and lifecycle management
+_KERNEL_NAMES = ("kernel_cte", "kernel_tkg", "kernel_cte_greedy_sampling", "kernel_tkg_greedy_sampling")
 
 
 # --- Request / Response schemas (vLLM-compatible subset) ---
@@ -82,13 +94,16 @@ class CompletionResponse(BaseModel):
     usage: CompletionUsage
 
 
+class PushWeightsRequest(BaseModel):
+    per_rank: list[dict]  # [{remote_metadata: str, remote_descs: str}, ...] per rank
+
+
 # --- Global state ---
 
 def setup_arch(arch: str):
     """Set global ModelClass and EOS_TOKEN_IDS for the chosen architecture."""
     global ModelClass, EOS_TOKEN_IDS
 
-    # Add arch-specific dir to sys.path for kernel imports
     arch_dir = os.path.join(_models_dir, arch)
     sys.path.insert(0, arch_dir)
 
@@ -112,8 +127,8 @@ class ModelState:
         self.weights = None
         self.config = None
         self.sleeping = False
-        self.kernel_cache = None  # saved during sleep: {name: (neff_path, cache_key)}
-        self.weight_server = None  # WeightServer for P2P transfer (active engine)
+        self.kernel_cache = None  # {name: (neff_path, cache_key)} saved during sleep
+        self.weight_server = None  # WeightServer for /weight_info (rank 0 only)
         self._lock = asyncio.Lock()
 
     def is_ready(self):
@@ -176,88 +191,98 @@ def run_generate(padded_ids, max_tokens):
     return tokens
 
 
-def run_sleep():
+# --- Device resource lifecycle ---
+
+def _cache_kernels_and_release(model):
+    """Save kernel NEFF paths to state.kernel_cache, free all device resources, and release cores."""
     from spike import get_spike_singleton, reset as spike_reset
     from nkipy.runtime.device_kernel import _LOADED_KERNELS
 
-    t0 = time.time()
-
-    model = state.model
-    spike = get_spike_singleton()
-
-    # Save kernel (neff_path, cache_key) for fast reload on wake_up
     state.kernel_cache = {}
-    for name in ("kernel_cte", "kernel_tkg", "kernel_cte_greedy_sampling", "kernel_tkg_greedy_sampling"):
+    for name in _KERNEL_NAMES:
         kernel = getattr(model, name, None)
         if kernel is not None:
             state.kernel_cache[name] = (kernel.neff_path, kernel.cache_key)
 
+    spike = get_spike_singleton()
     for layer in model.layer_tensors:
         for t in layer.values():
             spike.free_tensor(t.tensor_ref)
     for t in (model.norm_weight, model.lm_head_weight):
         if t is not None:
             spike.free_tensor(t.tensor_ref)
-
-    for kernel in (model.kernel_cte, model.kernel_tkg,
-                   model.kernel_cte_greedy_sampling, model.kernel_tkg_greedy_sampling):
+    for name in _KERNEL_NAMES:
+        kernel = getattr(model, name, None)
         if kernel is not None:
             spike.unload_model(kernel.model_ref)
 
-    state.model = None
     _LOADED_KERNELS.clear()
     gc.collect()
-
-    # Release Neuron cores (calls nrt_close) so another engine can use them
     spike_reset()
+
+
+def run_sleep():
+    t0 = time.time()
+    _cache_kernels_and_release(state.model)
+    state.model = None
     dist.barrier()
     state.sleeping = True
     print_log(f"Sleep completed in {time.time() - t0:.2f}s")
 
 
-def run_wake_up():
+def run_wake_up(peer_url=None):
     from spike import get_spike_singleton
     from nkipy.runtime import DeviceKernel
-    print_log(f"Waking up the model ...")
+
+    # Broadcast peer_url from rank 0 to all workers
+    obj_list = [peer_url]
+    dist.broadcast_object_list(obj_list, src=0)
+    peer_url = obj_list[0]
+
+    print_log("Waking up the model ...")
     dist.barrier()
     t0 = time.time()
-    # Re-acquire Neuron cores (lazy nrt_init via get_spike_singleton)
+
     get_spike_singleton()
     dist.barrier()
     print_log(f"--> get_spike_singleton() in {time.time() - t0:.2f}s")
-    # Build model, skip kernel trace/compile — reload from cached NEFFs
-    model = ModelClass(state.weights, state.config, skip_kernels=True)
 
-    # P2P weight transfer from peer if available
-    peer_url = getattr(state.args, "p2p_peer_url", None)
-    if peer_url and dist.get_rank() == 0:
-        t_p2p = time.time()
-        client = WeightClient(peer_url)
-        client.fetch_weights(model)
-        dist.barrier()
-        print_log(f"--> P2P weight transfer completed in {time.time() - t_p2p:.2f}s")
+    # Rebuild model tensors on device
+    if state.weights is not None:
+        model = ModelClass(state.weights, state.config, skip_kernels=True)
     else:
-        dist.barrier()
+        model = ModelClass(config=state.config, skip_kernels=True)
+        model._allocate_empty_tensors()
 
+    # P2P weight transfer from peer (all ranks participate)
+    if peer_url:
+        receive_weights(model, peer_url)
+
+    # Reload kernels from cached NEFFs
     t_neff = time.time()
     for name, (neff_path, cache_key) in state.kernel_cache.items():
         setattr(model, name, DeviceKernel.load_with_cache_key(neff_path, cache_key, name=name))
     dist.barrier()
     print_log(f"--> Kernel reload from NEFF completed in {time.time() - t_neff:.2f}s")
 
+    # Fetch tok_embedding from peer if needed
+    if model.tok_embedding is None and peer_url:
+        model.tok_embedding = fetch_tok_embedding(peer_url)
+
     # Warmup
-    dummy_ids = pad_input_ids(
+    warmup_ids = pad_input_ids(
         state.tokenizer("Hello", return_tensors="np")["input_ids"],
         state.config.context_len,
         state.tokenizer.pad_token_id or 0,
     )
-    for i, _ in enumerate(model.generate(dummy_ids)):
-        if i == 1:
-            break
+    _warmup(model, warmup_ids)
+
     state.model = model
     state.sleeping = False
     print_log(f"Wake up completed in {time.time() - t0:.2f}s")
 
+
+# --- Request handling ---
 
 def generate_text(prompt: str, max_tokens: int):
     model_inputs = state.tokenizer(prompt, return_tensors="np")
@@ -293,9 +318,11 @@ def worker_loop():
             run_sleep()
         elif cmd == CMD_WAKEUP:
             run_wake_up()
+        elif cmd == CMD_P2P_PUSH_WEIGHTS:
+            push_weights_to_peer(state.model)
 
 
-# --- Lifespan ---
+# --- FastAPI app ---
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -306,8 +333,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-
-# --- Endpoints ---
 
 @app.post("/completions")
 async def completions(req: CompletionRequest):
@@ -339,7 +364,6 @@ async def sleep():
         def _sleep():
             broadcast_cmd(CMD_SLEEP)
             run_sleep()
-            # Free P2P weight server resources
             if state.weight_server is not None:
                 state.weight_server.cleanup()
                 state.weight_server = None
@@ -347,17 +371,22 @@ async def sleep():
         return {"status": "sleeping"}
 
 
+class WakeUpRequest(BaseModel):
+    peer_url: str | None = None  # URL of active peer engine for P2P weight transfer
+
+
 @app.post("/wake_up")
-async def wake_up():
+async def wake_up(req: WakeUpRequest = None):
     async with state._lock:
         if not state.sleeping:
             return {"status": "already_awake"}
 
+        peer_url = req.peer_url if req else None
+
         loop = asyncio.get_event_loop()
         def _wake_up():
             broadcast_cmd(CMD_WAKEUP)
-            run_wake_up()
-            # Re-initialize weight server for P2P after wake
+            run_wake_up(peer_url)
             if state.model is not None:
                 state.weight_server = WeightServer(state.model)
         await loop.run_in_executor(None, _wake_up)
@@ -373,22 +402,40 @@ async def weight_info():
     return state.weight_server.get_weight_info()
 
 
-class PushWeightsRequest(BaseModel):
-    remote_metadata: str
-    remote_descs: str
-
-
 @app.post("/p2p_push_weights")
 async def p2p_push_weights(req: PushWeightsRequest):
-    if state.weight_server is None:
-        raise HTTPException(status_code=503, detail="Weight server not initialized")
+    if state.model is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
 
     loop = asyncio.get_event_loop()
-    remote_descs_bytes = bytes.fromhex(req.remote_descs)
-    await loop.run_in_executor(
-        None, state.weight_server.push_weights, req.remote_metadata, remote_descs_bytes
-    )
+    def _push():
+        per_rank_info = [(r["remote_metadata"], r["remote_descs"]) for r in req.per_rank]
+        broadcast_cmd(CMD_P2P_PUSH_WEIGHTS)
+        push_weights_to_peer(state.model, per_rank_info)
+    await loop.run_in_executor(None, _push)
     return {"status": "done"}
+
+
+@app.get("/tok_embedding")
+async def tok_embedding():
+    """Serve the token embedding table as raw bytes."""
+    from fastapi.responses import Response
+    if state.model is None or state.model.tok_embedding is None:
+        raise HTTPException(status_code=503, detail="Token embedding not available")
+    emb = state.model.tok_embedding
+    if isinstance(emb, torch.Tensor):
+        t = emb.cpu().contiguous()
+        raw = t.view(torch.uint8).numpy().tobytes()
+        shape, dtype = t.shape, str(t.dtype)
+    else:
+        data = np.ascontiguousarray(emb)
+        raw = data.tobytes()
+        shape, dtype = data.shape, str(data.dtype)
+    return Response(
+        content=raw,
+        media_type="application/octet-stream",
+        headers={"X-Shape": ",".join(str(d) for d in shape), "X-Dtype": dtype},
+    )
 
 
 # --- Main ---
@@ -398,18 +445,16 @@ def parse_args():
     parser.add_argument("--arch", choices=["qwen3", "llama3"], required=True,
                         help="Model architecture to serve.")
     parser.add_argument("--model", required=True,
-                        help="HuggingFace model name, e.g. Qwen/Qwen3-30B-A3B or TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-    parser.add_argument("--checkpoint", required=True,
-                        help="Path to pre-sharded safetensors directory.")
+                        help="HuggingFace model name, e.g. Qwen/Qwen3-30B-A3B")
+    parser.add_argument("--checkpoint", default=None,
+                        help="Path to pre-sharded safetensors directory. "
+                             "If omitted, weights are loaded from peer via --p2p-peer-url.")
     parser.add_argument("--context-len", type=int, default=64,
-                        help="Fixed context length for kernel compilation. Prompts are padded to this.")
+                        help="Fixed context length for kernel compilation.")
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--neuron-port", type=int, default=61239)
-    parser.add_argument("--p2p-peer-url", default=None,
-                        help="URL of the active peer engine for P2P weight transfer on wake_up, "
-                             "e.g. http://localhost:8000")
     parser.add_argument("--core-offset", type=int, default=0,
                         help="Neuron core offset. Rank i uses core (core_offset + i).")
     return parser.parse_args()
@@ -417,6 +462,7 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
+
     setup_arch(args.arch)
     state.args = args
 
@@ -428,16 +474,23 @@ if __name__ == "__main__":
     torch.set_num_interop_threads(1)
     os.environ["NEURON_RT_VISIBLE_CORES"] = str(dist.get_rank() + args.core_offset)
 
-    # All ranks load model together (kernels may have collectives)
     model, tokenizer, weights, config, _ = load_model(ModelClass, args)
-    state.model = model
     state.tokenizer = tokenizer
     state.weights = weights
     state.config = config
+
+    if weights is not None:
+        state.model = model
+    else:
+        # Kernels compiled, cache NEFFs, release device for other standby engines
+        _cache_kernels_and_release(model)
+        state.model = None
+        state.sleeping = True
+        print_log("Kernels compiled and cached, device released, waiting for /wake_up")
+
     dist.barrier()
 
-    # Initialize weight server for P2P transfer (only rank 0 serves HTTP)
-    if dist.get_rank() == 0:
+    if dist.get_rank() == 0 and state.model is not None:
         state.weight_server = WeightServer(model)
 
     if dist.get_rank() == 0:

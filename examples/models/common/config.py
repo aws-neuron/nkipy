@@ -16,6 +16,7 @@ class Config:
     num_kv_heads: int
     num_layers: int
     intermediate_size: int
+    vocab_size: int = None
     context_len: int = None
     max_new_tokens: int = None
     max_batch_size: int = 1
@@ -48,6 +49,7 @@ def get_config(model_name, context_len, max_new_tokens):
         num_kv_heads=hf_config.num_key_value_heads,
         norm_eps=hf_config.rms_norm_eps,
         num_layers=hf_config.num_hidden_layers,
+        vocab_size=hf_config.vocab_size,
         context_len=context_len,
         max_new_tokens=max_new_tokens,
     )
