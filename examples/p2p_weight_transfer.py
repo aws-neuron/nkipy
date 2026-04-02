@@ -11,6 +11,9 @@ Protocol (multi-rank):
   3. Active engine broadcasts per-rank info to its workers; each rank RDMA-writes
      its weight shard directly into the corresponding waking rank's device HBM
   4. tok_embedding (CPU tensor) is fetched separately over HTTP
+
+Optimization: Each rank keeps a persistent UCCL Endpoint and pre-registered
+memory regions across sleep/wake cycles, avoiding repeated RDMA init/teardown.
 """
 
 import os
@@ -84,59 +87,90 @@ def _register_weight_handles(model):
     return handles
 
 
-# --- Single-rank classes ---
+# --- Persistent per-rank endpoint ---
 
-class WeightServer:
-    """Runs on the active engine. Registers device tensor VAs and pushes them on request."""
+class _RankEndpoint:
+    """Persistent UCCL endpoint for a single rank. Reused across transfers."""
 
-    def __init__(self, model, nc_idx=None):
-        self.nc_idx = nc_idx if nc_idx is not None else _get_nc_idx()
-        self.ep = p2p.Endpoint(self.nc_idx)
-        self.metadata = self.ep.get_metadata()
+    def __init__(self):
+        self.ep = None
+        self.xfer_descs = []
         self.weight_info = []  # [(name, size_bytes)]
-        self._xfer_descs = []
 
-        t0 = time.time()
+    def ensure_endpoint(self):
+        if self.ep is None:
+            self.ep = p2p.Endpoint(_get_nc_idx())
+        return self.ep
+
+    def register_model(self, model):
+        """Register model weight tensors if not already registered."""
+        if self.xfer_descs:
+            return
+        ep = self.ensure_endpoint()
+
         handles = []
+        self.weight_info = []
         for name, dt in _collect_weight_tensors(model):
             va = dt.tensor_ref.va
             size_bytes = int(np.prod(dt.shape) * np.dtype(dt.dtype).itemsize)
             self.weight_info.append((name, size_bytes))
             handles.append(_VAHandle(va, size_bytes))
-        self._xfer_descs = self.ep.register_memory(handles)
-        print_log(f"WeightServer: registered {len(self._xfer_descs)} tensors "
-                  f"in {time.time() - t0:.2f}s")
+        self.xfer_descs = ep.register_memory(handles)
+
+    def _dereg_descs(self):
+        if self.ep is not None and self.xfer_descs:
+            for desc in self.xfer_descs:
+                self.ep.dereg(desc.mr_id)
+            self.xfer_descs = []
+            self.weight_info = []
+
+    def cleanup(self):
+        self._dereg_descs()
+        self.ep = None
+
+
+# Per-rank singleton
+_rank_ep = _RankEndpoint()
+
+
+# --- Single-rank classes ---
+
+class WeightServer:
+    """Runs on the active engine (rank 0). Exposes weight info and pushes on request.
+
+    Uses the persistent _rank_ep so Endpoint and memory registration survive
+    across multiple push requests.
+    """
+
+    def __init__(self, model):
+        _rank_ep.register_model(model)
+        print_log(f"WeightServer: registered {len(_rank_ep.xfer_descs)} tensors")
 
     def get_weight_info(self):
         return {
-            "weights": [(n, s) for n, s in self.weight_info],
-            "metadata": self.metadata.hex(),
+            "weights": [(n, s) for n, s in _rank_ep.weight_info],
+            "metadata": _rank_ep.ep.get_metadata().hex(),
         }
 
     def push_weights(self, remote_metadata_hex, remote_descs_bytes):
         """Connect to remote endpoint and RDMA-write all weights device-to-device."""
+        ep = _rank_ep.ep
         remote_metadata = bytes.fromhex(remote_metadata_hex)
-        ok, conn_id = self.ep.add_remote_endpoint(remote_metadata)
+        ok, conn_id = ep.add_remote_endpoint(remote_metadata)
         assert ok, "Failed to connect to remote endpoint"
 
-        remote_descs = self.ep.deserialize_descs(remote_descs_bytes)
-        assert len(remote_descs) == len(self._xfer_descs), \
-            f"Descriptor count mismatch: {len(remote_descs)} vs {len(self._xfer_descs)}"
+        remote_descs = ep.deserialize_descs(remote_descs_bytes)
+        assert len(remote_descs) == len(_rank_ep.xfer_descs), \
+            f"Descriptor count mismatch: {len(remote_descs)} vs {len(_rank_ep.xfer_descs)}"
 
         t0 = time.time()
-        ok, _ = self.ep.transfer(conn_id, "write", self._xfer_descs, remote_descs)
+        ok, _ = ep.transfer(conn_id, "write", _rank_ep.xfer_descs, remote_descs)
         assert ok, "RDMA write failed"
-        print_log(f"WeightServer: pushed {len(self._xfer_descs)} tensors "
+        print_log(f"WeightServer: pushed {len(_rank_ep.xfer_descs)} tensors "
                   f"via device-to-device P2P in {time.time() - t0:.2f}s")
 
     def cleanup(self):
-        if self.ep is not None:
-            for desc in self._xfer_descs:
-                self.ep.dereg(desc.mr_id)
-            self._xfer_descs = []
-            self.weight_info.clear()
-            self.ep = None
-            self.metadata = None
+        _rank_ep._dereg_descs()
 
 
 # --- Multi-rank transfer (all ranks participate) ---
@@ -144,20 +178,18 @@ class WeightServer:
 def receive_weights(model, peer_url):
     """All ranks receive their weight shard from the peer engine via P2P RDMA.
 
-    Each rank registers its device tensor VAs as receive buffers. Per-rank UCCL
-    metadata is gathered to rank 0, which POSTs it to the peer engine. The peer
-    pushes weights to all ranks simultaneously.
+    Each rank registers its device tensor VAs as receive buffers using the
+    persistent endpoint. Per-rank UCCL metadata is gathered to rank 0, which
+    POSTs it to the peer engine. The peer pushes weights to all ranks
+    simultaneously.
     """
     t0 = time.time()
 
-    # Each rank sets up a UCCL endpoint and registers receive buffers
-    nc_idx = _get_nc_idx()
-    ep = p2p.Endpoint(nc_idx)
+    _rank_ep.register_model(model)
+    ep = _rank_ep.ep
     ep.start_passive_accept()
 
-    handles = _register_weight_handles(model)
-    recv_descs = ep.register_memory(handles)
-    serialized = ep.get_serialized_descs(recv_descs)
+    serialized = ep.get_serialized_descs(_rank_ep.xfer_descs)
 
     # Gather per-rank UCCL metadata to rank 0
     my_info = (ep.get_metadata().hex(), serialized.hex())
@@ -174,19 +206,14 @@ def receive_weights(model, peer_url):
         resp.raise_for_status()
 
     dist.barrier()
-
-    # Cleanup UCCL resources
-    for desc in recv_descs:
-        ep.dereg(desc.mr_id)
-
     print_log(f"--> P2P weight transfer completed in {time.time() - t0:.2f}s")
 
 
 def push_weights_to_peer(model, per_rank_info=None):
     """All ranks push their weight shard to the corresponding peer rank via P2P RDMA.
 
-    Called on the active engine. Rank 0 receives per_rank_info from the HTTP
-    endpoint and broadcasts to all ranks.
+    Called on the active engine. Uses the persistent endpoint — only connects
+    and transfers, no Endpoint/memory re-creation.
     """
     if dist.get_rank() == 0:
         obj_list = [per_rank_info]
@@ -195,9 +222,22 @@ def push_weights_to_peer(model, per_rank_info=None):
     dist.broadcast_object_list(obj_list, src=0)
     remote_metadata_hex, remote_descs_hex = obj_list[0][dist.get_rank()]
 
-    server = WeightServer(model)
-    server.push_weights(remote_metadata_hex, bytes.fromhex(remote_descs_hex))
-    server.cleanup()
+    # Ensure this rank has registered its model weights
+    _rank_ep.register_model(model)
+
+    ep = _rank_ep.ep
+    remote_metadata = bytes.fromhex(remote_metadata_hex)
+    ok, conn_id = ep.add_remote_endpoint(remote_metadata)
+    assert ok, "Failed to connect to remote endpoint"
+
+    remote_descs = ep.deserialize_descs(bytes.fromhex(remote_descs_hex))
+    assert len(remote_descs) == len(_rank_ep.xfer_descs)
+
+    t0 = time.time()
+    ok, _ = ep.transfer(conn_id, "write", _rank_ep.xfer_descs, remote_descs)
+    assert ok, "RDMA write failed"
+    print_log(f"Rank {dist.get_rank()}: pushed weights via P2P in {time.time() - t0:.2f}s")
+
     dist.barrier()
 
 
