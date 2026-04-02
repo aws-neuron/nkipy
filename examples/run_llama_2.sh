@@ -7,5 +7,5 @@ torchrun --nproc-per-node $TP --master-port 29600 \
     --arch llama3 \
     --port 8001 \
     --neuron-port 61339 \
-    --core-offset 0 \
+    --core-offset 16 \
     # --checkpoint $WEIGHTS \

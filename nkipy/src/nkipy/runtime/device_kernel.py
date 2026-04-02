@@ -209,6 +209,53 @@ class DeviceKernel(SpikeModel):
         return device_kernel
 
     @classmethod
+    def compile_only(
+        cls,
+        kernel,
+        *args,
+        name=None,
+        additional_compiler_args=None,
+        use_cached_if_exists=True,
+        build_dir=None,
+        target=CompilationTarget.DEFAULT,
+        **kwargs,
+    ):
+        """Trace and compile a kernel to NEFF without loading onto device.
+
+        Same as compile_and_load but skips the load_from_neff step, so no
+        neuron cores are required.  Returns (neff_path, cache_key).
+        """
+        if name is None:
+            name = kernel.__name__
+
+        distributed = _is_distributed()
+
+        if distributed:
+            if dist.get_rank() == 0:
+                neff_path, cache_key = cls._trace_and_compile(
+                    kernel, name, args, kwargs,
+                    additional_compiler_args=additional_compiler_args,
+                    use_cached_if_exists=use_cached_if_exists,
+                    build_dir=build_dir,
+                    target=target,
+                )
+                dist.broadcast_object_list([neff_path, cache_key], src=0)
+            else:
+                info = [None, None]
+                dist.broadcast_object_list(info, src=0)
+                neff_path, cache_key = info
+        else:
+            neff_path, cache_key = cls._trace_and_compile(
+                kernel, name, args, kwargs,
+                additional_compiler_args=additional_compiler_args,
+                use_cached_if_exists=use_cached_if_exists,
+                build_dir=build_dir,
+                target=target,
+            )
+
+        return neff_path, cache_key
+
+    @classmethod
     def _trace_and_compile(
         cls,
         kernel,

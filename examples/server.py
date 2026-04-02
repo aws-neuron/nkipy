@@ -482,11 +482,11 @@ if __name__ == "__main__":
     if weights is not None:
         state.model = model
     else:
-        # Kernels compiled, cache NEFFs, release device for other standby engines
-        _cache_kernels_and_release(model)
+        # Kernels compiled to NEFF without device — no neuron cores were needed
+        state.kernel_cache = model.kernel_cache
         state.model = None
         state.sleeping = True
-        print_log("Kernels compiled and cached, device released, waiting for /wake_up")
+        print_log("Kernels compiled and cached, waiting for /wake_up")
 
     dist.barrier()
 

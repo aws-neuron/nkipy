@@ -150,78 +150,83 @@ class BaseModel:
         Override in subclass."""
         raise NotImplementedError
 
+    def _kernel_specs(self, x_context, x_token, start_pos, layer_args, norm_weight, lm_head_weight):
+        """Return list of (attr_name, compile_name, kernel_fn, kwargs) for all kernels."""
+        cfg = self.config
+        return [
+            ("kernel_cte", "cte_layer", self.transformer_layer,
+             dict(x=x_context, start_pos=None, **layer_args, configs=cfg)),
+            ("kernel_tkg", "tkg_layer", self.transformer_layer,
+             dict(x=x_token, start_pos=start_pos, **layer_args, configs=cfg)),
+            ("kernel_cte_greedy_sampling", "cte_greedy_sampling", self.greedy_sampling,
+             dict(h=x_context, norm_weight=norm_weight, lm_head_weight=lm_head_weight,
+                  configs=cfg, use_nki_rmsnorm=USE_NKI_RMSNORM)),
+            ("kernel_tkg_greedy_sampling", "tkg_greedy_sampling", self.greedy_sampling,
+             dict(h=x_token, norm_weight=norm_weight, lm_head_weight=lm_head_weight,
+                  configs=cfg, use_nki_rmsnorm=USE_NKI_RMSNORM)),
+        ]
+
     def _prepare_kernels(self):
         t = time.time()
         print_log("Preparing kernels")
 
+        cfg = self.config
         x_context = DeviceTensor.from_numpy(
-            np.empty(
-                shape=(self.config.max_batch_size, self.config.context_len, self.config.hidden_size),
-                dtype=self.config.dtype,
-            ),
-            "x_context",
-        )
+            np.empty((cfg.max_batch_size, cfg.context_len, cfg.hidden_size), dtype=cfg.dtype), "x_context")
         x_token = DeviceTensor.from_numpy(
-            np.empty(
-                shape=(self.config.max_batch_size, 1, self.config.hidden_size),
-                dtype=self.config.dtype,
-            ),
-            "x_token",
-        )
-        start_pos = DeviceTensor.from_numpy(
-            np.empty(shape=(1), dtype=np.int32), "start_pos"
-        )
+            np.empty((cfg.max_batch_size, 1, cfg.hidden_size), dtype=cfg.dtype), "x_token")
+        start_pos = DeviceTensor.from_numpy(np.empty((1,), dtype=np.int32), "start_pos")
 
-        layer_args = self._kernel_layer_args()
-        compiler_args = self.config.additional_compiler_args_nkipy
-
-        self.kernel_cte = DeviceKernel.compile_and_load(
-            self.transformer_layer,
-            name="cte_layer",
-            x=x_context,
-            start_pos=None,
-            **layer_args,
-            configs=self.config,
-            build_dir=BUILD_DIR,
-            additional_compiler_args=compiler_args,
-        )
-
-        self.kernel_tkg = DeviceKernel.compile_and_load(
-            self.transformer_layer,
-            name="tkg_layer",
-            x=x_token,
-            start_pos=start_pos,
-            **layer_args,
-            configs=self.config,
-            build_dir=BUILD_DIR,
-            additional_compiler_args=compiler_args,
-        )
-
-        self.kernel_cte_greedy_sampling = DeviceKernel.compile_and_load(
-            self.greedy_sampling,
-            name="cte_greedy_sampling",
-            h=x_context,
-            norm_weight=self.norm_weight,
-            lm_head_weight=self.lm_head_weight,
-            configs=self.config,
-            use_nki_rmsnorm=USE_NKI_RMSNORM,
-            build_dir=BUILD_DIR,
-            additional_compiler_args=compiler_args,
-        )
-
-        self.kernel_tkg_greedy_sampling = DeviceKernel.compile_and_load(
-            self.greedy_sampling,
-            name="tkg_greedy_sampling",
-            h=x_token,
-            norm_weight=self.norm_weight,
-            lm_head_weight=self.lm_head_weight,
-            configs=self.config,
-            use_nki_rmsnorm=USE_NKI_RMSNORM,
-            build_dir=BUILD_DIR,
-            additional_compiler_args=compiler_args,
-        )
+        compiler_args = cfg.additional_compiler_args_nkipy
+        for attr, name, kernel_fn, kwargs in self._kernel_specs(
+            x_context, x_token, start_pos, self._kernel_layer_args(),
+            self.norm_weight, self.lm_head_weight,
+        ):
+            setattr(self, attr, DeviceKernel.compile_and_load(
+                kernel_fn, name=name, build_dir=BUILD_DIR,
+                additional_compiler_args=compiler_args, **kwargs,
+            ))
 
         print_log(f"--> Finished Kernel Compilation and Loading in {time.time() - t:.2f}s")
+
+    def _compile_kernels(self):
+        """Compile kernels to NEFF without loading onto device (no neuron cores needed).
+
+        Returns a kernel_cache dict: {name: (neff_path, cache_key)} compatible
+        with the format used by server.py sleep/wake_up.
+        """
+        t = time.time()
+        print_log("Compiling kernels (compile-only, no device)")
+
+        cfg = self.config
+        tp = dist.get_world_size()
+
+        x_context = np.empty((cfg.max_batch_size, cfg.context_len, cfg.hidden_size), dtype=cfg.dtype)
+        x_token = np.empty((cfg.max_batch_size, 1, cfg.hidden_size), dtype=cfg.dtype)
+        start_pos = np.empty((1,), dtype=np.int32)
+
+        shapes = self._weight_shapes()
+        cache_k, cache_v = self._init_kv_caches()
+        layer_args = {k: np.empty(shapes[k], dtype=cfg.dtype) for k, _ in self.LAYER_WEIGHT_KEYS}
+        layer_args["cache_k"] = cache_k
+        layer_args["cache_v"] = cache_v
+
+        norm_weight = np.empty((cfg.hidden_size,), dtype=cfg.dtype)
+        lm_head_weight = np.empty((cfg.hidden_size, cfg.vocab_size // tp), dtype=cfg.dtype)
+
+        compiler_args = cfg.additional_compiler_args_nkipy
+        kernel_cache = {}
+        for attr, name, kernel_fn, kwargs in self._kernel_specs(
+            x_context, x_token, start_pos, layer_args, norm_weight, lm_head_weight,
+        ):
+            neff_path, cache_key = DeviceKernel.compile_only(
+                kernel_fn, name=name, build_dir=BUILD_DIR,
+                additional_compiler_args=compiler_args, **kwargs,
+            )
+            kernel_cache[attr] = (neff_path, cache_key)
+
+        print_log(f"--> Finished Kernel Compilation (no device) in {time.time() - t:.2f}s")
+        return kernel_cache
 
     # --- Inference ---
 
@@ -341,11 +346,10 @@ def load_model(model_class, args):
         print_log("Warming model")
         _warmup(model, _make_warmup_ids(tokenizer, context_len, input_ids))
     else:
-        print_log("No checkpoint, pre-initializing model for P2P transfer")
+        print_log("No checkpoint, compiling kernels for P2P transfer (no device needed)")
         weights = None
-        model = model_class(config=config)
-        model._allocate_empty_tensors()
-        model._prepare_kernels()
+        model = model_class(config=config, skip_kernels=True)
+        model.kernel_cache = model._compile_kernels()
 
     return model, tokenizer, weights, config, input_ids
 
