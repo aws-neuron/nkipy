@@ -36,7 +36,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from p2p_weight_transfer import (
+from nkipy.p2p import (
     WeightServer,
     fetch_tok_embedding,
     push_weights_to_peer,
@@ -223,12 +223,12 @@ def _cache_kernels_and_release(model):
 
 def run_sleep():
     t0 = time.time()
-    from p2p_weight_transfer import _rank_ep
+    from nkipy.p2p import rank_endpoint as _rank_ep
     # Kick off RDMA teardown in background so it doesn't block sleep.
     # The endpoint and memory registrations are no longer needed once we
-    # release device resources below.  The next wake_up's register_model()
-    # calls _wait_dereg() before creating a new endpoint.
-    _rank_ep.dereg_descs_async()
+    # release device resources below.  The next wake_up's register()
+    # calls wait() before creating a new endpoint.
+    _rank_ep.dereg_async()
     _cache_kernels_and_release(state.model)
     state.model = None
     dist.barrier()

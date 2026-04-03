@@ -76,6 +76,26 @@ class BaseModel:
 
         print_log(f"--> Finished Preparing Tensors in {time.time() - t:.2f}s")
 
+    def weight_buffers(self):
+        """Yield ``(name, va, size_bytes)`` for each weight tensor on device.
+
+        Used by :mod:`nkipy.p2p` for RDMA registration.  KV caches are
+        excluded because they are not transferred between engines.
+        """
+        for layer_idx, layer in enumerate(self.layer_tensors):
+            for key, dt in layer.items():
+                if key in ("cache_k", "cache_v"):
+                    continue
+                va = dt.tensor_ref.va
+                size = int(np.prod(dt.shape) * np.dtype(dt.dtype).itemsize)
+                yield f"layers.{layer_idx}.{key}", va, size
+        for attr in ("norm_weight", "lm_head_weight"):
+            dt = getattr(self, attr, None)
+            if dt is not None:
+                va = dt.tensor_ref.va
+                size = int(np.prod(dt.shape) * np.dtype(dt.dtype).itemsize)
+                yield attr, va, size
+
     def _weight_shapes(self):
         """Return dict of {weight_key: shape} for per-layer weights.
 
