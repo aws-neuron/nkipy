@@ -123,10 +123,12 @@ class _RankEndpoint:
                 self.ep.dereg(desc.mr_id)
             self.xfer_descs = []
             self.weight_info = []
+        # Destroy the endpoint so stale RDMA connections don't persist
+        # across sleep/wake cycles (causes remote access errors on re-push).
+        self.ep = None
 
     def cleanup(self):
         self._dereg_descs()
-        self.ep = None
 
 
 # Per-rank singleton
@@ -237,6 +239,10 @@ def push_weights_to_peer(model, per_rank_info=None):
     ok, _ = ep.transfer(conn_id, "write", _rank_ep.xfer_descs, remote_descs)
     assert ok, "RDMA write failed"
     print_log(f"Rank {dist.get_rank()}: pushed weights via P2P in {time.time() - t0:.2f}s")
+
+    # Reset endpoint so stale RDMA connections don't cause remote access
+    # errors when the receiver sleeps and wakes with a new endpoint.
+    _rank_ep._dereg_descs()
 
     dist.barrier()
 

@@ -223,6 +223,8 @@ def _cache_kernels_and_release(model):
 
 def run_sleep():
     t0 = time.time()
+    from p2p_weight_transfer import _rank_ep
+    _rank_ep._dereg_descs()
     _cache_kernels_and_release(state.model)
     state.model = None
     dist.barrier()
