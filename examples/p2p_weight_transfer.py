@@ -18,6 +18,7 @@ memory regions across sleep/wake cycles, avoiding repeated RDMA init/teardown.
 
 import os
 import sys
+import threading
 import time
 
 import numpy as np
@@ -96,6 +97,13 @@ class _RankEndpoint:
         self.ep = None
         self.xfer_descs = []
         self.weight_info = []  # [(name, size_bytes)]
+        self._dereg_thread = None
+
+    def _wait_dereg(self):
+        """Block until any pending async deregistration completes."""
+        if self._dereg_thread is not None:
+            self._dereg_thread.join()
+            self._dereg_thread = None
 
     def ensure_endpoint(self):
         if self.ep is None:
@@ -104,6 +112,7 @@ class _RankEndpoint:
 
     def register_model(self, model):
         """Register model weight tensors if not already registered."""
+        self._wait_dereg()
         if self.xfer_descs:
             return
         ep = self.ensure_endpoint()
@@ -127,7 +136,24 @@ class _RankEndpoint:
         # across sleep/wake cycles (causes remote access errors on re-push).
         self.ep = None
 
+    def dereg_descs_async(self):
+        """Kick off RDMA deregistration and endpoint teardown in a background thread."""
+        self._wait_dereg()
+        ep, descs = self.ep, self.xfer_descs
+        self.ep = None
+        self.xfer_descs = []
+        self.weight_info = []
+        if ep is not None:
+            def _bg(ep, descs):
+                for desc in descs:
+                    ep.dereg(desc.mr_id)
+            self._dereg_thread = threading.Thread(
+                target=_bg, args=(ep, descs), daemon=True
+            )
+            self._dereg_thread.start()
+
     def cleanup(self):
+        self._wait_dereg()
         self._dereg_descs()
 
 
@@ -172,7 +198,7 @@ class WeightServer:
                   f"via device-to-device P2P in {time.time() - t0:.2f}s")
 
     def cleanup(self):
-        _rank_ep._dereg_descs()
+        _rank_ep._wait_dereg()
 
 
 # --- Multi-rank transfer (all ranks participate) ---

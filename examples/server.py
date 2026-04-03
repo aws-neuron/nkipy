@@ -224,7 +224,11 @@ def _cache_kernels_and_release(model):
 def run_sleep():
     t0 = time.time()
     from p2p_weight_transfer import _rank_ep
-    _rank_ep._dereg_descs()
+    # Kick off RDMA teardown in background so it doesn't block sleep.
+    # The endpoint and memory registrations are no longer needed once we
+    # release device resources below.  The next wake_up's register_model()
+    # calls _wait_dereg() before creating a new endpoint.
+    _rank_ep.dereg_descs_async()
     _cache_kernels_and_release(state.model)
     state.model = None
     dist.barrier()
