@@ -1,5 +1,5 @@
-WEIGHTS=models/qwen3/tmp_Qwen3-30b-a3b
-TP=32
+WEIGHTS=../models/qwen3/tmp_Qwen3-30b-a3b
+TP=8
 
 torchrun --nproc-per-node $TP --master-port 29501 \
     server.py \
@@ -7,4 +7,7 @@ torchrun --nproc-per-node $TP --master-port 29501 \
     --model Qwen/Qwen3-30B-A3B \
     --arch qwen3 \
     --port 8000 \
-    --neuron-port 62239
+    --neuron-port 62239 \
+    --core-offset 0 \
+    --context-len 64 \
+    --max-tokens 256

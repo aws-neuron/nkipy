@@ -1,4 +1,4 @@
-WEIGHTS=models/llama3/tmp_tinyllama_TP8
+WEIGHTS=../models/llama3/tmp_tinyllama_TP8
 TP=8
 
 torchrun --nproc-per-node $TP --master-port 29600 \

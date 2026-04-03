@@ -44,7 +44,7 @@ from nkipy.p2p import (
 )
 
 # Add models/ to sys.path so common.* imports work
-_models_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+_models_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "models")
 sys.path.insert(0, _models_dir)
 
 from common.model import load_model, _warmup
