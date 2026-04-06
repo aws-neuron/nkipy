@@ -125,10 +125,8 @@ def receive_from_peer(
         dist.barrier()
         elapsed = time.time() - t0
         throughput_gbps = (total_bytes * 8) / elapsed / 1e9 if elapsed > 0 else 0
-        logger.info(
-            "Rank %d: P2P receive (pre-registered) — %d bufs, %.2f MB, %.2fs, %.2f Gbps",
-            dist.get_rank(), len(buffers), total_bytes / 1e6, elapsed, throughput_gbps,
-        )
+        if not dist.is_initialized() or dist.get_rank() == 0: logger.info("Rank %d: P2P receive (pre-registered) — %d bufs, %.2f MB, %.2fs, %.2f Gbps",
+        dist.get_rank(), len(buffers), total_bytes / 1e6, elapsed, throughput_gbps,)
         return
 
     # Fallback: chunked registration path.
@@ -172,21 +170,17 @@ def receive_from_peer(
         t_done = time.time()
 
         chunk_bytes = sum(sz for _, _, sz in buffers[cs:ce])
-        logger.info(
-            "Rank %d: recv chunk %d/%d [%d:%d] %d bufs %.2f MB — "
-            "reg %.3fs gather %.3fs post+xfer %.3fs barrier %.3fs total %.3fs",
-            dist.get_rank(), ci + 1, len(chunks), cs, ce, ce - cs,
-            chunk_bytes / 1e6,
-            t_reg - t_chunk, t_gather - t_reg, t_post - t_gather,
-            t_done - t_post, t_done - t_chunk,
-        )
+        if not dist.is_initialized() or dist.get_rank() == 0: logger.info("Rank %d: recv chunk %d/%d [%d:%d] %d bufs %.2f MB — "
+        "reg %.3fs gather %.3fs post+xfer %.3fs barrier %.3fs total %.3fs",
+        dist.get_rank(), ci + 1, len(chunks), cs, ce, ce - cs,
+        chunk_bytes / 1e6,
+        t_reg - t_chunk, t_gather - t_reg, t_post - t_gather,
+        t_done - t_post, t_done - t_chunk,)
 
     elapsed = time.time() - t0
     throughput_gbps = (total_bytes * 8) / elapsed / 1e9 if elapsed > 0 else 0
-    logger.info(
-        "Rank %d: P2P receive complete — %d bufs, %.2f MB, %.2fs, %.2f Gbps",
-        dist.get_rank(), len(buffers), total_bytes / 1e6, elapsed, throughput_gbps,
-    )
+    if not dist.is_initialized() or dist.get_rank() == 0: logger.info("Rank %d: P2P receive complete — %d bufs, %.2f MB, %.2fs, %.2f Gbps",
+    dist.get_rank(), len(buffers), total_bytes / 1e6, elapsed, throughput_gbps,)
 
 
 def push_to_peer(
@@ -248,13 +242,11 @@ def push_to_peer(
         ep.dereg_async()
     t_dereg = time.time()
 
-    logger.info(
-        "Rank %d: pushed %d bufs %.2f MB — "
-        "reg %.3fs connect %.3fs xfer %.3fs (%.2f Gbps) dereg %.3fs total %.3fs",
-        dist.get_rank(), len(buffers), chunk_bytes / 1e6,
-        t_reg - t0, t_conn - t_reg, xfer_secs, xfer_gbps,
-        t_dereg - t_xfer, t_dereg - t0,
-    )
+    if not dist.is_initialized() or dist.get_rank() == 0: logger.info("Rank %d: pushed %d bufs %.2f MB — "
+    "reg %.3fs connect %.3fs xfer %.3fs (%.2f Gbps) dereg %.3fs total %.3fs",
+    dist.get_rank(), len(buffers), chunk_bytes / 1e6,
+    t_reg - t0, t_conn - t_reg, xfer_secs, xfer_gbps,
+    t_dereg - t_xfer, t_dereg - t0,)
 
     dist.barrier()
 
@@ -275,7 +267,7 @@ class WeightServer:
         # buffers would make rank 0 a straggler during push (it would
         # have to deregister everything first).
         rank_endpoint._ensure_endpoint()
-        logger.info("WeightServer: %d tensors tracked", len(self._buf_info))
+        if not dist.is_initialized() or dist.get_rank() == 0: logger.info("WeightServer: %d tensors tracked", len(self._buf_info))
 
     def get_weight_info(self):
         return {
