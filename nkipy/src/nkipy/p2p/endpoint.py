@@ -113,6 +113,27 @@ class RankEndpoint:
             handles.append(_VAHandle(va, size_bytes))
         self.xfer_descs = ep.register_memory(handles)
 
+    def reregister(self, buffers: Sequence[Tuple[str, int, int]]) -> None:
+        """Deregister current MRs and register *buffers*, keeping the endpoint.
+
+        Unlike :meth:`dereg_sync` followed by :meth:`register`, this does
+        **not** destroy the underlying UCCL endpoint, so existing RDMA
+        connections remain valid.
+        """
+        self._wait_dereg()
+        ep = self._ensure_endpoint()
+        # Deregister old MRs (if any) without destroying the endpoint.
+        for desc in self.xfer_descs:
+            ep.dereg(desc.mr_id)
+        self.xfer_descs = []
+        self.buf_info = []
+        # Register new buffers on the same endpoint.
+        handles = []
+        for name, va, size_bytes in buffers:
+            self.buf_info.append((name, size_bytes))
+            handles.append(_VAHandle(va, size_bytes))
+        self.xfer_descs = ep.register_memory(handles)
+
     def dereg_sync(self) -> None:
         """Deregister memory and destroy the endpoint (blocking)."""
         self._wait_dereg()

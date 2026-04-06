@@ -1,5 +1,5 @@
 TP=8
-
+export NKIPY_MAX_RDMA_BUFS=64
 torchrun --nproc-per-node $TP --master-port 29601 \
     server.py \
     --model Qwen/Qwen3-30B-A3B \

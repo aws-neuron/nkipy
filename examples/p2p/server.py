@@ -96,6 +96,9 @@ class CompletionResponse(BaseModel):
 
 class PushWeightsRequest(BaseModel):
     per_rank: list[dict]  # [{remote_metadata: str, remote_descs: str}, ...] per rank
+    chunk_start: int | None = None
+    chunk_end: int | None = None
+    is_last_chunk: bool = True
 
 
 # --- Global state ---
@@ -325,7 +328,12 @@ def worker_loop():
         elif cmd == CMD_WAKEUP:
             run_wake_up()
         elif cmd == CMD_P2P_PUSH_WEIGHTS:
-            push_weights_to_peer(state.model)
+            chunk_info = [None, None, True]
+            dist.broadcast_object_list(chunk_info, src=0)
+            push_weights_to_peer(state.model,
+                                 chunk_start=chunk_info[0],
+                                 chunk_end=chunk_info[1],
+                                 is_last_chunk=chunk_info[2])
 
 
 # --- FastAPI app ---
@@ -417,7 +425,13 @@ async def p2p_push_weights(req: PushWeightsRequest):
     def _push():
         per_rank_info = [(r["remote_metadata"], r["remote_descs"]) for r in req.per_rank]
         broadcast_cmd(CMD_P2P_PUSH_WEIGHTS)
-        push_weights_to_peer(state.model, per_rank_info)
+        # Broadcast chunk boundaries to workers
+        chunk_info = [req.chunk_start, req.chunk_end, req.is_last_chunk]
+        dist.broadcast_object_list(chunk_info, src=0)
+        push_weights_to_peer(state.model, per_rank_info,
+                             chunk_start=req.chunk_start,
+                             chunk_end=req.chunk_end,
+                             is_last_chunk=req.is_last_chunk)
     await loop.run_in_executor(None, _push)
     return {"status": "done"}
 

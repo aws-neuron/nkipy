@@ -10,6 +10,7 @@ and a helper to collect device buffer descriptors from a model.
 """
 
 import logging
+import os
 import time
 from typing import List, Sequence, Tuple
 
@@ -19,6 +20,12 @@ import torch
 import torch.distributed as dist
 
 from .endpoint import RankEndpoint
+
+# Maximum number of buffers to register in a single RDMA registration.
+# MoE models (e.g. Qwen3-30B-A3B with 128 experts) can exceed hardware MR
+# limits when all per-layer weights are registered at once.  Chunking the
+# registration avoids "Failed to register memory with RDMA" errors.
+MAX_RDMA_BUFS = int(os.environ.get("NKIPY_MAX_RDMA_BUFS", "64"))
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +56,14 @@ def collect_weight_buffers(model) -> List[Tuple[str, int, int]]:
 # ------------------------------------------------------------------
 
 
+def _chunk_ranges(total: int, chunk_size: int) -> List[Tuple[int, int]]:
+    """Return ``[(start, end), ...]`` index ranges for chunking *total* items."""
+    return [
+        (i, min(i + chunk_size, total))
+        for i in range(0, total, chunk_size)
+    ]
+
+
 def receive_from_peer(
     ep: RankEndpoint,
     buffers: Sequence[Tuple[str, int, int]],
@@ -57,9 +72,9 @@ def receive_from_peer(
 ) -> None:
     """All ranks receive their buffer shard from a peer engine via P2P RDMA.
 
-    Each rank registers its device buffers as receive targets, gathers UCCL
-    metadata to rank 0, and POSTs it to the peer engine which then RDMA-writes
-    directly into device memory.
+    When the number of buffers exceeds *MAX_RDMA_BUFS*, the transfer is
+    automatically split into chunks so that neither side exceeds RDMA
+    memory-registration limits.
 
     Parameters
     ----------
@@ -73,30 +88,41 @@ def receive_from_peer(
         HTTP path on the peer to trigger the push.
     """
     t0 = time.time()
+    chunks = _chunk_ranges(len(buffers), MAX_RDMA_BUFS)
 
-    ep.register(buffers)
-    uccl_ep = ep.ep
-    uccl_ep.start_passive_accept()
+    for ci, (cs, ce) in enumerate(chunks):
+        # First chunk: create endpoint + register.
+        # Subsequent chunks: swap MRs, reuse endpoint & passive accept.
+        if ci == 0:
+            ep.dereg_sync()
+            ep.register(buffers[cs:ce])
+            ep.ep.start_passive_accept()
+        else:
+            ep.reregister(buffers[cs:ce])
 
-    serialized = uccl_ep.get_serialized_descs(ep.xfer_descs)
+        serialized = ep.ep.get_serialized_descs(ep.xfer_descs)
+        my_info = (ep.ep.get_metadata().hex(), serialized.hex())
+        gathered = [None] * dist.get_world_size() if dist.get_rank() == 0 else None
+        dist.gather_object(my_info, gathered, dst=0)
 
-    my_info = (uccl_ep.get_metadata().hex(), serialized.hex())
-    gathered = [None] * dist.get_world_size() if dist.get_rank() == 0 else None
-    dist.gather_object(my_info, gathered, dst=0)
+        if dist.get_rank() == 0:
+            base = peer_url.rstrip("/")
+            resp = requests.post(
+                f"{base}{push_endpoint}",
+                json={
+                    "per_rank": [
+                        {"remote_metadata": m, "remote_descs": d}
+                        for m, d in gathered
+                    ],
+                    "chunk_start": cs,
+                    "chunk_end": ce,
+                    "is_last_chunk": ci == len(chunks) - 1,
+                },
+            )
+            resp.raise_for_status()
 
-    if dist.get_rank() == 0:
-        base = peer_url.rstrip("/")
-        resp = requests.post(
-            f"{base}{push_endpoint}",
-            json={
-                "per_rank": [
-                    {"remote_metadata": m, "remote_descs": d} for m, d in gathered
-                ]
-            },
-        )
-        resp.raise_for_status()
+        dist.barrier()
 
-    dist.barrier()
     logger.info("P2P receive completed in %.2fs", time.time() - t0)
 
 
@@ -104,6 +130,7 @@ def push_to_peer(
     ep: RankEndpoint,
     buffers: Sequence[Tuple[str, int, int]],
     per_rank_info: list | None = None,
+    is_last_chunk: bool = True,
 ) -> None:
     """All ranks push their buffer shard to the corresponding peer rank.
 
@@ -119,12 +146,19 @@ def push_to_peer(
     per_rank_info : list, optional
         ``[(remote_metadata_hex, remote_descs_hex), ...]`` per rank.
         Only required on rank 0.
+    is_last_chunk : bool
+        If True (default), destroy the endpoint after the transfer.
+        Set to False to keep the endpoint alive for subsequent chunks.
     """
     obj_list = [per_rank_info] if dist.get_rank() == 0 else [None]
     dist.broadcast_object_list(obj_list, src=0)
     remote_metadata_hex, remote_descs_hex = obj_list[0][dist.get_rank()]
 
-    ep.register(buffers)
+    t0 = time.time()
+
+    # Re-register only the chunk's buffers, keeping the endpoint alive
+    # so add_remote_endpoint can reuse the cached connection.
+    ep.reregister(buffers)
 
     uccl_ep = ep.ep
     ok, conn_id = uccl_ep.add_remote_endpoint(bytes.fromhex(remote_metadata_hex))
@@ -133,7 +167,6 @@ def push_to_peer(
     remote_descs = uccl_ep.deserialize_descs(bytes.fromhex(remote_descs_hex))
     assert len(remote_descs) == len(ep.xfer_descs)
 
-    t0 = time.time()
     ok, _ = uccl_ep.transfer(conn_id, "write", ep.xfer_descs, remote_descs)
     assert ok, "RDMA write failed"
     logger.info(
@@ -143,9 +176,10 @@ def push_to_peer(
         time.time() - t0,
     )
 
-    # Reset endpoint so stale RDMA connections don't cause remote access
-    # errors when the receiver sleeps and wakes with a new endpoint.
-    ep.dereg_sync()
+    if is_last_chunk:
+        # Reset endpoint so stale RDMA connections don't cause remote access
+        # errors when the receiver sleeps and wakes with a new endpoint.
+        ep.dereg_sync()
 
     dist.barrier()
 
@@ -182,10 +216,17 @@ def receive_weights(model, peer_url: str) -> None:
     receive_from_peer(rank_endpoint, bufs, peer_url)
 
 
-def push_weights_to_peer(model, per_rank_info=None) -> None:
-    """All ranks push model weights to the corresponding peer rank."""
+def push_weights_to_peer(model, per_rank_info=None, chunk_start=None, chunk_end=None,
+                         is_last_chunk=True) -> None:
+    """All ranks push model weights to the corresponding peer rank.
+
+    When *chunk_start* / *chunk_end* are provided only that slice of
+    buffers is registered and transferred (used by the chunked protocol).
+    """
     bufs = collect_weight_buffers(model)
-    push_to_peer(rank_endpoint, bufs, per_rank_info)
+    if chunk_start is not None:
+        bufs = bufs[chunk_start:chunk_end]
+    push_to_peer(rank_endpoint, bufs, per_rank_info, is_last_chunk=is_last_chunk)
 
 
 def fetch_tok_embedding(peer_url: str):

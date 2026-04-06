@@ -1,6 +1,6 @@
 WEIGHTS=../models/qwen3/tmp_Qwen3-30b-a3b
 TP=8
-
+export NKIPY_MAX_RDMA_BUFS=64
 torchrun --nproc-per-node $TP --master-port 29501 \
     server.py \
     --checkpoint $WEIGHTS \
