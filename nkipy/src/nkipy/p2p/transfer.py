@@ -27,7 +27,7 @@ from .endpoint import RankEndpoint
 # once.  Chunking the registration avoids "Failed to register memory with
 # RDMA" errors.  Tune via env var — higher values reduce chunking overhead
 # but may hit registration limits on larger per-rank shards.
-MAX_RDMA_BUFS = int(os.environ.get("NKIPY_MAX_RDMA_BUFS", "64"))
+MAX_RDMA_BUFS = int(os.environ.get("NKIPY_MAX_RDMA_BUFS", "1024"))
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)

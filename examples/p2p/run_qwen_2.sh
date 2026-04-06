@@ -6,6 +6,7 @@ torchrun --nproc-per-node $TP --master-port 29601 \
     --arch qwen3 \
     --port 8001 \
     --neuron-port 62339 \
+    --spread-nics \
     --core-offset 16 \
     --context-len 64 \
     --max-tokens 256
