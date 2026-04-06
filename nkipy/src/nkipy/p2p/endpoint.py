@@ -114,6 +114,28 @@ class RankEndpoint:
             handles.append(_VAHandle(va, size_bytes))
         self.xfer_descs = ep.register_memory(handles)
 
+    def register_chunked(self, buffers: Sequence[Tuple[str, int, int]],
+                         chunk_size: int) -> None:
+        """Register buffers in chunks to stay within EFA MR limits.
+
+        Calls ``register_memory`` repeatedly with *chunk_size* buffers at a
+        time, accumulating all descriptors.  The endpoint is created once
+        and reused across chunks.
+        """
+        self._wait_dereg()
+        if self.xfer_descs:
+            return
+        ep = self._ensure_endpoint()
+        self.buf_info = []
+        self.xfer_descs = []
+        for i in range(0, len(buffers), chunk_size):
+            chunk = buffers[i : i + chunk_size]
+            handles = []
+            for name, va, size_bytes in chunk:
+                self.buf_info.append((name, size_bytes))
+                handles.append(_VAHandle(va, size_bytes))
+            self.xfer_descs.extend(ep.register_memory(handles))
+
     def reregister(self, buffers: Sequence[Tuple[str, int, int]]) -> None:
         """Deregister current MRs and register *buffers*, keeping the endpoint.
 

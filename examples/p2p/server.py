@@ -39,6 +39,7 @@ from pydantic import BaseModel, Field
 from nkipy.p2p import (
     WeightServer,
     fetch_tok_embedding,
+    preregister_weights,
     push_weights_to_peer,
     receive_weights,
 )
@@ -288,6 +289,7 @@ def run_wake_up(peer_url=None):
 
     state.model = model
     state.sleeping = False
+    preregister_weights(model)
     print_log(f"Wake up completed in {time.time() - t0:.2f}s")
 
 
@@ -501,6 +503,7 @@ if __name__ == "__main__":
 
     if weights is not None:
         state.model = model
+        preregister_weights(model)
     else:
         # Kernels compiled to NEFF without device — no neuron cores were needed
         state.kernel_cache = model.kernel_cache

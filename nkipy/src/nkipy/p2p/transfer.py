@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 if not logger.handlers:
     _handler = logging.StreamHandler()
-    _handler.setFormatter(logging.Formatter("[%(name)s] %(message)s"))
+    _handler.setFormatter(logging.Formatter("%(asctime)s [%(name)s] %(message)s"))
     logger.addHandler(_handler)
 
 # ------------------------------------------------------------------
@@ -96,6 +96,42 @@ def receive_from_peer(
     """
     t0 = time.time()
     total_bytes = sum(sz for _, _, sz in buffers)
+
+    if ep.registered and len(ep.xfer_descs) == len(buffers):
+        # Pre-registered — single-shot path, no chunking needed.
+        ep.ep.start_passive_accept()
+
+        serialized = ep.ep.get_serialized_descs(ep.xfer_descs)
+        my_info = (ep.ep.get_metadata().hex(), serialized.hex())
+        gathered = [None] * dist.get_world_size() if dist.get_rank() == 0 else None
+        dist.gather_object(my_info, gathered, dst=0)
+
+        if dist.get_rank() == 0:
+            base = peer_url.rstrip("/")
+            resp = requests.post(
+                f"{base}{push_endpoint}",
+                json={
+                    "per_rank": [
+                        {"remote_metadata": m, "remote_descs": d}
+                        for m, d in gathered
+                    ],
+                    "chunk_start": None,
+                    "chunk_end": None,
+                    "is_last_chunk": True,
+                },
+            )
+            resp.raise_for_status()
+
+        dist.barrier()
+        elapsed = time.time() - t0
+        throughput_gbps = (total_bytes * 8) / elapsed / 1e9 if elapsed > 0 else 0
+        logger.info(
+            "Rank %d: P2P receive (pre-registered) — %d bufs, %.2f MB, %.2fs, %.2f Gbps",
+            dist.get_rank(), len(buffers), total_bytes / 1e6, elapsed, throughput_gbps,
+        )
+        return
+
+    # Fallback: chunked registration path.
     chunks = _chunk_ranges(len(buffers), MAX_RDMA_BUFS)
 
     for ci, (cs, ce) in enumerate(chunks):
@@ -185,7 +221,9 @@ def push_to_peer(
 
     # Re-register only the chunk's buffers, keeping the endpoint alive
     # so add_remote_endpoint can reuse the cached connection.
-    ep.reregister(buffers)
+    # Skip if already pre-registered (same buffer count).
+    if len(ep.xfer_descs) != len(buffers):
+        ep.reregister(buffers)
     t_reg = time.time()
 
     uccl_ep = ep.ep
@@ -247,6 +285,22 @@ class WeightServer:
 
     def cleanup(self):
         rank_endpoint.wait()
+
+
+def preregister_weights(model) -> None:
+    """Pre-register all model weight buffers for RDMA in chunks.
+
+    Call once after model tensors are allocated (load or wake-up).
+    Subsequent ``push_to_peer`` / ``receive_from_peer`` calls will
+    skip registration entirely.
+    """
+    bufs = collect_weight_buffers(model)
+    t0 = time.time()
+    rank_endpoint.register_chunked(bufs, MAX_RDMA_BUFS)
+    logger.info(
+        "Rank %d: pre-registered %d bufs in %.2fs",
+        dist.get_rank(), len(bufs), time.time() - t0,
+    )
 
 
 def receive_weights(model, peer_url: str) -> None:
