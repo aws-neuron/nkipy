@@ -73,8 +73,8 @@ def receive_from_peer(
     """All ranks receive their buffer shard from a peer engine via P2P RDMA.
 
     When the number of buffers exceeds *MAX_RDMA_BUFS*, the transfer is
-    automatically split into chunks so that neither side exceeds RDMA
-    memory-registration limits.
+    automatically split into chunks.  The endpoint and RDMA connection are
+    reused across chunks — only MRs are swapped per chunk.
 
     Parameters
     ----------
@@ -94,8 +94,6 @@ def receive_from_peer(
     for ci, (cs, ce) in enumerate(chunks):
         t_chunk = time.time()
 
-        # First chunk: create endpoint + register.
-        # Subsequent chunks: swap MRs, reuse endpoint & passive accept.
         if ci == 0:
             ep.dereg_sync()
             ep.register(buffers[cs:ce])
@@ -141,7 +139,7 @@ def receive_from_peer(
         )
 
     elapsed = time.time() - t0
-    throughput_gbps = (total_bytes * 8) / elapsed / 1e9
+    throughput_gbps = (total_bytes * 8) / elapsed / 1e9 if elapsed > 0 else 0
     logger.info(
         "Rank %d: P2P receive complete — %d bufs, %.2f MB, %.2fs, %.2f Gbps",
         dist.get_rank(), len(buffers), total_bytes / 1e6, elapsed, throughput_gbps,
