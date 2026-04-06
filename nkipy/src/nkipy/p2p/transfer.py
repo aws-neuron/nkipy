@@ -295,12 +295,9 @@ def preregister_weights(model) -> None:
     skip registration entirely.
     """
     bufs = collect_weight_buffers(model)
-    t0 = time.time()
+    if rank_endpoint.registered:
+        return
     rank_endpoint.register_chunked(bufs, MAX_RDMA_BUFS)
-    logger.info(
-        "Rank %d: pre-registered %d bufs in %.2fs",
-        dist.get_rank(), len(bufs), time.time() - t0,
-    )
 
 
 def receive_weights(model, peer_url: str) -> None:

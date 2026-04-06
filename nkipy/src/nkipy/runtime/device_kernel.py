@@ -139,11 +139,7 @@ class DeviceKernel(SpikeModel):
 
         # Load the compiled NEFF
         if distributed:
-            t_barrier = time.time()
             dist.barrier()
-            t_barrier = time.time() - t_barrier
-
-            t_load = time.time()
             device_kernel = cls.load_from_neff(
                 neff_path,
                 name=name,
@@ -151,18 +147,8 @@ class DeviceKernel(SpikeModel):
                 rank_id=dist.get_rank(),
                 world_size=dist.get_world_size(),
             )
-            t_load = time.time() - t_load
-
-            logger.info(
-                f"[Rank {dist.get_rank()}] Kernel '{name}': "
-                f"barrier={t_barrier:.3f}s, "
-                f"load_from_neff(cc_enabled=True)={t_load:.3f}s"
-            )
         else:
-            t_load = time.time()
             device_kernel = cls.load_from_neff(neff_path, name=name)
-            t_load = time.time() - t_load
-            logger.info(f"Kernel '{name}': load_from_neff={t_load:.3f}s")
 
         device_kernel.cache_key = cache_key
         if use_cached_if_exists:
