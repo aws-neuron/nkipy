@@ -203,18 +203,20 @@ def push_to_peer(
     chunk_bytes = sum(sz for _, _, sz in buffers)
     xfer_secs = t_xfer - t_conn
     xfer_gbps = (chunk_bytes * 8) / xfer_secs / 1e9 if xfer_secs > 0 else 0
-    logger.info(
-        "Rank %d: pushed %d bufs %.2f MB — "
-        "reg %.3fs connect %.3fs xfer %.3fs (%.2f Gbps) total %.3fs",
-        dist.get_rank(), len(buffers), chunk_bytes / 1e6,
-        t_reg - t0, t_conn - t_reg, xfer_secs, xfer_gbps,
-        t_xfer - t0,
-    )
 
     if is_last_chunk:
-        # Reset endpoint so stale RDMA connections don't cause remote access
-        # errors when the receiver sleeps and wakes with a new endpoint.
-        ep.dereg_sync()
+        # Kick off MR deregistration in background — don't block the
+        # HTTP response or the barrier on the slow ibv_dereg_mr calls.
+        ep.dereg_async()
+    t_dereg = time.time()
+
+    logger.info(
+        "Rank %d: pushed %d bufs %.2f MB — "
+        "reg %.3fs connect %.3fs xfer %.3fs (%.2f Gbps) dereg %.3fs total %.3fs",
+        dist.get_rank(), len(buffers), chunk_bytes / 1e6,
+        t_reg - t0, t_conn - t_reg, xfer_secs, xfer_gbps,
+        t_dereg - t_xfer, t_dereg - t0,
+    )
 
     dist.barrier()
 
