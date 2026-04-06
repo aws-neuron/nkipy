@@ -88,9 +88,12 @@ def receive_from_peer(
         HTTP path on the peer to trigger the push.
     """
     t0 = time.time()
+    total_bytes = sum(sz for _, _, sz in buffers)
     chunks = _chunk_ranges(len(buffers), MAX_RDMA_BUFS)
 
     for ci, (cs, ce) in enumerate(chunks):
+        t_chunk = time.time()
+
         # First chunk: create endpoint + register.
         # Subsequent chunks: swap MRs, reuse endpoint & passive accept.
         if ci == 0:
@@ -99,11 +102,13 @@ def receive_from_peer(
             ep.ep.start_passive_accept()
         else:
             ep.reregister(buffers[cs:ce])
+        t_reg = time.time()
 
         serialized = ep.ep.get_serialized_descs(ep.xfer_descs)
         my_info = (ep.ep.get_metadata().hex(), serialized.hex())
         gathered = [None] * dist.get_world_size() if dist.get_rank() == 0 else None
         dist.gather_object(my_info, gathered, dst=0)
+        t_gather = time.time()
 
         if dist.get_rank() == 0:
             base = peer_url.rstrip("/")
@@ -120,10 +125,27 @@ def receive_from_peer(
                 },
             )
             resp.raise_for_status()
+        t_post = time.time()
 
         dist.barrier()
+        t_done = time.time()
 
-    logger.info("P2P receive completed in %.2fs", time.time() - t0)
+        chunk_bytes = sum(sz for _, _, sz in buffers[cs:ce])
+        logger.info(
+            "Rank %d: recv chunk %d/%d [%d:%d] %d bufs %.2f MB — "
+            "reg %.3fs gather %.3fs post+xfer %.3fs barrier %.3fs total %.3fs",
+            dist.get_rank(), ci + 1, len(chunks), cs, ce, ce - cs,
+            chunk_bytes / 1e6,
+            t_reg - t_chunk, t_gather - t_reg, t_post - t_gather,
+            t_done - t_post, t_done - t_chunk,
+        )
+
+    elapsed = time.time() - t0
+    throughput_gbps = (total_bytes * 8) / elapsed / 1e9
+    logger.info(
+        "Rank %d: P2P receive complete — %d bufs, %.2f MB, %.2fs, %.2f Gbps",
+        dist.get_rank(), len(buffers), total_bytes / 1e6, elapsed, throughput_gbps,
+    )
 
 
 def push_to_peer(
@@ -159,21 +181,29 @@ def push_to_peer(
     # Re-register only the chunk's buffers, keeping the endpoint alive
     # so add_remote_endpoint can reuse the cached connection.
     ep.reregister(buffers)
+    t_reg = time.time()
 
     uccl_ep = ep.ep
     ok, conn_id = uccl_ep.add_remote_endpoint(bytes.fromhex(remote_metadata_hex))
     assert ok, "Failed to connect to remote endpoint"
+    t_conn = time.time()
 
     remote_descs = uccl_ep.deserialize_descs(bytes.fromhex(remote_descs_hex))
     assert len(remote_descs) == len(ep.xfer_descs)
 
     ok, _ = uccl_ep.transfer(conn_id, "write", ep.xfer_descs, remote_descs)
     assert ok, "RDMA write failed"
+    t_xfer = time.time()
+
+    chunk_bytes = sum(sz for _, _, sz in buffers)
+    xfer_secs = t_xfer - t_conn
+    xfer_gbps = (chunk_bytes * 8) / xfer_secs / 1e9 if xfer_secs > 0 else 0
     logger.info(
-        "Rank %d: pushed %d buffers via P2P in %.2fs",
-        dist.get_rank(),
-        len(ep.xfer_descs),
-        time.time() - t0,
+        "Rank %d: pushed %d bufs %.2f MB — "
+        "reg %.3fs connect %.3fs xfer %.3fs (%.2f Gbps) total %.3fs",
+        dist.get_rank(), len(buffers), chunk_bytes / 1e6,
+        t_reg - t0, t_conn - t_reg, xfer_secs, xfer_gbps,
+        t_xfer - t0,
     )
 
     if is_last_chunk:
