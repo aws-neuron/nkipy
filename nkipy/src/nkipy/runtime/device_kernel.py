@@ -178,8 +178,7 @@ class DeviceKernel(SpikeModel):
             )
             t_load = time.time() - t_load
 
-            # logger.info(
-            print(
+            logger.info(
                 f"[Rank {dist.get_rank()}] Kernel '{name}' (reload): "
                 f"load_from_neff(cc_enabled=True)={t_load:.3f}s"
             )
@@ -187,8 +186,7 @@ class DeviceKernel(SpikeModel):
             t_load = time.time()
             device_kernel = cls.load_from_neff(neff_path, name=name)
             t_load = time.time() - t_load
-            # logger.info(f"Kernel '{name}' (reload): load_from_neff={t_load:.3f}s")
-            print(f"Kernel '{name}' (reload): load_from_neff={t_load:.3f}s")
+            logger.info(f"Kernel '{name}' (reload): load_from_neff={t_load:.3f}s")
 
         device_kernel.cache_key = cache_key
         _LOADED_KERNELS[cache_key] = device_kernel
