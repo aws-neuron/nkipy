@@ -22,9 +22,11 @@ import torch.distributed as dist
 from .endpoint import RankEndpoint
 
 # Maximum number of buffers to register in a single RDMA registration.
-# MoE models (e.g. Qwen3-30B-A3B with 128 experts) can exceed hardware MR
-# limits when all per-layer weights are registered at once.  Chunking the
-# registration avoids "Failed to register memory with RDMA" errors.
+# MoE models (e.g. Qwen3-30B-A3B with 128 experts) can exceed EFA device
+# memory registration limits when all per-layer weights are registered at
+# once.  Chunking the registration avoids "Failed to register memory with
+# RDMA" errors.  Tune via env var — higher values reduce chunking overhead
+# but may hit registration limits on larger per-rank shards.
 MAX_RDMA_BUFS = int(os.environ.get("NKIPY_MAX_RDMA_BUFS", "64"))
 
 logger = logging.getLogger(__name__)
@@ -223,19 +225,21 @@ def push_to_peer(
 
 
 class WeightServer:
-    """Runs on the active engine.  Registers model weights for RDMA push."""
+    """Runs on the active engine.  Tracks model buffer info for /weight_info."""
 
     def __init__(self, model):
         bufs = collect_weight_buffers(model)
-        rank_endpoint.register(bufs)
-        logger.info(
-            "WeightServer: registered %d tensors",
-            len(rank_endpoint.xfer_descs),
-        )
+        self._buf_info = [(name, sz) for name, _va, sz in bufs]
+        # Ensure an endpoint exists (for metadata) but do NOT register
+        # MRs — push_to_peer handles registration.  Pre-registering all
+        # buffers would make rank 0 a straggler during push (it would
+        # have to deregister everything first).
+        rank_endpoint._ensure_endpoint()
+        logger.info("WeightServer: %d tensors tracked", len(self._buf_info))
 
     def get_weight_info(self):
         return {
-            "weights": list(rank_endpoint.buf_info),
+            "weights": list(self._buf_info),
             "metadata": rank_endpoint.ep.get_metadata().hex(),
         }
 
