@@ -28,6 +28,11 @@ from .endpoint import RankEndpoint
 MAX_RDMA_BUFS = int(os.environ.get("NKIPY_MAX_RDMA_BUFS", "64"))
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("[%(name)s] %(message)s"))
+    logger.addHandler(_handler)
 
 # ------------------------------------------------------------------
 # Per-rank singleton

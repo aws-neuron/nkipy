@@ -477,8 +477,6 @@ def parse_args():
     parser.add_argument("--neuron-port", type=int, default=61239)
     parser.add_argument("--core-offset", type=int, default=0,
                         help="Neuron core offset. Rank i uses core (core_offset + i).")
-    parser.add_argument("--spread-nics", action="store_true",
-                        help="Place ranks on NCs that maximise NIC diversity (trn1.32xlarge).")
     return parser.parse_args()
 
 
@@ -494,14 +492,7 @@ if __name__ == "__main__":
     dist.init_process_group()
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
-    # One NC per NIC group on trn1.32xlarge (8 groups of 4 NCs each).
-    _TRN1_SPREAD = [0, 4, 8, 12, 16, 20, 24, 28]
-
-    if args.spread_nics:
-        nc = _TRN1_SPREAD[dist.get_rank()] + args.core_offset
-    else:
-        nc = dist.get_rank() + args.core_offset
-    os.environ["NEURON_RT_VISIBLE_CORES"] = str(nc)
+    os.environ["NEURON_RT_VISIBLE_CORES"] = str(dist.get_rank() + args.core_offset)
 
     model, tokenizer, weights, config, _ = load_model(ModelClass, args)
     state.tokenizer = tokenizer
