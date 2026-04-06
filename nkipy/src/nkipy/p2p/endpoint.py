@@ -71,7 +71,7 @@ class RankEndpoint:
     """
 
     def __init__(self, nc_idx: int | None = None):
-        self._nc_idx = nc_idx if nc_idx is not None else _get_nc_idx()
+        self._nc_idx = nc_idx  # None → resolve lazily from env at first use
         self.ep = None
         self.xfer_descs: list = []
         self.buf_info: List[Tuple[str, int]] = []  # [(name, size_bytes)]
@@ -87,7 +87,8 @@ class RankEndpoint:
 
     def _ensure_endpoint(self):
         if self.ep is None:
-            self.ep = p2p.Endpoint(self._nc_idx)
+            nc = self._nc_idx if self._nc_idx is not None else _get_nc_idx()
+            self.ep = p2p.Endpoint(nc)
         return self.ep
 
     # -- public API ------------------------------------------------

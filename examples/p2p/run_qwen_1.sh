@@ -8,6 +8,7 @@ torchrun --nproc-per-node $TP --master-port 29501 \
     --arch qwen3 \
     --port 8000 \
     --neuron-port 62239 \
+    --spread-nics \
     --core-offset 0 \
     --context-len 64 \
     --max-tokens 256
