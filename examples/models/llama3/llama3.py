@@ -1,14 +1,8 @@
 import os
-import sys
 
-# Ensure models/ is on sys.path for common.* imports
-_models_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _models_dir not in sys.path:
-    sys.path.insert(0, _models_dir)
-
-from common.kernels.sampling import greedy_sampling
-from common.model import BaseModel, generate_and_print, load_model
-from kernels.transformer_layer import transformer_layer
+from ..common.kernels.sampling import greedy_sampling
+from ..common.model import BaseModel, generate_and_print, load_model
+from .kernels.transformer_layer import transformer_layer
 
 EOS_TOKEN_IDS = {128001, 128009}
 

@@ -2,9 +2,9 @@ import nkipy.distributed.collectives as cc
 import numpy as np
 import torch.distributed as dist
 
-from common.config import Config
-from common.kernels.feedforward import feedforward_kernel
-from common.kernels.rmsnorm import rmsnorm_kernel
+from ...common.config import Config
+from ...common.kernels.feedforward import feedforward_kernel
+from ...common.kernels.rmsnorm import rmsnorm_kernel
 
 from .attention import attention_kernel
 

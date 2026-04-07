@@ -1,8 +1,8 @@
 """Combined transformer layer kernel for Qwen3"""
 
-from kernels.attention import qwen3_attention_kernel
-from kernels.ffn import feedforward_kernel
-from kernels.rmsnorm import rmsnorm
+from .attention import qwen3_attention_kernel
+from .ffn import feedforward_kernel
+from .rmsnorm import rmsnorm
 
 
 def transformer_layer_kernel(

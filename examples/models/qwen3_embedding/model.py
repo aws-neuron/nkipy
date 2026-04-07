@@ -5,12 +5,12 @@ from typing import Optional
 import numpy as np
 from config import BUILD_DIR, Qwen3Config
 from embedding_utils import last_token_pool
-from kernels.attention import qwen3_attention_kernel
-from kernels.ffn import feedforward_kernel
-from kernels.rmsnorm import rmsnorm
-from kernels.rope import compute_qwen3_cos_sin
-from kernels.token_embedding import token_embedding
-from kernels.transformer_layer import transformer_layer_kernel
+from .kernels.attention import qwen3_attention_kernel
+from .kernels.ffn import feedforward_kernel
+from .kernels.rmsnorm import rmsnorm
+from .kernels.rope import compute_qwen3_cos_sin
+from .kernels.token_embedding import token_embedding
+from .kernels.transformer_layer import transformer_layer_kernel
 from logger import get_logger
 from nkipy.core.trace import NKIPyKernel
 from nkipy.runtime import DeviceKernel, DeviceTensor

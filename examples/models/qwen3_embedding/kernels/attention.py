@@ -1,9 +1,9 @@
 """Simplified attention kernel for Qwen3 without tensor parallelism"""
 
 import numpy as np
-from kernels.rmsnorm import rmsnorm
-from kernels.rope import rope_qwen3
-from kernels.softmax import softmax
+from .rmsnorm import rmsnorm
+from .rope import rope_qwen3
+from .softmax import softmax
 
 
 def qwen3_attention_kernel(

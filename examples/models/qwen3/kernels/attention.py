@@ -7,9 +7,9 @@ import numpy as np
 import torch.distributed as dist
 from nkipy.core import tensor_apis
 
-from common.kernels.rmsnorm import rmsnorm_kernel
-from common.kernels.rope import apply_rotary_emb_kernel, compute_cos_sin_cache
-from common.kernels.softmax import softmax_kernel
+from ...common.kernels.rmsnorm import rmsnorm_kernel
+from ...common.kernels.rope import apply_rotary_emb_kernel, compute_cos_sin_cache
+from ...common.kernels.softmax import softmax_kernel
 
 
 def repeat_kv_kernel(x, n_rep: int):

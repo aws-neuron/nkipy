@@ -44,12 +44,12 @@ from nkipy.p2p import (
     receive_weights,
 )
 
-# Add models/ to sys.path so common.* imports work
-_models_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "models")
-sys.path.insert(0, _models_dir)
+# Add examples/ to sys.path so models.* imports work
+_examples_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+sys.path.insert(0, _examples_dir)
 
-from common.model import load_model, _warmup
-from common.utils import print_log
+from models.common.model import load_model, _warmup
+from models.common.utils import print_log
 
 # These will be set after parsing --arch
 ModelClass = None  # Qwen3Model or Llama3Model
@@ -108,15 +108,12 @@ def setup_arch(arch: str):
     """Set global ModelClass and EOS_TOKEN_IDS for the chosen architecture."""
     global ModelClass, EOS_TOKEN_IDS
 
-    arch_dir = os.path.join(_models_dir, arch)
-    sys.path.insert(0, arch_dir)
-
     if arch == "qwen3":
-        from qwen3 import Qwen3Model, EOS_TOKEN_IDS as eos
+        from models.qwen3.qwen3 import Qwen3Model, EOS_TOKEN_IDS as eos
         ModelClass = Qwen3Model
         EOS_TOKEN_IDS = eos
     elif arch == "llama3":
-        from llama3 import Llama3Model, EOS_TOKEN_IDS as eos
+        from models.llama3.llama3 import Llama3Model, EOS_TOKEN_IDS as eos
         ModelClass = Llama3Model
         EOS_TOKEN_IDS = eos
     else:

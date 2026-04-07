@@ -1,11 +1,6 @@
 """Evaluate NKIPy Qwen3: benchmark, validate, or generate baseline."""
 
-import os
-import sys
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from common.evaluate import (  # noqa: F401
+from ..common.evaluate import (  # noqa: F401
     benchmark_generation,
     generate_hf_baseline,
     load_baseline,
@@ -65,7 +60,7 @@ if __name__ == "__main__":
         import torch.distributed as dist
 
         from qwen3 import Qwen3Model
-        from common.model import load_model
+        from ..common.model import load_model
 
         model, _, _, _, input_ids = load_model(Qwen3Model, args)
 
