@@ -22,6 +22,7 @@ Example curl:
 
 import argparse
 import asyncio
+import datetime
 import gc
 import os
 import sys
@@ -488,7 +489,7 @@ if __name__ == "__main__":
     os.environ["TOKENIZERS_PARALLELISM"] = "true"
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["NEURON_RT_ROOT_COMM_ID"] = f"localhost:{args.neuron_port}"
-    dist.init_process_group()
+    dist.init_process_group(timeout=datetime.timedelta(days=365))
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
     os.environ["NEURON_RT_VISIBLE_CORES"] = str(dist.get_rank() + args.core_offset)
