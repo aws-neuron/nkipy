@@ -216,7 +216,8 @@ def push_to_peer(
     # Re-register only the chunk's buffers, keeping the endpoint alive
     # so add_remote_endpoint can reuse the cached connection.
     # Skip if already pre-registered (same buffer count).
-    if len(ep.xfer_descs) != len(buffers):
+    was_preregistered = len(ep.xfer_descs) == len(buffers)
+    if not was_preregistered:
         ep.reregister(buffers)
     t_reg = time.time()
 
@@ -236,9 +237,11 @@ def push_to_peer(
     xfer_secs = t_xfer - t_conn
     xfer_gbps = (chunk_bytes * 8) / xfer_secs / 1e9 if xfer_secs > 0 else 0
 
-    if is_last_chunk:
+    if is_last_chunk and not was_preregistered:
         # Kick off MR deregistration in background — don't block the
         # HTTP response or the barrier on the slow ibv_dereg_mr calls.
+        # Keep MRs alive if they were pre-registered so subsequent
+        # pushes skip the costly re-registration.
         ep.dereg_async()
     t_dereg = time.time()
 
