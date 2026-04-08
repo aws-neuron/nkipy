@@ -208,9 +208,83 @@ class DeviceKernel(SpikeModel):
         else:
             device_kernel = cls.load_from_neff(neff_path, name=name)
 
+        device_kernel.cache_key = cache_key
         if use_cached_if_exists:
             _LOADED_KERNELS[cache_key] = device_kernel
         return device_kernel
+
+    @classmethod
+    def load_with_cache_key(cls, neff_path, cache_key, name=None):
+        """Load a kernel from a known NEFF path and cache key, skipping trace/compile.
+
+        Useful for reloading kernels after a device reset (e.g. sleep/wake_up)
+        when the NEFF is already on disk and the cache key is known.
+        """
+        if cache_key in _LOADED_KERNELS:
+            logger.info(f"Using loaded kernel: {name} (cache_key={cache_key})")
+            return _LOADED_KERNELS[cache_key]
+
+        distributed = _is_distributed()
+        if distributed:
+            device_kernel = cls.load_from_neff(
+                neff_path,
+                name=name,
+                cc_enabled=True,
+                rank_id=dist.get_rank(),
+                world_size=dist.get_world_size(),
+            )
+        else:
+            device_kernel = cls.load_from_neff(neff_path, name=name)
+
+        device_kernel.cache_key = cache_key
+        _LOADED_KERNELS[cache_key] = device_kernel
+        return device_kernel
+
+    @classmethod
+    def compile_only(
+        cls,
+        kernel,
+        *args,
+        name=None,
+        additional_compiler_args=None,
+        use_cached_if_exists=True,
+        build_dir=None,
+        target=CompilationTarget.DEFAULT,
+        **kwargs,
+    ):
+        """Trace and compile a kernel to NEFF without loading onto device.
+
+        Returns (neff_path, cache_key).
+        """
+        if name is None:
+            name = kernel.__name__
+
+        distributed = _is_distributed()
+
+        if distributed:
+            if dist.get_rank() == 0:
+                neff_path, cache_key = cls._trace_and_compile(
+                    kernel, name, args, kwargs,
+                    additional_compiler_args=additional_compiler_args,
+                    use_cached_if_exists=use_cached_if_exists,
+                    build_dir=build_dir,
+                    target=target,
+                )
+                dist.broadcast_object_list([neff_path, cache_key], src=0)
+            else:
+                info = [None, None]
+                dist.broadcast_object_list(info, src=0)
+                neff_path, cache_key = info
+        else:
+            neff_path, cache_key = cls._trace_and_compile(
+                kernel, name, args, kwargs,
+                additional_compiler_args=additional_compiler_args,
+                use_cached_if_exists=use_cached_if_exists,
+                build_dir=build_dir,
+                target=target,
+            )
+
+        return neff_path, cache_key
 
     @classmethod
     def _trace_and_compile(

@@ -72,12 +72,34 @@ class NKIPyModelRunner:
             from .models.llama import Llama3Model as ModelClass
             logger.info("Using Llama3Model (dense)")
 
+        # Expose model class/config to P2P server endpoints early so
+        # sleep-mode servers can wake up without ever loading weights.
+        try:
+            from .server import _p2p
+            _p2p._model_class = ModelClass
+            _p2p._config = config
+            _p2p._model_runner = self
+        except Exception:
+            pass
+
         checkpoint = os.environ.get("NKIPY_CHECKPOINT")
         if not checkpoint:
-            raise RuntimeError(
-                "NKIPY_CHECKPOINT env var must point to the pre-sharded "
-                "safetensors directory (e.g. tmp_tinyllama_TP8)"
-            )
+            # No checkpoint → start in sleep mode (P2P receiver).
+            # Pre-compile kernels to NEFF so wake_up can reload them fast.
+            logger.info("No NKIPY_CHECKPOINT set — starting in sleep mode")
+            model = ModelClass(config=config, skip_kernels=True)
+            kernel_cache = model._compile_kernels()
+
+            self._nkipy_model = None
+            self.model = None
+            try:
+                _p2p.model = None
+                _p2p.sleeping = True
+                _p2p.kernel_cache = kernel_cache
+            except Exception:
+                pass
+            return
+
         shard_path = os.path.join(
             checkpoint, f"shard_{dist.get_rank()}.safetensors"
         )
@@ -86,7 +108,12 @@ class NKIPyModelRunner:
 
         self._nkipy_model = ModelClass(weights, config, skip_kernels=True)
         self.model = self._nkipy_model
-        logger.info("Model weights loaded (Neuron), kernels will compile on first request")
+        logger.info("Model weights loaded, kernels will compile during warmup")
+
+        try:
+            _p2p.model = self._nkipy_model
+        except Exception:
+            pass
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         block_size = self.vllm_config.cache_config.block_size
@@ -106,11 +133,19 @@ class NKIPyModelRunner:
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         logger.debug("KV cache initialized (managed internally)")
 
+    def warmup_model(self) -> None:
+        """Called after all workers are synchronized. Compilation deferred to first request."""
+        logger.info("NKIPy warmup complete (kernels compile on first request)")
+
     @torch.inference_mode()
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,
     ) -> ModelRunnerOutput | None:
+        # Sleep mode — model not loaded yet
+        if self._nkipy_model is None:
+            return EMPTY_MODEL_RUNNER_OUTPUT
+
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
 
@@ -152,6 +187,14 @@ class NKIPyModelRunner:
                     self._nkipy_model.config.context_len = ctx_len
                     self._nkipy_model.config.max_new_tokens = self.max_model_len
                     self._nkipy_model._prepare_kernels()
+
+                    try:
+                        from nkipy.p2p import preregister_weights, WeightServer
+                        from .server import _p2p
+                        preregister_weights(self._nkipy_model)
+                        _p2p.weight_server = WeightServer(self._nkipy_model)
+                    except Exception:
+                        pass
 
                 gen = self._nkipy_model.generate(input_ids)
                 next_id_tensor = next(gen)

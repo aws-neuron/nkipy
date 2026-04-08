@@ -48,9 +48,9 @@ _KERNEL_INPUT_KEYS = [
 class Qwen3Model:
     """NKIPy Qwen3 model running on Neuron cores (MoE)."""
 
-    def __init__(self, model_weights, config: Config, skip_kernels=False):
+    def __init__(self, model_weights=None, config: Config = None, skip_kernels=False):
         self.config = config
-        self.tok_embedding = model_weights.get("tok_embedding")
+        self.tok_embedding = model_weights.get("tok_embedding") if model_weights else None
 
         self.kernel_cte = None
         self.kernel_tkg = None
@@ -60,9 +60,10 @@ class Qwen3Model:
         self.lm_head_weight = None
         self.layer_tensors = []
 
-        self._prepare_tensors(model_weights)
-        if not skip_kernels and config.context_len is not None:
-            self._prepare_kernels()
+        if model_weights:
+            self._prepare_tensors(model_weights)
+            if not skip_kernels and config.context_len is not None:
+                self._prepare_kernels()
 
     def _prepare_tensors(self, weights):
         t = time.time()
@@ -85,6 +86,60 @@ class Qwen3Model:
         self.norm_weight = DeviceTensor.from_torch(weights["norm_weight"], "norm_weight")
         self.lm_head_weight = DeviceTensor.from_torch(weights["lm_head_weight"], "lm_head_weight")
         logger.info("Tensors prepared in %.2fs", time.time() - t)
+
+    def _allocate_empty_tensors(self):
+        """Allocate device tensors with zeros (for P2P receive)."""
+        cfg = self.config
+        tp = dist.get_world_size()
+        n_local_kv_heads = max(1, cfg.num_kv_heads // tp)
+        n_local_heads = cfg.num_heads // tp
+        cache_shape = (cfg.max_batch_size, cfg.max_seq_len, n_local_kv_heads, cfg.head_dim)
+        cache_k = np.zeros(cache_shape, dtype=cfg.dtype)
+        cache_v = np.zeros(cache_shape, dtype=cfg.dtype)
+
+        qkv_dim = (n_local_heads + 2 * n_local_kv_heads) * cfg.head_dim
+        shapes = {
+            "qkv_weight": (cfg.hidden_size, qkv_dim),
+            "o_weight": (n_local_heads * cfg.head_dim, cfg.hidden_size),
+            "gate_up_weight": (cfg.num_experts, cfg.hidden_size, 2 * cfg.intermediate_size),
+            "down_weight": (cfg.num_experts, cfg.intermediate_size, cfg.hidden_size),
+            "input_weight": (cfg.hidden_size,),
+            "post_attention_weight": (cfg.hidden_size,),
+            "router_weight": (cfg.hidden_size, cfg.num_experts),
+            "q_norm_weight": (cfg.head_dim,),
+            "k_norm_weight": (cfg.head_dim,),
+        }
+
+        self.layer_tensors = []
+        for lid in range(cfg.num_layers):
+            layer = {}
+            for wk, prefix in LAYER_WEIGHT_KEYS:
+                layer[wk] = DeviceTensor.from_numpy(
+                    np.zeros(shapes[wk], dtype=cfg.dtype), f"{prefix}_L{lid}")
+            layer["cache_k"] = DeviceTensor.from_numpy(cache_k, f"cache_k_L{lid}")
+            layer["cache_v"] = DeviceTensor.from_numpy(cache_v, f"cache_v_L{lid}")
+            self.layer_tensors.append(layer)
+
+        self.norm_weight = DeviceTensor.from_numpy(
+            np.zeros((cfg.hidden_size,), dtype=cfg.dtype), "norm_weight")
+        self.lm_head_weight = DeviceTensor.from_numpy(
+            np.zeros((cfg.hidden_size, cfg.vocab_size // tp), dtype=cfg.dtype), "lm_head_weight")
+
+    def weight_buffers(self):
+        """Yield (name, va, size_bytes) for all weight tensors (for P2P)."""
+        for lid, layer in enumerate(self.layer_tensors):
+            for key, dt in layer.items():
+                if key in ("cache_k", "cache_v"):
+                    continue
+                va = dt.tensor_ref.va
+                size = int(np.prod(dt.shape) * np.dtype(dt.dtype).itemsize)
+                yield f"layers.{lid}.{key}", va, size
+        for attr in ("norm_weight", "lm_head_weight"):
+            dt = getattr(self, attr, None)
+            if dt is not None:
+                va = dt.tensor_ref.va
+                size = int(np.prod(dt.shape) * np.dtype(dt.dtype).itemsize)
+                yield attr, va, size
 
     def _prepare_kernels(self):
         t = time.time()
@@ -126,6 +181,61 @@ class Qwen3Model:
             additional_compiler_args=compiler_args)
 
         logger.info("Kernels compiled in %.2fs", time.time() - t)
+
+    def _compile_kernels(self):
+        """Compile kernels to NEFF without loading onto device. Returns kernel_cache dict."""
+        cfg = self.config
+        tp = dist.get_world_size()
+        compiler_args = cfg.additional_compiler_args_nkipy
+
+        n_local_kv_heads = max(1, cfg.num_kv_heads // tp)
+        n_local_heads = cfg.num_heads // tp
+        qkv_dim = (n_local_heads + 2 * n_local_kv_heads) * cfg.head_dim
+        cache_shape = (cfg.max_batch_size, cfg.max_seq_len, n_local_kv_heads, cfg.head_dim)
+
+        shapes = {
+            "qkv_weight": (cfg.hidden_size, qkv_dim),
+            "o_weight": (n_local_heads * cfg.head_dim, cfg.hidden_size),
+            "gate_up_weight": (cfg.num_experts, cfg.hidden_size, 2 * cfg.intermediate_size),
+            "down_weight": (cfg.num_experts, cfg.intermediate_size, cfg.hidden_size),
+            "input_weight": (cfg.hidden_size,),
+            "post_attention_weight": (cfg.hidden_size,),
+            "router_weight": (cfg.hidden_size, cfg.num_experts),
+            "q_norm_weight": (cfg.head_dim,),
+            "k_norm_weight": (cfg.head_dim,),
+        }
+
+        x_ctx = np.empty((cfg.max_batch_size, cfg.context_len, cfg.hidden_size), dtype=cfg.dtype)
+        x_tok = np.empty((cfg.max_batch_size, 1, cfg.hidden_size), dtype=cfg.dtype)
+        sp = np.empty((1,), dtype=np.int32)
+
+        layer_args = {wk: np.empty(shapes[wk], dtype=cfg.dtype) for wk, _ in LAYER_WEIGHT_KEYS}
+        layer_args["cache_k"] = np.zeros(cache_shape, dtype=cfg.dtype)
+        layer_args["cache_v"] = np.zeros(cache_shape, dtype=cfg.dtype)
+
+        norm_w = np.empty((cfg.hidden_size,), dtype=cfg.dtype)
+        lm_head_w = np.empty((cfg.hidden_size, cfg.vocab_size // tp), dtype=cfg.dtype)
+
+        specs = [
+            ("kernel_cte", "cte_layer", qwen3_transformer_layer,
+             dict(x=x_ctx, start_pos=None, **layer_args, configs=cfg)),
+            ("kernel_tkg", "tkg_layer", qwen3_transformer_layer,
+             dict(x=x_tok, start_pos=sp, **layer_args, configs=cfg)),
+            ("kernel_cte_greedy_sampling", "cte_greedy_sampling", greedy_sampling,
+             dict(h=x_ctx, norm_weight=norm_w, lm_head_weight=lm_head_w,
+                  configs=cfg, use_nki_rmsnorm=USE_NKI_RMSNORM)),
+            ("kernel_tkg_greedy_sampling", "tkg_greedy_sampling", greedy_sampling,
+             dict(h=x_tok, norm_weight=norm_w, lm_head_weight=lm_head_w,
+                  configs=cfg, use_nki_rmsnorm=USE_NKI_RMSNORM)),
+        ]
+
+        kernel_cache = {}
+        for attr, name, kernel_fn, kwargs in specs:
+            neff_path, cache_key = DeviceKernel.compile_only(
+                kernel_fn, name=name, build_dir=BUILD_DIR,
+                additional_compiler_args=compiler_args, **kwargs)
+            kernel_cache[attr] = (neff_path, cache_key)
+        return kernel_cache
 
     def _build_inputs(self, lid, hidden, start_pos=None):
         inputs = {"x": hidden}

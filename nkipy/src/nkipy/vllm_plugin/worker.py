@@ -43,8 +43,11 @@ class NKIPyWorker(WorkerBase):
         self.device = None
 
     def init_device(self) -> None:
+        import torch_neuronx  # noqa: F401 — registers neuron Runtime class
+
+        core_offset = int(os.environ.get("NKIPY_CORE_OFFSET", "0"))
         os.environ.setdefault(
-            "NEURON_RT_VISIBLE_CORES", str(self.local_rank)
+            "NEURON_RT_VISIBLE_CORES", str(self.local_rank + core_offset)
         )
         runtime = torch.classes.neuron.Runtime()
         runtime.initialize()
@@ -135,7 +138,7 @@ class NKIPyWorker(WorkerBase):
         self.model_runner.initialize_kv_cache(kv_cache_config)
 
     def compile_or_warm_up_model(self) -> None:
-        logger.info("NKIPy warmup complete (no-op for basic inference)")
+        self.model_runner.warmup_model()
 
     def execute_model(self, scheduler_output) -> ModelRunnerOutput | None:
         return self.model_runner.execute_model(scheduler_output)
