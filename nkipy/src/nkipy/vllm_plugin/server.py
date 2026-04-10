@@ -78,9 +78,6 @@ def register_nkipy_routes(app: FastAPI) -> None:
             "nkipy_wake_up", args=(peer_url,),
         )
         _nkipy_sleeping = False
-        # Cache tok_embedding so /nkipy/tok_embedding serves from memory
-        global _tok_embedding_cache
-        _tok_embedding_cache = (await core.collective_rpc_async("nkipy_get_tok_embedding"))[0]
         result = results[0]
         result["server_total_s"] = round(_time.time() - t0, 4)
         logger.info("wake_up server total: %.4fs", _time.time() - t0)
@@ -128,9 +125,15 @@ async def run_server(args: Namespace) -> None:
         await init_app_state(engine_client, app.state, args)
 
         # Reject /v1/* requests while sleeping.
-        global _nkipy_sleeping
+        global _nkipy_sleeping, _tok_embedding_cache
         if not os.environ.get("NKIPY_CHECKPOINT"):
             _nkipy_sleeping = True
+        else:
+            # Pre-cache tok_embedding so /nkipy/tok_embedding serves instantly
+            core = _get_engine_core(app)
+            _tok_embedding_cache = (await core.collective_rpc_async("nkipy_get_tok_embedding"))[0]
+            logger.info("tok_embedding cached (%s)",
+                        f"{len(_tok_embedding_cache['raw'])/1e6:.1f} MB" if _tok_embedding_cache else "None")
 
         # Wrap app with ASGI middleware to reject requests while sleeping.
         inner_app = app
