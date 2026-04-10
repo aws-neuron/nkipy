@@ -11,6 +11,7 @@ and a helper to collect device buffer descriptors from a model.
 
 import logging
 import os
+import sys
 import time
 from typing import List, Sequence, Tuple
 
@@ -33,7 +34,7 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 logger.propagate = False
 if not logger.handlers:
-    _handler = logging.StreamHandler()
+    _handler = logging.StreamHandler(sys.stdout)
     _handler.setFormatter(logging.Formatter("%(asctime)s [%(name)s] %(message)s"))
     logger.addHandler(_handler)
 

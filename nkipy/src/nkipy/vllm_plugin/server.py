@@ -18,7 +18,7 @@ import logging
 import os
 from argparse import Namespace
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
@@ -64,15 +64,22 @@ def register_nkipy_routes(app: FastAPI) -> None:
         return results[0]
 
     @app.post("/nkipy/wake_up")
-    async def wake_up(req: WakeUpRequest = None):
+    async def wake_up(request: Request, req: WakeUpRequest = None):
+        import time as _time
+        client = f"{request.client.host}:{request.client.port}" if request.client else "unknown"
+        logger.info('%s - "POST /nkipy/wake_up HTTP/1.1"', client)
         global _nkipy_sleeping
+        t0 = _time.time()
         peer_url = req.peer_url if req else None
         core = _get_engine_core(app)
         results = await core.collective_rpc_async(
             "nkipy_wake_up", args=(peer_url,),
         )
         _nkipy_sleeping = False
-        return results[0]
+        result = results[0]
+        result["server_total_s"] = round(_time.time() - t0, 4)
+        logger.info("wake_up server total: %.4fs", _time.time() - t0)
+        return result
 
     @app.post("/nkipy/p2p_push_weights")
     async def p2p_push_weights(req: PushWeightsRequest):
@@ -144,17 +151,46 @@ async def run_server(args: Namespace) -> None:
         await uvicorn.Server(config).serve()
 
 
+def _release_neuron_cores():
+    """Best-effort release of Neuron cores via spike.reset() + nrt_close."""
+    try:
+        from spike import reset as spike_reset
+        spike_reset()
+    except Exception:
+        pass
+    # Belt-and-suspenders: call nrt_close directly in case spike singleton
+    # was never created but NRT was initialised by another path.
+    try:
+        from spike._spike import nrt_close  # noqa: F401
+        nrt_close()
+    except Exception:
+        pass
+
+
 def main():
+    import signal
+
     from vllm.entrypoints.openai.cli_args import (
         make_arg_parser,
         validate_parsed_serve_args,
     )
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+    def _shutdown_handler(signum, frame):
+        logger.info("Received signal %s, releasing Neuron cores...", signum)
+        _release_neuron_cores()
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGINT, _shutdown_handler)
+    signal.signal(signal.SIGTERM, _shutdown_handler)
+
     parser = make_arg_parser(FlexibleArgumentParser())
     args = parser.parse_args()
     validate_parsed_serve_args(args)
-    asyncio.run(run_server(args))
+    try:
+        asyncio.run(run_server(args))
+    finally:
+        _release_neuron_cores()
 
 
 if __name__ == "__main__":

@@ -57,6 +57,9 @@ class NKIPyWorker(WorkerBase):
         self._config = None
 
     def init_device(self) -> None:
+        import atexit
+        import signal
+
         import torch_neuronx  # noqa: F401 — registers neuron Runtime class
 
         core_offset = int(os.environ.get("NKIPY_CORE_OFFSET", "0"))
@@ -70,6 +73,18 @@ class NKIPyWorker(WorkerBase):
 
         self.device = torch.device(f"neuron:{self.local_rank}")
 
+        # Ensure Neuron cores are released on exit / signal in worker processes.
+        atexit.register(self._release_neuron_cores)
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            prev = signal.getsignal(sig)
+            def _handler(signum, frame, _prev=prev):
+                self._release_neuron_cores()
+                if callable(_prev) and _prev not in (signal.SIG_IGN, signal.SIG_DFL):
+                    _prev(signum, frame)
+                else:
+                    raise SystemExit(128 + signum)
+            signal.signal(sig, _handler)
+
         self._init_distributed()
         self._patch_get_accelerator()
 
@@ -80,6 +95,15 @@ class NKIPyWorker(WorkerBase):
         )
         set_random_seed(self.model_config.seed)
         logger.info("NKIPyWorker initialized: rank=%s device=%s", self.rank, self.device)
+
+    @staticmethod
+    def _release_neuron_cores():
+        """Best-effort release of Neuron cores."""
+        try:
+            from spike import reset as spike_reset
+            spike_reset()
+        except Exception:
+            pass
 
     @staticmethod
     def _patch_get_accelerator():
@@ -219,8 +243,12 @@ class NKIPyWorker(WorkerBase):
 
     def nkipy_wake_up(self, peer_url: str | None = None) -> dict:
         """Allocate tensors, receive weights from peer, reload kernels."""
+        import time as _time
+
         if not self._sleeping:
             return {"status": "already_awake"}
+
+        t_start = _time.time()
 
         from spike import get_spike_singleton
         from nkipy.runtime import DeviceKernel
@@ -229,39 +257,69 @@ class NKIPyWorker(WorkerBase):
         obj_list = [peer_url]
         dist.broadcast_object_list(obj_list, src=0)
         actual_peer = obj_list[0]
+        t_broadcast = _time.time()
 
         dist.barrier()
+        t_pre_nrt = _time.time()
         get_spike_singleton()
+        t_nrt = _time.time()
         dist.barrier()
+        t_nrt_barrier = _time.time()
 
         # Rebuild model with empty tensors
         model = self._model_class(config=self._config, skip_kernels=True)
         model._allocate_empty_tensors()
+        t_alloc = _time.time()
 
         if actual_peer:
             from nkipy.p2p import (
                 receive_from_peer, rank_endpoint, collect_weight_buffers,
             )
             bufs = collect_weight_buffers(model)
+            t_collect = _time.time()
             receive_from_peer(
                 rank_endpoint, bufs, actual_peer,
                 push_endpoint="/nkipy/p2p_push_weights",
             )
+            t_p2p = _time.time()
+        else:
+            t_collect = t_alloc
+            t_p2p = t_alloc
 
         # Reload kernels from cached NEFFs
         for name, (neff_path, cache_key) in self._kernel_cache.items():
             setattr(model, name, DeviceKernel.load_with_cache_key(
                 neff_path, cache_key, name=name,
             ))
+        t_kernels = _time.time()
         dist.barrier()
+        t_kernel_barrier = _time.time()
 
         if model.tok_embedding is None and actual_peer:
             model.tok_embedding = self._fetch_tok_embedding(actual_peer)
+        t_tok = _time.time()
 
         self.model_runner._nkipy_model = model
         self.model_runner.model = model
         self._sleeping = False
-        return {"status": "awake"}
+
+        t_end = _time.time()
+
+        latency = {
+            "broadcast_s": round(t_broadcast - t_start, 4),
+            "nrt_init_s": round(t_nrt - t_pre_nrt, 4),
+            "nrt_barrier_s": round(t_nrt_barrier - t_nrt, 4),
+            "alloc_tensors_s": round(t_alloc - t_nrt_barrier, 4),
+            "collect_bufs_s": round(t_collect - t_alloc, 4),
+            "p2p_transfer_s": round(t_p2p - t_collect, 4),
+            "kernel_load_s": round(t_kernels - t_p2p, 4),
+            "kernel_barrier_s": round(t_kernel_barrier - t_kernels, 4),
+            "tok_embedding_s": round(t_tok - t_kernel_barrier, 4),
+            "total_s": round(t_end - t_start, 4),
+        }
+        logger.info("wake_up latency breakdown (rank %d): %s", self.rank, latency)
+        print(f"wake_up latency breakdown (rank {self.rank}): {latency}", flush=True)
+        return {"status": "awake", "latency": latency}
 
     def nkipy_push_weights(
         self,
