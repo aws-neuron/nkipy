@@ -15,9 +15,9 @@ where = ["src"]
 name = "nkipy"
 version = "0.1.0"
 description = "A lightweight Pythonic kernel environment for AWS Neuron"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 authors = [{ name = "NKIPy Team (Ziyang Xu et al.)" }]
-dependencies = ["numpy>=1.26", "neuronx-cc>=0.0,!=1.*,<3.0", "nki>=0.1.0", "vllm==0.16.0"]
+dependencies = ["numpy>=1.26", "neuronx-cc>=2.15", "nki>=0.1.0", "vllm==0.16.0"]
 
 [project.entry-points."vllm.platform_plugins"]
 nkipy = "nkipy.vllm_plugin:register"
