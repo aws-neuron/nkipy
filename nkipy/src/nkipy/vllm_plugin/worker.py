@@ -374,7 +374,10 @@ class NKIPyWorker(WorkerBase):
     def _fetch_tok_embedding(peer_url: str):
         """Fetch tok_embedding from peer over HTTP and broadcast to all ranks."""
         import requests as _req
-        if dist.get_rank() == 0:
+        rank = dist.get_rank()
+        ws = dist.get_world_size()
+
+        if rank == 0:
             base = peer_url.rstrip("/")
             resp = _req.get(f"{base}/nkipy/tok_embedding")
             resp.raise_for_status()
@@ -391,8 +394,17 @@ class NKIPyWorker(WorkerBase):
                     np.frombuffer(resp.content, dtype=np.dtype(dtype_str))
                     .reshape(shape).copy()
                 )
+            # Broadcast shape/dtype metadata
+            meta = [shape, str(tok_embedding.dtype)]
         else:
-            tok_embedding = None
-        obj_list = [tok_embedding]
-        dist.broadcast_object_list(obj_list, src=0)
-        return obj_list[0]
+            meta = [None, None]
+
+        dist.broadcast_object_list(meta, src=0)
+        shape, dtype_str = meta
+
+        if rank != 0:
+            torch_dtype = getattr(torch, dtype_str.replace("torch.", ""), torch.float32)
+            tok_embedding = torch.empty(shape, dtype=torch_dtype)
+
+        dist.broadcast(tok_embedding, src=0)
+        return tok_embedding
