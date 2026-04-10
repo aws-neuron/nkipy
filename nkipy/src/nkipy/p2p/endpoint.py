@@ -92,7 +92,6 @@ class RankEndpoint:
         for t in self._dereg_threads:
             t.join()
         self._dereg_threads = []
-            self._dereg_thread = None
 
     def _ensure_endpoint(self):
         if self.ep is None:

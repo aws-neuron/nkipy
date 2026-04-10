@@ -2,14 +2,15 @@
 # Engine A: active engine with checkpoint (cores 0-7)
 set -euo pipefail
 
-WEIGHTS=~/zhuangw/nkipy/examples/models/qwen3/tmp_Qwen3-30b-a3b
-TP=8
+WEIGHTS=~/zhuangw/nkipy/examples/models/qwen3/tmp_Qwen3-30b-a3b_TP32
+TP=32
 
 export VLLM_PLUGINS=nkipy
 export VLLM_USE_V1=1
 export NKIPY_CHECKPOINT=$WEIGHTS
 export OMP_NUM_THREADS=1
 export VLLM_RPC_TIMEOUT=600000
+export NKIPY_MAX_RDMA_BUFS=2048
 
 python3 -m nkipy.vllm_plugin.server \
     --model Qwen/Qwen3-30B-A3B \
