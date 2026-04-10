@@ -4,11 +4,8 @@
 name = "nkipy-workspace"
 version = "0.1.0"
 description = "NKIPy Monorepo - A lightweight Pythonic kernel environment for AWS Neuron"
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 dependencies = ["nkipy"]
-
-[tool.uv]
-environments = ["sys_platform == 'linux'"]
 
 [tool.uv.workspace]
 members = ["nkipy", "spike"]
