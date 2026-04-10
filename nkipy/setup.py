@@ -82,4 +82,11 @@ class BuildProtos(build_py):
         super().run()
 
 
-setup(cmdclass={"build_py": BuildProtos})
+setup(
+    cmdclass={"build_py": BuildProtos},
+    entry_points={
+        "vllm.platform_plugins": [
+            "nkipy = nkipy.vllm_plugin:register",
+        ],
+    },
+)
