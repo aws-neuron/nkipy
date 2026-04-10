@@ -317,8 +317,9 @@ class NKIPyWorker(WorkerBase):
             "tok_embedding_s": round(t_tok - t_kernel_barrier, 4),
             "total_s": round(t_end - t_start, 4),
         }
-        logger.info("wake_up latency breakdown (rank %d): %s", self.rank, latency)
-        print(f"wake_up latency breakdown (rank {self.rank}): {latency}", flush=True)
+        if self.rank == 0:
+            logger.info("wake_up latency breakdown (rank %d): %s", self.rank, latency)
+            print(f"wake_up latency breakdown (rank {self.rank}): {latency}", flush=True)
         return {"status": "awake", "latency": latency}
 
     def nkipy_push_weights(

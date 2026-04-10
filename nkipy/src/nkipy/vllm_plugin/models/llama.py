@@ -16,7 +16,7 @@ from .kernels.sampling import greedy_sampling
 
 logger = logging.getLogger(__name__)
 BUILD_DIR = "./build"
-USE_NKI_RMSNORM = True
+USE_NKI_RMSNORM = False
 
 LAYER_WEIGHT_KEYS = [
     ("qkv_weight", "qkv_weight"),

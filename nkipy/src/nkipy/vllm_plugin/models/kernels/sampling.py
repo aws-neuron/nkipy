@@ -1,8 +1,12 @@
+import os
+
 import nki
 import nki.isa as nisa
 import nki.language as nl
 import nkipy.distributed.collectives as cc
 import numpy as np
+
+os.environ.setdefault("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
 import torch.distributed as dist
 
 from nkipy.core import (
@@ -27,7 +31,7 @@ def stream_shuffle_broadcast(src, dst):
         )
 
 
-@nki.jit(platform_target="trn2")
+@nki.jit
 def nki_rmsnorm_kernel(input_tensor, weight, eps):
     """RMSNorm NKI kernel - based on AWS official tutorial pattern."""
     MAX_P = 128
