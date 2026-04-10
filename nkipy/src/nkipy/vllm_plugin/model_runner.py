@@ -127,12 +127,6 @@ class NKIPyModelRunner:
             self._nkipy_model.config.max_new_tokens = self.max_model_len
             self._nkipy_model._prepare_kernels()
 
-            try:
-                from nkipy.p2p import preregister_weights
-                preregister_weights(self._nkipy_model)
-            except Exception:
-                pass
-
             logger.info("NKIPy warmup complete (kernels compiled)")
         else:
             logger.info("NKIPy warmup complete (no compilation needed)")
@@ -187,12 +181,6 @@ class NKIPyModelRunner:
                     self._nkipy_model.config.context_len = ctx_len
                     self._nkipy_model.config.max_new_tokens = self.max_model_len
                     self._nkipy_model._prepare_kernels()
-
-                    try:
-                        from nkipy.p2p import preregister_weights
-                        preregister_weights(self._nkipy_model)
-                    except Exception:
-                        pass
 
                 gen = self._nkipy_model.generate(input_ids)
                 next_id_tensor = next(gen)

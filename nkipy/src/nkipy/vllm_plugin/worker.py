@@ -60,9 +60,7 @@ class NKIPyWorker(WorkerBase):
         import torch_neuronx  # noqa: F401 — registers neuron Runtime class
 
         core_offset = int(os.environ.get("NKIPY_CORE_OFFSET", "0"))
-        os.environ.setdefault(
-            "NEURON_RT_VISIBLE_CORES", str(self.local_rank + core_offset)
-        )
+        os.environ["NEURON_RT_VISIBLE_CORES"] = str(self.local_rank + core_offset)
 
         # Only claim neuron cores if we have weights to load.
         # Sleep-mode engines defer core init to wake_up via get_spike_singleton().
@@ -226,7 +224,6 @@ class NKIPyWorker(WorkerBase):
 
         from spike import get_spike_singleton
         from nkipy.runtime import DeviceKernel
-        from nkipy.p2p import WeightServer, preregister_weights
 
         # Broadcast peer_url from rank 0 to all ranks
         obj_list = [peer_url]
@@ -245,13 +242,7 @@ class NKIPyWorker(WorkerBase):
             from nkipy.p2p import (
                 receive_from_peer, rank_endpoint, collect_weight_buffers,
             )
-            from nkipy.p2p.transfer import MAX_RDMA_BUFS
             bufs = collect_weight_buffers(model)
-            # Pre-register all buffers so receive_from_peer uses the
-            # single-shot path.  The chunked path deregisters MRs between
-            # chunks while async RDMA writes may still be in-flight,
-            # causing remote-access errors on the sender.
-            rank_endpoint.register_chunked(bufs, MAX_RDMA_BUFS)
             receive_from_peer(
                 rank_endpoint, bufs, actual_peer,
                 push_endpoint="/nkipy/p2p_push_weights",
@@ -270,8 +261,6 @@ class NKIPyWorker(WorkerBase):
         self.model_runner._nkipy_model = model
         self.model_runner.model = model
         self._sleeping = False
-
-        preregister_weights(model)
         return {"status": "awake"}
 
     def nkipy_push_weights(
