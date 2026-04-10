@@ -76,6 +76,7 @@ class RankEndpoint:
         self.xfer_descs: list = []
         self.buf_info: List[Tuple[str, int]] = []  # [(name, size_bytes)]
         self._dereg_thread: threading.Thread | None = None
+        self._dereg_threads: list[threading.Thread] = []
 
     # -- internal helpers ------------------------------------------
 
@@ -83,6 +84,14 @@ class RankEndpoint:
         """Block until any pending async deregistration completes."""
         if self._dereg_thread is not None:
             self._dereg_thread.join()
+            self._dereg_thread = None
+
+    def _wait_all_dereg(self) -> None:
+        """Block until all background deregistration threads complete."""
+        self._wait_dereg()
+        for t in self._dereg_threads:
+            t.join()
+        self._dereg_threads = []
             self._dereg_thread = None
 
     def _ensure_endpoint(self):
@@ -139,18 +148,25 @@ class RankEndpoint:
     def reregister(self, buffers: Sequence[Tuple[str, int, int]]) -> None:
         """Deregister current MRs and register *buffers*, keeping the endpoint.
 
-        Unlike :meth:`dereg_sync` followed by :meth:`register`, this does
-        **not** destroy the underlying UCCL endpoint, so existing RDMA
-        connections remain valid.
+        Old MRs are deregistered in a background thread — no waiting.
+        All background threads are joined on :meth:`dereg_sync`,
+        :meth:`dereg_async`, or :meth:`wait`.
         """
-        self._wait_dereg()
         ep = self._ensure_endpoint()
-        # Deregister old MRs (if any) without destroying the endpoint.
-        for desc in self.xfer_descs:
-            ep.dereg(desc.mr_id)
+        # Fire-and-forget deregistration of old MRs.
+        old_descs = self.xfer_descs
         self.xfer_descs = []
         self.buf_info = []
-        # Register new buffers on the same endpoint.
+        if old_descs:
+            def _bg_dereg(ep, descs):
+                for desc in descs:
+                    ep.dereg(desc.mr_id)
+            t = threading.Thread(
+                target=_bg_dereg, args=(ep, list(old_descs)), daemon=True
+            )
+            t.start()
+            self._dereg_threads.append(t)
+        # Register new buffers — new MRs are independent of old ones.
         handles = []
         for name, va, size_bytes in buffers:
             self.buf_info.append((name, size_bytes))
@@ -159,37 +175,40 @@ class RankEndpoint:
 
     def dereg_sync(self) -> None:
         """Deregister memory and destroy the endpoint (blocking)."""
-        self._wait_dereg()
+        self._wait_all_dereg()
         if self.ep is not None and self.xfer_descs:
             for desc in self.xfer_descs:
                 self.ep.dereg(desc.mr_id)
         self.xfer_descs = []
         self.buf_info = []
-        # Destroy the endpoint so stale RDMA connections don't persist
-        # across sleep/wake cycles (causes remote access errors on re-push).
         self.ep = None
 
     def dereg_async(self) -> None:
         """Kick off RDMA deregistration and endpoint teardown in a background thread."""
-        self._wait_dereg()
+        # Collect all pending dereg threads + current descs into one final thread.
+        pending = list(self._dereg_threads)
+        self._dereg_threads = []
+        if self._dereg_thread is not None:
+            pending.append(self._dereg_thread)
+            self._dereg_thread = None
         ep, descs = self.ep, self.xfer_descs
         self.ep = None
         self.xfer_descs = []
         self.buf_info = []
         if ep is not None:
-
-            def _bg(ep, descs):
+            def _bg(ep, descs, pending):
+                for t in pending:
+                    t.join()
                 for desc in descs:
                     ep.dereg(desc.mr_id)
-
             self._dereg_thread = threading.Thread(
-                target=_bg, args=(ep, descs), daemon=True
+                target=_bg, args=(ep, descs, pending), daemon=True
             )
             self._dereg_thread.start()
 
     def wait(self) -> None:
         """Wait for any pending async deregistration to finish."""
-        self._wait_dereg()
+        self._wait_all_dereg()
 
     @property
     def registered(self) -> bool:
