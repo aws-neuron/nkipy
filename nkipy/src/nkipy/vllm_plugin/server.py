@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 # Tracks sleep state in the API server process.
 _nkipy_sleeping = False
+_tok_embedding_cache = None  # cached raw bytes + headers for /tok_embedding
 
 
 # --- Request schemas ---
@@ -57,8 +58,9 @@ def register_nkipy_routes(app: FastAPI) -> None:
 
     @app.post("/nkipy/sleep")
     async def sleep():
-        global _nkipy_sleeping
+        global _nkipy_sleeping, _tok_embedding_cache
         _nkipy_sleeping = True
+        _tok_embedding_cache = None
         core = _get_engine_core(app)
         results = await core.collective_rpc_async("nkipy_sleep")
         return results[0]
@@ -76,6 +78,9 @@ def register_nkipy_routes(app: FastAPI) -> None:
             "nkipy_wake_up", args=(peer_url,),
         )
         _nkipy_sleeping = False
+        # Cache tok_embedding so /nkipy/tok_embedding serves from memory
+        global _tok_embedding_cache
+        _tok_embedding_cache = (await core.collective_rpc_async("nkipy_get_tok_embedding"))[0]
         result = results[0]
         result["server_total_s"] = round(_time.time() - t0, 4)
         logger.info("wake_up server total: %.4fs", _time.time() - t0)
@@ -92,10 +97,12 @@ def register_nkipy_routes(app: FastAPI) -> None:
 
     @app.get("/nkipy/tok_embedding")
     async def tok_embedding():
-        core = _get_engine_core(app)
-        results = await core.collective_rpc_async("nkipy_get_tok_embedding")
-        # Only rank 0's result matters
-        data = results[0]
+        global _tok_embedding_cache
+        if _tok_embedding_cache is None:
+            # Populate cache on first request
+            core = _get_engine_core(app)
+            _tok_embedding_cache = (await core.collective_rpc_async("nkipy_get_tok_embedding"))[0]
+        data = _tok_embedding_cache
         if data is None:
             raise HTTPException(503, "Token embedding not available")
         return Response(

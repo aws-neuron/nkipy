@@ -373,14 +373,16 @@ class NKIPyWorker(WorkerBase):
     @staticmethod
     def _fetch_tok_embedding(peer_url: str):
         """Fetch tok_embedding from peer over HTTP and broadcast to all ranks."""
+        import time as _time
         import requests as _req
         rank = dist.get_rank()
-        ws = dist.get_world_size()
 
+        t0 = _time.time()
         if rank == 0:
             base = peer_url.rstrip("/")
             resp = _req.get(f"{base}/nkipy/tok_embedding")
             resp.raise_for_status()
+            t_http = _time.time()
             shape = tuple(int(d) for d in resp.headers["X-Shape"].split(","))
             dtype_str = resp.headers["X-Dtype"]
             torch_dtype = getattr(torch, dtype_str.replace("torch.", ""), None)
@@ -394,8 +396,10 @@ class NKIPyWorker(WorkerBase):
                     np.frombuffer(resp.content, dtype=np.dtype(dtype_str))
                     .reshape(shape).copy()
                 )
-            # Broadcast shape/dtype metadata
+            t_deser = _time.time()
             meta = [shape, str(tok_embedding.dtype)]
+            size_mb = tok_embedding.numel() * tok_embedding.element_size() / 1e6
+            print(f"tok_embedding: http {t_http-t0:.3f}s, deser {t_deser-t_http:.3f}s, {size_mb:.1f} MB", flush=True)
         else:
             meta = [None, None]
 
@@ -406,5 +410,9 @@ class NKIPyWorker(WorkerBase):
             torch_dtype = getattr(torch, dtype_str.replace("torch.", ""), torch.float32)
             tok_embedding = torch.empty(shape, dtype=torch_dtype)
 
+        t_pre_bcast = _time.time()
         dist.broadcast(tok_embedding, src=0)
+        t_bcast = _time.time()
+        if rank == 0:
+            print(f"tok_embedding: broadcast {t_bcast-t_pre_bcast:.3f}s, total {t_bcast-t0:.3f}s", flush=True)
         return tok_embedding
