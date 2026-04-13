@@ -172,6 +172,10 @@ class NKIPyWorker(WorkerBase):
         self._kernel_cache = getattr(mr, '_kernel_cache', None)
         self._sleeping = mr._nkipy_model is None
 
+        # Pre-register RDMA buffers so push_to_peer skips registration.
+        if mr._nkipy_model is not None:
+            self._preregister_rdma()
+
     def determine_available_memory(self) -> int:
         return 1 * (1024 ** 3)
 
@@ -200,10 +204,21 @@ class NKIPyWorker(WorkerBase):
     # P2P operations (called via collective_rpc on ALL ranks)
     # ------------------------------------------------------------------
 
+    def _preregister_rdma(self) -> None:
+        """Pre-register model weight buffers for RDMA so push skips registration."""
+        from nkipy.p2p import preregister_weights
+        model = self.model_runner._nkipy_model
+        if model is not None:
+            preregister_weights(model)
+
     def nkipy_sleep(self) -> dict:
         """Release device resources and enter sleep mode."""
+        import time as _time
+
         if self._sleeping:
             return {"status": "already_sleeping"}
+
+        t_start = _time.time()
 
         from spike import reset as spike_reset
         from nkipy.runtime.device_kernel import _LOADED_KERNELS
@@ -218,6 +233,7 @@ class NKIPyWorker(WorkerBase):
             kernel = getattr(model, name, None)
             if kernel is not None:
                 self._kernel_cache[name] = (kernel.neff_path, kernel.cache_key)
+        t_cache = _time.time()
 
         # Skip individual free_tensor/unload_model calls — spike_reset()
         # calls nrt_close() which releases all NRT resources in one shot.
@@ -226,10 +242,23 @@ class NKIPyWorker(WorkerBase):
         self.model_runner.model = None
         del model
         gc.collect()
+        t_gc = _time.time()
+
         spike_reset()
+        t_reset = _time.time()
 
         self._sleeping = True
-        return {"status": "sleeping"}
+
+        latency = {
+            "cache_neffs_s": round(t_cache - t_start, 4),
+            "gc_s": round(t_gc - t_cache, 4),
+            "spike_reset_s": round(t_reset - t_gc, 4),
+            "total_s": round(t_reset - t_start, 4),
+        }
+        if self.rank == 0:
+            logger.info("sleep latency breakdown (rank %d): %s", self.rank, latency)
+            print(f"sleep latency breakdown (rank {self.rank}): {latency}", flush=True)
+        return {"status": "sleeping", "latency": latency}
 
     def nkipy_wake_up(self, peer_url: str | None = None) -> dict:
         """Allocate tensors, receive weights from peer, reload kernels."""
@@ -293,6 +322,10 @@ class NKIPyWorker(WorkerBase):
         self.model_runner.model = model
         self._sleeping = False
 
+        # Pre-register RDMA buffers so future push_to_peer skips registration.
+        self._preregister_rdma()
+        t_rdma_reg = _time.time()
+
         t_end = _time.time()
 
         latency = {
@@ -305,6 +338,7 @@ class NKIPyWorker(WorkerBase):
             "kernel_load_s": round(t_kernels - t_p2p, 4),
             "kernel_barrier_s": round(t_kernel_barrier - t_kernels, 4),
             "tok_embedding_s": round(t_tok - t_kernel_barrier, 4),
+            "rdma_prereg_s": round(t_rdma_reg - t_tok, 4),
             "total_s": round(t_end - t_start, 4),
         }
         if self.rank == 0:

@@ -58,12 +58,17 @@ def register_nkipy_routes(app: FastAPI) -> None:
 
     @app.post("/nkipy/sleep")
     async def sleep():
+        import time as _time
         global _nkipy_sleeping, _tok_embedding_cache
+        t0 = _time.time()
         _nkipy_sleeping = True
         _tok_embedding_cache = None
         core = _get_engine_core(app)
         results = await core.collective_rpc_async("nkipy_sleep")
-        return results[0]
+        result = results[0]
+        result["server_total_s"] = round(_time.time() - t0, 4)
+        logger.info("sleep server total: %.4fs", _time.time() - t0)
+        return result
 
     @app.post("/nkipy/wake_up")
     async def wake_up(request: Request, req: WakeUpRequest = None):
