@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """NKIPy Worker for vLLM integration."""
 
-import gc
 import logging
 import os
 from typing import Any
@@ -237,12 +236,14 @@ class NKIPyWorker(WorkerBase):
 
         # Skip individual free_tensor/unload_model calls — spike_reset()
         # calls nrt_close() which releases all NRT resources in one shot.
+        # Don't gc.collect() before spike_reset(): Python destructors for
+        # DeviceTensor/NrtTensor would call nrt_tensor_free individually
+        # (hundreds of sync NRT calls). Instead, reset spike first — after
+        # that, all C++ destructors become no-ops (is_freed()/is_unloaded()
+        # return true when spike is closed).
         _LOADED_KERNELS.clear()
         self.model_runner._nkipy_model = None
         self.model_runner.model = None
-        del model
-        gc.collect()
-        t_gc = _time.time()
 
         spike_reset()
         t_reset = _time.time()
@@ -251,8 +252,7 @@ class NKIPyWorker(WorkerBase):
 
         latency = {
             "cache_neffs_s": round(t_cache - t_start, 4),
-            "gc_s": round(t_gc - t_cache, 4),
-            "spike_reset_s": round(t_reset - t_gc, 4),
+            "spike_reset_s": round(t_reset - t_cache, 4),
             "total_s": round(t_reset - t_start, 4),
         }
         if self.rank == 0:
