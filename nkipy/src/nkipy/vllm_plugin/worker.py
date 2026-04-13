@@ -205,7 +205,7 @@ class NKIPyWorker(WorkerBase):
         if self._sleeping:
             return {"status": "already_sleeping"}
 
-        from spike import get_spike_singleton, reset as spike_reset
+        from spike import reset as spike_reset
         from nkipy.runtime.device_kernel import _LOADED_KERNELS
         from nkipy.p2p import rank_endpoint
 
@@ -219,25 +219,15 @@ class NKIPyWorker(WorkerBase):
             if kernel is not None:
                 self._kernel_cache[name] = (kernel.neff_path, kernel.cache_key)
 
-        # Free device tensors and unload kernels
-        spike = get_spike_singleton()
-        for layer in model.layer_tensors:
-            for t in layer.values():
-                spike.free_tensor(t.tensor_ref)
-        for t in (model.norm_weight, model.lm_head_weight):
-            if t is not None:
-                spike.free_tensor(t.tensor_ref)
-        for name in _KERNEL_NAMES:
-            kernel = getattr(model, name, None)
-            if kernel is not None:
-                spike.unload_model(kernel.model_ref)
-
+        # Skip individual free_tensor/unload_model calls — spike_reset()
+        # calls nrt_close() which releases all NRT resources in one shot.
         _LOADED_KERNELS.clear()
+        self.model_runner._nkipy_model = None
+        self.model_runner.model = None
+        del model
         gc.collect()
         spike_reset()
 
-        self.model_runner._nkipy_model = None
-        self.model_runner.model = None
         self._sleeping = True
         return {"status": "sleeping"}
 
