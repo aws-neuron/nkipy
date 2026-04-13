@@ -225,7 +225,7 @@ class NKIPyWorker(WorkerBase):
 
         model = self.model_runner._nkipy_model
 
-        # Cache kernel NEFFs
+        # Cache kernel NEFFs and kick off async RDMA deregistration.
         rank_endpoint.dereg_async()
         self._kernel_cache = {}
         for name in _KERNEL_NAMES:
@@ -234,12 +234,14 @@ class NKIPyWorker(WorkerBase):
                 self._kernel_cache[name] = (kernel.neff_path, kernel.cache_key)
         t_cache = _time.time()
 
-        # Skip individual free_tensor/unload_model calls — spike_reset()
+        # Wait for RDMA deregistration to finish before nrt_close(),
+        # otherwise nrt_close() blocks on in-flight RDMA resources.
+        rank_endpoint.wait()
+        t_dereg = _time.time()
+
+        # Drop Python references but don't gc.collect() — spike_reset()
         # calls nrt_close() which releases all NRT resources in one shot.
-        # Don't gc.collect() before spike_reset(): Python destructors for
-        # DeviceTensor/NrtTensor would call nrt_tensor_free individually
-        # (hundreds of sync NRT calls). Instead, reset spike first — after
-        # that, all C++ destructors become no-ops (is_freed()/is_unloaded()
+        # After that, C++ destructors become no-ops (is_freed()/is_unloaded()
         # return true when spike is closed).
         _LOADED_KERNELS.clear()
         self.model_runner._nkipy_model = None
@@ -251,13 +253,14 @@ class NKIPyWorker(WorkerBase):
         self._sleeping = True
 
         latency = {
+            "rank": self.rank,
             "cache_neffs_s": round(t_cache - t_start, 4),
-            "spike_reset_s": round(t_reset - t_cache, 4),
+            "rdma_dereg_s": round(t_dereg - t_cache, 4),
+            "spike_reset_s": round(t_reset - t_dereg, 4),
             "total_s": round(t_reset - t_start, 4),
         }
-        if self.rank == 0:
-            logger.info("sleep latency breakdown (rank %d): %s", self.rank, latency)
-            print(f"sleep latency breakdown (rank {self.rank}): {latency}", flush=True)
+        logger.info("sleep latency breakdown (rank %d): %s", self.rank, latency)
+        print(f"sleep latency breakdown (rank {self.rank}): {latency}", flush=True)
         return {"status": "sleeping", "latency": latency}
 
     def nkipy_wake_up(self, peer_url: str | None = None) -> dict:
