@@ -171,10 +171,6 @@ class NKIPyWorker(WorkerBase):
         self._kernel_cache = getattr(mr, '_kernel_cache', None)
         self._sleeping = mr._nkipy_model is None
 
-        # Pre-register RDMA buffers so push_to_peer skips registration.
-        if mr._nkipy_model is not None:
-            self._preregister_rdma()
-
     def determine_available_memory(self) -> int:
         return 1 * (1024 ** 3)
 
@@ -189,6 +185,10 @@ class NKIPyWorker(WorkerBase):
 
     def compile_or_warm_up_model(self) -> None:
         self.model_runner.warmup_model()
+        # Pre-register RDMA buffers after warmup so push_to_peer
+        # skips registration for the first chunk.
+        if self.model_runner._nkipy_model is not None:
+            self._preregister_rdma()
 
     def execute_model(self, scheduler_output) -> ModelRunnerOutput | None:
         return self.model_runner.execute_model(scheduler_output)
