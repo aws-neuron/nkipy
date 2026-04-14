@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """NKIPy Worker for vLLM integration."""
 
+import gc
 import logging
 import os
 from typing import Any
@@ -185,10 +186,6 @@ class NKIPyWorker(WorkerBase):
 
     def compile_or_warm_up_model(self) -> None:
         self.model_runner.warmup_model()
-        # Pre-register RDMA buffers after warmup so push_to_peer
-        # skips registration for the first chunk.
-        if self.model_runner._nkipy_model is not None:
-            self._preregister_rdma()
 
     def execute_model(self, scheduler_output) -> ModelRunnerOutput | None:
         return self.model_runner.execute_model(scheduler_output)
@@ -203,13 +200,6 @@ class NKIPyWorker(WorkerBase):
     # P2P operations (called via collective_rpc on ALL ranks)
     # ------------------------------------------------------------------
 
-    def _preregister_rdma(self) -> None:
-        """Pre-register model weight buffers for RDMA so push skips registration."""
-        from nkipy.p2p import preregister_weights
-        model = self.model_runner._nkipy_model
-        if model is not None:
-            preregister_weights(model)
-
     def nkipy_sleep(self) -> dict:
         """Release device resources and enter sleep mode."""
         import time as _time
@@ -219,16 +209,13 @@ class NKIPyWorker(WorkerBase):
 
         t_start = _time.time()
 
-        from spike import reset as spike_reset
+        from spike import get_spike_singleton, reset as spike_reset
         from nkipy.runtime.device_kernel import _LOADED_KERNELS
         from nkipy.p2p import rank_endpoint
 
         model = self.model_runner._nkipy_model
 
-        # Cache kernel NEFFs and kick off async RDMA deregistration.
-        # dereg_async() runs ibv_dereg_mr in a background thread — don't
-        # wait for it; RDMA MRs are EFA userspace resources independent
-        # of NRT, so nrt_close() doesn't need them cleaned up first.
+        # Cache kernel NEFFs
         rank_endpoint.dereg_async()
         self._kernel_cache = {}
         for name in _KERNEL_NAMES:
@@ -237,23 +224,34 @@ class NKIPyWorker(WorkerBase):
                 self._kernel_cache[name] = (kernel.neff_path, kernel.cache_key)
         t_cache = _time.time()
 
-        # Drop Python references but don't gc.collect() — spike_reset()
-        # calls nrt_close() which releases all NRT resources in one shot.
-        # After that, C++ destructors become no-ops (is_freed()/is_unloaded()
-        # return true when spike is closed).
-        _LOADED_KERNELS.clear()
-        self.model_runner._nkipy_model = None
-        self.model_runner.model = None
+        # Free device tensors and unload kernels
+        spike = get_spike_singleton()
+        for layer in model.layer_tensors:
+            for t in layer.values():
+                spike.free_tensor(t.tensor_ref)
+        for t in (model.norm_weight, model.lm_head_weight):
+            if t is not None:
+                spike.free_tensor(t.tensor_ref)
+        for name in _KERNEL_NAMES:
+            kernel = getattr(model, name, None)
+            if kernel is not None:
+                spike.unload_model(kernel.model_ref)
+        t_free = _time.time()
 
+        _LOADED_KERNELS.clear()
+        gc.collect()
         spike_reset()
         t_reset = _time.time()
 
+        self.model_runner._nkipy_model = None
+        self.model_runner.model = None
         self._sleeping = True
 
         latency = {
             "rank": self.rank,
             "cache_neffs_s": round(t_cache - t_start, 4),
-            "spike_reset_s": round(t_reset - t_cache, 4),
+            "free_tensors_s": round(t_free - t_cache, 4),
+            "gc_reset_s": round(t_reset - t_free, 4),
             "total_s": round(t_reset - t_start, 4),
         }
         logger.info("sleep latency breakdown (rank %d): %s", self.rank, latency)
@@ -322,10 +320,6 @@ class NKIPyWorker(WorkerBase):
         self.model_runner.model = model
         self._sleeping = False
 
-        # Pre-register RDMA buffers so future push_to_peer skips registration.
-        self._preregister_rdma()
-        t_rdma_reg = _time.time()
-
         t_end = _time.time()
 
         latency = {
@@ -338,7 +332,6 @@ class NKIPyWorker(WorkerBase):
             "kernel_load_s": round(t_kernels - t_p2p, 4),
             "kernel_barrier_s": round(t_kernel_barrier - t_kernels, 4),
             "tok_embedding_s": round(t_tok - t_kernel_barrier, 4),
-            "rdma_prereg_s": round(t_rdma_reg - t_tok, 4),
             "total_s": round(t_end - t_start, 4),
         }
         if self.rank == 0:

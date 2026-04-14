@@ -285,19 +285,16 @@ class WeightServer:
 
 
 def preregister_weights(model) -> None:
-    """Pre-register the first chunk of weight buffers for RDMA.
+    """Pre-register all model weight buffers for RDMA in chunks.
 
-    Eagerly registers up to MAX_RDMA_BUFS buffers so the first chunk
-    of a subsequent ``push_to_peer`` skips the registration cost.
-    Later chunks use ``reregister`` which overlaps deregistration of
-    the previous chunk with registration of the next.
+    Call once after model tensors are allocated (load or wake-up).
+    Subsequent ``push_to_peer`` / ``receive_from_peer`` calls will
+    skip registration entirely.
     """
     bufs = collect_weight_buffers(model)
     if rank_endpoint.registered:
-        # Clean up stale descriptors (e.g. leftover from receive path).
-        rank_endpoint.dereg_sync()
-    first_chunk = bufs[:MAX_RDMA_BUFS]
-    rank_endpoint.register(first_chunk)
+        return
+    rank_endpoint.register_chunked(bufs, MAX_RDMA_BUFS)
 
 
 def receive_weights(model, peer_url: str) -> None:
