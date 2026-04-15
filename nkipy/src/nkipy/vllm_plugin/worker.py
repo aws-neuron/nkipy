@@ -172,6 +172,11 @@ class NKIPyWorker(WorkerBase):
         self._kernel_cache = getattr(mr, '_kernel_cache', None)
         self._sleeping = mr._nkipy_model is None
 
+        # Pre-register weight MRs for RDMA so push_to_peer skips registration.
+        if mr._nkipy_model is not None:
+            from nkipy.p2p import preregister_weights
+            preregister_weights(mr._nkipy_model)
+
     def determine_available_memory(self) -> int:
         return 1 * (1024 ** 3)
 
@@ -209,49 +214,47 @@ class NKIPyWorker(WorkerBase):
 
         t_start = _time.time()
 
-        from spike import get_spike_singleton, reset as spike_reset
+        from spike import reset as spike_reset
         from nkipy.runtime.device_kernel import _LOADED_KERNELS
         from nkipy.p2p import rank_endpoint
 
-        model = self.model_runner._nkipy_model
+        # Just clear the descriptors — spike_reset() will tear down NRT runtime.
+        # Avoid touching rank_endpoint.ep to prevent triggering destructor cleanup.
+        rank_endpoint.xfer_descs = []
+        rank_endpoint.buf_info = []
+        t_endpoint = _time.time()
 
-        # Cache kernel NEFFs
-        rank_endpoint.dereg_async()
-        self._kernel_cache = {}
-        for name in _KERNEL_NAMES:
-            kernel = getattr(model, name, None)
-            if kernel is not None:
-                self._kernel_cache[name] = (kernel.neff_path, kernel.cache_key)
+        # Kernel cache is already populated during load_model() or wake_up().
+        # No need to access model attrs here — just verify cache exists.
+        if self._kernel_cache is None:
+            logger.warning("Rank %d: _kernel_cache is None during sleep, skipping cache check",
+                          self.rank)
         t_cache = _time.time()
 
-        # Free device tensors and unload kernels
-        spike = get_spike_singleton()
-        for layer in model.layer_tensors:
-            for t in layer.values():
-                spike.free_tensor(t.tensor_ref)
-        for t in (model.norm_weight, model.lm_head_weight):
-            if t is not None:
-                spike.free_tensor(t.tensor_ref)
-        for name in _KERNEL_NAMES:
-            kernel = getattr(model, name, None)
-            if kernel is not None:
-                spike.unload_model(kernel.model_ref)
-        t_free = _time.time()
-
-        _LOADED_KERNELS.clear()
-        gc.collect()
-        spike_reset()
-        t_reset = _time.time()
-
+        # Clear model references BEFORE gc/reset to speed up cleanup
+        # Skip _LOADED_KERNELS.clear() as spike_reset() will tear down NRT anyway
         self.model_runner._nkipy_model = None
         self.model_runner.model = None
+        t_clear_refs = _time.time()
+
+        # Skip gc.collect() - spike_reset() releases all device memory
+        spike_reset()
+        _LOADED_KERNELS.clear()  # Clear after reset for next wake
+        t_reset = _time.time()
+
+        # Clear endpoint after spike_reset to avoid blocking cleanup.
+        rank_endpoint.ep = None
+        rank_endpoint._dereg_threads = []
+        rank_endpoint._dereg_thread = None
+
         self._sleeping = True
 
         latency = {
             "rank": self.rank,
-            "cache_neffs_s": round(t_cache - t_start, 4),
-            "free_tensors_s": round(t_free - t_cache, 4),
-            "gc_reset_s": round(t_reset - t_free, 4),
+            "endpoint_clear_s": round(t_endpoint - t_start, 4),
+            "cache_check_s": round(t_cache - t_endpoint, 4),
+            "clear_refs_s": round(t_clear_refs - t_cache, 4),
+            "gc_reset_s": round(t_reset - t_clear_refs, 4),
             "total_s": round(t_reset - t_start, 4),
         }
         logger.info("sleep latency breakdown (rank %d): %s", self.rank, latency)

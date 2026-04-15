@@ -215,28 +215,21 @@ def push_to_peer(
 
     t0 = time.time()
 
-    # Free any pre-registered MRs to make room for connection MRs.
-    # EFA has a system-wide MR limit; with 32 ranks × 434 weight MRs
-    # there is no headroom for the QP memory that add_remote_endpoint
-    # registers internally.
-    had_mrs = bool(ep.xfer_descs)
-    if had_mrs:
-        for desc in ep.xfer_descs:
-            ep.ep.dereg(desc.mr_id)
-        ep.xfer_descs = []
-        ep.buf_info = []
+    pre_registered = ep.registered and len(ep.xfer_descs) == len(buffers)
 
     uccl_ep = ep._ensure_endpoint()
     ok, conn_id = uccl_ep.add_remote_endpoint(bytes.fromhex(remote_metadata_hex))
     assert ok, "Failed to connect to remote endpoint"
     t_conn = time.time()
 
-    # Now register the chunk's weight buffers for transfer.
-    handles = []
-    for name, va, size_bytes in buffers:
-        ep.buf_info.append((name, size_bytes))
-        handles.append(_VAHandle(va, size_bytes))
-    ep.xfer_descs = uccl_ep.register_memory(handles)
+    if not pre_registered:
+        # Register the chunk's weight buffers for transfer.
+        handles = []
+        ep.buf_info = []
+        for name, va, size_bytes in buffers:
+            ep.buf_info.append((name, size_bytes))
+            handles.append(_VAHandle(va, size_bytes))
+        ep.xfer_descs = uccl_ep.register_memory(handles)
     t_reg = time.time()
 
     remote_descs = uccl_ep.deserialize_descs(bytes.fromhex(remote_descs_hex))
@@ -250,15 +243,16 @@ def push_to_peer(
     xfer_secs = t_xfer - t_conn
     xfer_gbps = (chunk_bytes * 8) / xfer_secs / 1e9 if xfer_secs > 0 else 0
 
-    if is_last_chunk:
+    if is_last_chunk and not pre_registered:
         ep.dereg_async()
     t_dereg = time.time()
 
     if not dist.is_initialized() or dist.get_rank() == 0: logger.info("Rank %d: pushed %d bufs %.2f MB — "
-    "reg %.3fs connect %.3fs xfer %.3fs (%.2f Gbps) dereg %.3fs total %.3fs",
+    "connect %.3fs reg %.3fs xfer %.3fs (%.2f Gbps) dereg %.3fs total %.3fs%s",
     dist.get_rank(), len(buffers), chunk_bytes / 1e6,
-    t_reg - t0, t_conn - t_reg, xfer_secs, xfer_gbps,
-    t_dereg - t_xfer, t_dereg - t0,)
+    t_conn - t0, t_reg - t_conn, xfer_secs, xfer_gbps,
+    t_dereg - t_xfer, t_dereg - t0,
+    " (pre-registered)" if pre_registered else "",)
 
     dist.barrier()
 
@@ -300,8 +294,15 @@ def preregister_weights(model) -> None:
     """
     bufs = collect_weight_buffers(model)
     if rank_endpoint.registered:
+        logger.info("Rank %d: MRs already registered (%d descs), skipping",
+                    dist.get_rank() if dist.is_initialized() else 0, len(rank_endpoint.xfer_descs))
         return
+    t0 = time.time()
     rank_endpoint.register_chunked(bufs, MAX_RDMA_BUFS)
+    elapsed = time.time() - t0
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        logger.info("Rank %d: pre-registered %d weight MRs in %.3fs",
+                    dist.get_rank(), len(bufs), elapsed)
 
 
 def receive_weights(model, peer_url: str) -> None:
