@@ -231,16 +231,16 @@ class NKIPyWorker(WorkerBase):
                           self.rank)
         t_cache = _time.time()
 
-        # Clear model references BEFORE gc/reset to speed up cleanup
-        # Skip _LOADED_KERNELS.clear() as spike_reset() will tear down NRT anyway
+        # Strategy: Call spike_reset() FIRST to tear down NRT, then clear refs
+        # This way Python object cleanup happens after device resources are freed
+        spike_reset()
+        t_spike = _time.time()
+
+        # Now clear references - should be fast since spike_reset freed device memory
         self.model_runner._nkipy_model = None
         self.model_runner.model = None
+        _LOADED_KERNELS.clear()
         t_clear_refs = _time.time()
-
-        # Skip gc.collect() - spike_reset() releases all device memory
-        spike_reset()
-        _LOADED_KERNELS.clear()  # Clear after reset for next wake
-        t_reset = _time.time()
 
         # Clear endpoint after spike_reset to avoid blocking cleanup.
         rank_endpoint.ep = None
@@ -253,9 +253,9 @@ class NKIPyWorker(WorkerBase):
             "rank": self.rank,
             "endpoint_clear_s": round(t_endpoint - t_start, 4),
             "cache_check_s": round(t_cache - t_endpoint, 4),
-            "clear_refs_s": round(t_clear_refs - t_cache, 4),
-            "gc_reset_s": round(t_reset - t_clear_refs, 4),
-            "total_s": round(t_reset - t_start, 4),
+            "spike_reset_s": round(t_spike - t_cache, 4),
+            "clear_refs_s": round(t_clear_refs - t_spike, 4),
+            "total_s": round(t_clear_refs - t_start, 4),
         }
         logger.info("sleep latency breakdown (rank %d): %s", self.rank, latency)
         print(f"sleep latency breakdown (rank {self.rank}): {latency}", flush=True)
