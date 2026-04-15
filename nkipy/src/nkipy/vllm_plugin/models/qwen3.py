@@ -3,6 +3,7 @@
 """NKIPy Qwen3 model for Neuron (MoE, QK RMSNorm)."""
 
 import logging
+import os
 import time
 
 import numpy as np
@@ -229,8 +230,11 @@ class Qwen3Model:
                   configs=cfg, use_nki_rmsnorm=USE_NKI_RMSNORM)),
         ]
 
+        skip_cte = bool(os.environ.get("NKIPY_SKIP_CTE", ""))
         kernel_cache = {}
         for attr, name, kernel_fn, kwargs in specs:
+            if skip_cte and attr.startswith("kernel_cte"):
+                continue
             neff_path, cache_key = DeviceKernel.compile_only(
                 kernel_fn, name=name, build_dir=BUILD_DIR,
                 additional_compiler_args=compiler_args, **kwargs)

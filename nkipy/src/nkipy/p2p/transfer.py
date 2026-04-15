@@ -20,7 +20,7 @@ import requests
 import torch
 import torch.distributed as dist
 
-from .endpoint import RankEndpoint
+from .endpoint import RankEndpoint, _VAHandle
 
 # Maximum number of buffers to register in a single RDMA registration.
 # MoE models (e.g. Qwen3-30B-A3B with 128 experts) can exceed EFA device
@@ -28,7 +28,7 @@ from .endpoint import RankEndpoint
 # once.  Chunking the registration avoids "Failed to register memory with
 # RDMA" errors.  Tune via env var — higher values reduce chunking overhead
 # but may hit registration limits on larger per-rank shards.
-MAX_RDMA_BUFS = int(os.environ.get("NKIPY_MAX_RDMA_BUFS", "350"))
+MAX_RDMA_BUFS = int(os.environ.get("NKIPY_MAX_RDMA_BUFS", "1024"))
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -215,18 +215,29 @@ def push_to_peer(
 
     t0 = time.time()
 
-    # Re-register only the chunk's buffers, keeping the endpoint alive
-    # so add_remote_endpoint can reuse the cached connection.
-    # Skip if already pre-registered (same buffer count).
-    was_preregistered = len(ep.xfer_descs) == len(buffers)
-    if not was_preregistered:
-        ep.reregister(buffers)
-    t_reg = time.time()
+    # Free any pre-registered MRs to make room for connection MRs.
+    # EFA has a system-wide MR limit; with 32 ranks × 434 weight MRs
+    # there is no headroom for the QP memory that add_remote_endpoint
+    # registers internally.
+    had_mrs = bool(ep.xfer_descs)
+    if had_mrs:
+        for desc in ep.xfer_descs:
+            ep.ep.dereg(desc.mr_id)
+        ep.xfer_descs = []
+        ep.buf_info = []
 
-    uccl_ep = ep.ep
+    uccl_ep = ep._ensure_endpoint()
     ok, conn_id = uccl_ep.add_remote_endpoint(bytes.fromhex(remote_metadata_hex))
     assert ok, "Failed to connect to remote endpoint"
     t_conn = time.time()
+
+    # Now register the chunk's weight buffers for transfer.
+    handles = []
+    for name, va, size_bytes in buffers:
+        ep.buf_info.append((name, size_bytes))
+        handles.append(_VAHandle(va, size_bytes))
+    ep.xfer_descs = uccl_ep.register_memory(handles)
+    t_reg = time.time()
 
     remote_descs = uccl_ep.deserialize_descs(bytes.fromhex(remote_descs_hex))
     assert len(remote_descs) == len(ep.xfer_descs)
@@ -239,11 +250,7 @@ def push_to_peer(
     xfer_secs = t_xfer - t_conn
     xfer_gbps = (chunk_bytes * 8) / xfer_secs / 1e9 if xfer_secs > 0 else 0
 
-    if is_last_chunk and not was_preregistered:
-        # Kick off MR deregistration in background — don't block the
-        # HTTP response or the barrier on the slow ibv_dereg_mr calls.
-        # Keep MRs alive if they were pre-registered so subsequent
-        # pushes skip the costly re-registration.
+    if is_last_chunk:
         ep.dereg_async()
     t_dereg = time.time()
 
