@@ -234,6 +234,12 @@ class NKIPyWorker(WorkerBase):
         # CRITICAL: Clear model references BEFORE spike_reset
         # This allows spike to see that Python no longer holds references,
         # enabling faster device memory cleanup
+
+        # Explicitly clear tok_embedding_device to avoid slow cleanup
+        model = self.model_runner.model
+        if model and hasattr(model, 'tok_embedding_device'):
+            model.tok_embedding_device = None
+
         self.model_runner._nkipy_model = None
         self.model_runner.model = None
         _LOADED_KERNELS.clear()
