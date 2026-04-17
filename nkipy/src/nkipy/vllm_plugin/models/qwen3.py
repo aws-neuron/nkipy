@@ -51,7 +51,10 @@ class Qwen3Model:
 
     def __init__(self, model_weights=None, config: Config = None, skip_kernels=False):
         self.config = config
+        # Keep tok_embedding as CPU tensor for compatibility (used during inference)
         self.tok_embedding = model_weights.get("tok_embedding") if model_weights else None
+        # tok_embedding_device is DeviceTensor version for P2P transfer
+        self.tok_embedding_device = None
 
         self.kernel_cte = None
         self.kernel_tkg = None
@@ -86,15 +89,27 @@ class Qwen3Model:
 
         self.norm_weight = DeviceTensor.from_torch(weights["norm_weight"], "norm_weight")
         self.lm_head_weight = DeviceTensor.from_torch(weights["lm_head_weight"], "lm_head_weight")
+
+        # Convert tok_embedding to DeviceTensor for P2P transfer
+        if self.tok_embedding is not None:
+            self.tok_embedding_device = DeviceTensor.from_torch(self.tok_embedding, "tok_embedding")
+
         logger.info("Tensors prepared in %.2fs", time.time() - t)
 
     def _allocate_empty_tensors(self):
-        """Allocate device tensors with zeros (for P2P receive)."""
+        """Allocate device tensors WITHOUT initialization (for P2P receive).
+
+        Key optimization: Allocate device memory without writing zeros.
+        P2P RDMA will directly write weights to uninitialized memory,
+        avoiding double-write that causes memory fragmentation and slow spike_reset().
+        """
         cfg = self.config
         tp = dist.get_world_size()
         n_local_kv_heads = max(1, cfg.num_kv_heads // tp)
         n_local_heads = cfg.num_heads // tp
         cache_shape = (cfg.max_batch_size, cfg.max_seq_len, n_local_kv_heads, cfg.head_dim)
+
+        # Cache tensors still need zeros (they're not filled by P2P)
         cache_k = np.zeros(cache_shape, dtype=cfg.dtype)
         cache_v = np.zeros(cache_shape, dtype=cfg.dtype)
 
@@ -111,20 +126,35 @@ class Qwen3Model:
             "k_norm_weight": (cfg.head_dim,),
         }
 
+        # OPTIMIZATION: Allocate weight tensors first (uninitialized),
+        # then cache tensors (zeros) to avoid memory fragmentation.
+        # Interleaving uninitialized + zero-writes causes NRT cleanup issues.
         self.layer_tensors = []
         for lid in range(cfg.num_layers):
             layer = {}
             for wk, prefix in LAYER_WEIGHT_KEYS:
-                layer[wk] = DeviceTensor.from_numpy(
-                    np.zeros(shapes[wk], dtype=cfg.dtype), f"{prefix}_L{lid}")
-            layer["cache_k"] = DeviceTensor.from_numpy(cache_k, f"cache_k_L{lid}")
-            layer["cache_v"] = DeviceTensor.from_numpy(cache_v, f"cache_v_L{lid}")
+                # Use allocate_uninitialized instead of from_numpy(zeros)
+                # P2P RDMA will fill these directly
+                layer[wk] = DeviceTensor.allocate_uninitialized(
+                    shapes[wk], cfg.dtype, f"{prefix}_L{lid}")
+            # Cache tensors will be added in second pass
             self.layer_tensors.append(layer)
 
-        self.norm_weight = DeviceTensor.from_numpy(
-            np.zeros((cfg.hidden_size,), dtype=cfg.dtype), "norm_weight")
-        self.lm_head_weight = DeviceTensor.from_numpy(
-            np.zeros((cfg.hidden_size, cfg.vocab_size // tp), dtype=cfg.dtype), "lm_head_weight")
+        # Second pass: allocate cache tensors (need zeros, not P2P-filled)
+        for lid in range(cfg.num_layers):
+            layer = self.layer_tensors[lid]
+            layer["cache_k"] = DeviceTensor.from_numpy(cache_k, f"cache_k_L{lid}")
+            layer["cache_v"] = DeviceTensor.from_numpy(cache_v, f"cache_v_L{lid}")
+
+        # Model head weights also uninitialized (filled by P2P)
+        self.norm_weight = DeviceTensor.allocate_uninitialized(
+            (cfg.hidden_size,), cfg.dtype, "norm_weight")
+        self.lm_head_weight = DeviceTensor.allocate_uninitialized(
+            (cfg.hidden_size, cfg.vocab_size // tp), cfg.dtype, "lm_head_weight")
+
+        # Token embedding (uninitialized, filled by P2P) - NOT sharded across TP
+        self.tok_embedding_device = DeviceTensor.allocate_uninitialized(
+            (cfg.vocab_size, cfg.hidden_size), cfg.dtype, "tok_embedding")
 
     def weight_buffers(self):
         """Yield (name, va, size_bytes) for all weight tensors (for P2P)."""
@@ -135,12 +165,14 @@ class Qwen3Model:
                 va = dt.tensor_ref.va
                 size = int(np.prod(dt.shape) * np.dtype(dt.dtype).itemsize)
                 yield f"layers.{lid}.{key}", va, size
-        for attr in ("norm_weight", "lm_head_weight"):
+        for attr in ("norm_weight", "lm_head_weight", "tok_embedding_device"):
             dt = getattr(self, attr, None)
             if dt is not None:
                 va = dt.tensor_ref.va
                 size = int(np.prod(dt.shape) * np.dtype(dt.dtype).itemsize)
-                yield attr, va, size
+                # Use "tok_embedding" as the name for compatibility
+                name = "tok_embedding" if attr == "tok_embedding_device" else attr
+                yield name, va, size
 
     def _prepare_kernels(self):
         t = time.time()

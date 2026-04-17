@@ -231,16 +231,21 @@ class NKIPyWorker(WorkerBase):
                           self.rank)
         t_cache = _time.time()
 
-        # Strategy: Call spike_reset() FIRST to tear down NRT, then clear refs
-        # This way Python object cleanup happens after device resources are freed
-        spike_reset()
-        t_spike = _time.time()
-
-        # Now clear references - should be fast since spike_reset freed device memory
+        # CRITICAL: Clear model references BEFORE spike_reset
+        # This allows spike to see that Python no longer holds references,
+        # enabling faster device memory cleanup
         self.model_runner._nkipy_model = None
         self.model_runner.model = None
         _LOADED_KERNELS.clear()
         t_clear_refs = _time.time()
+
+        # Force GC to actually release the objects
+        gc.collect()
+        t_gc = _time.time()
+
+        # Now spike_reset should be fast - Python refs are gone
+        spike_reset()
+        t_spike = _time.time()
 
         # Clear endpoint after spike_reset to avoid blocking cleanup.
         rank_endpoint.ep = None
@@ -253,13 +258,48 @@ class NKIPyWorker(WorkerBase):
             "rank": self.rank,
             "endpoint_clear_s": round(t_endpoint - t_start, 4),
             "cache_check_s": round(t_cache - t_endpoint, 4),
-            "spike_reset_s": round(t_spike - t_cache, 4),
-            "clear_refs_s": round(t_clear_refs - t_spike, 4),
-            "total_s": round(t_clear_refs - t_start, 4),
+            "clear_refs_s": round(t_clear_refs - t_cache, 4),
+            "gc_collect_s": round(t_gc - t_clear_refs, 4),
+            "spike_reset_s": round(t_spike - t_gc, 4),
+            "total_s": round(t_spike - t_start, 4),
         }
         logger.info("sleep latency breakdown (rank %d): %s", self.rank, latency)
         print(f"sleep latency breakdown (rank {self.rank}): {latency}", flush=True)
         return {"status": "sleeping", "latency": latency}
+
+    @staticmethod
+    def _acknowledge_rdma_writes(model):
+        """Force NRT to acknowledge RDMA-written memory.
+
+        RDMA transfers bypass NRT's normal write tracking. Reading back a sample
+        of tensors forces NRT to check device memory and update its internal state,
+        potentially speeding up spike_reset() cleanup.
+
+        This is a hypothesis test - if successful, all ranks should achieve
+        ~2-5s spike_reset instead of 18s.
+        """
+        import os
+        sample_count = int(os.environ.get("NKIPY_RDMA_ACK_SAMPLES", "10"))
+
+        if sample_count <= 0:
+            return  # Disabled via env var
+
+        checked = 0
+        for layer in model.layer_tensors:
+            if checked >= sample_count:
+                break
+            for key, tensor in layer.items():
+                if key not in ("cache_k", "cache_v") and hasattr(tensor, "numpy"):
+                    # Read one element to force NRT memory check
+                    try:
+                        _ = tensor.numpy().flat[0]
+                        checked += 1
+                        break
+                    except Exception:
+                        pass  # Skip on error
+
+        # Force GC to release temporary numpy arrays
+        gc.collect()
 
     def nkipy_wake_up(self, peer_url: str | None = None) -> dict:
         """Allocate tensors, receive weights from peer, reload kernels."""
@@ -302,9 +342,17 @@ class NKIPyWorker(WorkerBase):
                 push_endpoint="/nkipy/p2p_push_weights",
             )
             t_p2p = _time.time()
+
+            # HYPOTHESIS TEST: Force NRT to acknowledge RDMA-written memory.
+            # RDMA writes bypass NRT tracking, potentially causing slow spike_reset.
+            # Reading back tensors forces NRT to discover modifications and update
+            # its memory state, which should speed up cleanup.
+            self._acknowledge_rdma_writes(model)
+            t_ack = _time.time()
         else:
             t_collect = t_alloc
             t_p2p = t_alloc
+            t_ack = t_alloc
 
         # Reload kernels from cached NEFFs
         for name, (neff_path, cache_key) in self._kernel_cache.items():
@@ -315,8 +363,9 @@ class NKIPyWorker(WorkerBase):
         dist.barrier()
         t_kernel_barrier = _time.time()
 
-        if model.tok_embedding is None and actual_peer:
-            model.tok_embedding = self._fetch_tok_embedding(actual_peer)
+        # Convert tok_embedding_device (DeviceTensor) back to CPU tensor for inference
+        if model.tok_embedding is None and model.tok_embedding_device is not None:
+            model.tok_embedding = model.tok_embedding_device.torch()
         t_tok = _time.time()
 
         self.model_runner._nkipy_model = model
@@ -332,7 +381,8 @@ class NKIPyWorker(WorkerBase):
             "alloc_tensors_s": round(t_alloc - t_nrt_barrier, 4),
             "collect_bufs_s": round(t_collect - t_alloc, 4),
             "p2p_transfer_s": round(t_p2p - t_collect, 4),
-            "kernel_load_s": round(t_kernels - t_p2p, 4),
+            "rdma_ack_s": round(t_ack - t_p2p, 4),
+            "kernel_load_s": round(t_kernels - t_ack, 4),
             "kernel_barrier_s": round(t_kernel_barrier - t_kernels, 4),
             "tok_embedding_s": round(t_tok - t_kernel_barrier, 4),
             "total_s": round(t_end - t_start, 4),
