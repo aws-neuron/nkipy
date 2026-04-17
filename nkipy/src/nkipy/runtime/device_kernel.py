@@ -78,13 +78,25 @@ class DeviceKernel(SpikeModel):
         use_cached_if_exists=True,
         build_dir=None,
         target=CompilationTarget.DEFAULT,
+        is_spmd=True,
+        cc_enabled=None,
+        rank_id=None,
+        world_size=None,
         **kwargs,
     ):
         """Compile and load a kernel, returning a DeviceKernel instance.
 
-        In distributed mode, only the lead worker (rank 0) traces and compiles.
-        The resulting paths are broadcast to all workers, which then load the
-        NEFF collectively.
+        Compilation strategy is controlled by ``is_spmd``:
+
+        * **True (default)** – rank 0 traces/compiles and broadcasts the NEFF
+          path to all workers.  Requires ``torch.distributed``.
+        * **False** – every rank traces and compiles independently (MPMD).
+          Required when each rank runs a different kernel or uses different
+          input shapes.  Works with or without ``torch.distributed``.
+
+        Collective-communication at load time is controlled separately by
+        ``cc_enabled``, ``rank_id``, and ``world_size``.  When left as
+        ``None`` these are auto-detected from ``torch.distributed``.
 
         Args:
             kernel: The kernel function to compile
@@ -93,6 +105,12 @@ class DeviceKernel(SpikeModel):
             use_cached_if_exists: If True, use cached neff if it exists.
             build_dir: Overriding the build directory for the kernel
             target: Compilation target for the kernel
+            is_spmd: If True, rank 0 compiles and broadcasts (SPMD).
+                If False, every rank compiles independently (MPMD).
+            cc_enabled: Enable collective communication for this kernel.
+                Auto-detected from torch.distributed when None.
+            rank_id: Worker rank for CC. Auto-detected when None.
+            world_size: Total workers for CC. Auto-detected when None.
             *args, **kwargs: Arguments for specialization (numpy array or DeviceTensor)
 
         Returns:
@@ -103,7 +121,25 @@ class DeviceKernel(SpikeModel):
 
         distributed = _is_distributed()
 
-        if distributed:
+        # In MPMD mode, namespace build dir by rank to avoid concurrent writes
+        # when different ranks produce the same content hash.
+        if not is_spmd:
+            effective_rank = (
+                rank_id
+                if rank_id is not None
+                else (dist.get_rank() if distributed else None)
+            )
+            if effective_rank is not None:
+                compile_build_dir = os.path.join(
+                    build_dir or _get_build_dir(), f"rank_{effective_rank}"
+                )
+            else:
+                compile_build_dir = build_dir
+        else:
+            compile_build_dir = build_dir
+
+        # --- 1. Compilation ---
+        if is_spmd and distributed:
             if dist.get_rank() == 0:
                 neff_path, cache_key = cls._trace_and_compile(
                     kernel,
@@ -112,7 +148,7 @@ class DeviceKernel(SpikeModel):
                     kwargs,
                     additional_compiler_args=additional_compiler_args,
                     use_cached_if_exists=use_cached_if_exists,
-                    build_dir=build_dir,
+                    build_dir=compile_build_dir,
                     target=target,
                 )
                 dist.broadcast_object_list([neff_path, cache_key], src=0)
@@ -128,7 +164,7 @@ class DeviceKernel(SpikeModel):
                 kwargs,
                 additional_compiler_args=additional_compiler_args,
                 use_cached_if_exists=use_cached_if_exists,
-                build_dir=build_dir,
+                build_dir=compile_build_dir,
                 target=target,
             )
 
@@ -137,15 +173,37 @@ class DeviceKernel(SpikeModel):
             logger.info(f"Using loaded kernel: {name} (cache_key={cache_key})")
             return _LOADED_KERNELS[cache_key]
 
-        # Load the compiled NEFF
-        if distributed:
+        # --- 2. Resolve CC parameters for loading ---
+        resolved_cc = cc_enabled if cc_enabled is not None else distributed
+        resolved_rank = (
+            rank_id
+            if rank_id is not None
+            else (dist.get_rank() if distributed else None)
+        )
+        resolved_world = (
+            world_size
+            if world_size is not None
+            else (dist.get_world_size() if distributed else None)
+        )
+
+        if resolved_cc and (resolved_rank is None or resolved_world is None):
+            raise ValueError(
+                "rank_id and world_size are required when cc_enabled=True "
+                "and torch.distributed is not available for auto-detection"
+            )
+
+        # Barrier only needed in SPMD mode (rank 0 compiled for everyone)
+        if is_spmd and distributed:
             dist.barrier()
+
+        # --- 3. Load the compiled NEFF ---
+        if resolved_cc:
             device_kernel = cls.load_from_neff(
                 neff_path,
                 name=name,
                 cc_enabled=True,
-                rank_id=dist.get_rank(),
-                world_size=dist.get_world_size(),
+                rank_id=resolved_rank,
+                world_size=resolved_world,
             )
         else:
             device_kernel = cls.load_from_neff(neff_path, name=name)

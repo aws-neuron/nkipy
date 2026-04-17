@@ -145,3 +145,31 @@ def greedy_sampling(
         final_next_id[b] = global_idx
 
     return final_next_id
+
+
+def greedy_sampling_with_embedding(
+    h,
+    norm_weight,
+    lm_head_weight,
+    tok_embedding,
+    configs: Config,
+    use_nki_rmsnorm=False,
+):
+    """Greedy sampling with on-device embedding lookup for double buffering.
+
+    Fuses token selection and embedding lookup into a single device kernel,
+    eliminating the host round-trip (D2H token ID -> host embedding lookup -> H2D embedding)
+    that would otherwise block each decode iteration.
+
+    Returns:
+        (final_next_id, embedded): The selected token ID and its embedding, both on device.
+    """
+    final_next_id = greedy_sampling(
+        h, norm_weight, lm_head_weight, configs, use_nki_rmsnorm
+    )
+
+    # On-device embedding lookup: gather rows from tok_embedding using selected token IDs
+    # final_next_id shape: (B, 1) -> embedded shape: (B, 1, hidden_size)
+    embedded = np.take(tok_embedding, final_next_id, axis=0)
+
+    return final_next_id, embedded

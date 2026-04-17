@@ -25,6 +25,9 @@ public:
   uint32_t get_core_id() const { return core_id_; }
   uint64_t get_size() const { return size_; }
   const std::string &get_name() const { return name_; }
+  uintptr_t get_va() const {
+    return ptr_ ? reinterpret_cast<uintptr_t>(nrt_tensor_get_va(ptr_)) : 0;
+  }
   bool is_freed() const;
   bool is_owner() const { return spike_ != nullptr; }
 

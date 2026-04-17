@@ -83,7 +83,9 @@ NB_MODULE(_spike, m) {
   nb::class_<NrtTensor>(m, "NrtTensor")
       .def_prop_ro("core_id", &NrtTensor::get_core_id, "Logical NeuronCore ID")
       .def_prop_ro("size", &NrtTensor::get_size, "Tensor size in bytes")
-      .def_prop_ro("name", &NrtTensor::get_name, "Tensor name");
+      .def_prop_ro("name", &NrtTensor::get_name, "Tensor name")
+      .def_prop_ro("va", &NrtTensor::get_va,
+                   "CPU-accessible virtual address of device HBM memory");
 
   // NrtModel class
   nb::class_<NrtModel>(m, "NrtModel")
