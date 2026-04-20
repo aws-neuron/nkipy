@@ -410,6 +410,12 @@ class NKIPyWorker(WorkerBase):
             model.tok_embedding = model.tok_embedding_device.torch()
         t_tok = _time.time()
 
+        # Reset context_len so _ensure_kernels() will recompile for the
+        # actual prompt length on the next inference call.  The cached NEFFs
+        # were compiled for the *initial* context_len (max_model_len), but the
+        # config may still carry a stale value from a previous inference cycle.
+        self._config.context_len = None
+
         self.model_runner._nkipy_model = model
         self.model_runner.model = model
         self._sleeping = False
