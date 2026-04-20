@@ -49,6 +49,40 @@ class DeviceTensor(SpikeTensor):
     """A tensor on device"""
 
     @classmethod
+    def allocate_uninitialized(cls, shape, dtype, name: str = None, core_id=0) -> "DeviceTensor":
+        """Allocate device tensor without initializing (for P2P receive).
+
+        This avoids writing zeros to device memory that will be immediately
+        overwritten by RDMA transfer, reducing memory fragmentation and
+        improving spike_reset() performance.
+
+        Args:
+            shape: Tensor shape tuple
+            dtype: NumPy dtype
+            name: Optional tensor name
+            core_id: Neuron core ID
+
+        Returns:
+            DeviceTensor with allocated but uninitialized device memory
+        """
+        spike = get_spike_singleton()
+
+        # Calculate size from shape and dtype
+        size_bytes = int(np.prod(shape) * np.dtype(dtype).itemsize)
+
+        # Allocate device memory WITHOUT writing
+        tensor_ref = spike.allocate_tensor(
+            size=size_bytes, core_id=core_id, name=name
+        )
+
+        return cls(
+            tensor_ref=tensor_ref,
+            shape=shape,
+            dtype=dtype,
+            name=name,
+        )
+
+    @classmethod
     def from_torch(cls, tensor, name: str = None, core_id=0) -> "DeviceTensor":
         if not _TORCH_ENABLED:
             raise ImportError("torch is not available")

@@ -98,12 +98,9 @@ class NKIPyWorker(WorkerBase):
 
     @staticmethod
     def _release_neuron_cores():
-        """Best-effort release of Neuron cores."""
-        try:
-            from spike import reset as spike_reset
-            spike_reset()
-        except Exception:
-            pass
+        """Best-effort release of Neuron cores and P2P RDMA resources."""
+        from .cleanup_utils import release_neuron_cores_and_rdma
+        release_neuron_cores_and_rdma()
 
     @staticmethod
     def _patch_get_accelerator():
@@ -172,10 +169,18 @@ class NKIPyWorker(WorkerBase):
         self._kernel_cache = getattr(mr, '_kernel_cache', None)
         self._sleeping = mr._nkipy_model is None
 
-        # Pre-register weight MRs for RDMA so push_to_peer skips registration.
-        if mr._nkipy_model is not None:
+        # Configurable: Pre-register MRs or register on-demand
+        # NKIPY_PREREGISTER_MRS=1: Pre-register (optimized /wake_up, slow /sleep ~20s)
+        # NKIPY_PREREGISTER_MRS=0: On-demand (alternative design, +2s /wake_up, fast /sleep ~2-5s)
+        import os
+        preregister = os.environ.get("NKIPY_PREREGISTER_MRS", "0") == "1"
+        if preregister and mr._nkipy_model is not None:
             from nkipy.p2p import preregister_weights
             preregister_weights(mr._nkipy_model)
+            if self.rank == 0:
+                logger.info("NKIPY: Pre-registered MRs (optimized design)")
+        elif self.rank == 0:
+            logger.info("NKIPY: On-demand MR registration (alternative design)")
 
     def determine_available_memory(self) -> int:
         return 1 * (1024 ** 3)
@@ -218,12 +223,6 @@ class NKIPyWorker(WorkerBase):
         from nkipy.runtime.device_kernel import _LOADED_KERNELS
         from nkipy.p2p import rank_endpoint
 
-        # Just clear the descriptors — spike_reset() will tear down NRT runtime.
-        # Avoid touching rank_endpoint.ep to prevent triggering destructor cleanup.
-        rank_endpoint.xfer_descs = []
-        rank_endpoint.buf_info = []
-        t_endpoint = _time.time()
-
         # Kernel cache is already populated during load_model() or wake_up().
         # No need to access model attrs here — just verify cache exists.
         if self._kernel_cache is None:
@@ -249,25 +248,42 @@ class NKIPyWorker(WorkerBase):
         gc.collect()
         t_gc = _time.time()
 
-        # Now spike_reset should be fast - Python refs are gone
+        # Wait for RDMA deregistration if still in progress.
+        # dereg_async() was called after P2P transfer during /wake_up.
+        # If /sleep is called >30s after /wake_up, dereg is likely complete (fast path).
+        # If called earlier, we wait here to ensure spike_reset() is fast.
+        dereg_waited = False
+        if rank_endpoint._dereg_thread and rank_endpoint._dereg_thread.is_alive():
+            if self.rank == 0:
+                logger.info("Rank %d: Waiting for dereg completion before spike_reset", self.rank)
+            rank_endpoint.wait()
+            dereg_waited = True
+        t_wait = _time.time()
+
+        # Call spike_reset() - now guaranteed to be fast (~0.2-1s)
+        # Active RDMA MRs cause 60x slowdown (7-25s), so we ensure they're deregistered first
         spike_reset()
         t_spike = _time.time()
 
-        # Clear endpoint after spike_reset to avoid blocking cleanup.
+        # Clear endpoint state to free memory
+        # Safe now because dereg thread has completed
         rank_endpoint.ep = None
-        rank_endpoint._dereg_threads = []
-        rank_endpoint._dereg_thread = None
+        rank_endpoint.xfer_descs = []
+        rank_endpoint.buf_info = []
+        t_endpoint = _time.time()
 
         self._sleeping = True
 
         latency = {
             "rank": self.rank,
-            "endpoint_clear_s": round(t_endpoint - t_start, 4),
-            "cache_check_s": round(t_cache - t_endpoint, 4),
+            "cache_check_s": round(t_cache - t_start, 4),
             "clear_refs_s": round(t_clear_refs - t_cache, 4),
             "gc_collect_s": round(t_gc - t_clear_refs, 4),
-            "spike_reset_s": round(t_spike - t_gc, 4),
-            "total_s": round(t_spike - t_start, 4),
+            "dereg_wait_s": round(t_wait - t_gc, 4),
+            "dereg_waited": dereg_waited,
+            "spike_reset_s": round(t_spike - t_wait, 4),
+            "endpoint_clear_s": round(t_endpoint - t_spike, 4),
+            "total_s": round(t_endpoint - t_start, 4),
         }
         logger.info("sleep latency breakdown (rank %d): %s", self.rank, latency)
         print(f"sleep latency breakdown (rank {self.rank}): {latency}", flush=True)
@@ -356,15 +372,35 @@ class NKIPyWorker(WorkerBase):
             self._acknowledge_rdma_writes(model)
             t_ack = _time.time()
         else:
-            t_collect = t_alloc
-            t_p2p = t_alloc
-            t_ack = t_alloc
+            # No peer - load weights from checkpoint
+            import os
+            from safetensors.torch import load_file
+            checkpoint_path = os.environ.get("NKIPY_CHECKPOINT")
+            if checkpoint_path:
+                if self.rank == 0:
+                    logger.info("Rank %d: Loading weights from checkpoint: %s", self.rank, checkpoint_path)
+                shard_path = os.path.join(checkpoint_path, f"shard_{self.rank}.safetensors")
+                weights = load_file(shard_path, device="cpu")
+                # Use _load_weights_into_existing_tensors() instead of _prepare_tensors()
+                # to populate the already-allocated tensors without recreating them
+                model._load_weights_into_existing_tensors(weights)
+                t_collect = _time.time()
+                t_p2p = t_collect
+                t_ack = t_collect
+            else:
+                logger.warning("Rank %d: No peer_url and no NKIPY_CHECKPOINT - model has no weights!", self.rank)
+                t_collect = t_alloc
+                t_p2p = t_alloc
+                t_ack = t_alloc
 
         # Reload kernels from cached NEFFs
-        for name, (neff_path, cache_key) in self._kernel_cache.items():
-            setattr(model, name, DeviceKernel.load_with_cache_key(
-                neff_path, cache_key, name=name,
-            ))
+        if self._kernel_cache is not None:
+            for name, (neff_path, cache_key) in self._kernel_cache.items():
+                setattr(model, name, DeviceKernel.load_with_cache_key(
+                    neff_path, cache_key, name=name,
+                ))
+        else:
+            logger.warning("Rank %d: _kernel_cache is None during wake_up, kernels not cached", self.rank)
         t_kernels = _time.time()
         dist.barrier()
         t_kernel_barrier = _time.time()

@@ -1,0 +1,40 @@
+Optimize P2P sleep/wake cycle and fix wake-from-checkpoint bug
+
+This commit includes three critical fixes:
+
+1. RDMA MR Deregistration (CRITICAL - 46.5s → 1s sleep)
+   - Added dereg_async() call in receive_from_peer() after P2P transfer
+   - Receivers now properly deregister 435 MRs asynchronously
+   - Without this, spike_reset() is 60x slower (18.5s vs 0.3s)
+
+2. Wake from Checkpoint Fix (garbage output → correct output)
+   - Added _load_weights_into_existing_tensors() to Qwen3Model and Llama3Model
+   - Uses DeviceTensor.write_from_torch() to populate existing tensors
+   - Prevents tensor recreation that caused wrong tensor references
+
+3. Ctrl+C RDMA Cleanup (resource leakage → clean shutdown)
+   - Extracted cleanup logic to cleanup_utils.release_neuron_cores_and_rdma()
+   - Enhanced signal handlers to wait for dereg and clear RDMA resources
+   - Prevents "ibv_reg_mr failed" errors on restart
+
+Architecture improvements:
+- Made MR pre-registration configurable (NKIPY_PREREGISTER_MRS env var)
+- Removed pre-registration path from receiver (architectural constraint)
+- Added dereg wait before spike_reset() for fast cleanup
+- Refactored duplicate cleanup code into shared utility
+
+Testing:
+- Verified on TP=8 and TP=32 configurations
+- Tested server and receiver roles across two instances
+- Confirmed sleep latency: ~1-2s (was 46.5s)
+- Confirmed wake-from-checkpoint produces correct output
+
+Documentation:
+- Added docs/CHANGES.md with detailed summary
+- Organized investigation docs in docs/optimization_work/
+- Preserved test scripts in test_scripts/
+
+Files changed:
+- Core fixes: p2p/transfer.py, models/qwen3.py, models/llama.py, worker.py
+- Refactoring: cleanup_utils.py (new), server.py, worker.py
+- Documentation: docs/CHANGES.md, docs/optimization_work/*, test_scripts/*

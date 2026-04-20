@@ -50,13 +50,16 @@ echo "=== PASS ==="
 
 
 
-echo "=== Step 2: Completion on Engine B ==="
 curl -sf -X POST "http://localhost:8000/v1/completions" \
   -H "Content-Type: application/json" \
   -d "{\"model\": \"Qwen/Qwen3-30B-A3B\", \"prompt\": \"The capital of France is\", \"max_tokens\": 20, \"temperature\": 0}"
-echo
+
 
 curl -sf -X POST "http://localhost:8001/v1/completions" \
+  -H "Content-Type: application/json" \
+  -d "{\"model\": \"Qwen/Qwen3-30B-A3B\", \"prompt\": \"The capital of France is\", \"max_tokens\": 20, \"temperature\": 0}"
+
+curl -sf -X POST "http://localhost:8002/v1/completions" \
   -H "Content-Type: application/json" \
   -d "{\"model\": \"Qwen/Qwen3-30B-A3B\", \"prompt\": \"The capital of France is\", \"max_tokens\": 20, \"temperature\": 0}"
 
@@ -64,3 +67,22 @@ curl -sf -X POST "http://localhost:8001/v1/completions" \
 curl -sf -X POST "http://localhost:8001/nkipy/wake_up" \
   -H "Content-Type: application/json" \
   -d "{\"peer_url\": \"http://localhost:8000\"}"
+
+
+curl -sf -X POST "http://localhost:8000/nkipy/wake_up" \
+  -H "Content-Type: application/json" \
+  -d "{\"peer_url\": \"http://172.31.44.131:8000\"}"
+
+curl -sf -X POST "http://localhost:8000/nkipy/sleep"
+
+curl -sf -X POST "http://localhost:8001/nkipy/wake_up" \
+  -H "Content-Type: application/json" \
+  -d "{\"peer_url\": \"http://172.31.44.131:8000\"}"
+
+curl -f -X POST "http://localhost:8001/nkipy/sleep"
+
+curl -sf -X POST "http://localhost:8002/nkipy/wake_up" \
+  -H "Content-Type: application/json" \
+  -d "{\"peer_url\": \"http://172.31.44.131:8000\"}"
+
+curl -f -X POST "http://localhost:8002/nkipy/sleep"

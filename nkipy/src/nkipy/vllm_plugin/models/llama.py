@@ -89,6 +89,37 @@ class Llama3Model:
 
         logger.info("Tensors prepared in %.2fs", time.time() - t)
 
+    def _load_weights_into_existing_tensors(self, weights):
+        """Load weights from checkpoint into existing DeviceTensors (for wake_up from checkpoint).
+
+        This populates already-allocated tensors without recreating them.
+        Used after _allocate_empty_tensors() has created the tensor structure.
+        """
+        t = time.time()
+        logger.info("Loading weights into existing tensors")
+
+        # Load layer weights
+        for lid in range(self.config.num_layers):
+            layer = self.layer_tensors[lid]
+            for wk, _ in LAYER_WEIGHT_KEYS:
+                weight_key = f"layers.{lid}.{wk}"
+                if weight_key in weights:
+                    layer[wk].write_from_torch(weights[weight_key])
+
+        # Load model head weights
+        if "norm_weight" in weights:
+            self.norm_weight.write_from_torch(weights["norm_weight"])
+        if "lm_head_weight" in weights:
+            self.lm_head_weight.write_from_torch(weights["lm_head_weight"])
+
+        # Load tok_embedding
+        if "tok_embedding" in weights:
+            self.tok_embedding_device.write_from_torch(weights["tok_embedding"])
+            # Also set the CPU version
+            self.tok_embedding = weights["tok_embedding"]
+
+        logger.info("Weights loaded into existing tensors in %.2fs", time.time() - t)
+
     def _allocate_empty_tensors(self):
         """Allocate device tensors WITHOUT initialization (for P2P receive).
 

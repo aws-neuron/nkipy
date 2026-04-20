@@ -5,6 +5,7 @@ set -euo pipefail
 WEIGHTS=~/zhuangw/nkipy/examples/models/llama3/tmp_tinyllama_TP8
 TP=8
 
+export VLLM_LOGGING_LEVEL=DEBUG
 export VLLM_PLUGINS=nkipy
 export VLLM_USE_V1=1
 export NKIPY_CHECKPOINT=$WEIGHTS

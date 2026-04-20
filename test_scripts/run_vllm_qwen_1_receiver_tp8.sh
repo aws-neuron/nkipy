@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# Engine A: active engine with checkpoint (cores 0-7)
+# Engine B (receiver): sleeping engine, no checkpoint — TP=8 for testing
 set -euo pipefail
 
-WEIGHTS=~/zhuangw/nkipy/examples/models/qwen3/tmp_Qwen3-30b-a3b_TP32
-TP=32
+source /home/ubuntu/vllm-nkipy/nkipy/.venv/bin/activate
+
+TP=8  # Reduced from 32 for testing
 
 export VLLM_PLUGINS=nkipy
 export VLLM_USE_V1=1
-export NKIPY_CHECKPOINT=$WEIGHTS
-export OMP_NUM_THREADS=1
+# No NKIPY_CHECKPOINT → starts in sleep mode (no weights loaded)
 export NKIPY_SKIP_CTE=1
+export OMP_NUM_THREADS=1
 export VLLM_RPC_TIMEOUT=600000
 
 python3 -m nkipy.vllm_plugin.server \

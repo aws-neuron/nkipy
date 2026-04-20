@@ -167,19 +167,9 @@ async def run_server(args: Namespace) -> None:
 
 
 def _release_neuron_cores():
-    """Best-effort release of Neuron cores via spike.reset() + nrt_close."""
-    try:
-        from spike import reset as spike_reset
-        spike_reset()
-    except Exception:
-        pass
-    # Belt-and-suspenders: call nrt_close directly in case spike singleton
-    # was never created but NRT was initialised by another path.
-    try:
-        from spike._spike import nrt_close  # noqa: F401
-        nrt_close()
-    except Exception:
-        pass
+    """Best-effort release of Neuron cores and RDMA resources."""
+    from .cleanup_utils import release_neuron_cores_and_rdma
+    release_neuron_cores_and_rdma()
 
 
 def main():

@@ -99,39 +99,8 @@ def receive_from_peer(
     t0 = time.time()
     total_bytes = sum(sz for _, _, sz in buffers)
 
-    if ep.registered and len(ep.xfer_descs) == len(buffers):
-        # Pre-registered — single-shot path, no chunking needed.
-        ep.ep.start_passive_accept()
-
-        serialized = ep.ep.get_serialized_descs(ep.xfer_descs)
-        my_info = (ep.ep.get_metadata().hex(), serialized.hex())
-        gathered = [None] * dist.get_world_size() if dist.get_rank() == 0 else None
-        dist.gather_object(my_info, gathered, dst=0)
-
-        if dist.get_rank() == 0:
-            base = peer_url.rstrip("/")
-            resp = requests.post(
-                f"{base}{push_endpoint}",
-                json={
-                    "per_rank": [
-                        {"remote_metadata": m, "remote_descs": d}
-                        for m, d in gathered
-                    ],
-                    "chunk_start": None,
-                    "chunk_end": None,
-                    "is_last_chunk": True,
-                },
-            )
-            resp.raise_for_status()
-
-        dist.barrier()
-        elapsed = time.time() - t0
-        throughput_gbps = (total_bytes * 8) / elapsed / 1e9 if elapsed > 0 else 0
-        if not dist.is_initialized() or dist.get_rank() == 0: logger.info("Rank %d: P2P receive (pre-registered) — %d bufs, %.2f MB, %.2fs, %.2f Gbps",
-        dist.get_rank(), len(buffers), total_bytes / 1e6, elapsed, throughput_gbps,)
-        return
-
-    # Fallback: chunked registration path.
+    # Note: Receivers NEVER pre-register MRs (constraint: "Don't pre-register MRs at the receiver side")
+    # Always use chunked on-demand registration path.
     chunks = _chunk_ranges(len(buffers), MAX_RDMA_BUFS)
 
     for ci, (cs, ce) in enumerate(chunks):
@@ -183,6 +152,12 @@ def receive_from_peer(
     throughput_gbps = (total_bytes * 8) / elapsed / 1e9 if elapsed > 0 else 0
     if not dist.is_initialized() or dist.get_rank() == 0: logger.info("Rank %d: P2P receive complete — %d bufs, %.2f MB, %.2fs, %.2f Gbps",
     dist.get_rank(), len(buffers), total_bytes / 1e6, elapsed, throughput_gbps,)
+
+    # Deregister MRs asynchronously after on-demand receive completes
+    # (We only reach here if not pre-registered, see early return above)
+    ep.dereg_async()
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        logger.info("Rank %d: Started async MR deregistration (%d MRs)", dist.get_rank(), len(ep.xfer_descs))
 
 
 def push_to_peer(
