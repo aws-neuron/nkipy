@@ -194,34 +194,37 @@ All inference outputs verified identical: `"The capital of France is"` → `"Par
 
 #### /wake_up latency (P2P transfer from Instance A → Instance B)
 
+**With non-blocking push (version-0.1.3+):**
+
 | Cycle | gloo_init_s | nrt_init_s | nrt_barrier_s | p2p_transfer_s | tok_embedding_s | total_s |
 |-------|------------|-----------|---------------|---------------|----------------|---------|
-| 1 | 0.92 | 17.63 | 0.64 | 8.25 | 1.07 | 29.24 |
-| 2 | 0.92 | 6.81 | 24.44 | 8.11 | 1.01 | 41.95 |
-| 3 | 0.92 | 14.08 | 4.27 | 8.22 | 1.00 | 29.19 |
+| 1 | 0.91 | 13.99 | 1.57 | 8.27 | 1.09 | 26.61 |
+| 2 | 0.81 | 7.11 | 9.68 | 8.25 | 0.96 | 27.53 |
+| 3 | 0.95 | 14.70 | 1.89 | 8.22 | 0.89 | 27.38 |
 
-Gloo reinit adds a consistent **~0.92s** to wake_up latency. The dominant costs are
-NRT init (6-18s, varies per cycle) and P2P transfer (~8.2s, consistent).
+Gloo reinit adds a consistent **~0.9s** to wake_up latency. The dominant costs are
+NRT init (7-15s, varies per cycle) and P2P transfer (~8.2s, consistent).
 
 #### /wake_up latency — other modes
 
 | Mode | gloo_init_s | total_s | Notes |
 |------|------------|---------|-------|
-| Checkpoint (Instance A, local) | 0.98 | 18.36 | No P2P transfer needed |
-| Reverse P2P (B → A) | 0.91 | 26.98 | Bidirectional P2P verified |
+| Checkpoint (Instance A, local) | 0.96 | 17.02 | No P2P transfer needed |
+| Reverse P2P (B → A) | 0.91 | 24.70 | Bidirectional P2P verified |
 
 #### /sleep latency
 
+**With non-blocking push (version-0.1.3+):**
+
 | Scenario | dereg_wait_s | gloo_destroy_s | spike_reset_s | total_s |
 |----------|-------------|---------------|--------------|---------|
-| Immediate (dereg in progress) | 52.67 | 0.88 | 0.14 | 54.26 |
-| After 60s wait (dereg done) | 0.00 | 1.40 | 0.13 | 1.93 |
-| After 60s wait (cycle 3) | 0.00 | 1.50 | 0.13 | 1.99 |
-| Instance A (server, no RDMA) | 0.00 | 1.70 | 0.15 | 2.39 |
+| After 60s wait (cycle 1) | 0.00 | 1.32 | 0.15 | 1.95 |
+| After 60s wait (cycle 2) | 0.00 | 1.35 | 0.14 | 2.00 |
+| After 60s wait (cycle 3) | 0.00 | 1.44 | 0.13 | 1.95 |
+| Instance A (server, no RDMA) | 0.00 | 1.49 | N/A | 1.98 |
 
-Gloo destroy adds **~1.0-1.7s** to sleep latency. When RDMA deregistration has completed
-in the background (>30s after wake_up), total sleep latency is **~2s**. If sleep is called
-immediately after wake_up, the dereg wait dominates (50-60s).
+Gloo destroy adds **~1.3-1.5s** to sleep latency. When RDMA deregistration has completed
+in the background (>30s after wake_up), total sleep latency is **~2s**.
 
 ### Step 3: Dynamically start or kill receiver engines
 
@@ -276,3 +279,38 @@ Sequential test covering the full dynamic lifecycle:
 - **Awake engines must be slept before killing** (Neuron cores are not released by kill -9)
 - **Dynamically started replacements work immediately** (~15s startup, then wake/infer/sleep cycle)
 - **All inference outputs are identical** across all receivers regardless of lifecycle
+
+### Step 3e: Non-blocking P2P push — concurrent inference + weight transfer
+
+Tested whether Instance A can serve inference requests with zero stalls while
+simultaneously pushing model weights to Instance B via RDMA.
+
+**Setup:**
+- A is awake and serving inference (Qwen3-30B-A3B, TP=32)
+- B is sleeping (standby mode, no checkpoint)
+- Background inference loop sends requests to A every ~1.3s (request + 0.5s gap)
+- After 8s baseline, trigger B's `/nkipy/wake_up` with `peer_url=http://172.31.44.131:8000`
+
+**Result: PASS — zero inference stalls during P2P transfer.**
+
+| Phase | Requests | Min (ms) | Max (ms) | Avg (ms) |
+|-------|----------|----------|----------|----------|
+| Baseline (before push) | 6 | 764 | 787 | 775 |
+| During push | 20 | 772 | 829 | 800 |
+| After push | 7 | 786 | 808 | 800 |
+
+- B wake_up: 27.2s total (gloo_init 0.9s, nrt_init 5.4s, p2p_transfer 8.2s)
+- B inference verified: output identical to A ("Paris. The capital of Germany is Berlin. The")
+- No stalls detected (threshold: 1574ms, all requests below 829ms)
+- During-push latency increase: ~3% over baseline (within normal variance)
+
+**Key insight:** The `nkipy_push_weights` RPC runs the RDMA push in a background thread
+per worker. vLLM's engine core serializes RPCs, but the push RPC returns immediately
+(just starts the thread), so inference RPCs (`execute_model`) are not blocked. The
+server-side polling loop (`nkipy_push_status`) uses `asyncio.sleep(0.1)` which yields
+to the asyncio event loop, allowing inference requests to interleave.
+
+**Previous test failure:** An earlier test hung because the `peer_url` used `localhost`
+instead of A's real IP. B's workers resolved `localhost` to B itself, causing B to
+POST the push request to its own engine — which was blocked executing `nkipy_wake_up`.
+Fix: always use the pusher's real IP in `peer_url`.
