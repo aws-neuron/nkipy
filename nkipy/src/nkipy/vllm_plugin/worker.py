@@ -121,6 +121,19 @@ class NKIPyWorker(WorkerBase):
 
         torch._C._get_accelerator = _safe_get_accelerator
 
+    def _destroy_gloo(self) -> None:
+        """Destroy Gloo distributed process groups to free TCP ports.
+
+        Each TP=32 engine holds ~482 TCP ephemeral ports via Gloo.
+        Destroying them on sleep allows 3-4x more standby engines.
+        """
+        from vllm.distributed import (
+            destroy_model_parallel,
+            destroy_distributed_environment,
+        )
+        destroy_model_parallel()
+        destroy_distributed_environment()
+
     def _init_distributed(self) -> None:
         import vllm.distributed.parallel_state as ps
         from vllm.distributed.parallel_state import (
@@ -168,6 +181,11 @@ class NKIPyWorker(WorkerBase):
         self._config = getattr(mr, '_config', None)
         self._kernel_cache = getattr(mr, '_kernel_cache', None)
         self._sleeping = mr._nkipy_model is None
+
+        # Standby engines (no checkpoint) start sleeping — destroy Gloo now
+        # to free ~482 TCP ports. Gloo will be recreated on wake_up.
+        if self._sleeping:
+            self._destroy_gloo()
 
         # Configurable: Pre-register MRs or register on-demand
         # NKIPY_PREREGISTER_MRS=1: Pre-register (optimized /wake_up, slow /sleep ~20s)
@@ -274,6 +292,11 @@ class NKIPyWorker(WorkerBase):
 
         self._sleeping = True
 
+        # Destroy Gloo process groups to free ~482 TCP ports per engine.
+        # SHM message queues (used by collective_rpc) are independent of Gloo.
+        self._destroy_gloo()
+        t_gloo = _time.time()
+
         latency = {
             "rank": self.rank,
             "cache_check_s": round(t_cache - t_start, 4),
@@ -283,7 +306,8 @@ class NKIPyWorker(WorkerBase):
             "dereg_waited": dereg_waited,
             "spike_reset_s": round(t_spike - t_wait, 4),
             "endpoint_clear_s": round(t_endpoint - t_spike, 4),
-            "total_s": round(t_endpoint - t_start, 4),
+            "gloo_destroy_s": round(t_gloo - t_endpoint, 4),
+            "total_s": round(t_gloo - t_start, 4),
         }
         logger.info("sleep latency breakdown (rank %d): %s", self.rank, latency)
         print(f"sleep latency breakdown (rank {self.rank}): {latency}", flush=True)
@@ -334,6 +358,10 @@ class NKIPyWorker(WorkerBase):
 
         from spike import get_spike_singleton
         from nkipy.runtime import DeviceKernel
+
+        # Recreate Gloo process groups destroyed during sleep
+        self._init_distributed()
+        t_gloo = _time.time()
 
         # Broadcast peer_url from rank 0 to all ranks
         obj_list = [peer_url]
@@ -423,7 +451,8 @@ class NKIPyWorker(WorkerBase):
         t_end = _time.time()
 
         latency = {
-            "broadcast_s": round(t_broadcast - t_start, 4),
+            "gloo_init_s": round(t_gloo - t_start, 4),
+            "broadcast_s": round(t_broadcast - t_gloo, 4),
             "nrt_init_s": round(t_nrt - t_pre_nrt, 4),
             "nrt_barrier_s": round(t_nrt_barrier - t_nrt, 4),
             "alloc_tensors_s": round(t_alloc - t_nrt_barrier, 4),
