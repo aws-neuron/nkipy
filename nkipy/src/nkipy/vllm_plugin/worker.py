@@ -5,6 +5,7 @@
 import gc
 import logging
 import os
+import threading
 from typing import Any
 
 import numpy as np
@@ -55,6 +56,8 @@ class NKIPyWorker(WorkerBase):
         self._kernel_cache = None  # {name: (neff_path, cache_key)}
         self._model_class = None
         self._config = None
+        self._push_thread: threading.Thread | None = None
+        self._push_error: BaseException | None = None
 
     def init_device(self) -> None:
         import atexit
@@ -236,6 +239,13 @@ class NKIPyWorker(WorkerBase):
             return {"status": "already_sleeping"}
 
         t_start = _time.time()
+
+        # Wait for any in-flight background push before tearing down.
+        if self._push_thread is not None and self._push_thread.is_alive():
+            if self.rank == 0:
+                logger.info("Rank %d: Waiting for background push to finish before sleep", self.rank)
+            self._push_thread.join()
+        self._push_thread = None
 
         from spike import reset as spike_reset
         from nkipy.runtime.device_kernel import _LOADED_KERNELS
@@ -476,7 +486,12 @@ class NKIPyWorker(WorkerBase):
         chunk_end: int | None = None,
         is_last_chunk: bool = True,
     ) -> dict:
-        """Push weight buffers to a peer engine via RDMA."""
+        """Start pushing weight buffers to a peer engine via RDMA in background.
+
+        Returns immediately so the worker busy loop can continue serving
+        execute_model requests.  The server polls nkipy_push_status to
+        detect completion.
+        """
         from nkipy.p2p import push_weights_to_peer
 
         model = self.model_runner._nkipy_model
@@ -487,12 +502,37 @@ class NKIPyWorker(WorkerBase):
             (r["remote_metadata"], r["remote_descs"])
             for r in per_rank_info
         ]
-        push_weights_to_peer(
-            model, info,
-            chunk_start=chunk_start,
-            chunk_end=chunk_end,
-            is_last_chunk=is_last_chunk,
-        )
+
+        self._push_error = None
+
+        def _bg_push():
+            try:
+                push_weights_to_peer(
+                    model, info,
+                    chunk_start=chunk_start,
+                    chunk_end=chunk_end,
+                    is_last_chunk=is_last_chunk,
+                )
+            except BaseException as exc:
+                self._push_error = exc
+                logger.exception("Background push_weights failed on rank %d", self.rank)
+
+        self._push_thread = threading.Thread(target=_bg_push, daemon=True)
+        self._push_thread.start()
+        return {"status": "started"}
+
+    def nkipy_push_status(self) -> dict:
+        """Check whether the background push is still running."""
+        t = self._push_thread
+        if t is None:
+            return {"status": "idle"}
+        if t.is_alive():
+            return {"status": "running"}
+        self._push_thread = None
+        if self._push_error is not None:
+            err = self._push_error
+            self._push_error = None
+            return {"status": "error", "message": str(err)}
         return {"status": "done"}
 
     def nkipy_get_tok_embedding(self) -> bytes | None:

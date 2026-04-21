@@ -91,10 +91,21 @@ def register_nkipy_routes(app: FastAPI) -> None:
     @app.post("/nkipy/p2p_push_weights")
     async def p2p_push_weights(req: PushWeightsRequest):
         core = _get_engine_core(app)
+        # Start the RDMA push in background threads on all workers.
+        # This returns immediately so workers can keep serving requests.
         results = await core.collective_rpc_async(
             "nkipy_push_weights",
             args=(req.per_rank, req.chunk_start, req.chunk_end, req.is_last_chunk),
         )
+        # Poll until the background push completes on all workers.
+        while True:
+            await asyncio.sleep(0.1)
+            statuses = await core.collective_rpc_async("nkipy_push_status")
+            if all(s.get("status") != "running" for s in statuses):
+                for s in statuses:
+                    if s.get("status") == "error":
+                        raise HTTPException(500, s.get("message", "push failed"))
+                break
         return results[0]
 
     @app.get("/nkipy/tok_embedding")
