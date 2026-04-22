@@ -65,21 +65,24 @@ The model loading code auto-detects whether tok_embedding is already sharded (by
 
 | Metric | Value |
 |--------|-------|
-| Engine A cold start (resharded checkpoint, NEFF cached) | **32s** |
+| Engine A cold start (NEFF + checkpoint page-cached) | **32s** |
+| Engine A cold start (page cache dropped) | **86s** |
 | Engine B (sleep mode, no checkpoint) | **12s** |
 
-The 32s cold start assumes pre-compiled NEFF kernels are already cached on disk from a prior run. Without the NEFF cache (first-ever start), compilation adds ~10 minutes. The resharding-specific contribution is reduced disk I/O: ~2.3 GB less per shard (6.7 GB → 4.4 GB), saving a few seconds of checkpoint loading.
+The 32s cold start requires both NEFF kernels and checkpoint files to be in the OS page cache. When the page cache is cold (e.g. after `echo 3 > /proc/sys/vm/drop_caches`), the same startup takes ~86s because 32 workers must re-read 149 GB of checkpoint data plus 1 GB of NEFF cache from disk concurrently. Without any NEFF cache on disk (first-ever start), compilation adds ~10 minutes.
 
-#### Checkpoint Disk-to-CPU Loading
+#### Checkpoint Disk-to-CPU Loading (Microbenchmark)
 
 | Scenario | Wall Clock | Per-Rank | Throughput |
 |----------|-----------|----------|------------|
-| 1 shard, cold (no page cache) | 0.22s | 0.22s | 21.7 GB/s |
-| 1 shard, warm (page cache) | 0.20s | 0.20s | 23.2 GB/s |
-| 32 shards concurrent, cold | 44.3s | avg 39.2s, max 40.5s | 3.4 GB/s |
-| 32 shards concurrent, warm | 43.1s | avg 37.7s, max 40.5s | 3.5 GB/s |
+| 1 shard (4.4 GB), cold | 0.22s | 0.22s | 21.7 GB/s |
+| 1 shard (4.4 GB), warm | 0.20s | 0.20s | 23.2 GB/s |
+| 32 shards concurrent (149 GB), cold | 44.3s | avg 39.2s, max 40.5s | 3.4 GB/s |
+| 32 shards concurrent (149 GB), warm | 43.1s | avg 37.7s, max 40.5s | 3.5 GB/s |
 
-With 32 concurrent readers, NVMe bandwidth (~3.4 GB/s aggregate) is the bottleneck. Cold vs warm makes little difference because the 149 GB checkpoint far exceeds available RAM for page cache. A single shard reads at 21.7 GB/s (close to NVMe sequential read limit), but 32-way contention reduces per-reader throughput to ~3.7 GB/shard.
+A single shard reads at 21.7 GB/s (near NVMe sequential limit), but 32-way concurrency reduces aggregate throughput to ~3.4 GB/s. Cold vs warm makes little difference because 149 GB far exceeds available page cache.
+
+The microbenchmark (44s) is slower than the actual engine cold start (86s includes all startup overhead, not just checkpoint I/O) because the engine uses **mmap + DMA pipelining**: `safetensors.load_file()` returns mmap-backed tensors without copying data to user space, and `DeviceTensor.from_torch()` reads each tensor directly from the mmap region and DMA-transfers it to device memory. Disk reads overlap with DMA transfers, so checkpoint loading is faster than the microbenchmark that forces all data into user-space RAM with `.clone()`.
 
 #### P2P Wake-Up Latency (Engine B activated from Engine A)
 
