@@ -9,7 +9,7 @@
 # Examples:
 #   # Qwen3 sender (Engine A) with checkpoint:
 #   ./run_engine.sh --model Qwen/Qwen3-30B-A3B --tp 32 \
-#       --checkpoint ~/models/qwen3/tmp_Qwen3-30b-a3b_TP32 --skip-cte
+#       --checkpoint ~/models/Qwen3-30b-a3b_TP32 --skip-cte
 #
 #   # Qwen3 receiver (Engine B) in sleep mode:
 #   ./run_engine.sh --model Qwen/Qwen3-30B-A3B --tp 32 --skip-cte --activate-venv
@@ -28,7 +28,7 @@
 #
 #   # TinyLlama sender:
 #   ./run_engine.sh --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --tp 8 \
-#       --checkpoint ~/models/llama3/tmp_tinyllama_TP8 --log-level DEBUG
+#       --checkpoint ~/models/tinyllama_TP8 --log-level DEBUG
 #
 #   # TinyLlama receiver on same node:
 #   ./run_engine.sh --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --tp 8 \

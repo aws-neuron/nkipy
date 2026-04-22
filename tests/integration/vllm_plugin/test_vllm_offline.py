@@ -20,7 +20,7 @@ import pytest
 
 _HAS_NEURON = len(glob.glob("/dev/neuron*")) > 0
 _QWEN3_CHECKPOINT = os.path.expanduser(
-    "~/models/qwen3/tmp_Qwen3-30b-a3b"
+    "~/models/Qwen3-30b-a3b"
 )
 _QWEN3_EXAMPLE_DIR = os.path.expanduser(
     "~/vllm-nkipy/nkipy/examples/models/qwen3"

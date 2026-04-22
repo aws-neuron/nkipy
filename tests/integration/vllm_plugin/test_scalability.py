@@ -26,7 +26,7 @@ import requests
 
 _HAS_NEURON = len(glob.glob("/dev/neuron*")) > 0
 _TINYLLAMA_CHECKPOINT = os.path.expanduser(
-    "~/models/llama3/tmp_tinyllama_TP8"
+    "~/models/tinyllama_TP8"
 )
 _MODEL = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 _PROMPT = "The capital of France is"

@@ -19,7 +19,7 @@ There are two roles in the tests:
 - server engine, which serves as the pusher of the model weights. The server engine is initialized with model checkpoints.
 - receiver engine, which serves as the receiver of the model weights, The receiver engine is initialized without model checkpoints, and it waits for /wake_up endpoint to be activated. Multiple receiver engines are needed to test the scalability and they may or may not share the same set of Neuron cores.
 - Due to Neuron contraints, if multiple engines are started on the same set of neuron cores, only one of them can be active and it must be asleep before another engine wakes up. We call the asleep receiver engines as `standby engines`.
-- Server engine: `./run_engine.sh --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --tp 8 --checkpoint ~/models/llama3/tmp_tinyllama_TP8 --log-level DEBUG`
+- Server engine: `./run_engine.sh --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --tp 8 --checkpoint ~/models/tinyllama_TP8 --log-level DEBUG`
 - Receiver engine: `./run_engine.sh --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --tp 8 --core-offset 16 --port 8001`
 
 

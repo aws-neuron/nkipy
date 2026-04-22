@@ -20,7 +20,7 @@ There are two roles in the tests:
 - server engine, which serves as the pusher of the model weights. The server engine is initialized with model checkpoints.
 - receiver engine, which serves as the receiver of the model weights, The receiver engine is initialized without model checkpoints, and it waits for /wake_up endpoint to be activated. Multiple receiver engines are needed to test the scalability and they may or may not share the same set of Neuron cores.
 - Due to Neuron contraints, if multiple engines are started on the same set of neuron cores, only one of them can be active and it must be asleep before another engine wakes up. We call the asleep receiver engines as `standby engines`.
-- Server engine: `./run_engine.sh --model Qwen/Qwen3-30B-A3B --tp 32 --checkpoint ~/models/qwen3/tmp_Qwen3-30b-a3b_TP32 --skip-cte`
+- Server engine: `./run_engine.sh --model Qwen/Qwen3-30B-A3B --tp 32 --checkpoint ~/models/Qwen3-30b-a3b_TP32 --skip-cte`
 - Receiver engine: `./run_engine.sh --model Qwen/Qwen3-30B-A3B --tp 32 --skip-cte --activate-venv`
 
 
