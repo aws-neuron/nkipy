@@ -1,27 +1,37 @@
-# P2P RDMA Sleep/Wake Optimization Work
+# P2P RDMA Sleep/Wake Optimization
 
-This directory contains documentation from the optimization work to reduce `/sleep` latency from 46.5s to ~1s and fix the wake-up from checkpoint bug.
+Documentation for the P2P weight transfer optimization work: reducing `/sleep` latency from 46.5s to ~1s, fixing wake-up correctness, and validating scalability.
+
+## Architecture & Design
+
+- **[ARCHITECTURE_CONSTRAINTS.md](ARCHITECTURE_CONSTRAINTS.md)** — MR registration strategy for server vs receiver, why receiver must call `dereg_async()`
+- **[SPIKE_RESET_MR_ANALYSIS.md](SPIKE_RESET_MR_ANALYSIS.md)** — Root cause analysis: active RDMA MRs cause 60x `spike_reset()` slowdown; three controlled tests proving it
+- **[observations_and_ideas.md](observations_and_ideas.md)** — Original design tradeoff analysis (naive vs optimized vs alternative MR strategies)
 
 ## Key Fixes
 
-1. **RECEIVER_DEREG_FIX.md** - The critical fix: receiver must call `dereg_async()` after P2P transfer
-2. **WAKE_FROM_CHECKPOINT_FIX.md** - Fixed garbage output after sleep/wake by properly loading weights into existing tensors
-3. **CTRL_C_CLEANUP_FIX.md** - Fixed RDMA resource leakage on Ctrl+C termination
-4. **DEREG_CONDITION_FIX.md** - Fixed condition logic bug in dereg_async() call
+- **[WAKE_FROM_CHECKPOINT_FIX.md](WAKE_FROM_CHECKPOINT_FIX.md)** — Fix for garbage output after sleep/wake: must write into existing tensors, not recreate them
+- **[CTRL_C_CLEANUP_FIX.md](CTRL_C_CLEANUP_FIX.md)** — Fix for RDMA resource leakage on Ctrl+C; cleanup ordering (RDMA before spike_reset)
 
-## Architecture Documentation
+## Performance Results
 
-- **ARCHITECTURE_CONSTRAINTS.md** - MR registration strategy and server/receiver differences
-- **SPIKE_RESET_MR_ANALYSIS.md** - Analysis of why spike_reset() is 60x slower with active MRs
+- **[P2P_LATENCY_LLAMA3_70B.md](P2P_LATENCY_LLAMA3_70B.md)** — LLaMA-3-70B benchmarks: tok_embedding TP sharding (2.1 GB → 65.7 MB/rank), wake/sleep/inference latency, non-blocking push
+- **[SCALABILITY_TEST_QWEN3.md](SCALABILITY_TEST_QWEN3.md)** — Qwen3-30B TP=32: 50 standby engines, resource costs, dynamic lifecycle, Gloo teardown fix
+- **[SCALABILITY_TEST_TINYLLAMA.md](SCALABILITY_TEST_TINYLLAMA.md)** — TinyLlama TP=8: 100 engines, bidirectional P2P, context_len bug fix
 
-## Historical Analysis
+## Roadmap
 
-The other markdown files document the investigation process, hypothesis testing, and intermediate results. They are kept for reference but are not required reading.
+- **[ROADMAP.md](ROADMAP.md)** — Feature gap analysis vs vllm-neuron; phased plan for continuous batching, KV cache, sampling, etc.
 
-## Final Results
+## Summary of Results
 
-- Server sleep: ~2s (was 1s, small regression due to cleanup additions)
-- Receiver sleep: ~1-2s (was 46.5s with active MRs)
-- Wake from checkpoint: Fixed - no longer produces garbage output
-- Wake from P2P: Works correctly
-- Ctrl+C cleanup: No longer leaks RDMA resources
+| Metric | Before | After |
+|--------|--------|-------|
+| `/sleep` (normal, >30s after wake) | 46.5s | ~1-2s |
+| `/sleep` (early, <30s after wake) | 46.5s | ~20s (waits for MR dereg) |
+| `/wake_up` (P2P, LLaMA-3-70B TP=32) | — | ~28-30s |
+| `spike_reset` (with active MRs) | 7-25s | avoided |
+| `spike_reset` (MRs deregistered) | — | 0.12-0.15s |
+| Standby engines per trn1 (TP=32) | ~58 (TCP limit) | ~110 (memory limit) |
+| Checkpoint size (LLaMA-3-70B) | 214 GB | 139 GB (35% smaller) |
+| Non-blocking push stalls | — | 0 |

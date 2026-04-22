@@ -2,7 +2,7 @@
 # Full end-to-end test of MR deregistration timing hypothesis
 set -euo pipefail
 
-WEIGHTS=~/zhuangw/nkipy/examples/models/qwen3/tmp_Qwen3-30b-a3b_TP32
+WEIGHTS=~/models/qwen3/tmp_Qwen3-30b-a3b_TP32
 
 echo "========================================"
 echo "MR Deregistration Timing Hypothesis Test"

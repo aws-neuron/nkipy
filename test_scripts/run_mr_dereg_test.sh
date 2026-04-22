@@ -3,7 +3,7 @@
 # This verifies the hypothesis on a SINGLE instance without P2P transfer
 set -euo pipefail
 
-WEIGHTS=~/zhuangw/nkipy/examples/models/qwen3/tmp_Qwen3-30b-a3b_TP32
+WEIGHTS=~/models/qwen3/tmp_Qwen3-30b-a3b_TP32
 TP=32
 
 echo "========================================"

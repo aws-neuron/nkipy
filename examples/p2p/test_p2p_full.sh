@@ -1,32 +1,54 @@
 #!/usr/bin/env bash
-# P2P weight transfer test for LLaMA-3-70B via vLLM+NKIPy plugin.
+# Full P2P weight transfer test for vLLM+NKIPy plugin.
 #
-# Prerequisites:
-#   - Engine A running on Instance A (172.31.44.131:8000) with checkpoint
-#   - Engine B running on Instance B (172.31.40.200:8000) in sleep mode
-#
-# This script:
-#   1. Verifies A is awake and B is sleeping
-#   2. Runs inference on A to verify baseline
-#   3. Wakes B via P2P from A
-#   4. Runs inference on B and compares output
-#   5. Sleeps B
+# Steps:
+#   1. Health check (A awake, B sleeping)
+#   2. Baseline inference on A
+#   3. Wake B via P2P from A
+#   4. Inference on B, compare output with A
+#   5. Sleep B, wait for RDMA deregistration
 #   6. Second wake/infer/sleep cycle
-#   7. Non-blocking push test (inference on A during transfer)
-
+#   7. Non-blocking push (inference on A during transfer to B)
+#
+# Usage:
+#   test_p2p_full.sh --model MODEL --engine-a URL --engine-b URL
+#                    [--rdma-wait SECONDS]
+#
+# Examples:
+#   ./test_p2p_full.sh --model /home/ubuntu/models/llama-3-70b \
+#       --engine-a http://172.31.44.131:8000 --engine-b http://172.31.40.200:8000
+#
+#   ./test_p2p_full.sh --model Qwen/Qwen3-30B-A3B \
+#       --engine-a http://172.31.44.131:8000 --engine-b http://172.31.40.200:8000
 set -euo pipefail
 
-ENGINE_A="http://172.31.44.131:8000"
-ENGINE_B="http://172.31.40.200:8000"
-MODEL="/home/ubuntu/models/llama-3-70b"
+RDMA_WAIT=60
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --model)     MODEL="$2";     shift 2;;
+        --engine-a)  ENGINE_A="$2";  shift 2;;
+        --engine-b)  ENGINE_B="$2";  shift 2;;
+        --rdma-wait) RDMA_WAIT="$2"; shift 2;;
+        *) echo "Unknown option: $1"; exit 1;;
+    esac
+done
+
+if [[ -z "${MODEL:-}" || -z "${ENGINE_A:-}" || -z "${ENGINE_B:-}" ]]; then
+    echo "Usage: $0 --model MODEL --engine-a URL --engine-b URL [--rdma-wait SECONDS]"
+    exit 1
+fi
+
 PROMPT="The capital of France is"
 
 echo "=============================================="
-echo "  LLaMA-3-70B P2P Weight Transfer Test"
+echo "  P2P Weight Transfer Test"
+echo "  Model: $MODEL"
+echo "  A: $ENGINE_A    B: $ENGINE_B"
 echo "=============================================="
 echo ""
 
-# Step 1: Health check
+# --- Step 1: Health check ---
 echo "=== Step 1: Health Check ==="
 a_health=$(curl -s "$ENGINE_A/nkipy/health")
 b_health=$(curl -s "$ENGINE_B/nkipy/health")
@@ -38,7 +60,7 @@ if [ "$a_sleep" != "False" ]; then echo "ERROR: A must be awake"; exit 1; fi
 if [ "$b_sleep" != "True" ]; then echo "ERROR: B must be sleeping"; exit 1; fi
 echo ""
 
-# Step 2: Baseline inference on A
+# --- Step 2: Baseline inference on A ---
 echo "=== Step 2: Baseline Inference on A ==="
 a_resp=$(curl -s "$ENGINE_A/v1/completions" \
     -H "Content-Type: application/json" \
@@ -47,7 +69,7 @@ a_text=$(echo "$a_resp" | python3 -c "import sys,json; print(json.load(sys.stdin
 echo "  A output: \"$a_text\""
 echo ""
 
-# Step 3: Wake B via P2P from A
+# --- Step 3: Wake B via P2P from A ---
 echo "=== Step 3: Wake B (P2P from A) ==="
 wake1=$(curl -s -X POST "$ENGINE_B/nkipy/wake_up" \
     -H "Content-Type: application/json" \
@@ -61,7 +83,7 @@ print(f'  Total: {l.get(\"total_s\",\"?\")}s  P2P: {l.get(\"p2p_transfer_s\",\"?
 "
 echo ""
 
-# Step 4: Inference on B and compare
+# --- Step 4: Inference on B and compare ---
 echo "=== Step 4: Inference on B ==="
 b_resp=$(curl -s "$ENGINE_B/v1/completions" \
     -H "Content-Type: application/json" \
@@ -75,7 +97,7 @@ else
 fi
 echo ""
 
-# Step 5: Sleep B
+# --- Step 5: Sleep B ---
 echo "=== Step 5: Sleep B ==="
 sleep1=$(curl -s -X POST "$ENGINE_B/nkipy/sleep")
 echo "$sleep1" | python3 -c "
@@ -84,13 +106,11 @@ d=json.load(sys.stdin)
 l=d.get('latency',{})
 print(f'  Status: {d[\"status\"]}  Total: {l.get(\"total_s\",\"?\")}s')
 "
+echo "  Waiting ${RDMA_WAIT}s for RDMA deregistration..."
+sleep "$RDMA_WAIT"
 echo ""
 
-# Wait for RDMA deregistration
-echo "  Waiting 60s for RDMA deregistration..."
-sleep 60
-
-# Step 6: Second wake/infer/sleep cycle
+# --- Step 6: Second wake/infer/sleep cycle ---
 echo "=== Step 6: Second Wake Cycle ==="
 wake2=$(curl -s -X POST "$ENGINE_B/nkipy/wake_up" \
     -H "Content-Type: application/json" \
@@ -118,15 +138,14 @@ echo "$sleep2" | python3 -c "
 import sys,json; d=json.load(sys.stdin); l=d.get('latency',{})
 print(f'  Sleep: {l.get(\"total_s\",\"?\")}s')
 "
+echo "  Waiting ${RDMA_WAIT}s for RDMA deregistration..."
+sleep "$RDMA_WAIT"
 echo ""
 
-echo "  Waiting 60s for RDMA deregistration..."
-sleep 60
-
-# Step 7: Non-blocking push (inference on A during transfer)
+# --- Step 7: Non-blocking push (inference on A during transfer) ---
 echo "=== Step 7: Non-blocking Push Test ==="
 echo "  Starting background inference loop on A..."
-LOG_DIR=/tmp/llama3_70b_p2p
+LOG_DIR=/tmp/nkipy_p2p_full
 mkdir -p "$LOG_DIR"
 rm -f "$LOG_DIR/inference.log"
 
@@ -170,7 +189,6 @@ sleep 8
 kill $INFER_PID 2>/dev/null
 wait $INFER_PID 2>/dev/null
 
-# Verify B
 b_resp3=$(curl -s "$ENGINE_B/v1/completions" \
     -H "Content-Type: application/json" \
     -d "{\"model\": \"$MODEL\", \"prompt\": \"$PROMPT\", \"max_tokens\": 20, \"temperature\": 0}")
@@ -182,7 +200,6 @@ else
     echo "  MISMATCH"
 fi
 
-# Analyze latency
 python3 -c "
 import re, statistics
 lines = open('$LOG_DIR/inference.log').readlines()
@@ -201,7 +218,6 @@ if stalls: print(f'  WARNING: {len(stalls)} stall(s) > {stall_threshold}ms: {sta
 else: print(f'  No stalls (threshold: {stall_threshold}ms)')
 "
 
-# Final sleep B
 curl -s -X POST "$ENGINE_B/nkipy/sleep" > /dev/null
 
 echo ""

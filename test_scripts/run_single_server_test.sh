@@ -2,7 +2,7 @@
 # Start single server and test sleep latency without P2P
 set -euo pipefail
 
-WEIGHTS=~/zhuangw/nkipy/examples/models/qwen3/tmp_Qwen3-30b-a3b_TP32
+WEIGHTS=~/models/qwen3/tmp_Qwen3-30b-a3b_TP32
 
 echo "========================================"
 echo "Single-Server Sleep Test"

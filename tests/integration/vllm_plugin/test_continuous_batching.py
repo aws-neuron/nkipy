@@ -21,7 +21,7 @@ import requests
 
 _HAS_NEURON = len(glob.glob("/dev/neuron*")) > 0
 _QWEN3_CHECKPOINT = os.path.expanduser(
-    "~/zhuangw/nkipy/examples/models/qwen3/tmp_Qwen3-30b-a3b"
+    "~/models/qwen3/tmp_Qwen3-30b-a3b"
 )
 
 

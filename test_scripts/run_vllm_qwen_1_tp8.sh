@@ -2,7 +2,7 @@
 # Engine A: active engine with checkpoint (cores 0-7) - TP=8
 set -euo pipefail
 
-WEIGHTS=~/zhuangw/nkipy/examples/models/qwen3/tmp_Qwen3-30b-a3b
+WEIGHTS=~/models/qwen3/tmp_Qwen3-30b-a3b
 TP=8
 
 export VLLM_PLUGINS=nkipy

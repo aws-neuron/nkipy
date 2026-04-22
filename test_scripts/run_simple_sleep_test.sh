@@ -2,7 +2,7 @@
 # Simplest test: Start server with checkpoint (awake), then test sleep latency
 set -euo pipefail
 
-WEIGHTS=~/zhuangw/nkipy/examples/models/qwen3/tmp_Qwen3-30b-a3b_TP32
+WEIGHTS=~/models/qwen3/tmp_Qwen3-30b-a3b_TP32
 
 echo "========================================"
 echo "Simple Sleep Latency Test"

@@ -3,7 +3,7 @@
 # Tests MR deregistration timing without needing Instance B
 set -euo pipefail
 
-WEIGHTS=~/zhuangw/nkipy/examples/models/qwen3/tmp_Qwen3-30b-a3b_TP32
+WEIGHTS=~/models/qwen3/tmp_Qwen3-30b-a3b_TP32
 TP=32
 
 echo "========================================"
