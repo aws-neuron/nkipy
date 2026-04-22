@@ -39,12 +39,27 @@ _KERNEL_INPUT_KEYS = [
 ]
 
 
+def _tp_embedding_lookup(shard, input_ids):
+    """Hidden-dim-parallel embedding lookup with all-gather across TP ranks.
+
+    Each rank holds tok_embedding[:, hidden_start:hidden_end].
+    Local lookup produces a partial hidden vector; all_gather reconstructs
+    the full hidden_size dimension.
+    """
+    partial = shard[input_ids.long()]                   # [*, hidden_per_rank]
+    world = dist.get_world_size()
+    if world == 1:
+        return partial
+    chunks = [torch.empty_like(partial) for _ in range(world)]
+    dist.all_gather(chunks, partial.contiguous())
+    return torch.cat(chunks, dim=-1)                    # [*, hidden_size]
+
+
 class Llama3Model:
     """NKIPy Llama3/TinyLlama model running on Neuron cores."""
 
     def __init__(self, model_weights=None, config: Config = None, skip_kernels=False):
         self.config = config
-        # Keep tok_embedding as CPU tensor for compatibility (used during inference)
         self.tok_embedding = model_weights.get("tok_embedding") if model_weights else None
         # tok_embedding_device is DeviceTensor version for P2P transfer
         self.tok_embedding_device = None
@@ -61,6 +76,22 @@ class Llama3Model:
             self._prepare_tensors(model_weights)
             if not skip_kernels and config.context_len is not None:
                 self._prepare_kernels()
+
+    def _shard_tok_embedding(self, embedding):
+        """Shard tok_embedding along hidden dimension for this TP rank.
+
+        If the embedding is already sharded (shape[1] == hidden_size // tp),
+        returns it as-is. Otherwise slices from the full embedding.
+        """
+        tp = dist.get_world_size()
+        rank = dist.get_rank()
+        expected_cols = self.config.hidden_size // tp
+        if embedding.shape[1] == expected_cols:
+            return embedding.contiguous()
+        cols_per_rank = embedding.shape[1] // tp
+        start = rank * cols_per_rank
+        end = start + cols_per_rank
+        return embedding[:, start:end].contiguous()
 
     def _prepare_tensors(self, weights):
         t = time.time()
@@ -83,8 +114,8 @@ class Llama3Model:
         self.norm_weight = DeviceTensor.from_torch(weights["norm_weight"], "norm_weight")
         self.lm_head_weight = DeviceTensor.from_torch(weights["lm_head_weight"], "lm_head_weight")
 
-        # Convert tok_embedding to DeviceTensor for P2P transfer
         if self.tok_embedding is not None:
+            self.tok_embedding = self._shard_tok_embedding(self.tok_embedding)
             self.tok_embedding_device = DeviceTensor.from_torch(self.tok_embedding, "tok_embedding")
 
         logger.info("Tensors prepared in %.2fs", time.time() - t)
@@ -112,11 +143,11 @@ class Llama3Model:
         if "lm_head_weight" in weights:
             self.lm_head_weight.write_from_torch(weights["lm_head_weight"])
 
-        # Load tok_embedding
+        # Load tok_embedding (shard from full embedding)
         if "tok_embedding" in weights:
-            self.tok_embedding_device.write_from_torch(weights["tok_embedding"])
-            # Also set the CPU version
-            self.tok_embedding = weights["tok_embedding"]
+            shard = self._shard_tok_embedding(weights["tok_embedding"])
+            self.tok_embedding_device.write_from_torch(shard)
+            self.tok_embedding = shard
 
         logger.info("Weights loaded into existing tensors in %.2fs", time.time() - t)
 
@@ -173,9 +204,10 @@ class Llama3Model:
         self.lm_head_weight = DeviceTensor.allocate_uninitialized(
             (cfg.hidden_size, cfg.vocab_size // tp), cfg.dtype, "lm_head_weight")
 
-        # Token embedding (uninitialized, filled by P2P) - NOT sharded across TP
+        # Token embedding — hidden-dim-parallel sharded across TP.
+        cols_per_rank = cfg.hidden_size // tp
         self.tok_embedding_device = DeviceTensor.allocate_uninitialized(
-            (cfg.vocab_size, cfg.hidden_size), cfg.dtype, "tok_embedding")
+            (cfg.vocab_size, cols_per_rank), cfg.dtype, "tok_embedding")
 
     def weight_buffers(self):
         """Yield (name, va, size_bytes) for all weight tensors (for P2P)."""
@@ -191,7 +223,6 @@ class Llama3Model:
             if dt is not None:
                 va = dt.tensor_ref.va
                 size = int(np.prod(dt.shape) * np.dtype(dt.dtype).itemsize)
-                # Use "tok_embedding" as the name for compatibility
                 name = "tok_embedding" if attr == "tok_embedding_device" else attr
                 yield name, va, size
 
@@ -303,10 +334,16 @@ class Llama3Model:
             "cache_v": self.layer_tensors[lid]["cache_v"],
         }
 
+    def embed_tokens(self, input_ids):
+        """Hidden-dim-parallel embedding lookup with all-gather."""
+        return _tp_embedding_lookup(
+            self.tok_embedding, torch.as_tensor(input_ids, dtype=torch.long),
+        )
+
     def generate(self, input_ids):
         """Yield one token tensor per step (prefill + decode)."""
         cfg = self.config
-        hidden = DeviceTensor.from_torch(self.tok_embedding[input_ids], "hidden_states")
+        hidden = DeviceTensor.from_torch(self.embed_tokens(input_ids), "hidden_states")
         next_id = DeviceTensor.from_numpy(np.array([[0]], dtype=np.uint32), "next_id")
 
         # Prefill
@@ -323,7 +360,7 @@ class Llama3Model:
         # Decode
         for pos in range(cfg.context_len, cfg.context_len + cfg.max_new_tokens):
             t_sp = DeviceTensor.from_numpy(np.array([pos], dtype=np.int32))
-            hidden = DeviceTensor.from_torch(self.tok_embedding[next_id_torch], "h0/res1")
+            hidden = DeviceTensor.from_torch(self.embed_tokens(next_id_torch), "h0/res1")
 
             for i in range(cfg.num_layers):
                 self.kernel_tkg(inputs=self._build_inputs(i, hidden, t_sp),

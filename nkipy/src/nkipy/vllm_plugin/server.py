@@ -145,11 +145,26 @@ async def run_server(args: Namespace) -> None:
         if not os.environ.get("NKIPY_CHECKPOINT"):
             _nkipy_sleeping = True
         else:
-            # Pre-cache tok_embedding so /nkipy/tok_embedding serves instantly
-            core = _get_engine_core(app)
-            _tok_embedding_cache = (await core.collective_rpc_async("nkipy_get_tok_embedding"))[0]
-            logger.info("tok_embedding cached (%s)",
-                        f"{len(_tok_embedding_cache['raw'])/1e6:.1f} MB" if _tok_embedding_cache else "None")
+            # Pre-cache tok_embedding so /nkipy/tok_embedding serves instantly.
+            # With hidden-dim TP sharding, each rank stores
+            # vocab_size * (hidden_size / tp) — check the per-shard size.
+            from transformers import AutoConfig
+            hf_cfg = AutoConfig.from_pretrained(args.model)
+            tp = getattr(args, "tensor_parallel_size", 1) or 1
+            emb_bytes = hf_cfg.vocab_size * (hf_cfg.hidden_size // tp) * 2  # bf16
+            if emb_bytes > 500_000_000:
+                logger.info("tok_embedding shard too large for pre-cache (%.0f MB), will serve lazily",
+                            emb_bytes / 1e6)
+            else:
+                core = _get_engine_core(app)
+                try:
+                    _tok_embedding_cache = (await core.collective_rpc_async(
+                        "nkipy_get_tok_embedding", timeout=30))[0]
+                    logger.info("tok_embedding cached (%s)",
+                                f"{len(_tok_embedding_cache['raw'])/1e6:.1f} MB" if _tok_embedding_cache else "None")
+                except Exception as e:
+                    logger.warning("tok_embedding pre-cache failed: %s", e)
+                    _tok_embedding_cache = None
 
         # Wrap app with ASGI middleware to reject requests while sleeping.
         inner_app = app

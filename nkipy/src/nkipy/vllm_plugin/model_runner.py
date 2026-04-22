@@ -208,7 +208,7 @@ class NKIPyModelRunner:
         self._ensure_kernels(ctx_len)
 
         input_ids = np.array([state.prompt_token_ids], dtype=np.int64)
-        hidden = DeviceTensor.from_torch(model.tok_embedding[input_ids], "hidden_states")
+        hidden = DeviceTensor.from_torch(model.embed_tokens(input_ids), "hidden_states")
         next_id = DeviceTensor.from_numpy(np.array([[0]], dtype=np.uint32), "next_id")
 
         for i in range(cfg.num_layers):
@@ -239,7 +239,7 @@ class NKIPyModelRunner:
         last_token = state.output_token_ids[-1]
         input_ids = np.array([[last_token]], dtype=np.int64)
         t_sp = DeviceTensor.from_numpy(np.array([pos], dtype=np.int32))
-        hidden = DeviceTensor.from_torch(model.tok_embedding[input_ids], "h0/res1")
+        hidden = DeviceTensor.from_torch(model.embed_tokens(input_ids), "h0/res1")
         next_id = DeviceTensor.from_numpy(np.array([[0]], dtype=np.uint32), "next_id")
 
         for i in range(cfg.num_layers):

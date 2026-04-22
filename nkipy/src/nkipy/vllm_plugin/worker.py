@@ -443,7 +443,7 @@ class NKIPyWorker(WorkerBase):
         dist.barrier()
         t_kernel_barrier = _time.time()
 
-        # Convert tok_embedding_device (DeviceTensor) back to CPU tensor for inference
+        # Convert tok_embedding_device (sharded DeviceTensor) back to CPU for inference.
         if model.tok_embedding is None and model.tok_embedding_device is not None:
             model.tok_embedding = model.tok_embedding_device.torch()
         t_tok = _time.time()
@@ -536,7 +536,11 @@ class NKIPyWorker(WorkerBase):
         return {"status": "done"}
 
     def nkipy_get_tok_embedding(self) -> bytes | None:
-        """Return serialized tok_embedding (rank 0 only)."""
+        """Return serialized tok_embedding (rank 0 shard only).
+
+        Returns this rank's vocab-parallel shard. The full embedding can
+        be reconstructed by concatenating all shards along dim 0.
+        """
         model = self.model_runner._nkipy_model
         if model is None or model.tok_embedding is None:
             return None
@@ -556,6 +560,38 @@ class NKIPyWorker(WorkerBase):
     def nkipy_health(self) -> dict:
         """Return P2P health status."""
         return {"status": "ok", "backend": "nkipy", "sleeping": self._sleeping}
+
+    def _load_tok_embedding_local(self, peer_url: str | None = None):
+        """Load tok_embedding from local model files, falling back to HTTP."""
+        import json
+        import time as _time
+
+        t0 = _time.time()
+        model_path = self.vllm_config.model_config.model
+        index_path = os.path.join(model_path, "model.safetensors.index.json")
+
+        if os.path.exists(index_path):
+            from safetensors.torch import load_file
+            with open(index_path) as f:
+                idx = json.load(f)
+            for key, shard_file in idx["weight_map"].items():
+                if "embed_tokens" in key:
+                    shard_path = os.path.join(model_path, shard_file)
+                    weights = load_file(shard_path, device="cpu")
+                    tok_embedding = weights[key]
+                    elapsed = _time.time() - t0
+                    if self.rank == 0:
+                        size_mb = tok_embedding.numel() * tok_embedding.element_size() / 1e6
+                        logger.info("tok_embedding loaded from %s in %.3fs (%.1f MB)",
+                                    shard_file, elapsed, size_mb)
+                    return tok_embedding
+
+        if peer_url:
+            if self.rank == 0:
+                logger.info("Local model weights not available, fetching tok_embedding via HTTP")
+            return self._fetch_tok_embedding(peer_url)
+
+        raise RuntimeError("tok_embedding: no local model files and no peer_url")
 
     @staticmethod
     def _fetch_tok_embedding(peer_url: str):

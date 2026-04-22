@@ -168,8 +168,10 @@ def push_to_peer(
 ) -> None:
     """All ranks push their buffer shard to the corresponding peer rank.
 
-    Called on the active engine.  Rank 0 broadcasts *per_rank_info* to all
-    workers; each rank connects to its peer and RDMA-writes its buffers.
+    Each worker receives *per_rank_info* (the full list) directly via
+    collective_rpc and extracts its own entry — no Gloo broadcast needed.
+    This avoids Gloo thread-safety issues when push runs in a background
+    thread while the main thread serves inference.
 
     Parameters
     ----------
@@ -177,16 +179,14 @@ def push_to_peer(
         The per-rank endpoint (will be registered if not already).
     buffers : sequence of (name, va, size_bytes)
         Device buffers to push from.
-    per_rank_info : list, optional
+    per_rank_info : list
         ``[(remote_metadata_hex, remote_descs_hex), ...]`` per rank.
-        Only required on rank 0.
+        Required on ALL ranks (distributed via collective_rpc).
     is_last_chunk : bool
         If True (default), destroy the endpoint after the transfer.
         Set to False to keep the endpoint alive for subsequent chunks.
     """
-    obj_list = [per_rank_info] if dist.get_rank() == 0 else [None]
-    dist.broadcast_object_list(obj_list, src=0)
-    remote_metadata_hex, remote_descs_hex = obj_list[0][dist.get_rank()]
+    remote_metadata_hex, remote_descs_hex = per_rank_info[dist.get_rank()]
 
     t0 = time.time()
 
@@ -198,7 +198,6 @@ def push_to_peer(
     t_conn = time.time()
 
     if not pre_registered:
-        # Register the chunk's weight buffers for transfer.
         handles = []
         ep.buf_info = []
         for name, va, size_bytes in buffers:
@@ -208,7 +207,12 @@ def push_to_peer(
     t_reg = time.time()
 
     remote_descs = uccl_ep.deserialize_descs(bytes.fromhex(remote_descs_hex))
-    assert len(remote_descs) == len(ep.xfer_descs)
+    if len(remote_descs) != len(ep.xfer_descs):
+        raise ValueError(
+            f"Rank {dist.get_rank()}: desc count mismatch: "
+            f"remote_descs={len(remote_descs)} vs xfer_descs={len(ep.xfer_descs)} "
+            f"buffers={len(buffers)} pre_registered={pre_registered}"
+        )
 
     ok, _ = uccl_ep.transfer(conn_id, "write", ep.xfer_descs, remote_descs)
     assert ok, "RDMA write failed"
@@ -228,8 +232,6 @@ def push_to_peer(
     t_conn - t0, t_reg - t_conn, xfer_secs, xfer_gbps,
     t_dereg - t_xfer, t_dereg - t0,
     " (pre-registered)" if pre_registered else "",)
-
-    dist.barrier()
 
 
 # ------------------------------------------------------------------
