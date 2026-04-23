@@ -359,7 +359,7 @@ class SendChannelGroup : public ChannelGroup {
 
   void pollingLoop() {
     LOG(INFO) << "SendChannelGroup::pollingLoop - Started";
-    uccl::pin_thread_to_numa(numa_node_);
+    relay::pin_thread_to_numa(numa_node_);
     while (running_.load(std::memory_order_acquire)) {
       pollControlChannel();
       processSendRequests();
@@ -489,7 +489,7 @@ class RecvChannelGroup : public ChannelGroup {
 
   void pollingLoop() {
     LOG(INFO) << "RecvChannelGroup::pollingLoop - Started";
-    uccl::pin_thread_to_numa(numa_node_);
+    relay::pin_thread_to_numa(numa_node_);
     while (running_.load(std::memory_order_acquire)) {
       pollAndProcessCompletions();
       // optional small sleep/yield to avoid busy-looping if desired:

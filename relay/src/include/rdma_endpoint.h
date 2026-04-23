@@ -121,7 +121,7 @@ class NICEndpoint {
       rank_oob_meta_[rank_id] = meta_ptr;
     }
   }
-  ConnID uccl_connect(int remote_gpuidx, std::string remote_ip,
+  ConnID relay_connect(int remote_gpuidx, std::string remote_ip,
                       uint16_t remote_port) {
     int32_t current_send_id = send_id_.fetch_add(1, std::memory_order_relaxed);
 
@@ -146,7 +146,7 @@ class NICEndpoint {
     return actual_device_ids_;
   }
 
-  inline ConnID uccl_accept(std::string& remote_ip, int* remote_gpuidx) {
+  inline ConnID relay_accept(std::string& remote_ip, int* remote_gpuidx) {
     AcceptedMeta accepted;
     uint64_t rank_id = 0;
 
@@ -191,9 +191,9 @@ class NICEndpoint {
     return conn_id;
   }
 
-  inline int uccl_regmr(void* const data, size_t const len, MRArray& mr_array) {
+  inline int relay_regmr(void* const data, size_t const len, MRArray& mr_array) {
     if (unlikely(!data)) {
-      LOG(ERROR) << "Error: uccl_regmr called with null data";
+      LOG(ERROR) << "Error: relay_regmr called with null data";
       return -1;
     }
 
@@ -222,7 +222,7 @@ class NICEndpoint {
     return 0;
   }
 
-  inline void uccl_deregmr(MRArray const& mr_array) {
+  inline void relay_deregmr(MRArray const& mr_array) {
     for (uint32_t ctx = 0; ctx < kNICContextNumber; ++ctx) {
       ibv_mr* mr = mr_array.getKeyByContextID(ctx);
       if (likely(mr != nullptr)) {

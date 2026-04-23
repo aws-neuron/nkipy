@@ -49,8 +49,8 @@ class RdmaDeviceManager {
   }
 
   std::vector<size_t> get_best_dev_idx(int gpu_idx) {
-    auto instance_type = uccl::get_instance_type();
-    auto selected_dev_indices = uccl::load_gpu_nic_map(instance_type, gpu_idx);
+    auto instance_type = relay::get_instance_type();
+    auto selected_dev_indices = relay::load_gpu_nic_map(instance_type, gpu_idx);
     CHECK(!selected_dev_indices.empty())
         << "[RDMA] GPU " << gpu_idx
         << " not found in GPU-NIC map for instance type: " << instance_type;
@@ -73,7 +73,7 @@ class RdmaDeviceManager {
       return -1;
     }
     std::string device_name = devices_[id]->name();
-    return uccl::get_dev_numa_node(device_name.c_str());
+    return relay::get_dev_numa_node(device_name.c_str());
   }
 
  private:

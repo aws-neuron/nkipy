@@ -17,7 +17,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-namespace uccl {
+namespace relay {
 
 #define MAX_IB_DEVS 32
 #define MAX_IFS 16
@@ -398,13 +398,13 @@ static int find_interfaces(char* ifNames, union socketAddress* ifAddrs,
   // Allow user to force the INET socket family selection
   int sock_family = env_socket_family();
   // User specified interface
-  char* env = getenv("UCCL_SOCKET_IFNAME");
+  char* env = getenv("RELAY_SOCKET_IFNAME");
   if (!env) env = getenv("NCCL_SOCKET_IFNAME");
   if (env && strlen(env) > 1) {
-    LOG(INFO) << "UCCL/NCCL_SOCKET_IFNAME set by environment to " << env;
+    LOG(INFO) << "RELAY/NCCL_SOCKET_IFNAME set by environment to " << env;
     // Specified by user : find or fail
     if (shownIfName++ == 0)
-      LOG(INFO) << "UCCL/NCCL_SOCKET_IFNAME set to " << env;
+      LOG(INFO) << "RELAY/NCCL_SOCKET_IFNAME set to " << env;
     nIfs = find_interfaces(env, ifNames, ifAddrs, sock_family, ifNameMaxSize,
                            maxIfs);
   } else {
@@ -489,11 +489,11 @@ static bool is_local_ip(std::string const& ip) {
   return found;
 }
 static inline std::string get_oob_ip() {
-  char uccl_ifname[MAX_IF_NAME_SIZE + 1];
-  socketAddress uccl_ifaddr;
+  char relay_ifname[MAX_IF_NAME_SIZE + 1];
+  socketAddress relay_ifaddr;
   int num_ifs =
-      uccl::find_interfaces(uccl_ifname, &uccl_ifaddr, MAX_IF_NAME_SIZE, 1);
+      relay::find_interfaces(relay_ifname, &relay_ifaddr, MAX_IF_NAME_SIZE, 1);
   CHECK(num_ifs == 1) << "No IP interface found";
-  return uccl::get_dev_ip(uccl_ifname);
+  return relay::get_dev_ip(relay_ifname);
 }
-}  // namespace uccl
+}  // namespace relay

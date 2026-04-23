@@ -9,7 +9,7 @@ description = "RDMA-based P2P communication for Trainium weight transfer"
 readme = "README.md"
 requires-python = ">=3.8"
 license = "Apache-2.0"
-authors = [{ name = "UCCL Team" }]
+authors = [{ name = "Relay Team" }]
 dependencies = ["pybind11>=2.6.0", "paramiko", "intervaltree", "numpy", "requests", "torch"]
 
 [tool.setuptools.package-dir]

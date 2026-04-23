@@ -52,7 +52,7 @@ class RDMAChannel {
     remote_meta_ = std::make_shared<ChannelMetaData>(remote_meta);
     ah_ = ctx_->createAH(remote_meta_->gid);
     impl_->connectQP(qp_, ctx_, *remote_meta_);
-    UCCL_LOG_EP << "RDMAChannel connected to remote qpn=" << remote_meta.qpn;
+    RELAY_LOG_EP << "RDMAChannel connected to remote qpn=" << remote_meta.qpn;
   }
 
   int64_t submitRequest(std::shared_ptr<RDMASendRequest> req) {

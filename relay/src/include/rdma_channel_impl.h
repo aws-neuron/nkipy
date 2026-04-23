@@ -21,7 +21,7 @@ struct ibv_wc;
 static inline int get_sl_from_env(int default_value) {
   static int sl = -1;
   if (sl == -1) {
-    char const* env = getenv("UCCL_P2P_RDMA_SL");
+    char const* env = getenv("RELAY_RDMA_SL");
     if (env) {
       sl = std::atoi(env);
       if (sl < 0 || sl > 15) {
@@ -40,7 +40,7 @@ static inline int get_sl_from_env(int default_value) {
 static inline int get_tc_from_env(int default_value) {
   static int tc = -1;
   if (tc == -1) {
-    char const* env = getenv("UCCL_P2P_RDMA_TC");
+    char const* env = getenv("RELAY_RDMA_TC");
     if (env) {
       tc = std::atoi(env);
       if (tc < 0 || tc > 255) {

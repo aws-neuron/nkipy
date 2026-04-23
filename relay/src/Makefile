@@ -7,7 +7,7 @@ BUILD_DIR := ../build
 # Compiler and flags
 CXX := g++
 CXXFLAGS := -O3 -shared -std=c++17 -fPIC -I. -Iinclude \
-	-DUCCL_P2P_USE_EFA \
+	-DRELAY_USE_EFA \
 	-Wno-pointer-arith -Wno-sign-compare -Wno-unused-variable \
 	-Wl,-rpath=/usr/local/lib -Wl,-rpath=/usr/lib/x86_64-linux-gnu
 
@@ -21,7 +21,7 @@ LIBS = -libverbs -lpthread $(LIBGLOG) -lgflags -L ${EFA_HOME}/lib -lefa
 NRT_AVAILABLE := $(shell test -d $(NRT_HOME)/include/nrt && echo yes)
 ifeq ($(NRT_AVAILABLE),yes)
     $(info NRT detected - enabling Neuron/Trainium support)
-    CXXFLAGS += -DUCCL_ENABLE_NRT -Wl,-rpath=$(NRT_HOME)/lib
+    CXXFLAGS += -DRELAY_ENABLE_NRT -Wl,-rpath=$(NRT_HOME)/lib
     INC += -I${NRT_HOME}/include
     LIBS += -L${NRT_HOME}/lib -lnrt
 else

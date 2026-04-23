@@ -1,5 +1,5 @@
 #include "engine.h"
-#ifdef UCCL_ENABLE_NRT
+#ifdef RELAY_ENABLE_NRT
 #include "nrt_tensor.h"
 #endif
 #include <pybind11/numpy.h>
@@ -113,7 +113,7 @@ std::pair<void const*, size_t> get_tensor_info(py::object tensor_obj) {
   return std::make_pair(reinterpret_cast<void const*>(ptr), total_size);
 }
 
-#ifdef UCCL_ENABLE_NRT
+#ifdef RELAY_ENABLE_NRT
 /**
  * Python wrapper class for NRT tensor
  */
@@ -155,7 +155,7 @@ class NRTTensor {
   // Get the size in bytes
   size_t get_size() const { return size_; }
 
-  // Get the tensor pointer as an integer (for registration with UCCL)
+  // Get the tensor pointer as an integer (for registration with Relay)
   uintptr_t get_va() const {
     if (!tensor_) return 0;
     return reinterpret_cast<uintptr_t>(nrt_tensor_get_va(tensor_));
@@ -193,17 +193,17 @@ class NRTTensor {
     return tensor;
   }
 };
-#endif  // UCCL_ENABLE_NRT
+#endif  // RELAY_ENABLE_NRT
 
 }  // namespace
 
 PYBIND11_MODULE(_relay, m) {
   m.doc() = "Relay Engine - High-performance RDMA-based peer-to-peer transport";
 
-  m.def("get_oob_ip", &uccl::get_oob_ip, "Get the OOB IP address");
+  m.def("get_oob_ip", &relay::get_oob_ip, "Get the OOB IP address");
 
   // Feature flags
-#ifdef UCCL_ENABLE_NRT
+#ifdef RELAY_ENABLE_NRT
   m.attr("HAS_NRT_SUPPORT") = true;
 #else
   m.attr("HAS_NRT_SUPPORT") = false;
@@ -636,9 +636,9 @@ PYBIND11_MODULE(_relay, m) {
           "conn_id_of_rank", &Endpoint::conn_id_of_rank,
           "Get the connection ID for a given peer rank (or UINT64_MAX if none)",
           py::arg("rank"))
-      .def("__repr__", [](Endpoint const& e) { return "<UCCL P2P Endpoint>"; });
+      .def("__repr__", [](Endpoint const& e) { return "<Relay Endpoint>"; });
 
-#ifdef UCCL_ENABLE_NRT
+#ifdef RELAY_ENABLE_NRT
   // NRT Tensor utilities (only available on Neuron/Trainium)
   py::class_<NRTTensor>(m, "NRTTensor")
       .def(py::init<int, size_t, char const*>(), py::arg("nc_idx"),
@@ -649,7 +649,7 @@ PYBIND11_MODULE(_relay, m) {
       .def("get_size", &NRTTensor::get_size,
            "Get the size of the tensor in bytes")
       .def("get_va", &NRTTensor::get_va,
-           "Get the virtual address for UCCL registration")
+           "Get the virtual address for Relay registration")
       .def(
           "to_torch",
           [](py::object self) { return NRTTensor::to_torch_impl(self); },
@@ -675,5 +675,5 @@ PYBIND11_MODULE(_relay, m) {
       "alive automatically)");
 
   m.def("nrt_init", &nrt_util_init, "Initialize NRT runtime (idempotent)");
-#endif  // UCCL_ENABLE_NRT
+#endif  // RELAY_ENABLE_NRT
 }

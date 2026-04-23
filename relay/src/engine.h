@@ -17,7 +17,7 @@ extern thread_local bool inside_python;
 int const kMaxNumGPUs = 8;
 
 inline int parseLogLevelFromEnv() {
-  char const* env = std::getenv("UCCL_P2P_LOG_LEVEL");
+  char const* env = std::getenv("RELAY_LOG_LEVEL");
   if (!env) {
     return google::WARNING;
   }
@@ -38,7 +38,7 @@ inline int parseLogLevelFromEnv() {
 
 using RDMAEndPoint = std::shared_ptr<NICEndpoint>;
 enum ReqType { ReqTx, ReqRx, ReqWrite };
-struct ucclRequest {
+struct RelayRequest {
   enum ReqType type;
   uint32_t n;
   uint32_t engine_idx;
@@ -54,7 +54,7 @@ struct MR {
 
 struct Conn {
   uint64_t conn_id_;
-  ConnID uccl_conn_id_;
+  ConnID relay_conn_id_;
   std::string ip_addr_;
   int remote_gpu_idx_;
 };

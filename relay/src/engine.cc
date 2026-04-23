@@ -34,7 +34,7 @@ Endpoint::Endpoint(uint32_t const local_gpu_idx)
   std::cout << "Creating Engine with GPU index: " << local_gpu_idx << std::endl;
 
   std::call_once(glog_init_once,
-                 []() { google::InitGoogleLogging("uccl_p2p"); });
+                 []() { google::InitGoogleLogging("relay"); });
   FLAGS_minloglevel = parseLogLevelFromEnv();
   FLAGS_logtostderr = true;
   google::InstallFailureSignalHandler();
@@ -107,30 +107,30 @@ bool Endpoint::connect(std::string ip_addr, int remote_gpu_idx, int remote_port,
 
   assert(local_gpu_idx_ != INVALID_GPU);
 
-  std::future<ConnID> uccl_conn_id_future = std::async(
+  std::future<ConnID> relay_conn_id_future = std::async(
       std::launch::async, [this, remote_gpu_idx, &ip_addr, remote_port]() {
-        return uccl_connect(ep_, remote_gpu_idx, ip_addr, remote_port);
+        return relay_connect(ep_, remote_gpu_idx, ip_addr, remote_port);
       });
 
   // Check for Python signals (eg, ctrl+c) while waiting for connection
-  while (uccl_conn_id_future.wait_for(std::chrono::seconds(0)) !=
+  while (relay_conn_id_future.wait_for(std::chrono::seconds(0)) !=
          std::future_status::ready) {
     auto _ = inside_python ? (check_python_signals(), nullptr) : nullptr;
     std::this_thread::sleep_for(std::chrono::seconds(1));
   }
-  ConnID uccl_conn_id = uccl_conn_id_future.get();
+  ConnID relay_conn_id =relay_conn_id_future.get();
 
   // Store the connection ID.
   {
     std::unique_lock<std::shared_mutex> lock(conn_mu_);
     conn_id_to_conn_[conn_id] =
-        new Conn{conn_id, uccl_conn_id, ip_addr, remote_gpu_idx};
+        new Conn{conn_id, relay_conn_id, ip_addr, remote_gpu_idx};
   }
   return true;
 }
 
 std::vector<uint8_t> Endpoint::get_metadata() {
-  std::string ip_str = uccl::get_oob_ip();
+  std::string ip_str = relay::get_oob_ip();
   uint16_t port = get_p2p_listen_port(ep_);
 
   bool is_ipv6 = ip_str.find(':') != std::string::npos;
@@ -210,13 +210,13 @@ bool Endpoint::accept(std::string& ip_addr, int& remote_gpu_idx,
   // For demo purposes, simulate accepted connection
   conn_id = next_conn_id_.fetch_add(1);
 
-  std::future<ConnID> uccl_conn_id_future =
+  std::future<ConnID> relay_conn_id_future =
       std::async(std::launch::async, [this, &ip_addr, &remote_gpu_idx]() {
-        return uccl_accept(ep_, ip_addr, &remote_gpu_idx);
+        return relay_accept(ep_, ip_addr, &remote_gpu_idx);
       });
 
   // Check for Python signals (eg, ctrl+c) while waiting for connection
-  while (uccl_conn_id_future.wait_for(std::chrono::seconds(0)) !=
+  while (relay_conn_id_future.wait_for(std::chrono::seconds(0)) !=
          std::future_status::ready) {
     if (passive_accept_ &&
         passive_accept_stop_.load(std::memory_order_acquire)) {
@@ -226,13 +226,13 @@ bool Endpoint::accept(std::string& ip_addr, int& remote_gpu_idx,
     auto _ = inside_python ? (check_python_signals(), nullptr) : nullptr;
     std::this_thread::sleep_for(std::chrono::seconds(1));
   }
-  ConnID uccl_conn_id = uccl_conn_id_future.get();
+  ConnID relay_conn_id =relay_conn_id_future.get();
 
   // Store the connection ID.
   {
     std::unique_lock<std::shared_mutex> lock(conn_mu_);
     conn_id_to_conn_[conn_id] =
-        new Conn{conn_id, uccl_conn_id, ip_addr, remote_gpu_idx};
+        new Conn{conn_id, relay_conn_id, ip_addr, remote_gpu_idx};
   }
 
   return true;
@@ -242,7 +242,7 @@ bool Endpoint::reg(void const* data, size_t size, uint64_t& mr_id) {
   mr_id = next_mr_id_.fetch_add(1);
 
   P2PMhandle* mhandle = new P2PMhandle();
-  if (!uccl_regmr(ep_, const_cast<void*>(data), size, mhandle)) {
+  if (!relay_regmr(ep_, const_cast<void*>(data), size, mhandle)) {
     return false;
   }
   {
@@ -279,7 +279,7 @@ bool Endpoint::regv(std::vector<void const*> const& data_v,
     uint64_t id = next_mr_id_.fetch_add(1);
     P2PMhandle* mhandle = new P2PMhandle();
 
-    if (!uccl_regmr(ep_, const_cast<void*>(data_v[i]), size_v[i], mhandle)) {
+    if (!relay_regmr(ep_, const_cast<void*>(data_v[i]), size_v[i], mhandle)) {
       std::cerr << "[Endpoint::regv] registration failed at i=" << i << '\n';
       return false;
     }
@@ -302,7 +302,7 @@ bool Endpoint::dereg(uint64_t mr_id) {
       return false;
     }
     auto mr = it->second;
-    uccl_deregmr(ep_, mr->mhandle_);
+    relay_deregmr(ep_, mr->mhandle_);
     delete mr;
     mr_id_to_mr_.erase(mr_id);
   }
@@ -318,7 +318,7 @@ bool Endpoint::writev(uint64_t conn_id, std::vector<uint64_t> mr_id_v,
     return false;
   }
 
-  ucclRequest ureq[kMaxInflightOps] = {};
+  RelayRequest ureq[kMaxInflightOps] = {};
   bool done[kMaxInflightOps] = {false};
 
   size_t iov_issued = 0, iov_finished = 0;
@@ -333,7 +333,7 @@ bool Endpoint::writev(uint64_t conn_id, std::vector<uint64_t> mr_id_v,
         return false;
       }
 
-      auto rc = uccl_write_async(ep_, conn, mhandle, src_v[iov_issued],
+      auto rc = relay_write_async(ep_, conn, mhandle, src_v[iov_issued],
                                  size_v[iov_issued], slot_item_v[iov_issued],
                                  &ureq[iov_issued % kMaxInflightOps]);
       if (rc == -1) break;
@@ -345,7 +345,7 @@ bool Endpoint::writev(uint64_t conn_id, std::vector<uint64_t> mr_id_v,
 
     for (size_t i = iov_finished; i < iov_issued; i++) {
       if (done[i % kMaxInflightOps]) continue;
-      if (uccl_poll_ureq_once(ep_, &ureq[i % kMaxInflightOps])) {
+      if (relay_poll_once(ep_, &ureq[i % kMaxInflightOps])) {
         done[i % kMaxInflightOps] = true;
       }
     }
@@ -371,18 +371,18 @@ bool Endpoint::write(uint64_t conn_id, uint64_t mr_id, void* src, size_t size,
     std::cerr << "[write] Error: Invalid mr_id " << mr_id << std::endl;
     return false;
   }
-  ucclRequest ureq = {};
+  RelayRequest ureq = {};
   FifoItem curr_slot_item = slot_item;
   curr_slot_item.size = size;
 
-  while (uccl_write_async(ep_, conn, mhandle, src, size, curr_slot_item,
+  while (relay_write_async(ep_, conn, mhandle, src, size, curr_slot_item,
                           &ureq) == -1)
     ;
 
   bool done = false;
   while (!done) {
     auto _ = inside_python ? (check_python_signals(), nullptr) : nullptr;
-    if (uccl_poll_ureq_once(ep_, &ureq)) {
+    if (relay_poll_once(ep_, &ureq)) {
       done = true;
     }
   }

@@ -5,7 +5,7 @@
 Multi-rank peer-to-peer weight transfer over RDMA.
 
 Provides functions to push / receive device memory between engines using
-UCCL P2P RDMA writes, plus a :class:`WeightServer` for the active engine
+Relay RDMA writes, plus a :class:`WeightServer` for the active engine
 and a helper to collect device buffer descriptors from a model.
 """
 
@@ -192,8 +192,8 @@ def push_to_peer(
 
     pre_registered = ep.registered and len(ep.xfer_descs) == len(buffers)
 
-    uccl_ep = ep._ensure_endpoint()
-    ok, conn_id = uccl_ep.add_remote_endpoint(bytes.fromhex(remote_metadata_hex))
+    relay_ep = ep._ensure_endpoint()
+    ok, conn_id = relay_ep.add_remote_endpoint(bytes.fromhex(remote_metadata_hex))
     assert ok, "Failed to connect to remote endpoint"
     t_conn = time.time()
 
@@ -203,10 +203,10 @@ def push_to_peer(
         for name, va, size_bytes in buffers:
             ep.buf_info.append((name, size_bytes))
             handles.append(_VAHandle(va, size_bytes))
-        ep.xfer_descs = uccl_ep.register_memory(handles)
+        ep.xfer_descs = relay_ep.register_memory(handles)
     t_reg = time.time()
 
-    remote_descs = uccl_ep.deserialize_descs(bytes.fromhex(remote_descs_hex))
+    remote_descs = relay_ep.deserialize_descs(bytes.fromhex(remote_descs_hex))
     if len(remote_descs) != len(ep.xfer_descs):
         raise ValueError(
             f"Rank {dist.get_rank()}: desc count mismatch: "
@@ -214,7 +214,7 @@ def push_to_peer(
             f"buffers={len(buffers)} pre_registered={pre_registered}"
         )
 
-    ok, _ = uccl_ep.transfer(conn_id, "write", ep.xfer_descs, remote_descs)
+    ok, _ = relay_ep.transfer(conn_id, "write", ep.xfer_descs, remote_descs)
     assert ok, "RDMA write failed"
     t_xfer = time.time()
 

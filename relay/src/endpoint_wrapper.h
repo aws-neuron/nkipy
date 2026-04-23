@@ -1,28 +1,28 @@
 #pragma once
 #include "engine.h"
 
-inline ConnID uccl_connect(RDMAEndPoint const& s, int remote_gpuidx,
+inline ConnID relay_connect(RDMAEndPoint const& s, int remote_gpuidx,
                            std::string remote_ip, uint16_t remote_port) {
-  return s->uccl_connect(remote_gpuidx, remote_ip, remote_port);
+  return s->relay_connect(remote_gpuidx, remote_ip, remote_port);
 }
 inline uint16_t get_p2p_listen_port(RDMAEndPoint const& s) {
   return s->get_p2p_listen_port();
 }
 
-inline ConnID uccl_accept(RDMAEndPoint const& s, std::string& remote_ip,
+inline ConnID relay_accept(RDMAEndPoint const& s, std::string& remote_ip,
                           int* remote_gpuidx) {
-  return s->uccl_accept(remote_ip, remote_gpuidx);
+  return s->relay_accept(remote_ip, remote_gpuidx);
 }
 
 inline void stop_accept(RDMAEndPoint const& s) { s->stop_accept(); }
 
-inline bool uccl_regmr(RDMAEndPoint const& s, void* data, size_t len,
+inline bool relay_regmr(RDMAEndPoint const& s, void* data, size_t len,
                        struct P2PMhandle* mhandle) {
-  return s->uccl_regmr(data, len, mhandle->mr_array) >= 0;
+  return s->relay_regmr(data, len, mhandle->mr_array) >= 0;
 }
 
-inline bool uccl_poll_ureq_once(RDMAEndPoint const& s,
-                                struct ucclRequest* ureq) {
+inline bool relay_poll_once(RDMAEndPoint const& s,
+                                struct RelayRequest* ureq) {
   if (ureq->type == ReqType::ReqTx || ureq->type == ReqType::ReqWrite) {
     s->sendRoutine();
     return s->checkSendComplete_once(ureq->n, ureq->engine_idx);
@@ -34,9 +34,9 @@ inline bool uccl_poll_ureq_once(RDMAEndPoint const& s,
   return false;
 }
 
-inline int uccl_write_async(RDMAEndPoint const& s, Conn* conn,
+inline int relay_write_async(RDMAEndPoint const& s, Conn* conn,
                             P2PMhandle* local_mh, void* src, size_t size,
-                            FifoItem const& slot_item, ucclRequest* ureq) {
+                            FifoItem const& slot_item, RelayRequest* ureq) {
   ureq->type = ReqType::ReqWrite;
 
   // Create RemoteMemInfo from FifoItem
@@ -50,11 +50,11 @@ inline int uccl_write_async(RDMAEndPoint const& s, Conn* conn,
   local_mem->mr_array = local_mh->mr_array;
 
   auto req = std::make_shared<RDMASendRequest>(local_mem, remote_mem);
-  req->to_rank_id = conn->uccl_conn_id_.flow_id;
+  req->to_rank_id = conn->relay_conn_id_.flow_id;
   req->send_type = SendType::Write;
 
   ureq->engine_idx = s->writeOrRead(req);
-  ureq->n = conn->uccl_conn_id_.flow_id;
+  ureq->n = conn->relay_conn_id_.flow_id;
 
   return ureq->engine_idx;
 }
@@ -75,8 +75,8 @@ inline int prepare_fifo_metadata(RDMAEndPoint const& s, Conn* conn,
   return 0;
 }
 
-inline void uccl_deregmr(RDMAEndPoint const& s, P2PMhandle* mhandle) {
-  s->uccl_deregmr(mhandle->mr_array);
+inline void relay_deregmr(RDMAEndPoint const& s, P2PMhandle* mhandle) {
+  s->relay_deregmr(mhandle->mr_array);
 }
 
 inline bool initialize_rdma_ctx_for_gpu(RDMAEndPoint const& s, int dev) {

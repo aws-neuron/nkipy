@@ -14,9 +14,9 @@
 #include <sched.h>
 #include <stdarg.h>
 
-namespace uccl {
+namespace relay {
 
-#define UCCL_LOG_EP VLOG(2) << "[Endpoint] "
+#define RELAY_LOG_EP VLOG(2) << "[Endpoint] "
 
 #ifndef likely
 #define likely(X) __builtin_expect(!!(X), 1)
@@ -195,4 +195,4 @@ static inline std::vector<size_t> load_gpu_nic_map(
   return (*mapping)[gpu_idx];
 }
 
-}  // namespace uccl
+}  // namespace relay

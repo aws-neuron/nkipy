@@ -4,7 +4,7 @@
 """
 Low-level RDMA endpoint management for peer-to-peer device memory transfers.
 
-Provides :class:`RankEndpoint`, a per-rank singleton that wraps a UCCL P2P
+Provides :class:`RankEndpoint`, a per-rank singleton that wraps a Relay
 Endpoint and manages RDMA memory registration / deregistration lifecycle.
 The class is transport-generic — callers supply ``(va, size_bytes)`` pairs
 and receive opaque transfer descriptors back.
@@ -58,7 +58,7 @@ class _VAHandle:
 
 
 class RankEndpoint:
-    """Persistent UCCL endpoint for a single rank.
+    """Persistent Relay endpoint for a single rank.
 
     Manages the RDMA Endpoint lifecycle and memory registration.  Callers
     register device buffers via :meth:`register`, transfer via the raw
