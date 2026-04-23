@@ -4,12 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "relay"
-version = "0.0.1.post4"
+version = "0.0.1"
 description = "RDMA-based P2P communication for Trainium weight transfer"
 readme = "README.md"
 requires-python = ">=3.8"
-license = "Apache-2.0"
-authors = [{ name = "Relay Team" }]
+authors = [{ name = "NKIPy Team" }]
 dependencies = ["pybind11>=2.6.0", "paramiko", "intervaltree", "numpy", "requests", "torch"]
 
 [tool.setuptools.package-dir]
@@ -17,4 +16,3 @@ dependencies = ["pybind11>=2.6.0", "paramiko", "intervaltree", "numpy", "request
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
