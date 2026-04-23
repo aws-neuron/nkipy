@@ -527,6 +527,11 @@ def _diag_hlo(v, k=0):
             # Diagonal starts at row -k: raw col index gives position in v
             idx_ref = NKIPyTensorRef(col_iota)
 
+        # Clamp indices to valid range — out-of-bounds positions are zeroed by the mask
+        from nkipy.core.ops.unary import clip
+
+        idx_ref = clip(idx_ref, 0, v_bt.shape[0] - 1)
+
         # Use take to gather v values at idx positions, then mask
         from nkipy.core.ops.indexing import take
 
