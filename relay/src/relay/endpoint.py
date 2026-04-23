@@ -17,7 +17,7 @@ from typing import List, Sequence, Tuple
 
 os.environ.setdefault("UCCL_RCMODE", "1")
 
-from uccl import p2p  # noqa: E402
+from relay import _relay  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +96,7 @@ class RankEndpoint:
     def _ensure_endpoint(self):
         if self.ep is None:
             nc = self._nc_idx if self._nc_idx is not None else _get_nc_idx()
-            self.ep = p2p.Endpoint(nc)
+            self.ep = _relay.Endpoint(nc)
         return self.ep
 
     # -- public API ------------------------------------------------

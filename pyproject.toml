@@ -7,17 +7,30 @@ description = "NKIPy Monorepo - A lightweight Pythonic kernel environment for AW
 requires-python = ">=3.10"
 dependencies = ["nkipy"]
 
+[tool.uv]
+environments = ["sys_platform == 'linux' and python_version == '3.12'"]
+index-strategy = "unsafe-best-match"
+
 [tool.uv.workspace]
-members = ["nkipy", "spike"]
+members = ["nkipy", "spike", "relay"]
 
 [[tool.uv.index]]
 name = "neuron"
 url = "https://pip.repos.neuron.amazonaws.com"
 explicit = true
 
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
 [tool.uv.sources]
 spike = { workspace = true }
 nkipy = { workspace = true }
+relay = { workspace = true }
+torch = { index = "pytorch-cpu" }
+torch-neuronx = { index = "neuron" }
+libneuronxla = { index = "neuron" }
 
 [dependency-groups]
 dev = ["spike"]
@@ -37,6 +50,13 @@ examples = [
     "safetensors",
     "accelerate",
     "boto3>=1.34",
+]
+vllm = [
+    "vllm==0.16.0",
+    "torch==2.9.1",
+    "torch-neuronx==2.9.0.2.13.24727+8e870898",
+    "torch-xla==2.9.0",
+    "libneuronxla",
 ]
 docs = [
     "sphinx",

@@ -18,7 +18,7 @@ def release_neuron_cores_and_rdma():
     """
     # Clean up P2P RDMA resources first
     try:
-        from nkipy.p2p import rank_endpoint
+        from relay import rank_endpoint
         if rank_endpoint.ep is not None:
             logger.info("Cleaning up P2P endpoint and MRs...")
             # Synchronously wait for any pending dereg

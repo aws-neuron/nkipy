@@ -196,7 +196,7 @@ class NKIPyWorker(WorkerBase):
         import os
         preregister = os.environ.get("NKIPY_PREREGISTER_MRS", "0") == "1"
         if preregister and mr._nkipy_model is not None:
-            from nkipy.p2p import preregister_weights
+            from relay import preregister_weights
             preregister_weights(mr._nkipy_model)
             if self.rank == 0:
                 logger.info("NKIPY: Pre-registered MRs (optimized design)")
@@ -249,7 +249,7 @@ class NKIPyWorker(WorkerBase):
 
         from spike import reset as spike_reset
         from nkipy.runtime.device_kernel import _LOADED_KERNELS
-        from nkipy.p2p import rank_endpoint
+        from relay import rank_endpoint
 
         # Kernel cache is already populated during load_model() or wake_up().
         # No need to access model attrs here — just verify cache exists.
@@ -392,7 +392,7 @@ class NKIPyWorker(WorkerBase):
         t_alloc = _time.time()
 
         if actual_peer:
-            from nkipy.p2p import (
+            from relay import (
                 receive_from_peer, rank_endpoint, collect_weight_buffers,
             )
             bufs = collect_weight_buffers(model)
@@ -492,7 +492,7 @@ class NKIPyWorker(WorkerBase):
         execute_model requests.  The server polls nkipy_push_status to
         detect completion.
         """
-        from nkipy.p2p import push_weights_to_peer
+        from relay import push_weights_to_peer
 
         model = self.model_runner._nkipy_model
         if model is None:

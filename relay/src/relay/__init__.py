@@ -1,7 +1,15 @@
-# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
-# SPDX-License-Identifier: Apache-2.0
+import importlib
+import pathlib
+import sys
 
-"""Peer-to-peer device memory transfer over RDMA."""
+_build_dir = pathlib.Path(__file__).resolve().parent.parent.parent / "build"
+if _build_dir.is_dir() and str(_build_dir) not in sys.path:
+    sys.path.insert(0, str(_build_dir))
+
+try:
+    _relay = importlib.import_module("_relay")
+except ImportError:
+    _relay = None
 
 from .endpoint import RankEndpoint
 from .transfer import (
@@ -28,3 +36,5 @@ __all__ = [
     "receive_from_peer",
     "receive_weights",
 ]
+
+__version__ = "0.0.1.post4"

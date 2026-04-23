@@ -42,6 +42,10 @@ runtime to support kernel execution.
 
 Spike provides a modern, efficient Python interface to AWS Neuron Runtime (NRT) through optimized C++ bindings. It enables direct execution of compiled NEFF models and tensor management on AWS Neuron devices with minimal overhead.
 
+### Relay
+
+Relay provides high-performance RDMA-based peer-to-peer communication for weight transfer between devices. It uses AWS EFA (Elastic Fabric Adapter) and supports Trainium via the Neuron Runtime. The P2P engine is built as a C++ pybind11 extension.
+
 ## Installation
 
 ### Prerequisites
@@ -73,7 +77,7 @@ uv sync --all-groups
 
 This will:
 - Create a `.venv` virtual environment
-- Install `nkipy`, `spike`, and all dependencies (including `neuronx-cc` from the Neuron repository)
+- Install `nkipy`, `spike`, `relay`, and all dependencies (including `neuronx-cc` from the Neuron repository)
 
 The `--all-groups` flag additionally installs:
 - **test**: pytest, ruff, mypy for testing and linting
@@ -87,7 +91,7 @@ The `--all-groups` flag additionally installs:
 ```bash
 # Run Python with the workspace environment
 source .venv/bin/activate
-python -c "import nkipy; import spike"
+python -c "import nkipy; import spike; import relay"
 
 # Run a small NKIPy kernel
 python examples/playground/simple_nkipy_kernel.py 
@@ -103,6 +107,9 @@ uv build --package nkipy
 
 # Build spike
 uv build --package spike
+
+# Build relay
+uv build --package relay
 ```
 
 Wheels will be created in the `dist/` directory.
@@ -193,6 +200,10 @@ uv run make -C docs html
 - **`runtime/baremetal_executor.py`** — Hardware execution via Spike.
 - **`distributed/`** — Multi-device collective operations.
 - **`third_party/`** — Generated protobuf files for XLA HLO representation. Built during `nkipy` package build via custom `setup.py` that compiles `.proto` files.
+
+#### Relay (`relay/`)
+
+RDMA-based P2P communication engine with pybind11 Python bindings. Provides `relay.p2p` for high-performance weight transfer over AWS EFA. The C++ source is in `src/p2p/`, compiled artifacts go in `build/`, and the Python package lives in `src/relay/`.
 
 #### Spike Runtime (`spike/`)
 
