@@ -1,14 +1,12 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 import atexit
-import hashlib
 import os
 import shutil
 import time
 import types
 
 from nkipy.core import compile
-from nkipy.core.backend.hlo import HLOModule
 from nkipy.core.compile import CompilationTarget, _get_build_dir, compile_to_neff, trace
 from nkipy.core.logger import get_logger
 from nkipy.core.trace import NKIPyKernel
@@ -33,24 +31,6 @@ def _cleanup_kernels():
 
 
 atexit.register(_cleanup_kernels)
-
-
-def _hlo_content_hash(hlo_module: HLOModule, compiler_args: str) -> str:
-    """Compute a content hash from the HLO protobuf and compiler args.
-
-    Hashing the HLO (instead of source code) ensures that different input
-    shapes/dtypes produce different cache entries, even when the kernel
-    source is identical.
-
-    The HLO proto uses only ``repeated`` fields (no ``map`` fields), so
-    ``SerializeToString()`` is deterministic for the same computation graph.
-    """
-    h = hashlib.sha256()
-
-    # TODO: this SerializeToString can be slow for large HLO
-    h.update(hlo_module.to_proto().SerializeToString())
-    h.update(compiler_args.encode("utf-8"))
-    return h.hexdigest()[:12]
 
 
 def _is_distributed() -> bool:
@@ -255,12 +235,7 @@ class DeviceKernel(SpikeModel):
 
         traced_kernel.specialize(*numpy_args, **numpy_kwargs)
 
-        # Compute content hash from HLO
-        hlo_module = traced_kernel._code
-        if not isinstance(hlo_module, HLOModule):
-            raise NotImplementedError("Only HLOModule is supported for content hashing")
-
-        content_hash = _hlo_content_hash(hlo_module, compiler_args)
+        content_hash = traced_kernel._code.content_hash(compiler_args)
         cache_key = f"{name}_{content_hash}"
 
         # Determine output paths

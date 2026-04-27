@@ -1,8 +1,8 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""NKI kernel integration for NKIPy - wraps NKI kernels as HLO custom-calls
+"""NKI kernel integration for NKIPy.
 
-This module provides two ways to use NKI kernels in NKIPy:
+This module provides three ways to use NKI kernels in NKIPy:
 
 1. Direct @nki.jit support (lazy/dynamic):
    - Any kernel decorated with @nki.jit can be called directly during NKIPy tracing
@@ -14,6 +14,10 @@ This module provides two ways to use NKI kernels in NKIPy:
    - Returns a NKICustomOp that only works with those shapes
    - Useful for explicit control over specialization
 
+3. nki_custom_op for cross-backend custom ops:
+   - Accepts both @nki.jit (HLO backend) and kernel_builder (kernelgen backend)
+   - Dispatches to the correct implementation based on the active backend
+
 Supports two NKI frontends:
 - Legacy frontend (neuronxcc.nki): Default, supports CPU execution
 - Beta 2 frontend (nki): New frontend, hardware-only (no CPU execution support)
@@ -21,7 +25,7 @@ Supports two NKI frontends:
 
 import dataclasses
 import inspect
-from typing import Callable, Iterable, Optional, Tuple
+from typing import Callable, Iterable, List, Optional, Tuple
 
 import numpy as np
 
@@ -274,10 +278,10 @@ if BETA2_NKI_AVAILABLE:
 
 
 class NKICustomOp:
-    """Backward-compatible NKI custom op class.
+    """HLO custom-call wrapper for a pre-traced NKI kernel.
 
-    This class provides the original API for wrapping NKI kernels.
-    New code should use wrap_nki_kernel() or direct @nki.jit instead.
+    Pre-traces the kernel at construction time for specific operand shapes.
+    Used by ``wrap_nki_kernel``.
     """
 
     def __init__(
@@ -362,3 +366,111 @@ def wrap_nki_kernel(
         is_nki_beta_2_version=is_nki_beta_2_version,
         platform_target=platform_target,
     )
+
+
+# ---------------------------------------------------------------------------
+# Kernelgen custom op support
+# ---------------------------------------------------------------------------
+
+
+def _generate_kernelgen_custom_call(kernel_builder, input_specs, output_specs, *args):
+    """Compile a kernel_builder function and inline it during kernelgen tracing."""
+    from nkipy_kernelgen.builder import apply_custom_op
+
+    return apply_custom_op(
+        kernel_builder=kernel_builder,
+        reference_fn=None,
+        input_specs=input_specs,
+        output_specs=output_specs,
+        args=args,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Unified custom op interface
+# ---------------------------------------------------------------------------
+
+
+def nki_custom_op(
+    *,
+    nki_kernel: Optional[Callable] = None,
+    kernel_builder: Optional[Callable] = None,
+    input_specs: Optional[List[Tuple[Tuple[int, ...], str]]] = None,
+    output_specs: Optional[List[Tuple[Tuple[int, ...], str]]] = None,
+) -> "NKICustomOpHandle":
+    """Create a cross-backend custom NKI op.
+
+    Args:
+        nki_kernel: ``@nki.jit`` decorated kernel for the HLO backend.
+        kernel_builder: ``nki.compiler.kernel_builder`` function for the
+            kernelgen backend.  Requires ``input_specs`` and ``output_specs``.
+        input_specs: List of ``((shape), dtype_str)`` for each input.
+            Required when ``kernel_builder`` is provided.
+        output_specs: List of ``((shape), dtype_str)`` for each output.
+            Required when ``kernel_builder`` is provided.
+
+    Returns:
+        An ``NKICustomOpHandle`` callable that dispatches to the correct
+        backend at call time.
+    """
+    if nki_kernel is None and kernel_builder is None:
+        raise ValueError(
+            "At least one of nki_kernel or kernel_builder must be provided."
+        )
+    if kernel_builder is not None:
+        if input_specs is None or output_specs is None:
+            raise ValueError(
+                "input_specs and output_specs are required when kernel_builder "
+                "is provided."
+            )
+    return NKICustomOpHandle(
+        nki_kernel=nki_kernel,
+        kernel_builder=kernel_builder,
+        input_specs=input_specs,
+        output_specs=output_specs,
+    )
+
+
+class NKICustomOpHandle:
+    """Backend-aware callable wrapping a custom NKI op definition."""
+
+    def __init__(
+        self,
+        *,
+        nki_kernel: Optional[Callable],
+        kernel_builder: Optional[Callable],
+        input_specs: Optional[List[Tuple[Tuple[int, ...], str]]],
+        output_specs: Optional[List[Tuple[Tuple[int, ...], str]]],
+    ):
+        self._nki_kernel = nki_kernel
+        self._kernel_builder = kernel_builder
+        self._input_specs = input_specs
+        self._output_specs = output_specs
+
+    def __call__(self, *args):
+        backend = get_backend()
+
+        if backend == "hlo":
+            if self._nki_kernel is None:
+                raise RuntimeError(
+                    "nki_custom_op has no nki_kernel for the HLO backend. "
+                    "Provide an @nki.jit decorated kernel via nki_kernel=."
+                )
+            return _generate_nki_custom_call(self._nki_kernel, *args)
+
+        if backend == "kernelgen":
+            if self._kernel_builder is None:
+                raise RuntimeError(
+                    "nki_custom_op has no kernel_builder for the kernelgen "
+                    "backend. Provide a kernel_builder function via "
+                    "kernel_builder=."
+                )
+            return _generate_kernelgen_custom_call(
+                self._kernel_builder, self._input_specs, self._output_specs,
+                *args,
+            )
+
+        raise RuntimeError(
+            f"nki_custom_op is not supported on backend '{backend}'. "
+            f"Use the 'hlo' or 'kernelgen' backend."
+        )

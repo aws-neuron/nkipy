@@ -10,6 +10,7 @@ from nkipy.runtime.execute import baremetal_run_traced_kernel
 def baremetal_jit(
     kernel_func=None,
     *,
+    backend="hlo",
     additional_compiler_args="",
     target=compile.CompilationTarget.DEFAULT,
 ):
@@ -21,6 +22,7 @@ def baremetal_jit(
 
     Args:
         kernel_func: The kernel function to decorate (when used without parentheses)
+        backend: Compilation backend ("hlo" or "kernelgen")
         additional_compiler_args: Additional arguments to pass to the compiler
         target: Compilation target (default: CompilationTarget.DEFAULT)
 
@@ -35,8 +37,8 @@ def baremetal_jit(
         # Compiles on first call with this signature
         result = my_kernel(input_a, input_b)
 
-        # Or with compiler args:
-        @baremetal_jit(additional_compiler_args="--lnc 1")
+        # Or with kernelgen backend:
+        @baremetal_jit(backend="kernelgen")
         def my_kernel(A, B):
             return A @ B
     """
@@ -45,7 +47,7 @@ def baremetal_jit(
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
             # Trace the kernel
-            traced_kernel = trace(func)
+            traced_kernel = trace(func, backend=backend)
             # Use baremetal_run_traced_kernel for execution
             return baremetal_run_traced_kernel(
                 traced_kernel,
