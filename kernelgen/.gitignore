@@ -1,0 +1,47 @@
+# Override parent nkipy/.gitignore's `lib/` rule so MLIR C++ sources in
+# mlir/lib/ are tracked (the parent rule is aimed at Python venv lib/ dirs).
+!mlir/lib/
+!mlir/lib/**
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+*.whl
+
+# Built MLIR bindings (generated during build)
+nkipy_kernelgen/_mlir/
+
+# Virtual environments
+venv/
+.env
+
+# Testing
+.pytest_cache/
+.coverage
+tests/**/outputs/
+tests/**/artifacts/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# LLVM lit test outputs
+.lit_test_times.txt
+Output/
+
+# Compiler Explorer (cloned repo)
+compiler_explorer/compiler-explorer/
