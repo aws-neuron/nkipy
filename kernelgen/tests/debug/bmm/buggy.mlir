@@ -1,0 +1,47 @@
+module attributes {nisa.target = #nisa.target<trn2>} {
+  func.func @bmm_kernel(%arg0: memref<2x256x256xf32, strided<[?, ?, ?], offset: ?>, #nisa.mem<shared_hbm>>, %arg1: memref<2x256x256xf32, strided<[?, ?, ?], offset: ?>, #nisa.mem<shared_hbm>>) -> memref<2x256x256xf32, #nisa.mem<shared_hbm>> {
+    %c128 = arith.constant 128 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %c0 = arith.constant 0 : index
+    %mem = nisa.alloc alignment=64 : memref<2x256x256xf32, #nisa.mem<shared_hbm>>
+    scf.for %arg2 = %c0 to %c2 step %c1 {
+      %mem_0 = nisa.alloc alignment=64 : memref<128x2x2x128xf32, #nisa.mem<sbuf>>
+      scf.for %arg3 = %c0 to %c2 step %c1 {
+        scf.for %arg4 = %c0 to %c2 step %c1 {
+          %0 = arith.muli %arg4, %c128 : index
+          %1 = arith.muli %arg3, %c128 : index
+          %2 = arith.addi %0, %arg2 : index
+          nisa.dma_transpose(dst<128| 128>=memref<128x2x2x128xf32, #nisa.mem<sbuf>> %mem_0[d0, %arg3 + 0, %arg4 + 0, d1], src<128| 128>=memref<2x256x256xf32, strided<[?, ?, ?], offset: ?>, #nisa.mem<shared_hbm>> %arg0[%2 + d0, %1 + 0, d1], permutation=[1, 0], dge_mode=no_dge, oob_is_err=true) engine=dma
+        }
+      }
+      %mem_1 = nisa.alloc alignment=64 : memref<128x2x2x128xf32, #nisa.mem<sbuf>>
+      scf.for %arg3 = %c0 to %c2 step %c1 {
+        scf.for %arg4 = %c0 to %c2 step %c1 {
+          %0 = arith.muli %arg3, %c128 : index
+          %1 = arith.muli %arg4, %c128 : index
+          %2 = arith.addi %0, %arg2 : index
+          nisa.dma_copy(dst<128| 128>=memref<128x2x2x128xf32, #nisa.mem<sbuf>> %mem_1[d0, %arg3 + 0, %arg4 + 0, d1], src<128| 128>=memref<2x256x256xf32, strided<[?, ?, ?], offset: ?>, #nisa.mem<shared_hbm>> %arg1[%2 + d0, %1 + 0, d1], dge_mode=no_dge, oob_is_err=true) engine=dma
+        }
+      }
+      scf.for %arg3 = %c0 to %c2 step %c1 {
+        %0 = arith.muli %arg3, %c128 : index
+        scf.for %arg4 = %c0 to %c2 step %c1 {
+          %1 = arith.muli %arg4, %c128 : index
+          %mem_2 = nisa.alloc alignment=64 : memref<128x128xf32, #nisa.mem<psum>>
+          scf.for %arg5 = %c0 to %c2 step %c1 {
+            nisa.matmul(dst<128| 128>=memref<128x128xf32, #nisa.mem<psum>> %mem_2[d0, d1], stationary<128| 128>=memref<128x2x2x128xf32, #nisa.mem<sbuf>> %mem_0[d0, %arg5 + 0, %arg3 + 0, d1], moving<128| 128>=memref<128x2x2x128xf32, #nisa.mem<sbuf>> %mem_1[d0, %arg5 + 0, %arg4 + 0, d1], row_pos=index %c0, col_pos=index %c0, is_transpose=false, perf_opt=none_, psum_zero_region=size2048) engine=tensor
+          }
+          %2 = arith.addi %0, %arg2 : index
+          %mem_3 = nisa.alloc alignment=64 : memref<128x128xf32, #nisa.mem<sbuf>>
+          nisa.tensor_copy(dst<128| 128>=memref<128x128xf32, #nisa.mem<sbuf>> %mem_3[d0, d1], src<128| 128>=memref<128x128xf32, #nisa.mem<psum>> %mem_2[d0, d1]) engine=vector
+          nisa.dma_copy(dst<128| 128>=memref<2x256x256xf32, #nisa.mem<shared_hbm>> %mem[%2 + d0, %1 + 0, d1], src<128| 128>=memref<128x128xf32, #nisa.mem<sbuf>> %mem_3[d0, d1], dge_mode=no_dge, oob_is_err=true) engine=dma
+          nisa.release %mem_2 : memref<128x128xf32, #nisa.mem<psum>>
+        }
+      }
+      nisa.release %mem_0 : memref<128x2x2x128xf32, #nisa.mem<sbuf>>
+      nisa.release %mem_1 : memref<128x2x2x128xf32, #nisa.mem<sbuf>>
+    }
+    return %mem : memref<2x256x256xf32, #nisa.mem<shared_hbm>>
+  }
+}

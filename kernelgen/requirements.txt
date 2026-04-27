@@ -1,0 +1,4 @@
+numpy
+pytest==8.4.2
+PyYAML==6.0.3
+black==25.9.0
