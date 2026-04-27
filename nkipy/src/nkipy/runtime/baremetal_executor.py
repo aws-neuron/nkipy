@@ -71,25 +71,22 @@ class BaremetalExecutor:
         }
 
         # Prepare inputs using DeviceTensor
-        inputs = {}
-        for intensor in compiled_kernel.ir.inputs:
-            real_name = (
-                intensor.name.split(".must_alias_input")[0]
-                if ".must_alias_input" in intensor.name
-                else intensor.name
-            )
-            np_tensor = original_inputs.get(real_name, boundargs.arguments[real_name])
-            inputs[intensor.name] = DeviceTensor.from_numpy(np_tensor)
+        ir = compiled_kernel.ir
+        input_arrays = ir.resolve_input_arrays(original_inputs)
+        inputs = {
+            name: DeviceTensor.from_numpy(arr)
+            for name, arr in input_arrays.items()
+        }
 
         # Prepare outputs — aliased outputs share the input device buffer
         outputs = device_kernel.allocate_output_tensors()
         outputs_dict = {t.name: t for t in outputs}
 
-        alias_by_output = {a.output_index: a for a in compiled_kernel.ir.aliases}
-        for i, outtensor in enumerate(compiled_kernel.ir.outputs):
+        alias_by_output = {a.output_index: a for a in ir.aliases}
+        for i, outtensor in enumerate(ir.outputs):
             if i in alias_by_output:
                 alias = alias_by_output[i]
-                input_name = f"{alias.param_name}.must_alias_input"
+                input_name = ir.get_alias_input_name(alias)
                 outputs_dict[outtensor.name] = inputs[input_name]
 
         return inputs, outputs_dict, original_inputs

@@ -29,28 +29,30 @@ baremetal_assert_allclose = partial(
 NEURON_AVAILABLE = is_neuron_compatible()
 
 
+def _trace_mode_to_backend(trace_mode):
+    if trace_mode in ("hlo", "kernelgen"):
+        return trace_mode
+    raise ValueError(f"Unknown trace mode: {trace_mode}")
+
+
 def trace_and_compile(kernel_fn, trace_mode, *args, **kwargs):
     """
-    Validate kernel is traceable to HLO and compilable to NEFF.
+    Validate kernel is traceable and compilable to NEFF.
 
-    Traces the kernel to HLO IR and compiles it using the Neuron compiler,
+    Traces the kernel to IR and compiles it using the Neuron compiler,
     but does not execute on device.
 
     Args:
         kernel_fn: The kernel function to test
-        trace_mode: "hlo" or other supported tracing mode
+        trace_mode: "hlo" or "kernelgen"
         *args: Input arrays for the kernel
         **kwargs: Additional arguments
     """
-    if trace_mode == "hlo":
-        traced_kernel = NKIPyKernel.trace(kernel_fn, backend="hlo")
-    else:
-        raise ValueError(f"Unknown trace mode: {trace_mode}")
+    backend = _trace_mode_to_backend(trace_mode)
+    traced_kernel = NKIPyKernel.trace(kernel_fn, backend=backend)
 
-    # Trace to HLO
     traced_kernel.specialize(*args, **kwargs)
 
-    # Compile to NEFF
     worker_id = os.environ.get("PYTEST_XDIST_WORKER", "main")
     artifacts_dir = os.path.join(tempfile.gettempdir(), f"nkipy_artifacts_{worker_id}")
     if os.path.exists(artifacts_dir):
@@ -70,7 +72,7 @@ def on_device_test(kernel_fn, trace_mode, *args, artifacts_dir=None, **kwargs):
 
     Args:
         kernel_fn: The kernel function to execute
-        trace_mode: "hlo" or other supported tracing mode
+        trace_mode: "hlo" or "kernelgen"
         *args: Input arrays for the kernel
         artifacts_dir: Directory for compilation artifacts (for parallel test isolation)
         **kwargs: Additional arguments
@@ -78,17 +80,14 @@ def on_device_test(kernel_fn, trace_mode, *args, artifacts_dir=None, **kwargs):
     Returns:
         Device execution output
     """
-    # Auto-generate worker-specific artifacts_dir if not provided
     if artifacts_dir is None:
         worker_id = os.environ.get("PYTEST_XDIST_WORKER", "main")
         artifacts_dir = os.path.join(
             tempfile.gettempdir(), f"nkipy_artifacts_{worker_id}"
         )
 
-    if trace_mode == "hlo":
-        traced_kernel = NKIPyKernel.trace(kernel_fn, backend="hlo")
-    else:
-        raise ValueError(f"Unknown trace mode: {trace_mode}")
+    backend = _trace_mode_to_backend(trace_mode)
+    traced_kernel = NKIPyKernel.trace(kernel_fn, backend=backend)
 
     return baremetal_run_traced_kernel(
         traced_kernel, *args, artifacts_dir=artifacts_dir, **kwargs
