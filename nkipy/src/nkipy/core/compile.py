@@ -112,89 +112,67 @@ class Compiler:
     def __init__(self, config: CompilationConfig):
         self.config = config
 
-    def _build_compile_command(self, mode="hlo") -> List[str]:
+    def _resolve_target(self) -> CompilationTarget:
+        if self.config.target != CompilationTarget.DEFAULT:
+            return self.config.target
+        try:
+            return get_platform_target()
+        except Exception:
+            logging.warning(
+                "Failed to detect platform target, falling back to trn2..."
+            )
+            return CompilationTarget.TRN2
+
+    def _build_hlo_compile_command(self, work_dir: Path) -> List[str]:
+        """Build the neuronx-cc command line for HLO compilation."""
+        target = self._resolve_target()
+        self.config.target = target
+
         cmd = [
-            "neuronx-cc",
-            "compile",
-            "--framework",
-            "XLA",
+            "neuronx-cc", "compile",
+            "--framework", "XLA",
+            str(work_dir / "hlo_module.pb"),
+            "--pipeline", *self.config.pipeline,
+            "--target", target.value,
+            f"--output={self.config.neff_name}",
         ]
-        if mode == "hlo":
-            cmd.extend(["hlo_module.pb"])
-        else:
-            raise RuntimeError(f"Unknown mode: {mode}")
-
-        cmd.append("--pipeline")
-        cmd.extend(self.config.pipeline)
-
-        # When using default target, detect platform target
-        if self.config.target == CompilationTarget.DEFAULT:
-            try:
-                self.config.target = get_platform_target()
-            except Exception:
-                logging.warning(
-                    "Failed to detect platform target, falling back to trn1..."
-                )
-                self.config.target = CompilationTarget.TRN1
-
-        cmd.extend(
-            ["--target", self.config.target.value, f"--output={self.config.neff_name}"]
-        )
 
         if self.config.additional_args:
             cmd.extend(shlex.split(self.config.additional_args))
 
         return cmd
 
-    def compile(
+    @staticmethod
+    def _compilation_error(message, cmd=None, result=None):
+        """Build a RuntimeError with compiler output when available."""
+        parts = [message]
+        if cmd is not None:
+            parts.append(f"Command: {' '.join(cmd)}")
+        if result is not None:
+            def decode(b):
+                return b.decode("utf-8", errors="replace") if b else ""
+            parts.append(f"stderr:\n{decode(result.stderr)}")
+            parts.append(f"stdout:\n{decode(result.stdout)}")
+        return RuntimeError("\n".join(parts))
+
+    def _compile_hlo(
         self,
         ir,
         work_dir: Path,
         output_file: str,
         use_neuronx_cc_python_interface: bool = False,
     ) -> Path:
-        """
-        Run compilation in specified directory
+        """Compile an HLOModule to NEFF via neuronx-cc."""
+        hlo_pb_path = work_dir / "hlo_module.pb"
+        proto = ir.to_proto()
+        with open(hlo_pb_path, "wb") as f:
+            f.write(proto.SerializeToString())
 
-        Args:
-            ir: The IR to compile
-            work_dir: Directory to compile in
-            output_file: Name of the output file to check for ("file.neff" or "nki.py")
-
-        Returns:
-            Path to the output file
-        """
-
-        mode = "hlo" if isinstance(ir, HLOModule) else "unknown"
-        cmd = self._build_compile_command(mode)
-
-        def _compilation_error(message, result=None):
-            """Build a RuntimeError with compiler output when available."""
-            parts = [message, f"Command: {' '.join(cmd)}"]
-            if result is not None:
-
-                def decode(b):
-                    return b.decode("utf-8", errors="replace") if b else ""
-
-                parts.append(f"stderr:\n{decode(result.stderr)}")
-                parts.append(f"stdout:\n{decode(result.stdout)}")
-            return RuntimeError("\n".join(parts))
+        cmd = self._build_hlo_compile_command(work_dir)
 
         current_dir = os.getcwd()
         try:
             os.chdir(work_dir)
-            if mode == "hlo":
-                hlo_pb_path = "hlo_module.pb"
-                proto = ir.to_proto()
-                with open(hlo_pb_path, "wb") as f:
-                    f.write(proto.SerializeToString())
-            else:
-                raise RuntimeError(
-                    f"Unknown mode: {mode}. "
-                    "Note: For NKI kernels, You can either embed a NKI kernel as an op"
-                    " in NKIPy kernel or implement your own helper function to get the"
-                    " NEFF from a NKI kernel."
-                )
             if use_neuronx_cc_python_interface:
                 original_argv = sys.argv.copy()
                 sys.argv = cmd
@@ -202,9 +180,9 @@ class Compiler:
             else:
                 result = subprocess.run(cmd, capture_output=True)
                 if result.returncode != 0:
-                    raise _compilation_error(
+                    raise self._compilation_error(
                         f"Compilation failed (exit code {result.returncode}).",
-                        result,
+                        cmd, result,
                     )
         finally:
             if use_neuronx_cc_python_interface:
@@ -213,12 +191,65 @@ class Compiler:
 
         output_path = work_dir / output_file
         if not output_path.exists():
-            raise _compilation_error(
+            raise self._compilation_error(
                 f"Compilation failed: {output_file} expected but not generated.",
+                cmd,
                 result if not use_neuronx_cc_python_interface else None,
             )
-
         return output_path
+
+    def _compile_kernelgen(self, ir, work_dir: Path, output_file: str) -> Path:
+        """Compile a KernelGenIR module to NEFF via nkipy_kernelgen."""
+        from nkipy_kernelgen.compile import compile_to_neff
+
+        target_str = self._resolve_target().value
+
+        cc_args = tuple(shlex.split(self.config.additional_args)) if self.config.additional_args else ()
+
+        compile_to_neff(
+            ir._mlir_text,
+            ir._func_name,
+            input_specs=[(s.name, s.shape, s.dtype) for s in ir.inputs],
+            output_specs=[(s.name, s.shape, s.dtype) for s in ir.outputs],
+            target=target_str,
+            output_path=str(work_dir / output_file),
+            artifacts_dir=str(work_dir),
+            neuronx_cc_args=cc_args,
+        )
+
+        output_path = work_dir / output_file
+        if not output_path.exists():
+            raise self._compilation_error(
+                f"KernelGen compilation failed: {output_file} not generated."
+            )
+        return output_path
+
+    def compile(
+        self,
+        ir,
+        work_dir: Path,
+        output_file: str,
+        use_neuronx_cc_python_interface: bool = False,
+    ) -> Path:
+        """Compile an IR module to a NEFF file.
+
+        Dispatches to ``_compile_hlo`` or ``_compile_kernelgen`` based on
+        the IR type.
+        """
+        if isinstance(ir, HLOModule):
+            return self._compile_hlo(
+                ir, work_dir, output_file, use_neuronx_cc_python_interface
+            )
+
+        from nkipy.core.backend.kernelgen import KernelGenIR
+
+        if isinstance(ir, KernelGenIR):
+            return self._compile_kernelgen(ir, work_dir, output_file)
+
+        raise RuntimeError(
+            f"Unknown IR type: {type(ir).__name__}. "
+            "Expected HLOModule or KernelGenIR."
+        )
 
     def compile_in_directory(
         self,

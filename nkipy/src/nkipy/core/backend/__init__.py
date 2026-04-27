@@ -12,9 +12,94 @@ Public API:
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Protocol, Tuple, runtime_checkable
 
+import numpy as np
+
+# ---------------------------------------------------------------------------
+# Shared IR data types
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TensorPlaceholder:
+    """Lightweight tensor metadata used by the execution pipeline.
+
+    Attributes:
+        name: Identifier used to key this tensor in input/output dicts at runtime.
+        shape: Static shape of the tensor.
+        dtype: NumPy dtype of the tensor elements.
+    """
+
+    name: str
+    shape: Tuple[int, ...]
+    dtype: np.dtype
+
+
+@dataclass(frozen=True)
+class AliasInfo:
+    """One input-output alias pair.
+
+    Attributes:
+        output_index: Position of this alias in the IR outputs list.
+        param_index: Position of the aliased parameter in the IR inputs list.
+        param_name: Name of the aliased input parameter.
+        is_user_returned: True when the user's kernel explicitly returns this
+            tensor.  False when the framework auto-appended it as an output
+            solely to write back an in-place mutation.
+    """
+
+    output_index: int
+    param_index: int
+    param_name: str
+    is_user_returned: bool
+
+
+# ---------------------------------------------------------------------------
+# IR Protocol — the interface that every backend IR must satisfy
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class ComputationIR(Protocol):
+    """Protocol satisfied by both ``HLOModule`` and ``KernelGenIR``."""
+
+    @property
+    def inputs(self) -> List[TensorPlaceholder]: ...
+
+    @property
+    def outputs(self) -> List[TensorPlaceholder]: ...
+
+    @property
+    def aliases(self) -> List[AliasInfo]:
+        """Input-output alias pairs for in-place mutations."""
+        ...
+
+    @property
+    def auto_aliased_indices(self) -> set[int]:
+        """Output indices implicitly appended for write-back, not user-returned."""
+        ...
+
+    def resolve_input_arrays(
+        self, original_inputs: Dict[str, np.ndarray]
+    ) -> Dict[str, np.ndarray]:
+        """Map parameter names to backend-specific input names."""
+        ...
+
+    def get_alias_input_name(self, alias: AliasInfo) -> str:
+        """Return the backend input name for an aliased parameter."""
+        ...
+
+    def content_hash(self, compiler_args: str) -> str:
+        """Deterministic hash of IR content and compiler flags for caching."""
+        ...
+
+
+# ---------------------------------------------------------------------------
 # Package-private active context — shared with submodules (e.g. hlo.py).
+# ---------------------------------------------------------------------------
+
 _active_ctx = None
 
 
