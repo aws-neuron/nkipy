@@ -86,6 +86,8 @@ The microbenchmark (44s) is slower than the actual engine cold start (86s includ
 
 #### P2P Wake-Up Latency (Engine B activated from Engine A)
 
+**Before `NEURON_RT_RESET_CORES=0`:**
+
 | Phase | Cycle 1 | Cycle 2 | Cycle 3 (non-blocking) |
 |-------|---------|---------|----------------------|
 | Gloo init | 0.95s | 0.70s | - |
@@ -95,6 +97,18 @@ The microbenchmark (44s) is slower than the actual engine cold start (86s includ
 | Kernel load | 0.11s | 0.16s | - |
 | tok_embedding | 0.11s | - | - |
 | **Total wake-up** | **28.9s** | **27.7s** | **30.6s** |
+
+**After `NEURON_RT_RESET_CORES=0`** (see [NRT_INIT_SKIP_RESET.md](NRT_INIT_SKIP_RESET.md)):
+
+| Phase | Cycle 1 (cold) | Cycle 2+ (`reset_cores=0`) |
+|-------|---------------|---------------------------|
+| Gloo init | 0.95s | 0.99s |
+| NRT init | 15.56s | **0.18s** |
+| P2P transfer | 7.75s | 7.69s |
+| Kernel load | 0.09s | 0.09s |
+| **Total wake-up** | **30.8s** | **9.6s** |
+
+Subsequent wake-ups (after at least one sleep cycle) are **~3× faster** — NRT init drops from 5–15s to 0.18s by skipping the redundant NC firmware reset.
 
 P2P transfer volume: ~139 GB across 32 ranks (4.35 GB/rank), completing in ~10s = **~14 GB/s aggregate RDMA throughput**.
 

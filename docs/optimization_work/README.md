@@ -15,6 +15,7 @@ Documentation for the P2P weight transfer optimization work: reducing `/sleep` l
 
 ## Performance Results
 
+- **[NRT_INIT_SKIP_RESET.md](NRT_INIT_SKIP_RESET.md)** — Skip NC firmware reset on subsequent wake-ups (`NEURON_RT_RESET_CORES=0`): nrt_init from 5–15s → 0.15s, validated with cross-model interleaving (Qwen3 ↔ LLaMA)
 - **[P2P_LATENCY_LLAMA3_70B.md](P2P_LATENCY_LLAMA3_70B.md)** — LLaMA-3-70B benchmarks: tok_embedding TP sharding (2.1 GB → 65.7 MB/rank), wake/sleep/inference latency, non-blocking push
 - **[SCALABILITY_TEST_QWEN3.md](SCALABILITY_TEST_QWEN3.md)** — Qwen3-30B TP=32: 50 standby engines, resource costs, dynamic lifecycle, Gloo teardown fix
 - **[SCALABILITY_TEST_TINYLLAMA.md](SCALABILITY_TEST_TINYLLAMA.md)** — TinyLlama TP=8: 100 engines, bidirectional P2P, context_len bug fix
@@ -29,7 +30,9 @@ Documentation for the P2P weight transfer optimization work: reducing `/sleep` l
 |--------|--------|-------|
 | `/sleep` (normal, >30s after wake) | 46.5s | ~1-2s |
 | `/sleep` (early, <30s after wake) | 46.5s | ~20s (waits for MR dereg) |
-| `/wake_up` (P2P, LLaMA-3-70B TP=32) | — | ~28-30s |
+| `/wake_up` (P2P, LLaMA-3-70B TP=32, cold) | — | ~28-30s |
+| `/wake_up` (P2P, TP=32, `reset_cores=0`) | ~28-30s | ~9.6s |
+| `nrt_init` (subsequent, `reset_cores=0`) | 5-15s | 0.15-0.18s |
 | `spike_reset` (with active MRs) | 7-25s | avoided |
 | `spike_reset` (MRs deregistered) | — | 0.12-0.15s |
 | Standby engines per trn1 (TP=32) | ~58 (TCP limit) | ~110 (memory limit) |

@@ -24,6 +24,8 @@ _KERNEL_NAMES = (
     "kernel_cte_greedy_sampling", "kernel_tkg_greedy_sampling",
 )
 
+_NRT_CLOSED_MARKER = "/tmp/nkipy_nrt_closed"
+
 
 class NKIPyWorker(WorkerBase):
     """Worker that bridges vLLM with NKIPy backend."""
@@ -293,10 +295,10 @@ class NKIPyWorker(WorkerBase):
         spike_reset()
         t_spike = _time.time()
 
-        # After a clean nrt_close(), the NC firmware is already initialized.
-        # Skip the 5s hardware NC reset on the next nrt_init by setting
-        # NEURON_RT_RESET_CORES=0.  Only safe after nrt_close() has run.
-        os.environ["NEURON_RT_RESET_CORES"] = "0"
+        # Signal that nrt_close() completed cleanly on this machine.
+        # Any engine (including other processes) can skip the 5s NC firmware
+        # reset on the next nrt_init by reading this marker.
+        open(_NRT_CLOSED_MARKER, "w").close()
 
         # Clear endpoint state to free memory
         # Safe now because dereg thread has completed
@@ -386,6 +388,8 @@ class NKIPyWorker(WorkerBase):
 
         dist.barrier()
         t_pre_nrt = _time.time()
+        if os.path.exists(_NRT_CLOSED_MARKER):
+            os.environ["NEURON_RT_RESET_CORES"] = "0"
         get_spike_singleton()
         t_nrt = _time.time()
         dist.barrier()
@@ -416,7 +420,6 @@ class NKIPyWorker(WorkerBase):
             t_ack = _time.time()
         else:
             # No peer - load weights from checkpoint
-            import os
             from safetensors.torch import load_file
             checkpoint_path = os.environ.get("NKIPY_CHECKPOINT")
             if checkpoint_path:
