@@ -293,6 +293,11 @@ class NKIPyWorker(WorkerBase):
         spike_reset()
         t_spike = _time.time()
 
+        # After a clean nrt_close(), the NC firmware is already initialized.
+        # Skip the 5s hardware NC reset on the next nrt_init by setting
+        # NEURON_RT_RESET_CORES=0.  Only safe after nrt_close() has run.
+        os.environ["NEURON_RT_RESET_CORES"] = "0"
+
         # Clear endpoint state to free memory
         # Safe now because dereg thread has completed
         rank_endpoint.ep = None
