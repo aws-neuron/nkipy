@@ -192,18 +192,14 @@ class NKIPyWorker(WorkerBase):
         if self._sleeping:
             self._destroy_gloo()
 
-        # Configurable: Pre-register MRs or register on-demand
-        # NKIPY_PREREGISTER_MRS=1: Pre-register (optimized /wake_up, slow /sleep ~20s)
-        # NKIPY_PREREGISTER_MRS=0: On-demand (alternative design, +2s /wake_up, fast /sleep ~2-5s)
-        import os
-        preregister = os.environ.get("NKIPY_PREREGISTER_MRS", "0") == "1"
-        if preregister and mr._nkipy_model is not None:
+        # Pre-register sender MRs so push_to_peer skips the 2.3s registration.
+        # Safe because dereg_async() runs after each push and we wait for it
+        # during sleep, so MRs are gone before spike_reset().
+        if mr._nkipy_model is not None:
             from relay import preregister_weights
             preregister_weights(mr._nkipy_model)
             if self.rank == 0:
-                logger.info("NKIPY: Pre-registered MRs (optimized design)")
-        elif self.rank == 0:
-            logger.info("NKIPY: On-demand MR registration (alternative design)")
+                logger.info("NKIPY: Pre-registered sender MRs")
 
     def determine_available_memory(self) -> int:
         return 1 * (1024 ** 3)
@@ -278,12 +274,18 @@ class NKIPyWorker(WorkerBase):
         gc.collect()
         t_gc = _time.time()
 
-        # Wait for RDMA deregistration if still in progress.
-        # dereg_async() was called after P2P transfer during /wake_up.
-        # If /sleep is called >30s after /wake_up, dereg is likely complete (fast path).
-        # If called earlier, we wait here to ensure spike_reset() is fast.
+        # Deregister any active MRs before spike_reset to avoid the 60x slowdown.
+        # Three cases:
+        #   1. Sender pre-registered MRs but never pushed → dereg_sync needed
+        #   2. Receiver: dereg_async running → wait for completion
+        #   3. No MRs active → fast path
         dereg_waited = False
-        if rank_endpoint._dereg_thread and rank_endpoint._dereg_thread.is_alive():
+        if rank_endpoint.registered:
+            if self.rank == 0:
+                logger.info("Rank %d: Deregistering active MRs before spike_reset", self.rank)
+            rank_endpoint.dereg_sync()
+            dereg_waited = True
+        elif rank_endpoint._dereg_thread and rank_endpoint._dereg_thread.is_alive():
             if self.rank == 0:
                 logger.info("Rank %d: Waiting for dereg completion before spike_reset", self.rank)
             rank_endpoint.wait()
@@ -466,6 +468,12 @@ class NKIPyWorker(WorkerBase):
         self.model_runner.model = model
         self._sleeping = False
 
+        # Sender engines: pre-register MRs so push_to_peer skips registration.
+        if os.environ.get("NKIPY_CHECKPOINT"):
+            from relay import preregister_weights
+            preregister_weights(model)
+        t_prereg = _time.time()
+
         t_end = _time.time()
 
         latency = {
@@ -480,6 +488,7 @@ class NKIPyWorker(WorkerBase):
             "kernel_load_s": round(t_kernels - t_ack, 4),
             "kernel_barrier_s": round(t_kernel_barrier - t_kernels, 4),
             "tok_embedding_s": round(t_tok - t_kernel_barrier, 4),
+            "prereg_mrs_s": round(t_prereg - t_tok, 4),
             "total_s": round(t_end - t_start, 4),
         }
         if self.rank == 0:
