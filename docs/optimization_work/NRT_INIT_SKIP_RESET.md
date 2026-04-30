@@ -161,6 +161,37 @@ For any wake-up after the first sleep cycle on the machine (all standby engines 
 
 The remaining wake-up time is dominated by receiver MR registration (~2.3s, overlapped with sender connect), RDMA write (~0.6s), and Gloo init (~0.9s).
 
+## 10-Engine Scalability Test (Qwen3-30B-A3B, TP=32)
+
+10 standby engines started on Instance B (172.31.40.200, trn1.32xlarge), all sleeping. Single sender on Instance A (172.31.44.131). Each engine woken sequentially: wake → verify inference → sleep → next engine.
+
+| Engine | nrt | p2p | gloo | total | server | Inference |
+|--------|-----|-----|------|-------|--------|-----------|
+| 1 (cold) | 5.79s | 3.22s | 0.86s | 21.63s | 21.83s | Correct |
+| 2 | 0.17s | 3.25s | 0.58s | 4.75s | 4.81s | Correct |
+| 3 | 0.15s | 3.23s | 0.91s | 5.03s | 5.21s | Correct |
+| 4 | 0.16s | 3.23s | 0.83s | 4.99s | 5.01s | Correct |
+| 5 | 0.16s | 3.23s | 0.95s | 5.07s | 5.21s | Correct |
+| 6 | 0.17s | 3.21s | 0.95s | 5.01s | 5.11s | Correct |
+| 7 | 0.18s | 3.23s | 0.92s | 5.10s | 5.21s | Correct |
+| 8 | 0.17s | 3.21s | 0.89s | 5.04s | 5.11s | Correct |
+| 9 | 0.17s | 3.22s | 0.94s | 5.06s | 5.21s | Correct |
+| 10 | 0.17s | 3.24s | 0.93s | 5.11s | 5.21s | Correct |
+| **Warm avg** | **0.17s** | **3.23s** | **0.88s** | **5.02s** | **5.12s** | **10/10** |
+
+P2P transfer is extremely consistent at 3.21–3.25s across all 10 engines. No degradation as the sender serves more receivers.
+
+### Sleep Latency
+
+Sleep latency depends on whether background MR deregistration has completed:
+
+| Scenario | dereg_wait | spike_reset | gloo_destroy | Total |
+|----------|-----------|-------------|--------------|-------|
+| Immediate (seconds after wake) | 61–63s | 0.12s | 0.8–1.4s | **63–65s** |
+| Deferred (>60s after wake) | 0.0s | 0.12–0.14s | 0.8–1.4s | **~2s** |
+
+MR deregistration (`ibv_dereg_mr`) runs asynchronously after each wake-up and takes ~60s for 435 MRs × 4 NIC contexts. If sleep is called before deregistration finishes, it must wait synchronously. In production, standby engines typically serve requests for much longer than 60s, so sleep is expected to hit the fast ~2s path.
+
 ## Safety
 
 - `reset_cores=0` is only applied when the marker file exists, proving a prior `nrt_close()` ran on this machine.

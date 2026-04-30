@@ -28,12 +28,13 @@ Documentation for the P2P weight transfer optimization work: reducing `/sleep` l
 
 | Metric | Before | After |
 |--------|--------|-------|
-| `/sleep` (normal, >30s after wake) | 46.5s | ~1-2s |
-| `/sleep` (early, <30s after wake) | 46.5s | ~20s (waits for MR dereg) |
-| `/wake_up` (P2P, LLaMA-3-70B TP=32, cold) | — | ~28-30s |
+| `/sleep` (deferred, >60s after wake) | 46.5s | ~2s |
+| `/sleep` (immediate, <60s after wake) | 46.5s | ~63-65s (waits for MR dereg) |
+| `/wake_up` (P2P, LLaMA-3-70B TP=32, cold) | — | ~22s |
 | `/wake_up` (P2P, TP=32, optimized) | ~28-30s | ~5.0s |
-| `nrt_init` (subsequent, `reset_cores=0`) | 5-15s | 0.15-0.17s |
-| P2P transfer (all optimizations) | 7.7s | 3.25s |
+| `/wake_up` (P2P, TP=32, 10-engine avg) | — | 5.02s (warm), 21.6s (cold) |
+| `nrt_init` (subsequent, `reset_cores=0`) | 5-15s | 0.15-0.18s |
+| P2P transfer (all optimizations) | 7.7s | 3.21-3.25s |
 | `spike_reset` (with active MRs) | 7-25s | avoided |
 | `spike_reset` (MRs deregistered) | — | 0.12-0.15s |
 | Standby engines per trn1 (TP=32) | ~58 (TCP limit) | ~110 (memory limit) |
