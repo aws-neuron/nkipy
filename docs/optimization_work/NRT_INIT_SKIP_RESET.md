@@ -99,7 +99,7 @@ Pre-register sender MRs at model load time and after wake-from-checkpoint. `push
 | RDMA write | 0.63s | 0.63s |
 | **Total wake-up** | **9.5s** | **7.1s** |
 
-### Remaining P2P Breakdown
+### Remaining P2P Breakdown (after sender pre-registration)
 
 | Phase | Time | Notes |
 |-------|------|-------|
@@ -108,18 +108,58 @@ Pre-register sender MRs at model load time and after wake-from-checkpoint. `push
 | RDMA write | ~0.6s | 1977 MB at 25 Gbps |
 | HTTP + serialization | ~0.3s | Metadata exchange |
 
+## Overlapped Sender Connect with Receiver Registration
+
+### Problem
+
+After sender pre-registration, the remaining P2P latency was ~5.2s with the sender's 2.0s RDMA connect (`add_remote_endpoint`) running sequentially after receiver MR registration. The receiver registered MRs first, then sent metadata to the sender, who then connected and transferred — these steps were unnecessarily serialized.
+
+### Solution
+
+Split the receiver's metadata exchange into two HTTP calls:
+
+1. **Early preconnect** (`/nkipy/p2p_preconnect`): Sends receiver endpoint metadata to sender BEFORE MR registration. Fires in a background thread so all ranks proceed to MR registration immediately.
+2. **Push descriptors** (`/nkipy/p2p_push_weights`): Sends transfer descriptors after registration completes.
+
+The sender's `add_remote_endpoint()` (2.0s) runs in parallel with receiver's `register_memory()` (2.3s). The sender caches the connection, so the subsequent push call's `add_remote_endpoint()` returns instantly.
+
+```
+Timeline (before):
+  Receiver: [dereg+reg 2.3s] → [gather+POST] → ...wait...
+  Sender:                                       [connect 2.0s] → [xfer 0.6s]
+  Total: 2.3 + 2.0 + 0.6 = ~5.2s (measured: 5.18s)
+
+Timeline (after):
+  Receiver: [accept] → [POST /preconnect (async)] → [reg 2.3s] → [gather+POST]
+  Sender:              [connect 2.0s .........]                    [xfer 0.6s]
+  Total: max(2.3, 2.0) + 0.6 = ~2.9s (measured: 3.25s)
+```
+
+### Results (Qwen3-30B-A3B, TP=32, warm cycle)
+
+| Phase | Before (sender prereg only) | After (+ overlap) |
+|-------|------|-------|
+| accept | — | 0.004s |
+| preconnect (async) | — | 0.031s |
+| reg | 2.34s | 2.36s |
+| gather | 0.09s | 0.09s |
+| post+xfer | 2.60s | 0.78s |
+| **P2P total** | **5.18s** | **3.25s** |
+
+The 0.78s post+xfer (vs 2.60s before) confirms the sender's connect is fully overlapped — it only needs to do the RDMA write (0.6s) plus HTTP round-trip.
+
 ## Combined Impact on Wake-Up Latency
 
 For any wake-up after the first sleep cycle on the machine (all standby engines benefit):
 
-| Phase | Original | + `reset_cores=0` | + sender pre-reg | Speedup |
-|-------|----------|-------------------|-----------------|---------|
-| `nrt_init` | 5–15s | 0.15–0.17s | 0.17s | **35–100×** |
-| P2P transfer | 7.7–10.4s | 7.7–10.4s | 5.2s | **1.5–2×** |
-| Total wake-up (TP=32) | 28–31s | 9.5–12.5s | **7.1s** | **~4×** |
-| Total wake-up (TP=8, same-node) | 16.2s | 4.0s | — | **~4×** |
+| Phase | Original | + `reset_cores=0` | + sender pre-reg | + overlap | Speedup |
+|-------|----------|-------------------|-----------------|-----------|---------|
+| `nrt_init` | 5–15s | 0.15–0.17s | 0.17s | 0.16s | **35–100×** |
+| P2P transfer | 7.7–10.4s | 7.7–10.4s | 5.2s | **3.25s** | **2.4–3.2×** |
+| Total wake-up (TP=32) | 28–31s | 9.5–12.5s | 7.1s | **5.0s** | **~6×** |
+| Total wake-up (TP=8, same-node) | 16.2s | 4.0s | — | — | **~4×** |
 
-The remaining wake-up time is dominated by receiver MR registration (~2.3s), RDMA connect (~2.0s), and RDMA write (~0.6s).
+The remaining wake-up time is dominated by receiver MR registration (~2.3s, overlapped with sender connect), RDMA write (~0.6s), and Gloo init (~0.9s).
 
 ## Safety
 
@@ -131,8 +171,11 @@ The remaining wake-up time is dominated by receiver MR registration (~2.3s), RDM
 
 ## Files Changed
 
-- `nkipy/src/nkipy/vllm_plugin/worker.py` — Sleep: write `/tmp/nkipy_nrt_closed` marker after `spike_reset()`. Wake: read marker and set `NEURON_RT_RESET_CORES=0` before `get_spike_singleton()`. Load/wake: pre-register sender MRs when checkpoint is loaded. Sleep: `dereg_sync()` active MRs before `spike_reset()`.
+- `nkipy/src/nkipy/vllm_plugin/worker.py` — Sleep: write `/tmp/nkipy_nrt_closed` marker after `spike_reset()`. Wake: read marker and set `NEURON_RT_RESET_CORES=0` before `get_spike_singleton()`. Load/wake: pre-register sender MRs when checkpoint is loaded. Sleep: `dereg_sync()` active MRs before `spike_reset()`. Added `nkipy_preconnect()` method for early RDMA connect.
+- `nkipy/src/nkipy/vllm_plugin/server.py` — Added `/nkipy/p2p_preconnect` endpoint for early RDMA connect.
+- `relay/src/relay/transfer.py` — `receive_from_peer()` sends endpoint metadata before MR registration via async HTTP POST. Added `preconnect_to_peer()` function.
+- `relay/src/relay/__init__.py` — Added `preconnect_to_peer` to exports.
 
 ## Date
 
-2026-04-29 (NRT skip reset), 2026-04-30 (sender pre-registration)
+2026-04-29 (NRT skip reset), 2026-04-30 (sender pre-registration, overlapped connect)
