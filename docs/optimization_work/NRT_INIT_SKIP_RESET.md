@@ -71,17 +71,55 @@ Verified across all cycles for both models:
 
 Qwen3 output is byte-identical between step 1 and step 3, confirming no corruption from the cross-model interleave.
 
-## Impact on Wake-Up Latency
+## Sender MR Pre-Registration
+
+### Problem
+
+After fixing `nrt_init`, P2P transfer became the dominant wake-up cost (~7.7s). Profiling the transfer pipeline (Qwen3-30B-A3B, TP=32):
+
+| Phase | Receiver | Sender |
+|-------|----------|--------|
+| MR registration | 2.34s | 2.35s |
+| RDMA connect | — | 2.00s |
+| RDMA write (1977 MB) | — | 0.63s |
+| HTTP + gather | 0.09s | — |
+
+The sender's 2.35s MR registration happened on every push, even though the sender's weight buffers don't change between pushes. This was serialized on the critical path: receiver registers → HTTP post → sender registers → connect → write.
+
+### Solution
+
+Pre-register sender MRs at model load time and after wake-from-checkpoint. `push_to_peer()` detects pre-registered MRs and skips registration (`reg 0.000s`). The sleep path handles cleanup: `dereg_sync()` if MRs are still active, or `wait()` if async dereg is in progress.
+
+### Results (Qwen3-30B-A3B, TP=32, cycle 2+)
+
+| Phase | Before | After |
+|-------|--------|-------|
+| P2P transfer | 7.67s | **5.18s** |
+| Sender reg | 2.35s | **0.00s** (pre-registered) |
+| RDMA write | 0.63s | 0.63s |
+| **Total wake-up** | **9.5s** | **7.1s** |
+
+### Remaining P2P Breakdown
+
+| Phase | Time | Notes |
+|-------|------|-------|
+| Receiver MR registration | ~2.3s | On critical path, cannot pre-register receiver |
+| Sender RDMA connect | ~2.0s | QP establishment per wake-up |
+| RDMA write | ~0.6s | 1977 MB at 25 Gbps |
+| HTTP + serialization | ~0.3s | Metadata exchange |
+
+## Combined Impact on Wake-Up Latency
 
 For any wake-up after the first sleep cycle on the machine (all standby engines benefit):
 
-| Phase | Before | After | Speedup |
-|-------|--------|-------|---------|
-| `nrt_init` | 5–15s | 0.15–0.17s | **35–100×** |
-| Total wake-up (TP=32, P2P) | 28–31s | 9.5–12.5s | **~2.5–3×** |
-| Total wake-up (TP=8, same-node) | 16.2s | 4.0s | **~4×** |
+| Phase | Original | + `reset_cores=0` | + sender pre-reg | Speedup |
+|-------|----------|-------------------|-----------------|---------|
+| `nrt_init` | 5–15s | 0.15–0.17s | 0.17s | **35–100×** |
+| P2P transfer | 7.7–10.4s | 7.7–10.4s | 5.2s | **1.5–2×** |
+| Total wake-up (TP=32) | 28–31s | 9.5–12.5s | **7.1s** | **~4×** |
+| Total wake-up (TP=8, same-node) | 16.2s | 4.0s | — | **~4×** |
 
-The remaining wake-up time is dominated by P2P transfer (~7.7–10.4s for TP=32 cross-node) and Gloo init (~0.9s).
+The remaining wake-up time is dominated by receiver MR registration (~2.3s), RDMA connect (~2.0s), and RDMA write (~0.6s).
 
 ## Safety
 
@@ -89,11 +127,12 @@ The remaining wake-up time is dominated by P2P transfer (~7.7–10.4s for TP=32 
 - Cold starts (fresh machine, no marker) always use the default `reset_cores=1`.
 - HBM scrub still runs, so device memory is zeroed before reuse.
 - Cross-model interleaving is safe: cores that previously ran LLaMA can immediately run Qwen3 without firmware reset.
+- Sender pre-registered MRs are cleaned up during sleep via `dereg_sync()` before `spike_reset()`, so no MR slowdown.
 
 ## Files Changed
 
-- `nkipy/src/nkipy/vllm_plugin/worker.py` — Sleep: write `/tmp/nkipy_nrt_closed` marker after `spike_reset()`. Wake: read marker and set `NEURON_RT_RESET_CORES=0` before `get_spike_singleton()`.
+- `nkipy/src/nkipy/vllm_plugin/worker.py` — Sleep: write `/tmp/nkipy_nrt_closed` marker after `spike_reset()`. Wake: read marker and set `NEURON_RT_RESET_CORES=0` before `get_spike_singleton()`. Load/wake: pre-register sender MRs when checkpoint is loaded. Sleep: `dereg_sync()` active MRs before `spike_reset()`.
 
 ## Date
 
-2026-04-29
+2026-04-29 (NRT skip reset), 2026-04-30 (sender pre-registration)
