@@ -88,6 +88,15 @@ def register_nkipy_routes(app: FastAPI) -> None:
         logger.info("wake_up server total: %.4fs", _time.time() - t0)
         return result
 
+    @app.post("/nkipy/p2p_preconnect")
+    async def p2p_preconnect(request: Request):
+        body = await request.json()
+        core = _get_engine_core(app)
+        await core.collective_rpc_async(
+            "nkipy_preconnect", args=(body["per_rank"],),
+        )
+        return JSONResponse({"status": "connected"})
+
     @app.post("/nkipy/p2p_push_weights")
     async def p2p_push_weights(req: PushWeightsRequest):
         core = _get_engine_core(app)

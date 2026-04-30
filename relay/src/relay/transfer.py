@@ -78,6 +78,7 @@ def receive_from_peer(
     buffers: Sequence[Tuple[str, int, int]],
     peer_url: str,
     push_endpoint: str = "/p2p_push_weights",
+    preconnect_endpoint: str = "/p2p_preconnect",
 ) -> None:
     """All ranks receive their buffer shard from a peer engine via P2P RDMA.
 
@@ -85,22 +86,12 @@ def receive_from_peer(
     automatically split into chunks.  The endpoint and RDMA connection are
     reused across chunks — only MRs are swapped per chunk.
 
-    Parameters
-    ----------
-    ep : RankEndpoint
-        The per-rank endpoint (will be registered if not already).
-    buffers : sequence of (name, va, size_bytes)
-        Device buffers to receive into.
-    peer_url : str
-        Base URL of the active peer engine.
-    push_endpoint : str
-        HTTP path on the peer to trigger the push.
+    Sends endpoint metadata to the sender *before* MR registration so the
+    sender can start the 2s RDMA connect in parallel with receiver
+    registration.
     """
     t0 = time.time()
     total_bytes = sum(sz for _, _, sz in buffers)
-
-    # Note: Receivers NEVER pre-register MRs (constraint: "Don't pre-register MRs at the receiver side")
-    # Always use chunked on-demand registration path.
     chunks = _chunk_ranges(len(buffers), MAX_RDMA_BUFS)
 
     for ci, (cs, ce) in enumerate(chunks):
@@ -108,20 +99,46 @@ def receive_from_peer(
 
         if ci == 0:
             ep.dereg_sync()
-            ep.register(buffers[cs:ce])
+            ep._ensure_endpoint()
             ep.ep.start_passive_accept()
+        t_accept = time.time()
+
+        # Send endpoint metadata to sender BEFORE registration so the
+        # sender can start RDMA connect (~2s) in parallel with our
+        # MR registration (~2.3s).
+        meta_hex = ep.ep.get_metadata().hex()
+        gathered_meta = [None] * dist.get_world_size() if dist.get_rank() == 0 else None
+        dist.gather_object(meta_hex, gathered_meta, dst=0)
+        preconnect_future = None
+        if dist.get_rank() == 0:
+            import concurrent.futures
+            base = peer_url.rstrip("/")
+            _pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            preconnect_future = _pool.submit(
+                requests.post,
+                f"{base}{preconnect_endpoint}",
+                json={"per_rank": [{"remote_metadata": m} for m in gathered_meta]},
+            )
+            _pool.shutdown(wait=False)
+        t_preconnect = time.time()
+
+        # Register MRs — overlapped with sender connect
+        if ci == 0:
+            ep.register(buffers[cs:ce])
         else:
             ep.reregister(buffers[cs:ce])
+        if preconnect_future is not None:
+            preconnect_future.result()
         t_reg = time.time()
 
+        # Send transfer descriptors so the sender can do the RDMA write
         serialized = ep.ep.get_serialized_descs(ep.xfer_descs)
-        my_info = (ep.ep.get_metadata().hex(), serialized.hex())
+        my_info = (meta_hex, serialized.hex())
         gathered = [None] * dist.get_world_size() if dist.get_rank() == 0 else None
         dist.gather_object(my_info, gathered, dst=0)
         t_gather = time.time()
 
         if dist.get_rank() == 0:
-            base = peer_url.rstrip("/")
             resp = requests.post(
                 f"{base}{push_endpoint}",
                 json={
@@ -141,23 +158,42 @@ def receive_from_peer(
         t_done = time.time()
 
         chunk_bytes = sum(sz for _, _, sz in buffers[cs:ce])
-        if not dist.is_initialized() or dist.get_rank() == 0: logger.info("Rank %d: recv chunk %d/%d [%d:%d] %d bufs %.2f MB — "
-        "reg %.3fs gather %.3fs post+xfer %.3fs barrier %.3fs total %.3fs",
-        dist.get_rank(), ci + 1, len(chunks), cs, ce, ce - cs,
-        chunk_bytes / 1e6,
-        t_reg - t_chunk, t_gather - t_reg, t_post - t_gather,
-        t_done - t_post, t_done - t_chunk,)
+        if not dist.is_initialized() or dist.get_rank() == 0: logger.info(
+            "Rank %d: recv chunk %d/%d [%d:%d] %d bufs %.2f MB — "
+            "accept %.3fs preconnect %.3fs reg %.3fs gather %.3fs "
+            "post+xfer %.3fs barrier %.3fs total %.3fs",
+            dist.get_rank(), ci + 1, len(chunks), cs, ce, ce - cs,
+            chunk_bytes / 1e6,
+            t_accept - t_chunk, t_preconnect - t_accept,
+            t_reg - t_preconnect, t_gather - t_reg,
+            t_post - t_gather, t_done - t_post, t_done - t_chunk,)
 
     elapsed = time.time() - t0
     throughput_gbps = (total_bytes * 8) / elapsed / 1e9 if elapsed > 0 else 0
     if not dist.is_initialized() or dist.get_rank() == 0: logger.info("Rank %d: P2P receive complete — %d bufs, %.2f MB, %.2fs, %.2f Gbps",
     dist.get_rank(), len(buffers), total_bytes / 1e6, elapsed, throughput_gbps,)
 
-    # Deregister MRs asynchronously after on-demand receive completes
-    # (We only reach here if not pre-registered, see early return above)
     ep.dereg_async()
     if not dist.is_initialized() or dist.get_rank() == 0:
         logger.info("Rank %d: Started async MR deregistration (%d MRs)", dist.get_rank(), len(ep.xfer_descs))
+
+
+def preconnect_to_peer(
+    ep: RankEndpoint,
+    per_rank_info: list | None = None,
+) -> None:
+    """All ranks establish RDMA connection to the peer (no data transfer).
+
+    Called ahead of ``push_to_peer`` so the 2s QP handshake overlaps with
+    receiver MR registration.  ``add_remote_endpoint`` caches the connection,
+    so the subsequent ``push_to_peer`` reuses it instantly.
+    """
+    remote_metadata_hex = per_rank_info[dist.get_rank()]
+    relay_ep = ep._ensure_endpoint()
+    ok, _ = relay_ep.add_remote_endpoint(bytes.fromhex(remote_metadata_hex))
+    assert ok, "Failed to pre-connect to remote endpoint"
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        logger.info("Rank %d: RDMA pre-connect complete", dist.get_rank())
 
 
 def push_to_peer(

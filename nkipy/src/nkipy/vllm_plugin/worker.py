@@ -408,10 +408,7 @@ class NKIPyWorker(WorkerBase):
             )
             bufs = collect_weight_buffers(model)
             t_collect = _time.time()
-            receive_from_peer(
-                rank_endpoint, bufs, actual_peer,
-                push_endpoint="/nkipy/p2p_push_weights",
-            )
+            receive_from_peer(rank_endpoint, bufs, actual_peer)
             t_p2p = _time.time()
 
             # HYPOTHESIS TEST: Force NRT to acknowledge RDMA-written memory.
@@ -495,6 +492,13 @@ class NKIPyWorker(WorkerBase):
             logger.info("wake_up latency breakdown (rank %d): %s", self.rank, latency)
             print(f"wake_up latency breakdown (rank {self.rank}): {latency}", flush=True)
         return {"status": "awake", "latency": latency}
+
+    def nkipy_preconnect(self, per_rank_info: list[dict]) -> dict:
+        """Establish RDMA connection to receiver ahead of push."""
+        from relay import preconnect_to_peer, rank_endpoint
+        info = [r["remote_metadata"] for r in per_rank_info]
+        preconnect_to_peer(rank_endpoint, info)
+        return {"status": "connected"}
 
     def nkipy_push_weights(
         self,
