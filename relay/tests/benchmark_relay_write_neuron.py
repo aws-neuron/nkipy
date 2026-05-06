@@ -23,27 +23,24 @@ def _check_ptr_valid(ptr: int) -> bool:
 
 
 def _make_buffer(n_bytes: int, device: str, nc: int):
-    n = n_bytes // 4
     if device == "trn":
-        buf = torch.ones(n, dtype=torch.float32).to(f"privateuseone:{nc}")
+        if os.environ.get("NEURON_RT_MAP_HBM") == "1":
+            buf = torch.ones(n_bytes // 4, dtype=torch.float32).to(
+                f"privateuseone:{nc}"
+            )
+            return buf, buf.data_ptr()
+        # Without MAP_HBM, NRT device tensors reside in HBM which is very slow
+        # for EFA DMA. Use host-pinned memory for the RDMA benchmark instead.
+        buf = torch.ones(n_bytes // 4, dtype=torch.float32)
+        return buf, buf.data_ptr()
     else:
-        buf = torch.ones(n, dtype=torch.float32)
-    ptr = buf.data_ptr()
-
-    if _check_ptr_valid(ptr):
-        # 1/ buf is created on CPU, or
-        # 2/ buf is created on Trn with eager mode and NEURON_RT_MAP_HBM = 1
-        return buf, ptr
-    elif device == "trn":
-        # On Trn2 without NEURON_RT_MAP_HBM, use NRT tensor allocation
-        buf_nrt = _relay.create_nrt_tensor(nc_idx=nc, size_bytes=n_bytes)
-        ptr_nrt = buf_nrt.data_ptr()
-        return buf_nrt, ptr_nrt
-    else:
+        buf = torch.ones(n_bytes // 4, dtype=torch.float32)
+        ptr = buf.data_ptr()
+        if _check_ptr_valid(ptr):
+            return buf, ptr
         buf_nrt = _relay.create_nrt_tensor(nc_idx=nc, size_bytes=n_bytes)
         buf_nrt.copy_(buf)
-        ptr_nrt = buf_nrt.data_ptr()
-        return buf_nrt, ptr_nrt
+        return buf_nrt, buf_nrt.data_ptr()
 
 
 def _pretty(num: int):
