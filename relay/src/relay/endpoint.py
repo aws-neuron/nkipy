@@ -15,8 +15,6 @@ import os
 import threading
 from typing import List, Sequence, Tuple
 
-os.environ.setdefault("UCCL_RCMODE", "1")
-
 from relay import _relay  # noqa: E402
 
 logger = logging.getLogger(__name__)

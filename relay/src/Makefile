@@ -2,6 +2,7 @@
 
 EFA_HOME ?= /opt/amazon/efa
 NRT_HOME ?= /opt/aws/neuron
+THIRD_PARTY ?= ../third_party/install
 BUILD_DIR := ../build
 
 # Compiler and flags
@@ -13,9 +14,18 @@ CXXFLAGS := -O3 -shared -std=c++17 -fPIC -I. -Iinclude \
 
 INC = -I./ -I${EFA_HOME}/include
 
-# Try to use specific libglog.so.0 if available, otherwise use system libglog
-LIBGLOG := $(shell test -f /usr/local/lib/libglog.so.0 && echo "/usr/local/lib/libglog.so.0" || echo "-lglog")
-LIBS = -libverbs -lpthread $(LIBGLOG) -lgflags -L ${EFA_HOME}/lib -lefa
+# Try to use specific libglog.so.0 if available, then third_party, then system
+LIBGLOG := $(shell test -f /usr/local/lib/libglog.so.0 && echo "/usr/local/lib/libglog.so.0" || \
+	(test -f $(THIRD_PARTY)/lib/libglog.so && echo "-L$(THIRD_PARTY)/lib -lglog -lgflags") || echo "-lglog -lgflags")
+
+# Check if third_party install has glog headers
+THIRD_PARTY_AVAILABLE := $(shell test -d $(THIRD_PARTY)/include/glog && echo yes)
+ifeq ($(THIRD_PARTY_AVAILABLE),yes)
+    INC += -I$(THIRD_PARTY)/include
+    CXXFLAGS += -Wl,-rpath=$(realpath $(THIRD_PARTY))/lib
+endif
+
+LIBS = -libverbs -lpthread $(LIBGLOG) -L ${EFA_HOME}/lib -lefa
 
 # Detect if NRT is available (for Neuron/Trainium support)
 NRT_AVAILABLE := $(shell test -d $(NRT_HOME)/include/nrt && echo yes)
@@ -29,7 +39,7 @@ else
 endif
 
 # Python and pybind11 configuration
-PYTHON          ?= python3
+PYTHON          ?= $(shell test -x ../../.venv/bin/python && echo ../../.venv/bin/python || echo python3)
 PYEXT           := $(shell $(PYTHON) -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
 PYBIND11_INCLUDES := $(shell $(PYTHON) -m pybind11 --includes)
 PYTHON_LDFLAGS := $(shell $(PYTHON) -c "import sysconfig; print(sysconfig.get_config_var('LDFLAGS') or '')")

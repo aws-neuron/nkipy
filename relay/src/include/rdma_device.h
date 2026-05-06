@@ -51,6 +51,12 @@ class RdmaDeviceManager {
   std::vector<size_t> get_best_dev_idx(int gpu_idx) {
     auto instance_type = relay::get_instance_type();
     auto selected_dev_indices = relay::load_gpu_nic_map(instance_type, gpu_idx);
+
+    // If no hardcoded mapping, discover via NUMA topology
+    if (selected_dev_indices.empty()) {
+      selected_dev_indices = discover_nic_map_from_numa(gpu_idx);
+    }
+
     CHECK(!selected_dev_indices.empty())
         << "[RDMA] GPU " << gpu_idx
         << " not found in GPU-NIC map for instance type: " << instance_type;
@@ -65,6 +71,47 @@ class RdmaDeviceManager {
     LOG(INFO) << ss.str();
 
     return selected_dev_indices;
+  }
+
+  std::vector<size_t> discover_nic_map_from_numa(int gpu_idx) {
+    // Find NUMA node of the NeuronCore/GPU
+    int nc_numa = -1;
+    // Try NeuronCore sysfs (Trn2 has 2 cores per device)
+    for (int cores_per_dev : {2, 1}) {
+      int neuron_dev = gpu_idx / cores_per_dev;
+      std::string nc_path = relay::Format(
+          "/sys/class/neuron_device/neuron%d/device/numa_node", neuron_dev);
+      std::ifstream nc_file(nc_path);
+      if (nc_file.is_open()) {
+        std::string line;
+        if (std::getline(nc_file, line)) {
+          nc_numa = std::stoi(line);
+          break;
+        }
+      }
+    }
+
+    // Collect NUMA nodes of all RDMA devices
+    std::vector<size_t> same_numa, all_devs;
+    for (size_t i = 0; i < devices_.size(); ++i) {
+      all_devs.push_back(i);
+      int dev_numa = relay::get_dev_numa_node(devices_[i]->name().c_str());
+      if (nc_numa >= 0 && dev_numa == nc_numa) {
+        same_numa.push_back(i);
+      }
+    }
+
+    auto& result = same_numa.empty() ? all_devs : same_numa;
+
+    // Cap to kNICContextNumber (the max contexts the engine supports)
+    std::vector<size_t> capped(
+        result.begin(),
+        result.begin() +
+            std::min(result.size(), static_cast<size_t>(kNICContextNumber)));
+
+    LOG(INFO) << "[RDMA] Discovered NIC map for GPU " << gpu_idx
+              << " (NUMA " << nc_numa << "): " << capped.size() << " NIC(s)";
+    return capped;
   }
 
   int get_numa_node(size_t id) {

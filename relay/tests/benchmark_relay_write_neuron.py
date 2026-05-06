@@ -34,6 +34,11 @@ def _make_buffer(n_bytes: int, device: str, nc: int):
         # 1/ buf is created on CPU, or
         # 2/ buf is created on Trn with eager mode and NEURON_RT_MAP_HBM = 1
         return buf, ptr
+    elif device == "trn":
+        # On Trn2 without NEURON_RT_MAP_HBM, use NRT tensor allocation
+        buf_nrt = _relay.create_nrt_tensor(nc_idx=nc, size_bytes=n_bytes)
+        ptr_nrt = buf_nrt.data_ptr()
+        return buf_nrt, ptr_nrt
     else:
         buf_nrt = _relay.create_nrt_tensor(nc_idx=nc, size_bytes=n_bytes)
         buf_nrt.copy_(buf)
@@ -191,10 +196,9 @@ def main():
     global torch, dist, _relay
     import torch.distributed as dist
     import torch
-    import torch_neuronx
 
     os.environ["NEURON_RT_VISIBLE_CORES"] = str(nc_idx)
-    os.environ["UCCL_RCMODE"] = "1"
+    import torch_neuronx
     try:
         from relay import _relay
     except ImportError:
