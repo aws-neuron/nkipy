@@ -92,6 +92,7 @@ class RankEndpoint:
         self._dereg_threads = []
 
     def _ensure_endpoint(self):
+        self._wait_dereg()
         if self.ep is None:
             nc = self._nc_idx if self._nc_idx is not None else _get_nc_idx()
             self.ep = _relay.Endpoint(nc)
@@ -202,6 +203,35 @@ class RankEndpoint:
                 target=_bg, args=(ep, descs, pending), daemon=True
             )
             self._dereg_thread.start()
+
+    def reset_endpoint_async(self) -> None:
+        """Destroy endpoint and re-register MRs in background to free QPs.
+
+        Used by the sender after each push to prevent RDMA QP exhaustion.
+        The next call to _ensure_endpoint() will block until the reset
+        completes.
+        """
+        if self.ep is None or not self.xfer_descs:
+            return
+        old_ep = self.ep
+        old_descs = self.xfer_descs
+        self.ep = None
+        self.xfer_descs = []
+
+        nc = self._nc_idx if self._nc_idx is not None else _get_nc_idx()
+
+        def _bg_reset():
+            for desc in old_descs:
+                old_ep.dereg(desc.mr_id)
+            new_ep = _relay.Endpoint(nc)
+            buf_handles = [_VAHandle(desc.addr, desc.size) for desc in old_descs]
+            new_descs = new_ep.register_memory(buf_handles)
+            self.ep = new_ep
+            self.xfer_descs = new_descs
+
+        t = threading.Thread(target=_bg_reset, daemon=True)
+        t.start()
+        self._dereg_thread = t
 
     def wait(self) -> None:
         """Wait for any pending async deregistration to finish."""

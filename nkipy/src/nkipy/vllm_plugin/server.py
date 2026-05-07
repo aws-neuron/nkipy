@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 # Tracks sleep state in the API server process.
 _nkipy_sleeping = False
+_nkipy_transitioning = False  # guards against concurrent wake/sleep
 _tok_embedding_cache = None  # cached raw bytes + headers for /tok_embedding
 
 
@@ -52,41 +53,80 @@ def register_nkipy_routes(app: FastAPI) -> None:
 
     @app.get("/nkipy/health")
     async def nkipy_health():
-        core = _get_engine_core(app)
-        results = await core.collective_rpc_async("nkipy_health")
-        return JSONResponse(results[0])
+        if _nkipy_transitioning:
+            return JSONResponse({"status": "transitioning", "backend": "nkipy",
+                                 "sleeping": _nkipy_sleeping})
+        try:
+            core = _get_engine_core(app)
+            results = await asyncio.wait_for(
+                core.collective_rpc_async("nkipy_health"), timeout=5.0
+            )
+            return JSONResponse(results[0])
+        except (asyncio.TimeoutError, Exception) as e:
+            return JSONResponse({"status": "degraded", "backend": "nkipy",
+                                 "sleeping": _nkipy_sleeping,
+                                 "error": str(e)[:200]})
 
     @app.post("/nkipy/sleep")
     async def sleep():
         import time as _time
-        global _nkipy_sleeping, _tok_embedding_cache
+        global _nkipy_sleeping, _nkipy_transitioning, _tok_embedding_cache
+        if _nkipy_sleeping:
+            return JSONResponse({"status": "already_sleeping"})
+        if _nkipy_transitioning:
+            raise HTTPException(409, "Engine is transitioning (wake/sleep in progress)")
+        _nkipy_transitioning = True
         t0 = _time.time()
         _nkipy_sleeping = True
         _tok_embedding_cache = None
-        core = _get_engine_core(app)
-        results = await core.collective_rpc_async("nkipy_sleep")
-        result = results[0]
-        result["server_total_s"] = round(_time.time() - t0, 4)
-        logger.info("sleep server total: %.4fs", _time.time() - t0)
-        return result
+        try:
+            core = _get_engine_core(app)
+            results = await core.collective_rpc_async("nkipy_sleep")
+            result = results[0]
+            result["server_total_s"] = round(_time.time() - t0, 4)
+            logger.info("sleep server total: %.4fs", _time.time() - t0)
+            return result
+        except Exception as e:
+            logger.error("sleep failed: %s", e)
+            _nkipy_sleeping = False
+            return JSONResponse({"status": "error", "error": f"Sleep failed: {e}"},
+                                status_code=500)
+        finally:
+            _nkipy_transitioning = False
 
     @app.post("/nkipy/wake_up")
     async def wake_up(request: Request, req: WakeUpRequest = None):
         import time as _time
         client = f"{request.client.host}:{request.client.port}" if request.client else "unknown"
         logger.info('%s - "POST /nkipy/wake_up HTTP/1.1"', client)
-        global _nkipy_sleeping
+        global _nkipy_sleeping, _nkipy_transitioning
+        if not _nkipy_sleeping:
+            return JSONResponse({"status": "already_awake"})
+        if _nkipy_transitioning:
+            raise HTTPException(409, "Engine is transitioning (wake/sleep in progress)")
+        _nkipy_transitioning = True
         t0 = _time.time()
         peer_url = req.peer_url if req else None
-        core = _get_engine_core(app)
-        results = await core.collective_rpc_async(
-            "nkipy_wake_up", args=(peer_url,),
-        )
-        _nkipy_sleeping = False
-        result = results[0]
-        result["server_total_s"] = round(_time.time() - t0, 4)
-        logger.info("wake_up server total: %.4fs", _time.time() - t0)
-        return result
+        try:
+            core = _get_engine_core(app)
+            results = await core.collective_rpc_async(
+                "nkipy_wake_up", args=(peer_url,),
+            )
+            result = results[0]
+            result["server_total_s"] = round(_time.time() - t0, 4)
+            if result.get("status") == "error":
+                err_msg = result.get("error", "unknown error")
+                logger.error("wake_up failed: %s", err_msg)
+                return JSONResponse(result, status_code=503)
+            _nkipy_sleeping = False
+            logger.info("wake_up server total: %.4fs", _time.time() - t0)
+            return result
+        except Exception as e:
+            logger.error("wake_up RPC failed: %s", e)
+            return JSONResponse({"status": "error", "error": f"Wake-up failed: {e}"},
+                                status_code=500)
+        finally:
+            _nkipy_transitioning = False
 
     @app.post("/nkipy/p2p_preconnect")
     async def p2p_preconnect(request: Request):

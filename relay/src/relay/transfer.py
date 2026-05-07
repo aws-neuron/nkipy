@@ -77,8 +77,8 @@ def receive_from_peer(
     ep: RankEndpoint,
     buffers: Sequence[Tuple[str, int, int]],
     peer_url: str,
-    push_endpoint: str = "/p2p_push_weights",
-    preconnect_endpoint: str = "/p2p_preconnect",
+    push_endpoint: str = "/nkipy/p2p_push_weights",
+    preconnect_endpoint: str = "/nkipy/p2p_preconnect",
 ) -> None:
     """All ranks receive their buffer shard from a peer engine via P2P RDMA.
 
@@ -258,8 +258,14 @@ def push_to_peer(
     xfer_secs = t_xfer - t_conn
     xfer_gbps = (chunk_bytes * 8) / xfer_secs / 1e9 if xfer_secs > 0 else 0
 
-    if is_last_chunk and not pre_registered:
-        ep.dereg_async()
+    if is_last_chunk:
+        if pre_registered:
+            # Reset endpoint to free QPs from this connection while keeping
+            # MRs registered for subsequent pushes.  Without this, QPs
+            # accumulate across pushes and eventually exhaust RDMA resources.
+            ep.reset_endpoint_async()
+        else:
+            ep.dereg_async()
     t_dereg = time.time()
 
     if not dist.is_initialized() or dist.get_rank() == 0: logger.info("Rank %d: pushed %d bufs %.2f MB — "
@@ -341,7 +347,7 @@ def fetch_tok_embedding(peer_url: str):
     """Fetch tok_embedding from peer over HTTP and broadcast to all ranks."""
     if dist.get_rank() == 0:
         base = peer_url.rstrip("/")
-        resp = requests.get(f"{base}/tok_embedding")
+        resp = requests.get(f"{base}/nkipy/tok_embedding")
         resp.raise_for_status()
         shape = tuple(int(d) for d in resp.headers["X-Shape"].split(","))
         dtype_str = resp.headers["X-Dtype"]

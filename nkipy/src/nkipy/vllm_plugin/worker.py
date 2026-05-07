@@ -139,7 +139,8 @@ class NKIPyWorker(WorkerBase):
         destroy_model_parallel()
         destroy_distributed_environment()
 
-    def _init_distributed(self) -> None:
+    def _init_distributed(self, max_retries: int = 3) -> None:
+        import time as _time
         import vllm.distributed.parallel_state as ps
         from vllm.distributed.parallel_state import (
             init_distributed_environment,
@@ -148,8 +149,6 @@ class NKIPyWorker(WorkerBase):
 
         parallel_config = self.vllm_config.parallel_config
 
-        # Patch in_the_same_node_as to avoid PrivateUse1 barrier issue
-        # (same approach as vllm-neuron)
         def _patched_in_same_node(pg, source_rank=0):
             ws = dist.get_world_size(group=pg)
             nnodes = parallel_config.nnodes
@@ -159,19 +158,38 @@ class NKIPyWorker(WorkerBase):
 
         ps.in_the_same_node_as = _patched_in_same_node
 
-        init_distributed_environment(
-            world_size=parallel_config.world_size,
-            rank=self.rank,
-            local_rank=self.local_rank,
-            distributed_init_method=self.distributed_init_method,
-            backend="gloo",
-        )
-
-        ensure_model_parallel_initialized(
-            parallel_config.tensor_parallel_size,
-            parallel_config.pipeline_parallel_size,
-            backend="gloo",
-        )
+        for attempt in range(max_retries):
+            try:
+                init_distributed_environment(
+                    world_size=parallel_config.world_size,
+                    rank=self.rank,
+                    local_rank=self.local_rank,
+                    distributed_init_method=self.distributed_init_method,
+                    backend="gloo",
+                )
+                ensure_model_parallel_initialized(
+                    parallel_config.tensor_parallel_size,
+                    parallel_config.pipeline_parallel_size,
+                    backend="gloo",
+                )
+                return
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    wait = 2 ** attempt
+                    logger.warning("Rank %d: Gloo init failed (attempt %d/%d): %s — retrying in %ds",
+                                   self.rank, attempt + 1, max_retries, e, wait)
+                    _time.sleep(wait)
+                    try:
+                        from vllm.distributed import (
+                            destroy_model_parallel,
+                            destroy_distributed_environment,
+                        )
+                        destroy_model_parallel()
+                        destroy_distributed_environment()
+                    except Exception:
+                        pass
+                else:
+                    raise
 
     def load_model(self) -> None:
         from vllm.config import set_current_vllm_config
@@ -282,14 +300,22 @@ class NKIPyWorker(WorkerBase):
         dereg_waited = False
         if rank_endpoint.registered:
             if self.rank == 0:
-                logger.info("Rank %d: Deregistering active MRs before spike_reset", self.rank)
+                logger.info("Rank %d: Deregistering active MRs before spike_reset (%d descs)",
+                            self.rank, len(rank_endpoint.xfer_descs))
             rank_endpoint.dereg_sync()
             dereg_waited = True
         elif rank_endpoint._dereg_thread and rank_endpoint._dereg_thread.is_alive():
             if self.rank == 0:
-                logger.info("Rank %d: Waiting for dereg completion before spike_reset", self.rank)
+                logger.info("Rank %d: Waiting for async dereg thread before spike_reset", self.rank)
             rank_endpoint.wait()
             dereg_waited = True
+        elif rank_endpoint._dereg_threads:
+            alive = [t for t in rank_endpoint._dereg_threads if t.is_alive()]
+            if alive:
+                if self.rank == 0:
+                    logger.info("Rank %d: Waiting for %d background dereg threads", self.rank, len(alive))
+                rank_endpoint.wait()
+                dereg_waited = True
         t_wait = _time.time()
 
         # Call spike_reset() - now guaranteed to be fast (~0.2-1s)
@@ -390,12 +416,47 @@ class NKIPyWorker(WorkerBase):
 
         dist.barrier()
         t_pre_nrt = _time.time()
-        if os.path.exists(_NRT_CLOSED_MARKER):
-            os.environ["NEURON_RT_RESET_CORES"] = "0"
-        get_spike_singleton()
+        # Try fast path first (skip firmware reset). If it fails, retry with
+        # reset enabled. The fast path works after clean shutdowns (spike_reset
+        # releases cores). The retry handles corrupted state from dirty kills
+        # where cores need a full firmware reset to recover.
+        os.environ["NEURON_RT_RESET_CORES"] = "0"
+        nrt_error = None
+        try:
+            get_spike_singleton()
+        except Exception as e:
+            logger.warning("Rank %d: NRT fast-init failed, retrying with reset: %s", self.rank, e)
+            os.environ.pop("NEURON_RT_RESET_CORES", None)
+            try:
+                get_spike_singleton()
+                nrt_error = None
+            except Exception as e2:
+                nrt_error = e2
+                logger.error("Rank %d: NRT init failed (with reset): %s", self.rank, e2)
         t_nrt = _time.time()
+        # All ranks must participate in the barrier even on failure,
+        # otherwise healthy ranks hang waiting for failed ones.
         dist.barrier()
+        # Collective check: did ANY rank fail?
+        errors = [None] * dist.get_world_size()
+        dist.all_gather_object(errors, nrt_error)
+        any_failed = any(e is not None for e in errors)
         t_nrt_barrier = _time.time()
+        if any_failed:
+            # Some ranks may have successfully claimed cores — release them.
+            if nrt_error is None:
+                from spike import reset as spike_reset
+                try:
+                    spike_reset()
+                    open(_NRT_CLOSED_MARKER, "w").close()
+                except Exception:
+                    pass
+            self._sleeping = True
+            self._destroy_gloo()
+            first_err = next((e for e in errors if e is not None), "unknown")
+            return {"status": "error", "error": f"NRT init failed: {first_err}",
+                    "latency": {"gloo_init_s": round(t_gloo - t_start, 4),
+                                "total_s": round(_time.time() - t_start, 4)}}
 
         # Rebuild model with empty tensors
         model = self._model_class(config=self._config, skip_kernels=True)
@@ -408,13 +469,24 @@ class NKIPyWorker(WorkerBase):
             )
             bufs = collect_weight_buffers(model)
             t_collect = _time.time()
-            receive_from_peer(rank_endpoint, bufs, actual_peer)
+            try:
+                receive_from_peer(rank_endpoint, bufs, actual_peer)
+            except Exception as e:
+                logger.error("Rank %d: P2P receive failed: %s — cleaning up", self.rank, e)
+                from spike import reset as spike_reset
+                rank_endpoint.dereg_async()
+                spike_reset()
+                open(_NRT_CLOSED_MARKER, "w").close()
+                rank_endpoint.ep = None
+                rank_endpoint.xfer_descs = []
+                rank_endpoint.buf_info = []
+                self._destroy_gloo()
+                return {"status": "error", "error": f"P2P transfer failed: {e}",
+                        "latency": {"gloo_init_s": round(t_gloo - t_start, 4),
+                                    "p2p_error": str(e),
+                                    "total_s": round(_time.time() - t_start, 4)}}
             t_p2p = _time.time()
 
-            # HYPOTHESIS TEST: Force NRT to acknowledge RDMA-written memory.
-            # RDMA writes bypass NRT tracking, potentially causing slow spike_reset.
-            # Reading back tensors forces NRT to discover modifications and update
-            # its memory state, which should speed up cleanup.
             self._acknowledge_rdma_writes(model)
             t_ack = _time.time()
         else:
