@@ -14,20 +14,25 @@ The **on-demand** path avoids this cost by loading models only when traffic arri
 
 We profiled cold-start latency across two trn1.32xlarge instances (each with 32 NeuronCores, 4 instance store NVMe drives, 8 EFA NICs) running LLaMA-3-70B with TP=32 under the vLLM serving framework. The model checkpoint size is 139 GB.
 
-| Phase | Latency | Bottleneck |
-|-------|---------|------------|
-| Prior model release | ~65s | RDMA MR deregistration (~63s) + spike_reset + Gloo destroy (measured) |
-| Python imports + framework init + worker spawn | ~22s | vLLM, PyTorch, plugin loading, fork 32 worker processes (measured) |
-| Gloo distributed init | ~1s | Establish Gloo mesh across 32 ranks (measured: ~1s without CPU contention) |
-| NeuronCore runtime init | 5–20s | Firmware reset, device allocation via NRT (measured: 5–20s first init) |
-| Weight loading from local NVMe | ~35s | Instance store NVMe aggregate ~4 GB/s for 139 GB (measured: ~1 GB/s per drive × 4 drives) |
-| Weight loading from FSx for Lustre | 70–140s | Shared bandwidth (~1 GB/s/TiB); degrades under concurrent access |
-| Weight loading from S3 | 105–175s | Download to local disk (~2–3 GB/s, 50–70s) + load from disk (~35s); sequential |
-| NEFF kernel compilation | 5–30min | Neuron compiler translates model graph to NeuronCore binaries (first run only) |
-| NEFF kernel load + warmup | ~18s | Load pre-compiled NEFF, profile, allocate KV cache (measured) |
-| **Total cold start (local NVMe)** | **~141s** | |
-| **Total cold start (FSx)** | **176–246s** | |
-| **Total cold start (S3)** | **211–301s** | |
+<table>
+<tr><th>Category</th><th>Phase</th><th>Latency</th><th>Bottleneck</th></tr>
+<tr><td rowspan="5"><b>Software init</b></td>
+    <td>Python imports + framework init + worker spawn</td><td>~22s</td><td>vLLM, PyTorch, plugin loading, fork 32 worker processes (measured)</td></tr>
+<tr><td>Gloo distributed init</td><td>~1s</td><td>Establish Gloo mesh across 32 ranks (measured: ~1s without CPU contention)</td></tr>
+<tr><td>NeuronCore runtime init</td><td>5–20s</td><td>Firmware reset, device allocation via NRT (measured: 5–20s first init)</td></tr>
+<tr><td>NEFF kernel compilation</td><td>14–83s</td><td>Neuron compiler traces + compiles kernels (measured: ~9.2s/bucket; 8 buckets → ~14s cached, ~83s cold)</td></tr>
+<tr><td>NEFF kernel load + warmup</td><td>~18s</td><td>Load pre-compiled NEFF, profile, allocate KV cache (measured)</td></tr>
+<tr><td rowspan="3"><b>Weight loading</b></td>
+    <td>From local NVMe</td><td>~35s</td><td>Instance store NVMe aggregate ~4 GB/s for 139 GB (measured: ~1 GB/s per drive × 4 drives)</td></tr>
+<tr><td>From FSx for Lustre</td><td>70–140s</td><td>Shared bandwidth (~1 GB/s/TiB); degrades under concurrent access</td></tr>
+<tr><td>From S3</td><td>105–175s</td><td>Download to local disk (~2–3 GB/s, 50–70s) + load from disk (~35s); sequential</td></tr>
+<tr><td><b>Hardware init</b></td>
+    <td>Provisioning accelerator</td><td>~5min</td><td>Readying NeuronCores for new engine (e.g., ~5min in Mantle)</td></tr>
+<tr><td rowspan="3"><b>Total</b></td>
+    <td>Cold start (local NVMe)</td><td><b>~7min</b></td><td></td></tr>
+<tr><td>Cold start (FSx)</td><td><b>~8–9min</b></td><td></td></tr>
+<tr><td>Cold start (S3)</td><td><b>~9–10min</b></td><td></td></tr>
+</table>
 
 Weight loading dominates: reading 139 GB of Neuron-compiled checkpoint from disk is bounded by storage bandwidth. trn1.32xlarge has 4 instance store NVMe drives (~1 GB/s each, ~4 GB/s aggregate as measured by `dd iflag=direct`), giving a best-case load time of ~35s. In practice, checkpoint format overhead and 32-worker contention push this to 44s+. From networked storage (FSx/S3), it can exceed 2–3 minutes. Engine startup overhead (imports, worker spawn, Gloo init) adds another 15–23s before weight loading even begins.
 
@@ -43,28 +48,34 @@ We reduce cold-start latency from minutes to seconds through three key design pr
 
 **1. Decouple engine initialization from weight loading and compilation.** A traditional cold start serializes everything: process spawn → NRT init → compile → load weights → serve. We separate these concerns so that CPU-heavy work (Python imports, framework init, NEFF compilation) happens once at deployment time, not on the critical path of each scale-up event.
 
-**2. Standby engine pool with shared hardware.** Each instance hosts 100+ standby engines of different models sharing the same NeuronCores, with only one active at a time. This enables fast model switch among hundreds of models on a single instance. Every instance in the cluster independently initializes its own standby pool, so the number of instances that can serve any given model scales linearly with cluster size.
+**2. Standby engine pool with shared hardware.** Each instance hosts 100+ standby engines of different models sharing the same NeuronCores, with only one active at a time. This is made possible by the decoupling in principle 1: since sleeping engines hold only CPU-resident state (no device resources), hundreds can coexist on a single instance. Because the hardware is already provisioned and shared across all engines in the pool, scaling up a new model does not require provisioning new accelerator hardware — it simply switches which engine holds the NeuronCores. This eliminates the ~5min hardware init latency entirely. Every instance in the cluster independently initializes its own standby pool, so the number of instances that can serve any given model scales linearly with cluster size.
 
 **3. P2P RDMA weight transfer.** Instead of reading weights from disk (bounded by NVMe at ~4 GB/s) or network storage (FSx/S3), we push weights directly from an active engine's device memory over EFA (e.g., 800 Gbps on trn1.32xlarge). This reduces weight loading from 35–175s to ~2s and eliminates the requirement for a local checkpoint entirely.
 
-**Expected result**: Cold start drops from **3–5 minutes** to **< 10 seconds** for LLaMA-3-70B at TP=32.
+**Expected result**: Cold start drops from **8–10 minutes** to **< 10 seconds** for LLaMA-3-70B at TP=32.
 
 ### 2.2 System Overview
 
-Each instance in the cluster runs a **standby engine pool** — 100+ pre-initialized engines of different models sharing the same NeuronCores. Only one engine is active at a time; others sleep in a minimal state (zero device resources). An external scheduler orchestrates sleep/wake transitions via HTTP endpoints.
+#### 2.2.1 Standby Engine Pool
 
+A traditional cold start serializes every phase — hardware provisioning, software initialization, kernel compilation, and weight loading — into a single blocking pipeline. Each phase must complete before the next can begin, and every scale-up event pays the full cost from scratch. This makes on-demand scaling impractical for latency-sensitive serving.
 
 ```
 Traditional cold start (serialized):
 
 ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────┐ ┌───────┐
-│  Prior   │ │ Imports  │ │ NRT init │ │   NEFF   │ │ Weight load  │ │       │
-│  model   │→│ + spawn  │→│ + Gloo   │→│ compile  │→│ (from disk)  │→│ Serve │
-│ release  │ │  ~22s    │ │  ~6–21s  │ │ 5–30min  │ │   35–175s    │ │       │
-│  ~65s    │ │          │ │          │ │          │ │              │ │       │
+│ Hardware │ │ Imports  │ │ NRT init │ │   NEFF   │ │ Weight load  │ │       │
+│   init   │→│ + spawn  │→│ + Gloo   │→│ compile  │→│ (from disk)  │→│ Serve │
+│          │ │  ~22s    │ │  ~6–21s  │ │  ~83s    │ │   35–175s    │ │       │
+│  ~5min   │ │          │ │          │ │          │ │              │ │       │
 └──────────┘ └──────────┘ └──────────┘ └──────────┘ └──────────────┘ └───────┘
-                              Total: 3–5 minutes
+                              Total: 8–10 minutes
+```
 
+In our design, each instance in the cluster runs a **standby engine pool** — 100+ pre-initialized engines of different models sharing the same NeuronCores. Only one engine is active at a time; others sleep in a minimal state (zero device resources). Sleeping engines hold only CPU-resident state (Python process, compiled NEFFs in memory, framework metadata) and consume no NeuronCore or device memory resources. This makes it feasible to initialize hundreds of engines concurrently at deploy time — the bottleneck is CPU and host memory (~2.8 GB RAM per sleeping engine), not accelerator capacity.
+
+
+```
 Our approach (decoupled):
 
 ┌──────────────────────────────────────────────────────────────────────────┐
@@ -100,7 +111,7 @@ Our approach (decoupled):
 │  Model B (activating):                                                   │
 │  ┌────────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────┐  ┌──────┐  │
 │  │ Wait sleep │→ │ NRT init │→ │   Gloo   │→ │  P2P weight  │→ │Serve │  │
-│  │    ~2s     │  │  ~0.2s   │  │   init   │  │ transfer ~2s │  │      │  │
+│  │    ~2s     │  │          │  │   init   │  │ transfer ~2s │  │      │  │
 │  │            │  │          │  │   ~1s    │  └──────────────┘  └──────┘  │
 │  └────────────┘  └──────────┘  └──────────┘                              │
 │                                                                          │
@@ -108,7 +119,7 @@ Our approach (decoupled):
                         Total: ~5s
 ```
 
-
+An external scheduler orchestrates sleep/wake transitions via HTTP endpoints.
 We assume at least one engine of a given model is always active for serving. When scaling up that model, the active **sender engine** pushes weights directly into the standby **receiver engine's** device memory via per-rank RDMA writes over EFA. This is possible because model weights remain unchanged during inference — the sender's device memory always holds a valid, up-to-date copy that can be read at any time without coordination. This bypasses disk I/O entirely and allows the sender engine to continue serving requests during the transfer.
 
 
@@ -148,73 +159,85 @@ We assume at least one engine of a given model is always active for serving. Whe
 └────────────────────────┘                  └────────────────────────┘
 ```
 
-### 2.3 P2P Weight Transfer: Data Plane
+### 2.3 P2P Weight Transfer
 
-The data plane uses a custom RDMA library ("Relay") built on AWS EFA. Each TP rank on both sender and receiver has its own RDMA endpoint with up to 8 NIC contexts for parallelism. The sender pushes weights from device memory while continuing to serve inference — no downtime on the sender side.
+The data plane uses a custom RDMA library ("Relay") built on AWS EFA. Each TP rank on both sender and receiver has its own RDMA endpoint that distributes transfers across all available NICs for maximum bandwidth utilization. The sender pushes weights directly from device memory while continuing to serve inference — zero downtime on the sender side.
 
 **Transfer protocol (receiver-initiated):**
 
+The receiver orchestrates the entire transfer. It sends two HTTP requests to the sender: one to establish the RDMA connection, and one to trigger the weight push. The sender is purely reactive — it connects, writes, and returns. Only the RDMA WRITE moves bulk weight data; the HTTP calls carry only lightweight metadata (endpoint addresses, buffer descriptors).
+
 ```
-Receiver (standby engine waking up)               Sender (active engine)
-───────────────────────────────────               ──────────────────────
-1. POST /p2p_preconnect
-   (endpoint metadata)  ─────────────────────────▶ Start RDMA QP connect (~2s)
-                                                       │
-2. Register MRs (~2.3s)                               │ (overlapped)
-   ┌─────────────────────┐                            │
-   │ ibv_reg_mr() x 435  │                            ▼
-   │ buffers in chunks    │                       Connection established
-   └─────────────────────┘                            │
-                                                       │
-3. POST /p2p_push_weights                             │
-   (transfer descriptors) ────────────────────────────▶
-                                                       │
-                                                  4. RDMA WRITE (~0.6s)
-                          ◀════════════════════════════╡ (one-sided, no CPU
-                            Direct memory write         │  involvement on receiver)
-                                                       │
-5. Acknowledge writes                             5. Done (background thread)
-   (read-back forces                                   │
-    NRT cache coherence)                               │  Sender continues serving
-                                                       ▼  inference throughout
-6. Load cached NEFF kernels                       Return success
+         Receiver                                 Sender
+         ────────                                 ──────
+            │                                        │
+  ┌─────────┴────────────────────────────────────────┴────────────┐
+  │ Phase 1: Setup                                                │
+  │                                                               │
+  │  Receiver tells sender "here is my RDMA address, connect"     │
+  │                                                               │
+  │  Receiver: POST /preconnect ────────────────────▶ Sender      │
+  │                                                               │
+  │  Both sides work in parallel:                                 │
+  │    Receiver: register weight buffers with NIC                 │
+  │    Sender:   establish RDMA connection to receiver            │
+  │                                                               │
+  │  Sender: 200 OK ◀──────────────────────────────── Sender      │
+  └─────────┬────────────────────────────────────────┬────────────┘
+            │                                        │
+  ┌─────────┴────────────────────────────────────────┴────────────┐
+  │ Phase 2: Weight Transfer                                      │
+  │                                                               │
+  │  Receiver tells sender "push weights into these buffers"      │
+  │                                                               │
+  │  Receiver: POST /push_weights ──────────────────▶ Sender      │
+  │                                                               │
+  │  Sender performs one-sided RDMA WRITE:                        │
+  │    ◀═══════════════ weights (bulk data) ═══════════════       │
+  │    Written directly into receiver's device memory             │
+  │    No receiver CPU involvement during transfer                │
+  │                                                               │
+  │  Sender: 200 OK ◀──────────────────────────────── Sender      │
+  └─────────┬────────────────────────────────────────┬────────────┘
+            │                                        │
+  ┌─────────┴────────────────────────────────────────┴────────────┐
+  │ Phase 3: Cleanup (async, off critical path)                   │
+  │                                                               │
+  │  Receiver: deregister memory      Sender: close RDMA          │
+  │  regions in background            connection in background    │
+  │                                                               │
+  │  Neither side blocks — cleanup runs asynchronously while      │
+  │  both engines continue normal operation.                      │
+  └───────────────────────────────────────────────────────────────┘
 ```
 
 **Key design decisions:**
 
-- **One-sided RDMA WRITE**: The sender writes directly into the receiver's registered memory regions. No receiver CPU involvement during transfer — the receiver just waits for completion.
-- **Chunked MR registration**: EFA has per-device MR limits. We register buffers in chunks of 1024 to stay within limits while keeping registration fast.
-- **Overlapped connect + register**: The sender's 2.0s QP establishment runs in parallel with the receiver's 2.3s MR registration (via async HTTP preconnect). Critical path = max(2.0, 2.3) + 0.6s = ~2.9s.
-- **Non-blocking push**: The sender runs RDMA writes in a background thread per worker. The sender's inference loop is never blocked — zero stalls during transfer.
-- **Deferred resource cleanup**: After a push, MR deregistration and endpoint reset run asynchronously in the background (~63s), completely off the critical path.
+- **One-sided RDMA WRITE**: The sender writes directly into the receiver's registered memory regions. No receiver CPU involvement during transfer — the receiver simply waits for completion.
+- **Overlapped setup**: Connection establishment and memory registration run in parallel via an async preconnect phase. The critical path is the maximum of the two, not the sum.
+- **Non-blocking push**: The sender runs RDMA writes in a background thread. The inference loop is never blocked — the sender continues serving requests throughout the entire transfer.
+- **Deferred resource cleanup**: After transfer completes, connection teardown and memory deregistration run asynchronously in the background, completely off the critical path.
 
-### 2.4 Control Plane: Sleep/Wake Lifecycle
+### 2.4 Engine HTTP Endpoints
 
-Each engine exposes HTTP endpoints for lifecycle management:
+Each engine exposes HTTP endpoints for lifecycle management. These fall into two categories:
+
+**Scheduler-facing endpoints** — initiated by the LLM Serving Scheduler based on per-model workload metrics:
 
 | Endpoint | Action |
 |----------|--------|
 | `POST /nkipy/wake_up` | Allocate tensors, receive weights via P2P, reload kernels |
-| `POST /nkipy/sleep` | Deregister MRs, release NeuronCores, destroy Gloo |
-| `GET /nkipy/health` | Returns `{sleeping: true/false, ...}` |
-| `POST /nkipy/p2p_preconnect` | Early RDMA connection establishment |
-| `POST /nkipy/p2p_push_weights` | Trigger weight push from active engine |
+| `POST /nkipy/sleep` | Release NeuronCores, destroy Gloo, enter standby |
+| `GET /nkipy/health` | Returns engine state (sleeping/active) |
+
+**Internal endpoints** — used by the P2P weight transfer protocol between engines:
+
+| Endpoint | Action |
+|----------|--------|
+| `POST /nkipy/p2p_preconnect` | Exchange RDMA connection metadata (Phase 1) |
+| `POST /nkipy/p2p_push_weights` | Trigger one-sided RDMA weight write (Phase 2) |
 
 **Sleep state**: A sleeping engine holds ~2.8 GB of host memory (Python process + framework state) but **zero** device resources — NeuronCores are fully released and available for other engines.
-
-**Wake sequence (Qwen3-30B-A3B TP=32, measured from 100-engine test):**
-
-| Step | Qwen3-30B | LLaMA-3-70B | Description |
-|------|-----------|-------------|-------------|
-| Gloo init | 0.92s | 0.92s | Recreate distributed process group |
-| NRT init | 0.15s | 0.15s | NeuronCore runtime (skip firmware reset) |
-| Alloc tensors | 0.05s | 0.05s | Empty device memory for model weights |
-| P2P transfer | 3.23s | 4.95s | RDMA receive (1977 MB / 4350 MB per rank) |
-| RDMA ack | 0.63s | 0.67s | Read-back for NRT cache coherence |
-| Kernel load | 0.08s | 0.08s | Reload cached NEFF binaries from disk |
-| **Total** | **5.1s** | **7.0s** | |
-
-**Standby engine pool**: Multiple engines share the same NeuronCores. Only one is active at a time; others sleep. An external scheduler calls `/sleep` on the current engine and `/wake_up` on the next one.
 
 ### 2.5 Token Embedding: Sharding Optimization
 
