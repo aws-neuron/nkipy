@@ -125,7 +125,7 @@ class KernelGenIR:
     """
 
     def __init__(self, mlir_text, func_name, input_specs, output_specs,
-                 alias_map=None, user_return_len=None, param_name_by_neff=None):
+                 alias_map=None, user_return_len=None, original_param_names=None):
         self._mlir_text = mlir_text
         self._func_name = func_name
         self._input_specs = input_specs    # [(name, shape, dtype), ...]
@@ -133,8 +133,9 @@ class KernelGenIR:
         # alias_map: {output_index: (param_name, param_index)}
         self._alias_map = alias_map or {}
         self._user_return_len = user_return_len if user_return_len is not None else len(output_specs)
-        # Maps NEFF input names ("in_tensor_0") to original param names ("A")
-        self._param_name_by_neff = param_name_by_neff or {}
+        # Positionally aligned with _input_specs: original_param_names[i] is the
+        # user-facing parameter name for the i-th NEFF input ("in_tensor_i").
+        self._original_param_names = original_param_names or []
 
     @property
     def inputs(self):
@@ -171,25 +172,24 @@ class KernelGenIR:
         """Map NEFF input names to numpy arrays.
 
         NEFF inputs use ``in_tensor_N`` names.  *original_inputs* is keyed
-        by bare parameter names (``A``, ``B``).  ``_param_name_by_neff``
-        bridges the two.
+        by bare parameter names (``A``, ``B``).  ``_original_param_names``
+        (positionally aligned with ``_input_specs``) bridges the two.
         """
         if len(original_inputs) != len(self._input_specs):
             raise RuntimeError(
                 f"Expected {len(self._input_specs)} tensor arguments, "
                 f"got {len(original_inputs)}"
             )
-        mapping = {}
-        for intensor in self.inputs:
-            param_name = self._param_name_by_neff.get(intensor.name, intensor.name)
-            mapping[intensor.name] = original_inputs[param_name]
-        return mapping
+        return {
+            spec[0]: original_inputs[self._original_param_names[i]]
+            for i, spec in enumerate(self._input_specs)
+        }
 
     def get_alias_input_name(self, alias):
         """Return the NEFF input name for an aliased parameter."""
-        for neff_name, param_name in self._param_name_by_neff.items():
+        for i, param_name in enumerate(self._original_param_names):
             if param_name == alias.param_name:
-                return neff_name
+                return self._input_specs[i][0]
         return alias.param_name
 
     def content_hash(self, compiler_args: str) -> str:

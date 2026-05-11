@@ -360,13 +360,6 @@ class NKIPyKernel:
             for i, t in enumerate(result_kg_tensors)
         ]
 
-        # Map NEFF input names back to original parameter names so
-        # resolve_input_arrays can look up the right numpy arrays.
-        param_name_by_neff = {
-            f"in_tensor_{i}": name
-            for i, name in enumerate(arg_names)
-        }
-
         from nkipy.core.backend.kernelgen import KernelGenIR
 
         self._code = KernelGenIR(
@@ -376,7 +369,7 @@ class NKIPyKernel:
             output_specs=output_info,
             alias_map=alias_map,
             user_return_len=user_return_len,
-            param_name_by_neff=param_name_by_neff,
+            original_param_names=arg_names,
         )
         return self._code
 
