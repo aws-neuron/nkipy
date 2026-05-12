@@ -120,6 +120,9 @@ class NKIPyKernel:
 
     def _specialize_hlo(self, *args, **kwargs):
         """Trace the kernel with specific arguments."""
+        from nkipy.core.ops._register_hlo import register_all_hlo_impls
+
+        register_all_hlo_impls()
 
         code = HLOModule(name=self.func.__name__)
 

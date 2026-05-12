@@ -5,9 +5,9 @@
 Called lazily the first time the kernelgen backend is activated, so MLIR
 imports only happen when needed.
 
-Composed ops (floor_divide, tan, rint, etc.) reuse the HLO implementations
-since those are expressed purely in terms of Op-dispatched calls and work
-on any backend that has the primitives registered.
+Composed ops (floor_divide, tan, rint, etc.) use ``composed_impl`` on the
+Op itself and need no per-backend registration — they dispatch through
+other ops that have kernelgen primitives registered.
 """
 
 _registered = False
@@ -24,6 +24,8 @@ def register_all_kernelgen_impls():
     # --- Binary ops (primitives) ---
     from nkipy.core.ops.binary import (
         add, subtract, multiply, divide, power, maximum, minimum,
+        equal, not_equal, greater, greater_equal, less, less_equal,
+        bitwise_and, bitwise_or, bitwise_xor,
     )
     add.impl("kernelgen")(kernelgen_impls.add)
     subtract.impl("kernelgen")(kernelgen_impls.subtract)
@@ -32,24 +34,6 @@ def register_all_kernelgen_impls():
     power.impl("kernelgen")(kernelgen_impls.power)
     maximum.impl("kernelgen")(kernelgen_impls.maximum)
     minimum.impl("kernelgen")(kernelgen_impls.minimum)
-
-    # --- Binary ops (composed) — reuse HLO impls since they use Op dispatch ---
-    from nkipy.core.ops.binary import (
-        floor_divide, remainder, logaddexp,
-        logical_and, logical_or, logical_xor,
-    )
-    floor_divide.impl("kernelgen")(floor_divide._impls["hlo"])
-    remainder.impl("kernelgen")(remainder._impls["hlo"])
-    logaddexp.impl("kernelgen")(logaddexp._impls["hlo"])
-    logical_and.impl("kernelgen")(logical_and._impls["hlo"])
-    logical_or.impl("kernelgen")(logical_or._impls["hlo"])
-    logical_xor.impl("kernelgen")(logical_xor._impls["hlo"])
-
-    # --- Comparison / bitwise ops ---
-    from nkipy.core.ops.binary import (
-        equal, not_equal, greater, greater_equal, less, less_equal,
-        bitwise_and, bitwise_or, bitwise_xor,
-    )
     equal.impl("kernelgen")(kernelgen_impls.equal)
     not_equal.impl("kernelgen")(kernelgen_impls.not_equal)
     greater.impl("kernelgen")(kernelgen_impls.greater)
@@ -63,7 +47,7 @@ def register_all_kernelgen_impls():
     # --- Unary ops (primitives) ---
     from nkipy.core.ops.unary import (
         abs, exp, log, sqrt, sin, cos, tanh, ceil, floor, sign,
-        square, negative, reciprocal, logical_not,
+        negative, reciprocal, square, logical_not,
     )
     exp.impl("kernelgen")(kernelgen_impls.exp)
     log.impl("kernelgen")(kernelgen_impls.log)
@@ -79,21 +63,6 @@ def register_all_kernelgen_impls():
     reciprocal.impl("kernelgen")(kernelgen_impls.reciprocal)
     square.impl("kernelgen")(kernelgen_impls.square)
     logical_not.impl("kernelgen")(kernelgen_impls.logical_not)
-
-    # --- Unary ops (composed) — reuse HLO impls ---
-    from nkipy.core.ops.unary import (
-        log1p, log2, expm1, tan, clip, rint, trunc, round_, isnan, isfinite,
-    )
-    log1p.impl("kernelgen")(log1p._impls["hlo"])
-    log2.impl("kernelgen")(log2._impls["hlo"])
-    expm1.impl("kernelgen")(expm1._impls["hlo"])
-    tan.impl("kernelgen")(tan._impls["hlo"])
-    clip.impl("kernelgen")(clip._impls["hlo"])
-    rint.impl("kernelgen")(rint._impls["hlo"])
-    trunc.impl("kernelgen")(trunc._impls["hlo"])
-    round_.impl("kernelgen")(round_._impls["hlo"])
-    isnan.impl("kernelgen")(isnan._impls["hlo"])
-    isfinite.impl("kernelgen")(isfinite._impls["hlo"])
 
     # --- Linalg ops ---
     from nkipy.core.ops.linalg import matmul
