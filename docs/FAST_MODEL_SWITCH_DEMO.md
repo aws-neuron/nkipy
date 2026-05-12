@@ -253,10 +253,10 @@ Each engine exposes HTTP endpoints for lifecycle management. These fall into two
 
 ### 3.1 End-to-End Wake-Up Latency
 
-| Model | Traditional Cold Start | Our Approach | Speedup |
-|---|---|---|---|
-| LLaMA-3-70B (TP=32) | ~8 min | **7.0s** | **~69x** |
-| Qwen3-30B-A3B (TP=32) | ~6 min | **5.1s** | **~71x** |
+| Model | Traditional Cold Start | Our Approach |
+|---|---|---|
+| LLaMA-3-70B (TP=32) | ~8 min | **7.0s** |
+| Qwen3-30B-A3B (TP=32) | ~7 min | **5.1s** |
 
 ### 3.2 Sleep Latency
 
