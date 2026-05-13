@@ -71,18 +71,20 @@ cd nkipy
 # Install everything (Python packages + native extensions)
 make install
 
-# Or for additional features (examples, docs, testing):
-make install UV_SYNC_ARGS="--all-groups"
+# Or for a minimal install without optional groups (test, examples, vllm, docs):
+make install UV_SYNC_ARGS=""
 ```
 
 This will:
 - Create a `.venv` virtual environment
 - Install `nkipy`, `spike`, `relay`, and all dependencies (including `neuronx-cc` from the Neuron repository)
+- Install all optional dependency groups (test, examples, vllm, docs)
 - Build the Relay C++ extension (`_relay` pybind11 module)
 
-The `--all-groups` flag additionally installs:
+The default install includes these optional groups:
 - **test**: pytest, ruff, mypy for testing and linting
 - **examples**: torch, transformers, ipython for running examples
+- **vllm**: vllm, torch-neuronx, libneuronxla for serving with the NKIPy vLLM plugin
 - **docs**: sphinx and related tools for building documentation
 
 #### Manual Step-by-Step

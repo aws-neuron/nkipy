@@ -179,6 +179,8 @@ static inline std::vector<size_t> load_gpu_nic_map(
     mapping = &p5en_48xlarge;
   } else if (instance_type == "trn1.32xlarge") {
     mapping = &trn1_32xlarge;
+  } else if (instance_type.rfind("trn2", 0) == 0) {
+    return {};
   } else {
     LOG(WARNING) << "[RDMA] Unknown instance type: " << instance_type;
     return {};

@@ -1,6 +1,6 @@
 .PHONY: install sync relay clean
 
-UV_SYNC_ARGS ?=
+UV_SYNC_ARGS ?= --all-groups
 
 install: sync relay
 
