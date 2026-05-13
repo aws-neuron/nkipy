@@ -182,8 +182,8 @@ def receive_from_peer_staged(
     ep: RankEndpoint,
     buffers_with_tensors: Sequence[Tuple[str, int, int, object]],
     peer_url: str,
-    push_endpoint: str = "/p2p_push_weights",
-    preconnect_endpoint: str = "/p2p_preconnect",
+    push_endpoint: str = "/nkipy/p2p_push_weights",
+    preconnect_endpoint: str = "/nkipy/p2p_preconnect",
 ) -> None:
     """Host-staged receive: RDMA into host buffer, then DMA host->device.
 
@@ -272,7 +272,8 @@ def receive_from_peer_staged(
     spike.batch_dma_write(dma_ops)
     t_dma = time.time()
 
-    staging.close()
+    if not use_prereg:
+        staging.close()
     ep.dereg_async()
 
     elapsed = time.time() - t0
@@ -553,7 +554,8 @@ def push_weights_to_peer_staged(model, per_rank_info=None, chunk_start=None,
 
     t_done = time.time()
 
-    staging.close()
+    if prereg is None:
+        staging.close()
 
     elapsed = t_done - t0
     throughput_gbps = (total_size * 8) / elapsed / 1e9 if elapsed > 0 else 0

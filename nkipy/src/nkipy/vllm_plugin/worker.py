@@ -479,12 +479,17 @@ class NKIPyWorker(WorkerBase):
 
         if actual_peer:
             from relay import (
-                receive_from_peer, rank_endpoint, collect_weight_buffers,
+                receive_from_peer, receive_from_peer_staged,
+                rank_endpoint, collect_weight_buffers,
             )
-            bufs = collect_weight_buffers(model)
             t_collect = _time.time()
             try:
-                receive_from_peer(rank_endpoint, bufs, actual_peer)
+                if os.environ.get("NKIPY_HOST_STAGING", "0") == "1":
+                    bufs_with_tensors = model.weight_buffers_with_tensors()
+                    receive_from_peer_staged(rank_endpoint, bufs_with_tensors, actual_peer)
+                else:
+                    bufs = collect_weight_buffers(model)
+                    receive_from_peer(rank_endpoint, bufs, actual_peer)
             except Exception as e:
                 logger.error("Rank %d: P2P receive failed: %s — cleaning up", self.rank, e)
                 from spike import reset as spike_reset
