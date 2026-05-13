@@ -133,11 +133,13 @@ def _post_process_shard(shard, config):
             processed[f"{out}.o_weight"] = o.T
 
         # Norm weights
+        if f"{pfx}.input_layernorm.weight" in shard:
+            processed[f"{out}.input_weight"] = shard[f"{pfx}.input_layernorm.weight"]
+        if f"{pfx}.post_attention_layernorm.weight" in shard:
+            processed[f"{out}.post_attention_weight"] = shard[f"{pfx}.post_attention_layernorm.weight"]
         if f"{pfx}.self_attn.q_norm.weight" in shard:
             processed[f"{out}.q_norm_weight"] = shard[f"{pfx}.self_attn.q_norm.weight"]
             processed[f"{out}.k_norm_weight"] = shard[f"{pfx}.self_attn.k_norm.weight"]
-            processed[f"{out}.input_weight"] = shard[f"{pfx}.input_layernorm.weight"]
-            processed[f"{out}.post_attention_weight"] = shard[f"{pfx}.post_attention_layernorm.weight"]
 
         # Router
         if f"{pfx}.mlp.gate.weight" in shard:
