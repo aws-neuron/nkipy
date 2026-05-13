@@ -24,6 +24,7 @@ class HostStagingBuffer:
 
     Allocates a single large buffer that is sliced into sub-regions matching
     individual weight tensors. One ibv_reg_mr call covers the entire buffer.
+    Uses MAP_POPULATE to pre-fault pages, reducing ibv_reg_mr time significantly.
     """
 
     def __init__(self, total_size: int):

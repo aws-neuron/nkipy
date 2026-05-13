@@ -114,6 +114,38 @@ class NKIPyWorker(WorkerBase):
         prereg = PreregisteredStaging(sizes, relay_ep)
         rank_endpoint._sender_staging = prereg
 
+    def _preregister_receiver_staging(self):
+        """Pre-register host staging buffer for receiver to eliminate MR reg at wake time."""
+        import time as _time
+        from relay import rank_endpoint
+        from relay.staging import HostStagingBuffer, PreregisteredStaging, compute_offsets
+
+        t0 = _time.time()
+        sizes = self._model_class.compute_weight_sizes(self._config)
+        total_bytes = sum(sizes)
+        offsets = compute_offsets(sizes)
+
+        staging = HostStagingBuffer(total_bytes)
+        t_alloc = _time.time()
+
+        relay_ep = rank_endpoint._ensure_endpoint()
+        relay_ep.start_passive_accept()
+        xfer_descs = relay_ep.register_contiguous_buffer(
+            staging.ptr, total_bytes, offsets, sizes)
+        t_reg = _time.time()
+
+        prereg = PreregisteredStaging.__new__(PreregisteredStaging)
+        prereg.sizes = sizes
+        prereg.offsets = offsets
+        prereg.total_size = total_bytes
+        prereg.staging = staging
+        prereg.xfer_descs = xfer_descs
+        rank_endpoint._receiver_staging = prereg
+
+        if self.rank == 0:
+            logger.info("Pre-registered receiver staging: %.2f MB, alloc %.3fs, reg %.3fs",
+                        total_bytes / 1e6, t_alloc - t0, t_reg - t_alloc)
+
     @staticmethod
     def _release_neuron_cores():
         """Best-effort release of Neuron cores and P2P RDMA resources."""
@@ -347,6 +379,12 @@ class NKIPyWorker(WorkerBase):
         rank_endpoint.ep = None
         rank_endpoint.xfer_descs = []
         rank_endpoint.buf_info = []
+        # Clear cached staging buffers. Receiver staging has no active MRs
+        # (endpoint destroyed after each transfer). Sender staging has MRs.
+        if hasattr(rank_endpoint, '_receiver_staging'):
+            rank_endpoint._receiver_staging = None
+        if hasattr(rank_endpoint, '_sender_staging'):
+            rank_endpoint._sender_staging = None
         t_endpoint = _time.time()
 
         self._sleeping = True
@@ -506,7 +544,10 @@ class NKIPyWorker(WorkerBase):
                                     "total_s": round(_time.time() - t_start, 4)}}
             t_p2p = _time.time()
 
-            self._acknowledge_rdma_writes(model)
+            # With host-staged DMA, data integrity is guaranteed by the
+            # DMA engine. Skip the slow read-back acknowledgment.
+            if os.environ.get("NKIPY_HOST_STAGING", "0") != "1":
+                self._acknowledge_rdma_writes(model)
             t_ack = _time.time()
         else:
             # No peer - load weights from checkpoint

@@ -209,6 +209,36 @@ class Llama3Model:
         self.tok_embedding_device = DeviceTensor.allocate_uninitialized(
             (cfg.vocab_size, cols_per_rank), cfg.dtype, "tok_embedding")
 
+    @classmethod
+    def compute_weight_sizes(cls, config) -> list:
+        """Compute weight buffer sizes from config without allocating tensors."""
+        cfg = config
+        tp = dist.get_world_size()
+        n_local_kv_heads = max(1, cfg.num_kv_heads // tp)
+        n_local_heads = cfg.num_heads // tp
+        itemsize = np.dtype(cfg.dtype).itemsize
+
+        qkv_dim = (n_local_heads + 2 * n_local_kv_heads) * cfg.head_dim
+        shapes = {
+            "qkv_weight": (cfg.hidden_size, qkv_dim),
+            "o_weight": (n_local_heads * cfg.head_dim, cfg.hidden_size),
+            "gate_up_weight": (cfg.hidden_size, 2 * cfg.intermediate_size),
+            "down_weight": (cfg.intermediate_size, cfg.hidden_size),
+            "input_weight": (cfg.hidden_size,),
+            "post_attention_weight": (cfg.hidden_size,),
+        }
+
+        sizes = []
+        for lid in range(cfg.num_layers):
+            for wk, _ in LAYER_WEIGHT_KEYS:
+                sizes.append(int(np.prod(shapes[wk])) * itemsize)
+        # norm_weight, lm_head_weight, tok_embedding
+        sizes.append(cfg.hidden_size * itemsize)
+        sizes.append(cfg.hidden_size * (cfg.vocab_size // tp) * itemsize)
+        cols_per_rank = cfg.hidden_size // tp
+        sizes.append(cfg.vocab_size * cols_per_rank * itemsize)
+        return sizes
+
     def weight_buffers(self):
         """Yield (name, va, size_bytes) for all weight tensors (for P2P)."""
         for name, va, size, _ in self._iter_weights():

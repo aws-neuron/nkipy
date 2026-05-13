@@ -22,7 +22,7 @@
 #       --engine-a http://172.31.44.131:8000 --engine-b http://172.31.40.200:8000
 set -euo pipefail
 
-RDMA_WAIT=60
+RDMA_WAIT=5
 
 while [[ $# -gt 0 ]]; do
     case $1 in
