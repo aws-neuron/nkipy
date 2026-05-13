@@ -22,6 +22,7 @@ from .transfer import (
     push_weights_to_peer,
     rank_endpoint,
     receive_from_peer,
+    receive_from_peer_staged,
     receive_weights,
 )
 
@@ -36,6 +37,7 @@ __all__ = [
     "push_weights_to_peer",
     "rank_endpoint",
     "receive_from_peer",
+    "receive_from_peer_staged",
     "receive_weights",
 ]
 

@@ -178,6 +178,114 @@ def receive_from_peer(
         logger.info("Rank %d: Started async MR deregistration (%d MRs)", dist.get_rank(), len(ep.xfer_descs))
 
 
+def receive_from_peer_staged(
+    ep: RankEndpoint,
+    buffers_with_tensors: Sequence[Tuple[str, int, int, object]],
+    peer_url: str,
+    push_endpoint: str = "/p2p_push_weights",
+    preconnect_endpoint: str = "/p2p_preconnect",
+) -> None:
+    """Host-staged receive: RDMA into host buffer, then DMA host->device.
+
+    On Trn2, registering host memory for RDMA is much faster than device memory,
+    and RDMA to host achieves ~100+ Gbps vs ~3.5 Gbps to device.
+    """
+    from spike import get_spike_singleton
+    from .staging import HostStagingBuffer, compute_offsets
+
+    t0 = time.time()
+    sizes = [size for _, _, size, _ in buffers_with_tensors]
+    total_bytes = sum(sizes)
+    offsets = compute_offsets(sizes)
+
+    # Use pre-registered staging if available
+    prereg = getattr(ep, '_receiver_staging', None)
+    if prereg and prereg.total_size == total_bytes:
+        staging = prereg.staging
+        use_prereg = True
+    else:
+        staging = HostStagingBuffer(total_bytes)
+        use_prereg = False
+    t_alloc = time.time()
+
+    # Setup RDMA endpoint
+    ep.dereg_sync()
+    ep._ensure_endpoint()
+    ep.ep.start_passive_accept()
+
+    # Send endpoint metadata to sender for RDMA connect
+    meta_hex = ep.ep.get_metadata().hex()
+    gathered_meta = [None] * dist.get_world_size() if dist.get_rank() == 0 else None
+    dist.gather_object(meta_hex, gathered_meta, dst=0)
+    preconnect_future = None
+    if dist.get_rank() == 0:
+        import concurrent.futures
+        base = peer_url.rstrip("/")
+        _pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        preconnect_future = _pool.submit(
+            requests.post,
+            f"{base}{preconnect_endpoint}",
+            json={"per_rank": [{"remote_metadata": m} for m in gathered_meta]},
+        )
+        _pool.shutdown(wait=False)
+    t_preconnect = time.time()
+
+    # Register HOST staging buffer as single MR (fast) or use pre-registered
+    ep.buf_info = [(f"staged_{i}", sizes[i]) for i in range(len(sizes))]
+    if use_prereg:
+        ep.xfer_descs = prereg.xfer_descs
+    else:
+        ep.xfer_descs = ep.ep.register_contiguous_buffer(
+            staging.ptr, total_bytes, offsets, sizes)
+    if preconnect_future is not None:
+        preconnect_future.result()
+    t_reg = time.time()
+
+    # Send transfer descriptors to sender
+    serialized = ep.ep.get_serialized_descs(ep.xfer_descs)
+    my_info = (meta_hex, serialized.hex())
+    gathered = [None] * dist.get_world_size() if dist.get_rank() == 0 else None
+    dist.gather_object(my_info, gathered, dst=0)
+
+    if dist.get_rank() == 0:
+        base = peer_url.rstrip("/")
+        resp = requests.post(
+            f"{base}{push_endpoint}",
+            json={
+                "per_rank": [
+                    {"remote_metadata": m, "remote_descs": d}
+                    for m, d in gathered
+                ],
+                "chunk_start": None,
+                "chunk_end": None,
+                "is_last_chunk": True,
+            },
+        )
+        resp.raise_for_status()
+    dist.barrier()
+    t_rdma = time.time()
+
+    # Batch DMA from host staging to device (parallel)
+    spike = get_spike_singleton()
+    dma_ops = [(dt.tensor_ref, staging.slice_as_numpy(offsets[i], size))
+               for i, (name, va, size, dt) in enumerate(buffers_with_tensors)]
+    spike.batch_dma_write(dma_ops)
+    t_dma = time.time()
+
+    staging.close()
+    ep.dereg_async()
+
+    elapsed = time.time() - t0
+    throughput_gbps = (total_bytes * 8) / elapsed / 1e9 if elapsed > 0 else 0
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        logger.info(
+            "Rank %d: staged recv %d bufs %.2f MB — "
+            "alloc %.3fs preconnect %.3fs reg %.3fs rdma %.3fs dma %.3fs total %.3fs (%.2f Gbps)",
+            dist.get_rank(), len(buffers_with_tensors), total_bytes / 1e6,
+            t_alloc - t0, t_preconnect - t_alloc, t_reg - t_preconnect,
+            t_rdma - t_reg, t_dma - t_rdma, elapsed, throughput_gbps)
+
+
 def preconnect_to_peer(
     ep: RankEndpoint,
     per_rank_info: list | None = None,
@@ -337,10 +445,123 @@ def push_weights_to_peer(model, per_rank_info=None, chunk_start=None, chunk_end=
     When *chunk_start* / *chunk_end* are provided only that slice of
     buffers is registered and transferred (used by the chunked protocol).
     """
+    if os.environ.get("NKIPY_HOST_STAGING", "0") == "1":
+        push_weights_to_peer_staged(model, per_rank_info, chunk_start, chunk_end, is_last_chunk)
+        return
     bufs = collect_weight_buffers(model)
     if chunk_start is not None:
         bufs = bufs[chunk_start:chunk_end]
     push_to_peer(rank_endpoint, bufs, per_rank_info, is_last_chunk=is_last_chunk)
+
+
+def push_weights_to_peer_staged(model, per_rank_info=None, chunk_start=None,
+                                chunk_end=None, is_last_chunk=True) -> None:
+    """Host-staged push: DMA device->host, then RDMA host->remote_host.
+
+    On Trn2, direct device RDMA is ~3.5 Gbps/rank. Host RDMA is ~100+ Gbps/NIC.
+    This function copies device weights into a host staging buffer, then
+    does the RDMA transfer from host memory.
+    """
+    from spike import get_spike_singleton
+    from .staging import HostStagingBuffer, compute_offsets
+
+    bufs_with_tensors = model.weight_buffers_with_tensors()
+    if chunk_start is not None:
+        bufs_with_tensors = bufs_with_tensors[chunk_start:chunk_end]
+
+    sizes = [size for _, _, size, _ in bufs_with_tensors]
+    total_size = sum(sizes)
+    offsets = compute_offsets(sizes)
+
+    t0 = time.time()
+
+    # Use pre-registered staging if available, else allocate fresh
+    prereg = getattr(rank_endpoint, '_sender_staging', None)
+    if prereg and prereg.total_size == total_size:
+        staging = prereg.staging
+        xfer_descs = prereg.xfer_descs
+    else:
+        staging = HostStagingBuffer(total_size)
+        prereg = None
+        xfer_descs = None
+
+    # Register MRs as single contiguous MR (skip if pre-registered)
+    relay_ep = rank_endpoint._ensure_endpoint()
+    if xfer_descs is None:
+        rank_endpoint.xfer_descs = []
+        xfer_descs = relay_ep.register_contiguous_buffer(
+            staging.ptr, total_size, offsets, sizes)
+    rank_endpoint.xfer_descs = xfer_descs
+    rank_endpoint.buf_info = [(name, size) for name, _, size, _ in bufs_with_tensors]
+
+    # Connect to remote
+    remote_metadata_hex, remote_descs_hex = per_rank_info[dist.get_rank()]
+    ok, conn_id = relay_ep.add_remote_endpoint(bytes.fromhex(remote_metadata_hex))
+    assert ok, "Failed to connect to remote endpoint"
+    remote_descs = relay_ep.deserialize_descs(bytes.fromhex(remote_descs_hex))
+    assert len(remote_descs) == len(xfer_descs), (
+        f"desc mismatch: remote={len(remote_descs)} local={len(xfer_descs)}")
+
+    # Pipelined DMA + RDMA: overlap DMA[N+1] with RDMA[N]
+    spike = get_spike_singleton()
+    num_stages = int(os.environ.get("NKIPY_PIPELINE_STAGES", "4"))
+    n = len(bufs_with_tensors)
+    stage_size = (n + num_stages - 1) // num_stages
+
+    import concurrent.futures
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+    # Stage 0: DMA (blocking)
+    s0_end = min(stage_size, n)
+    dma_ops_0 = [(bufs_with_tensors[i][3].tensor_ref,
+                  staging.slice_as_numpy(offsets[i], sizes[i]))
+                 for i in range(s0_end)]
+    spike.batch_dma_read(dma_ops_0)
+
+    for stage in range(1, num_stages):
+        s_start = stage * stage_size
+        s_end = min(s_start + stage_size, n)
+        if s_start >= n:
+            break
+
+        # Start DMA for current stage in background
+        dma_ops_s = [(bufs_with_tensors[i][3].tensor_ref,
+                      staging.slice_as_numpy(offsets[i], sizes[i]))
+                     for i in range(s_start, s_end)]
+        dma_future = executor.submit(spike.batch_dma_read, dma_ops_s)
+
+        # RDMA write previous stage (overlapped with DMA)
+        prev_start = (stage - 1) * stage_size
+        prev_end = min(prev_start + stage_size, n)
+        ok, _ = relay_ep.transfer(
+            conn_id, "write",
+            xfer_descs[prev_start:prev_end],
+            remote_descs[prev_start:prev_end])
+        assert ok, f"RDMA write failed for stage {stage-1}"
+
+        dma_future.result()  # Wait for DMA to complete
+
+    # RDMA write last stage
+    last_start = (min(num_stages, (n + stage_size - 1) // stage_size) - 1) * stage_size
+    last_end = n
+    ok, _ = relay_ep.transfer(
+        conn_id, "write",
+        xfer_descs[last_start:last_end],
+        remote_descs[last_start:last_end])
+    assert ok, "RDMA write failed for last stage"
+    executor.shutdown(wait=False)
+
+    t_done = time.time()
+
+    staging.close()
+
+    elapsed = t_done - t0
+    throughput_gbps = (total_size * 8) / elapsed / 1e9 if elapsed > 0 else 0
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        logger.info("Rank %d: staged push (pipelined, %d stages) %d bufs %.2f MB — "
+                    "%.3fs (%.1f Gbps)",
+                    dist.get_rank(), num_stages, len(bufs_with_tensors),
+                    total_size / 1e6, elapsed, throughput_gbps)
 
 
 def fetch_tok_embedding(peer_url: str):

@@ -65,16 +65,8 @@ class NKIPyWorker(WorkerBase):
         import atexit
         import signal
 
-        import torch_neuronx  # noqa: F401 — registers neuron Runtime class
-
         core_offset = int(os.environ.get("NKIPY_CORE_OFFSET", "0"))
         os.environ["NEURON_RT_VISIBLE_CORES"] = str(self.local_rank + core_offset)
-
-        # Only claim neuron cores if we have weights to load.
-        # Sleep-mode engines defer core init to wake_up via get_spike_singleton().
-        if os.environ.get("NKIPY_CHECKPOINT"):
-            from spike import get_spike_singleton
-            get_spike_singleton()
 
         self.device = torch.device(f"neuron:{self.local_rank}")
 
@@ -93,6 +85,16 @@ class NKIPyWorker(WorkerBase):
         self._init_distributed()
         self._patch_get_accelerator()
 
+        import torch.distributed as dist
+        if dist.is_initialized():
+            dist.barrier()
+
+        # Only claim neuron cores if we have weights to load.
+        # Sleep-mode engines defer core init to wake_up via get_spike_singleton().
+        if os.environ.get("NKIPY_CHECKPOINT"):
+            from spike import get_spike_singleton
+            get_spike_singleton()
+
         from .model_runner import NKIPyModelRunner
 
         self.model_runner = NKIPyModelRunner(
@@ -100,6 +102,17 @@ class NKIPyWorker(WorkerBase):
         )
         set_random_seed(self.model_config.seed)
         logger.info("NKIPyWorker initialized: rank=%s device=%s", self.rank, self.device)
+
+    def _preregister_host_staging(self, model):
+        """Pre-allocate and register host staging buffer for P2P transfers."""
+        from relay import rank_endpoint, collect_weight_buffers
+        from relay.staging import PreregisteredStaging
+
+        bufs = collect_weight_buffers(model)
+        sizes = [size for _, _, size in bufs]
+        relay_ep = rank_endpoint._ensure_endpoint()
+        prereg = PreregisteredStaging(sizes, relay_ep)
+        rank_endpoint._sender_staging = prereg
 
     @staticmethod
     def _release_neuron_cores():
@@ -210,12 +223,13 @@ class NKIPyWorker(WorkerBase):
         if self._sleeping:
             self._destroy_gloo()
 
-        # Pre-register sender MRs so push_to_peer skips the 2.3s registration.
-        # Safe because dereg_async() runs after each push and we wait for it
-        # during sleep, so MRs are gone before spike_reset().
+        # Pre-register sender MRs for P2P push.
         if mr._nkipy_model is not None:
-            from relay import preregister_weights
-            preregister_weights(mr._nkipy_model)
+            if os.environ.get("NKIPY_HOST_STAGING", "0") == "1":
+                self._preregister_host_staging(mr._nkipy_model)
+            else:
+                from relay import preregister_weights
+                preregister_weights(mr._nkipy_model)
             if self.rank == 0:
                 logger.info("NKIPY: Pre-registered sender MRs")
 
@@ -592,9 +606,12 @@ class NKIPyWorker(WorkerBase):
             return {"status": "error", "message": "model not loaded"}
 
         info = [
-            (r["remote_metadata"], r["remote_descs"])
+            (r["remote_metadata"], r.get("remote_descs", ""))
             for r in per_rank_info
         ]
+        if self.rank == 0:
+            descs_lens = [len(r.get("remote_descs", "")) for r in per_rank_info]
+            logger.info("push_weights: rank0 received descs lens: %s (first 5)", descs_lens[:5])
 
         self._push_error = None
 

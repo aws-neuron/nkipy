@@ -146,3 +146,9 @@ class Spike:
 
     def get_tensor_info(self, model: NrtModel) -> ModelTensorInfo:
         """Get tensor information for a model"""
+
+    def batch_dma_read(self, ops: list) -> None:
+        """Batch DMA read: list of (tensor, buffer) tuples. Reads in parallel."""
+
+    def batch_dma_write(self, ops: list) -> None:
+        """Batch DMA write: list of (tensor, buffer) tuples. Writes in parallel."""

@@ -201,7 +201,7 @@ async def run_server(args: Namespace) -> None:
             hf_cfg = AutoConfig.from_pretrained(args.model)
             tp = getattr(args, "tensor_parallel_size", 1) or 1
             emb_bytes = hf_cfg.vocab_size * (hf_cfg.hidden_size // tp) * 2  # bf16
-            if emb_bytes > 500_000_000:
+            if emb_bytes > 0:
                 logger.info("tok_embedding shard too large for pre-cache (%.0f MB), will serve lazily",
                             emb_bytes / 1e6)
             else:

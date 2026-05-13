@@ -20,6 +20,11 @@ logger = logging.getLogger(__name__)
 # Importing torch_neuronx registers the PrivateUse1HooksInterface which is
 # required by torch.distributed.barrier() and other PyTorch internals.
 # This is the same approach used by vllm-neuron.
+# Enable HBM MR registration for RDMA on Trn2 (ibv_reg_mr on device memory).
+os.environ.setdefault("NEURON_RT_REGISTER_HBM_MR", "1")
+# Use host-staged RDMA transfers on Trn2 for higher throughput.
+# Direct device RDMA is ~3.5 Gbps/rank; host-staged achieves ~100+ Gbps/NIC.
+os.environ.setdefault("NKIPY_HOST_STAGING", "1")
 try:
     import torch_neuronx  # noqa: F401 — registers neuron backend
 except ImportError:

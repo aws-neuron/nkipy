@@ -636,6 +636,45 @@ PYBIND11_MODULE(_relay, m) {
           "conn_id_of_rank", &Endpoint::conn_id_of_rank,
           "Get the connection ID for a given peer rank (or UINT64_MAX if none)",
           py::arg("rank"))
+      .def(
+          "register_contiguous_buffer",
+          [](Endpoint& self, uint64_t base_ptr, size_t total_size,
+             std::vector<size_t> const& offsets,
+             std::vector<size_t> const& sizes) {
+            uint64_t mr_id;
+            bool ok;
+            {
+              py::gil_scoped_release release;
+              InsidePythonGuard guard;
+              ok = self.reg(reinterpret_cast<void const*>(base_ptr), total_size,
+                            mr_id);
+            }
+            if (!ok) return std::vector<XferDesc>{};
+
+            auto mhandle = self.get_mhandle(mr_id);
+            assert(mhandle != nullptr);
+
+            std::vector<XferDesc> descs;
+            descs.reserve(offsets.size());
+            for (size_t i = 0; i < offsets.size(); ++i) {
+              XferDesc desc;
+              desc.addr = reinterpret_cast<void const*>(base_ptr + offsets[i]);
+              desc.size = sizes[i];
+              desc.mr_id = mr_id;
+              for (size_t j = 0; j < kNICContextNumber; ++j) {
+                auto mr = mhandle->mr_array.getKeyByContextID(j);
+                assert(mr != nullptr);
+                desc.lkeys.push_back(mr->lkey);
+                desc.rkeys.push_back(mr->rkey);
+              }
+              descs.push_back(std::move(desc));
+            }
+            return descs;
+          },
+          "Register a contiguous buffer as a single MR and return per-sub-buffer "
+          "XferDescs. Much faster than register_memory for many small buffers.",
+          py::arg("base_ptr"), py::arg("total_size"), py::arg("offsets"),
+          py::arg("sizes"))
       .def("__repr__", [](Endpoint const& e) { return "<Relay Endpoint>"; });
 
 #ifdef RELAY_ENABLE_NRT

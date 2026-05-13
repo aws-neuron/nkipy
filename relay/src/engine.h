@@ -71,7 +71,7 @@ struct VectorUint8Hash {
 };
 
 class Endpoint {
-  static constexpr int kMaxInflightOps = 8;  // Max 8 concurrent Ops
+  static constexpr int kMaxInflightOps = 64;  // Max concurrent Ops in writev
 
  public:
   /* Create engine threads running in background for a single interface. It also

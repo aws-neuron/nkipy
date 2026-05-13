@@ -221,21 +221,28 @@ class Qwen3Model:
 
     def weight_buffers(self):
         """Yield (name, va, size_bytes) for all weight tensors (for P2P)."""
+        for name, va, size, _ in self._iter_weights():
+            yield name, va, size
+
+    def weight_buffers_with_tensors(self):
+        """Yield (name, va, size_bytes, device_tensor) for host-staged DMA."""
+        return list(self._iter_weights())
+
+    def _iter_weights(self):
         for lid, layer in enumerate(self.layer_tensors):
             for key, dt in layer.items():
                 if key in ("cache_k", "cache_v"):
                     continue
                 va = dt.tensor_ref.va
                 size = int(np.prod(dt.shape) * np.dtype(dt.dtype).itemsize)
-                yield f"layers.{lid}.{key}", va, size
+                yield f"layers.{lid}.{key}", va, size, dt
         for attr in ("norm_weight", "lm_head_weight", "tok_embedding_device"):
             dt = getattr(self, attr, None)
             if dt is not None:
                 va = dt.tensor_ref.va
                 size = int(np.prod(dt.shape) * np.dtype(dt.dtype).itemsize)
-                # Use "tok_embedding" as the name for compatibility
                 name = "tok_embedding" if attr == "tok_embedding_device" else attr
-                yield name, va, size
+                yield name, va, size, dt
 
     def _prepare_kernels(self):
         t = time.time()

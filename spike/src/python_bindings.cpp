@@ -10,6 +10,8 @@
 #include <cstring>
 #include <iostream>
 #include <sstream>
+#include <thread>
+#include <vector>
 
 #include "model.h"
 #include "spike.h"
@@ -217,5 +219,99 @@ NB_MODULE(_spike, m) {
 
       // Model introspection
       .def("get_tensor_info", &Spike::get_tensor_info, "model"_a,
-           "Get tensor information for a model");
+           "Get tensor information for a model")
+
+      .def(
+          "batch_dma_read",
+          [](Spike &self, nb::list ops) -> void {
+            // Extract all tensor/buffer/size tuples while holding GIL
+            struct DmaOp {
+              NrtTensor *tensor;
+              void *buf;
+              size_t size;
+            };
+            std::vector<DmaOp> dma_ops;
+            dma_ops.reserve(nb::len(ops));
+
+            for (size_t i = 0; i < nb::len(ops); ++i) {
+              nb::tuple t = nb::cast<nb::tuple>(ops[i]);
+              NrtTensor &tensor = nb::cast<NrtTensor &>(t[0]);
+              nb::object buffer = nb::borrow(t[1]);
+              Py_buffer py_buffer;
+              if (PyObject_GetBuffer(buffer.ptr(), &py_buffer,
+                                     PyBUF_WRITABLE) != 0) {
+                throw std::runtime_error("Buffer does not support writable protocol");
+              }
+              dma_ops.push_back({&tensor, py_buffer.buf, (size_t)py_buffer.len});
+              PyBuffer_Release(&py_buffer);
+            }
+
+            // Release GIL and do parallel DMA
+            {
+              nb::gil_scoped_release release;
+              const size_t n_threads = std::min(dma_ops.size(), (size_t)8);
+              std::vector<std::thread> threads;
+              size_t chunk = (dma_ops.size() + n_threads - 1) / n_threads;
+
+              for (size_t t = 0; t < n_threads; ++t) {
+                size_t start = t * chunk;
+                size_t end = std::min(start + chunk, dma_ops.size());
+                if (start >= end) break;
+                threads.emplace_back([&dma_ops, start, end]() {
+                  for (size_t i = start; i < end; ++i) {
+                    dma_ops[i].tensor->read(dma_ops[i].buf, dma_ops[i].size, 0);
+                  }
+                });
+              }
+              for (auto &th : threads) th.join();
+            }
+          },
+          "ops"_a,
+          "Batch DMA read: list of (tensor, buffer) tuples. Reads in parallel.")
+
+      .def(
+          "batch_dma_write",
+          [](Spike &self, nb::list ops) -> void {
+            struct DmaOp {
+              NrtTensor *tensor;
+              const void *buf;
+              size_t size;
+            };
+            std::vector<DmaOp> dma_ops;
+            dma_ops.reserve(nb::len(ops));
+
+            for (size_t i = 0; i < nb::len(ops); ++i) {
+              nb::tuple t = nb::cast<nb::tuple>(ops[i]);
+              NrtTensor &tensor = nb::cast<NrtTensor &>(t[0]);
+              nb::object buffer = nb::borrow(t[1]);
+              Py_buffer py_buffer;
+              if (PyObject_GetBuffer(buffer.ptr(), &py_buffer,
+                                     PyBUF_SIMPLE) != 0) {
+                throw std::runtime_error("Buffer does not support protocol");
+              }
+              dma_ops.push_back({&tensor, py_buffer.buf, (size_t)py_buffer.len});
+              PyBuffer_Release(&py_buffer);
+            }
+
+            {
+              nb::gil_scoped_release release;
+              const size_t n_threads = std::min(dma_ops.size(), (size_t)8);
+              std::vector<std::thread> threads;
+              size_t chunk = (dma_ops.size() + n_threads - 1) / n_threads;
+
+              for (size_t t = 0; t < n_threads; ++t) {
+                size_t start = t * chunk;
+                size_t end = std::min(start + chunk, dma_ops.size());
+                if (start >= end) break;
+                threads.emplace_back([&dma_ops, start, end]() {
+                  for (size_t i = start; i < end; ++i) {
+                    dma_ops[i].tensor->write(dma_ops[i].buf, dma_ops[i].size, 0);
+                  }
+                });
+              }
+              for (auto &th : threads) th.join();
+            }
+          },
+          "ops"_a,
+          "Batch DMA write: list of (tensor, buffer) tuples. Writes in parallel.");
 }

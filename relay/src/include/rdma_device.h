@@ -103,15 +103,21 @@ class RdmaDeviceManager {
 
     auto& result = same_numa.empty() ? all_devs : same_numa;
 
-    // Cap to kNICContextNumber (the max contexts the engine supports)
-    std::vector<size_t> capped(
-        result.begin(),
-        result.begin() +
-            std::min(result.size(), static_cast<size_t>(kNICContextNumber)));
+    // Distribute NICs across workers by rotating based on gpu_idx.
+    // Each worker gets kNICContextNumber NICs starting at a different offset
+    // to spread load across all available NICs.
+    size_t n = result.size();
+    size_t count = std::min(n, static_cast<size_t>(kNICContextNumber));
+    size_t offset = (gpu_idx * count) % n;
+    std::vector<size_t> selected;
+    for (size_t i = 0; i < count; ++i) {
+      selected.push_back(result[(offset + i) % n]);
+    }
 
     LOG(INFO) << "[RDMA] Discovered NIC map for GPU " << gpu_idx
-              << " (NUMA " << nc_numa << "): " << capped.size() << " NIC(s)";
-    return capped;
+              << " (NUMA " << nc_numa << "): " << selected.size()
+              << " NIC(s), offset " << offset;
+    return selected;
   }
 
   int get_numa_node(size_t id) {
