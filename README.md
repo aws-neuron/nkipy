@@ -68,21 +68,34 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 git clone https://github.com/aws-neuron/nkipy.git
 cd nkipy
 
-# Install all packages in editable mode
-uv sync
+# Install everything (Python packages + native extensions)
+make install
 
-# For additional features (examples, docs, testing):
-uv sync --all-groups
+# Or for additional features (examples, docs, testing):
+make install UV_SYNC_ARGS="--all-groups"
 ```
 
 This will:
 - Create a `.venv` virtual environment
 - Install `nkipy`, `spike`, `relay`, and all dependencies (including `neuronx-cc` from the Neuron repository)
+- Build the Relay C++ extension (`_relay` pybind11 module)
 
 The `--all-groups` flag additionally installs:
 - **test**: pytest, ruff, mypy for testing and linting
 - **examples**: torch, transformers, ipython for running examples
 - **docs**: sphinx and related tools for building documentation
+
+#### Manual Step-by-Step
+
+If you prefer to run each step individually:
+
+```bash
+# Install Python packages
+uv sync --all-groups
+
+# Build the Relay C++ extension (requires EFA and optionally NRT)
+make -C relay/src all
+```
 
 ### Running Commands
 

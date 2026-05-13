@@ -131,11 +131,23 @@ inline void RDMAChannelImpl::initQP(std::shared_ptr<RdmaContext> ctx,
   efa_attr.driver_qp_type = EFADV_QP_DRIVER_TYPE_SRD;
   efa_attr.sl = get_sl_from_env(SERVICE_LEVEL);
   efa_attr.flags = 0;
-  // If set, Receive WRs will not be consumed for RDMA write with imm.
-  efa_attr.flags |= EFADV_QP_FLAGS_UNSOLICITED_WRITE_RECV;
+
+  struct efadv_device_attr dev_attr = {};
+  if (efadv_query_device(ctx->getCtx(), &dev_attr, sizeof(dev_attr)) == 0 &&
+      (dev_attr.device_caps & EFADV_DEVICE_ATTR_CAPS_UNSOLICITED_WRITE_RECV)) {
+    efa_attr.flags |= EFADV_QP_FLAGS_UNSOLICITED_WRITE_RECV;
+  }
 
   *qp =
       efadv_create_qp_ex(ctx->getCtx(), &qp_attr, &efa_attr, sizeof(efa_attr));
+
+  if (!*qp && efa_attr.sl != 0) {
+    LOG(WARNING) << "[RDMA] QP creation failed with SL="
+                 << static_cast<int>(efa_attr.sl) << ", retrying with SL=0";
+    efa_attr.sl = 0;
+    *qp = efadv_create_qp_ex(ctx->getCtx(), &qp_attr, &efa_attr,
+                              sizeof(efa_attr));
+  }
 
   assert(*qp);
 
