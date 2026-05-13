@@ -68,6 +68,9 @@ class NKIPyWorker(WorkerBase):
         core_offset = int(os.environ.get("NKIPY_CORE_OFFSET", "0"))
         os.environ["NEURON_RT_VISIBLE_CORES"] = str(self.local_rank + core_offset)
 
+        if "NEURON_RT_ROOT_COMM_ID" not in os.environ:
+            os.environ["NEURON_RT_ROOT_COMM_ID"] = f"localhost:{61239 + core_offset}"
+
         self.device = torch.device(f"neuron:{self.local_rank}")
 
         # Ensure Neuron cores are released on exit / signal in worker processes.
@@ -89,11 +92,8 @@ class NKIPyWorker(WorkerBase):
         if dist.is_initialized():
             dist.barrier()
 
-        # Only claim neuron cores if we have weights to load.
-        # Sleep-mode engines defer core init to wake_up via get_spike_singleton().
-        if os.environ.get("NKIPY_CHECKPOINT"):
-            from spike import get_spike_singleton
-            get_spike_singleton()
+        from spike import get_spike_singleton
+        get_spike_singleton()
 
         from .model_runner import NKIPyModelRunner
 
