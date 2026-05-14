@@ -494,6 +494,66 @@ def push_weights_to_peer(model, per_rank_info=None, chunk_start=None, chunk_end=
     push_to_peer(rank_endpoint, bufs, per_rank_info, is_last_chunk=is_last_chunk)
 
 
+def start_pre_dma_to_staging(model) -> None:
+    """Start staged DMA device->host for all weights in background.
+
+    Called during preconnect so DMA overlaps with receiver MR registration
+    (~2s). Uses the same stage count as the push pipeline so partially-
+    completed DMA allows the push to start RDMA on ready stages immediately.
+
+    Only applicable when NKIPY_HOST_STAGING=1 (Trn2 path).
+    No-op if staging buffer is not pre-registered.
+    """
+    prereg = getattr(rank_endpoint, '_sender_staging', None)
+    if prereg is None:
+        return
+
+    # Don't start another pre-DMA if one is already in progress
+    if getattr(rank_endpoint, '_pre_dma_thread', None) is not None:
+        return
+
+    import threading
+    from spike import get_spike_singleton
+    from .staging import compute_offsets
+
+    all_bufs = model.weight_buffers_with_tensors()
+    all_sizes = [size for _, _, size, _ in all_bufs]
+    all_offsets = compute_offsets(all_sizes)
+    staging = prereg.staging
+    num_stages = int(os.environ.get("NKIPY_PIPELINE_STAGES", "4"))
+    n = len(all_bufs)
+    stage_size = (n + num_stages - 1) // num_stages
+
+    # Track per-stage completion for the push function to consume
+    stages_done = [False] * num_stages
+    rank_endpoint._pre_dma_stages_done = stages_done
+    rank_endpoint._pre_dma_num_stages = num_stages
+    rank_endpoint._pre_dma_stage_size = stage_size
+
+    def _bg_dma():
+        spike = get_spike_singleton()
+        for stage in range(num_stages):
+            s_start = stage * stage_size
+            s_end = min(s_start + stage_size, n)
+            if s_start >= n:
+                stages_done[stage] = True
+                continue
+            dma_ops = [(all_bufs[i][3].tensor_ref,
+                        staging.slice_as_numpy(all_offsets[i], all_sizes[i]))
+                       for i in range(s_start, s_end)]
+            spike.batch_dma_read(dma_ops)
+            stages_done[stage] = True
+
+    t = threading.Thread(target=_bg_dma, daemon=True)
+    t.start()
+    rank_endpoint._pre_dma_thread = t
+    rank_endpoint._pre_dma_time = time.time()
+
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        logger.info("Rank %d: started pre-DMA to staging (%.2f MB, %d stages)",
+                    dist.get_rank(), sum(all_sizes) / 1e6, num_stages)
+
+
 def push_weights_to_peer_staged(model, per_rank_info=None, chunk_start=None,
                                 chunk_end=None, is_last_chunk=True) -> None:
     """Host-staged push: DMA device->host, then RDMA host->remote_host.
@@ -501,6 +561,9 @@ def push_weights_to_peer_staged(model, per_rank_info=None, chunk_start=None,
     On Trn2, direct device RDMA is ~3.5 Gbps/rank. Host RDMA is ~100+ Gbps/NIC.
     This function copies device weights into a host staging buffer, then
     does the RDMA transfer from host memory.
+
+    If start_pre_dma_to_staging() was called during preconnect, the DMA is
+    already complete (or nearly so) and we skip straight to RDMA.
 
     Supports chunked transfer: when chunk_start/chunk_end are provided, only
     that slice is transferred using the pre-registered full staging buffer.
@@ -519,6 +582,13 @@ def push_weights_to_peer_staged(model, per_rank_info=None, chunk_start=None,
         bufs_with_tensors = all_bufs
 
     t0 = time.time()
+
+    # Check if pre-DMA was started during preconnect.
+    # _pre_dma_done is set after the thread completes and persists across
+    # chunked calls so subsequent chunks also skip the DMA pipeline.
+    pre_dma_thread = getattr(rank_endpoint, '_pre_dma_thread', None)
+    pre_dma_done = getattr(rank_endpoint, '_pre_dma_done', False)
+    pre_dma_started = pre_dma_thread is not None or pre_dma_done
 
     # Use pre-registered staging for the FULL model buffer
     prereg = getattr(rank_endpoint, '_sender_staging', None)
@@ -561,6 +631,44 @@ def push_weights_to_peer_staged(model, per_rank_info=None, chunk_start=None,
         remote_descs = all_remote_descs
     assert len(remote_descs) == len(xfer_descs), (
         f"desc mismatch: remote={len(remote_descs)} local={len(xfer_descs)}")
+
+    # If pre-DMA was started during preconnect, wait for full completion then
+    # RDMA the entire chunk at once. Sending RDMA while DMA is still running
+    # causes PCIe bus contention that drops throughput from ~32 Gbps to ~9 Gbps.
+    if pre_dma_started:
+        pre_dma_elapsed = time.time() - getattr(rank_endpoint, '_pre_dma_time', t0)
+
+        # Wait for the background DMA thread to finish ALL stages
+        if pre_dma_thread is not None:
+            pre_dma_thread.join()
+            rank_endpoint._pre_dma_thread = None
+            rank_endpoint._pre_dma_done = True
+        t_dma_ready = time.time()
+        dma_wait = t_dma_ready - t0
+
+        # Single RDMA write for the entire chunk (no contention = full speed)
+        ok, _ = relay_ep.transfer(conn_id, "write", xfer_descs, remote_descs)
+        assert ok, "RDMA write failed (pre-DMA path)"
+
+        if is_last_chunk:
+            rank_endpoint._pre_dma_done = False
+            rank_endpoint._pre_dma_stages_done = None
+        t_done = time.time()
+
+        if prereg is None:
+            staging.close()
+
+        elapsed = t_done - t0
+        rdma_time = t_done - t_dma_ready
+        throughput_gbps = (total_size * 8) / rdma_time / 1e9 if rdma_time > 0 else 0
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            logger.info("Rank %d: staged push (pre-DMA) %d bufs %.2f MB — "
+                        "dma_wait %.3fs rdma %.3fs total %.3fs (%.1f Gbps) "
+                        "[pre-DMA started %.1fs ago]",
+                        dist.get_rank(), len(bufs_with_tensors), total_size / 1e6,
+                        dma_wait, rdma_time,
+                        elapsed, throughput_gbps, pre_dma_elapsed)
+        return
 
     # Pipelined DMA + RDMA: overlap DMA[N+1] with RDMA[N]
     spike = get_spike_singleton()

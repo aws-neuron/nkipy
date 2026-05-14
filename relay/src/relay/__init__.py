@@ -24,6 +24,7 @@ from .transfer import (
     receive_from_peer,
     receive_from_peer_staged,
     receive_weights,
+    start_pre_dma_to_staging,
 )
 
 __all__ = [
@@ -39,6 +40,7 @@ __all__ = [
     "receive_from_peer",
     "receive_from_peer_staged",
     "receive_weights",
+    "start_pre_dma_to_staging",
 ]
 
 __version__ = "0.0.1.post4"

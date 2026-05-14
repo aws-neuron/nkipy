@@ -385,6 +385,10 @@ class NKIPyWorker(WorkerBase):
             rank_endpoint._receiver_staging = None
         if hasattr(rank_endpoint, '_sender_staging'):
             rank_endpoint._sender_staging = None
+        # Clear pre-DMA state from previous push cycles
+        rank_endpoint._pre_dma_thread = None
+        rank_endpoint._pre_dma_done = False
+        rank_endpoint._pre_dma_time = None
         t_endpoint = _time.time()
 
         self._sleeping = True
@@ -452,6 +456,19 @@ class NKIPyWorker(WorkerBase):
             return {"status": "already_awake"}
 
         t_start = _time.time()
+
+        # Signal sender to start device->host DMA immediately (fire-and-forget).
+        # This gives the sender ~4s head start (gloo_init + alloc + mr_reg)
+        # so DMA is complete before the actual push request arrives.
+        if (peer_url and self.rank == 0
+                and os.environ.get("NKIPY_HOST_STAGING", "0") == "1"):
+            import requests as _req
+            import concurrent.futures
+            _prepare_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            _prepare_pool.submit(
+                _req.post, f"{peer_url.rstrip('/')}/nkipy/p2p_prepare", timeout=5
+            )
+            _prepare_pool.shutdown(wait=False)
 
         from spike import get_spike_singleton
         from nkipy.runtime import DeviceKernel
@@ -624,6 +641,22 @@ class NKIPyWorker(WorkerBase):
             logger.info("wake_up latency breakdown (rank %d): %s", self.rank, latency)
             print(f"wake_up latency breakdown (rank {self.rank}): {latency}", flush=True)
         return {"status": "awake", "latency": latency}
+
+    def nkipy_prepare_push(self) -> dict:
+        """Start device->host DMA early, before RDMA connection is established.
+
+        Called at the very beginning of the receiver's wake_up flow so DMA
+        overlaps with gloo_init + alloc + MR_reg (~4s). By the time the
+        actual push_weights request arrives, all data is in host staging.
+        """
+        if os.environ.get("NKIPY_HOST_STAGING", "0") != "1":
+            return {"status": "skipped"}
+        model = self.model_runner._nkipy_model
+        if model is None:
+            return {"status": "skipped"}
+        from relay import start_pre_dma_to_staging
+        start_pre_dma_to_staging(model)
+        return {"status": "preparing"}
 
     def nkipy_preconnect(self, per_rank_info: list[dict]) -> dict:
         """Establish RDMA connection to receiver ahead of push."""

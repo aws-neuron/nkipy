@@ -128,6 +128,12 @@ def register_nkipy_routes(app: FastAPI) -> None:
         finally:
             _nkipy_transitioning = False
 
+    @app.post("/nkipy/p2p_prepare")
+    async def p2p_prepare():
+        core = _get_engine_core(app)
+        await core.collective_rpc_async("nkipy_prepare_push")
+        return JSONResponse({"status": "preparing"})
+
     @app.post("/nkipy/p2p_preconnect")
     async def p2p_preconnect(request: Request):
         body = await request.json()
