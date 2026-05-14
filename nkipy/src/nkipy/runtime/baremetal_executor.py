@@ -9,6 +9,7 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 
+from nkipy.core.backend import prepare_io_mapping
 from nkipy.runtime.device_kernel import DeviceKernel
 from nkipy.runtime.device_tensor import DeviceTensor
 
@@ -72,7 +73,7 @@ class BaremetalExecutor:
 
         # Prepare inputs using DeviceTensor
         ir = compiled_kernel.ir
-        input_arrays = ir.resolve_input_arrays(original_inputs)
+        input_arrays, alias_input_names = prepare_io_mapping(ir.inputs, ir.aliases, original_inputs)
         inputs = {
             name: DeviceTensor.from_numpy(arr)
             for name, arr in input_arrays.items()
@@ -82,12 +83,9 @@ class BaremetalExecutor:
         outputs = device_kernel.allocate_output_tensors()
         outputs_dict = {t.name: t for t in outputs}
 
-        alias_by_output = {a.output_index: a for a in ir.aliases}
         for i, outtensor in enumerate(ir.outputs):
-            if i in alias_by_output:
-                alias = alias_by_output[i]
-                input_name = ir.get_alias_input_name(alias)
-                outputs_dict[outtensor.name] = inputs[input_name]
+            if i in alias_input_names:
+                outputs_dict[outtensor.name] = inputs[alias_input_names[i]]
 
         return inputs, outputs_dict, original_inputs
 

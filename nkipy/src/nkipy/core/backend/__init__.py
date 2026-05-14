@@ -30,11 +30,17 @@ class TensorPlaceholder:
         name: Identifier used to key this tensor in input/output dicts at runtime.
         shape: Static shape of the tensor.
         dtype: NumPy dtype of the tensor elements.
+        original_name: User-facing parameter name. Defaults to *name* when not set.
     """
 
     name: str
     shape: Tuple[int, ...]
     dtype: np.dtype
+    original_name: Optional[str] = None
+
+    def __post_init__(self):
+        if self.original_name is None:
+            self.original_name = self.name
 
 
 @dataclass(frozen=True)
@@ -81,19 +87,43 @@ class ComputationIR(Protocol):
         """Output indices implicitly appended for write-back, not user-returned."""
         ...
 
-    def resolve_input_arrays(
-        self, original_inputs: Dict[str, np.ndarray]
-    ) -> Dict[str, np.ndarray]:
-        """Map parameter names to backend-specific input names."""
-        ...
-
-    def get_alias_input_name(self, alias: AliasInfo) -> str:
-        """Return the backend input name for an aliased parameter."""
-        ...
-
     def content_hash(self, compiler_args: str) -> str:
         """Deterministic hash of IR content and compiler flags for caching."""
         ...
+
+
+def prepare_io_mapping(
+    inputs: List[TensorPlaceholder],
+    aliases: List[AliasInfo],
+    original_inputs: Dict[str, np.ndarray],
+) -> Tuple[Dict[str, np.ndarray], Dict[int, str]]:
+    """Map parameter names to backend-specific input names and resolve aliases.
+
+    Args:
+        inputs: IR input placeholders (from ``ir.inputs``).
+        aliases: IR alias pairs (from ``ir.aliases``).
+        original_inputs: User-provided arrays keyed by parameter name.
+
+    Returns:
+        A tuple of (input_arrays, alias_input_names) where:
+        - input_arrays maps backend IR input names to numpy arrays.
+        - alias_input_names maps output index to the IR input name that the
+          aliased output should share a buffer with.
+    """
+    if len(original_inputs) != len(inputs):
+        raise RuntimeError(
+            f"Expected {len(inputs)} tensor arguments, "
+            f"got {len(original_inputs)}"
+        )
+    input_arrays = {
+        inp.name: original_inputs[inp.original_name]
+        for inp in inputs
+    }
+    alias_input_names = {
+        alias.output_index: inputs[alias.param_index].name
+        for alias in aliases
+    }
+    return input_arrays, alias_input_names
 
 
 # ---------------------------------------------------------------------------

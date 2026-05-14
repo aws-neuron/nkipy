@@ -343,7 +343,13 @@ class HLOModule:
     def inputs(self) -> List[TensorPlaceholder]:
         """Return parameters as inputs for compatibility with IR Function interface."""
         return [
-            TensorPlaceholder(name=p.name, shape=p.shape, dtype=p.dtype)
+            TensorPlaceholder(
+                name=p.name,
+                shape=p.shape,
+                dtype=p.dtype,
+                # Neuron compiler appends ".must_alias_input" to mutated params
+                original_name=p.name.split(".must_alias_input")[0],
+            )
             for p in self.parameters
         ]
 
@@ -358,26 +364,6 @@ class HLOModule:
             )
             for r in self.results
         ]
-
-    def resolve_input_arrays(self, original_inputs):
-        """Map IR input names to numpy arrays.
-
-        HLO input names are parameter names, possibly suffixed with
-        ``.must_alias_input`` for mutated parameters.  Both forms are
-        resolved against *original_inputs* (keyed by bare parameter name).
-        """
-        mapping = {}
-        for intensor in self.inputs:
-            if ".must_alias_input" in intensor.name:
-                base_name = intensor.name.split(".must_alias_input")[0]
-            else:
-                base_name = intensor.name
-            mapping[intensor.name] = original_inputs[base_name]
-        return mapping
-
-    def get_alias_input_name(self, alias):
-        """Return the IR input name that an aliased output should share."""
-        return f"{alias.param_name}.must_alias_input"
 
     def add_parameter(
         self, shape: Tuple[int, ...], dtype: np.dtype, name: str = ""

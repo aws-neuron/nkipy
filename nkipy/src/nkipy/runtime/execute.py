@@ -11,7 +11,7 @@ import shutil
 import numpy as np
 
 from nkipy.core import compile
-from nkipy.core.backend import ComputationIR
+from nkipy.core.backend import ComputationIR, prepare_io_mapping
 
 try:
     from nkipy.runtime.device_kernel import DeviceKernel
@@ -88,10 +88,8 @@ def _execute_neff(neff, name, ir: ComputationIR, original_inputs, save_trace=Fal
 
     device_kernel = DeviceKernel.load_from_neff(neff, name)
 
-    # Build alias lookup: output_index -> AliasInfo
-    alias_by_output = {a.output_index: a for a in ir.aliases}
-
-    input_arrays = ir.resolve_input_arrays(original_inputs)
+    ir_inputs = ir.inputs
+    input_arrays, alias_input_names = prepare_io_mapping(ir_inputs, ir.aliases, original_inputs)
     device_inputs = {
         input_name: DeviceTensor.from_numpy(arr)
         for input_name, arr in input_arrays.items()
@@ -99,10 +97,8 @@ def _execute_neff(neff, name, ir: ComputationIR, original_inputs, save_trace=Fal
 
     device_outputs = {}
     for i, outtensor in enumerate(ir.outputs):
-        if i in alias_by_output:
-            alias = alias_by_output[i]
-            input_name = ir.get_alias_input_name(alias)
-            device_outputs[outtensor.name] = device_inputs[input_name]
+        if i in alias_input_names:
+            device_outputs[outtensor.name] = device_inputs[alias_input_names[i]]
         else:
             np_output = np.zeros(outtensor.shape, dtype=outtensor.dtype)
             device_outputs[outtensor.name] = DeviceTensor.from_numpy(np_output)
@@ -110,6 +106,7 @@ def _execute_neff(neff, name, ir: ComputationIR, original_inputs, save_trace=Fal
     device_kernel(inputs=device_inputs, outputs=device_outputs, save_trace=save_trace)
 
     output_arrays = {}
+    alias_by_output = {a.output_index: a for a in ir.aliases}
     for i, outtensor in enumerate(ir.outputs):
         result = device_outputs[outtensor.name].numpy()
         if i in alias_by_output:

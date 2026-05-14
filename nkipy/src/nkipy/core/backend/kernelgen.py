@@ -140,7 +140,10 @@ class KernelGenIR:
     @property
     def inputs(self):
         """Return input tensor metadata as ``TensorPlaceholder`` list."""
-        return [TensorPlaceholder(n, tuple(s), np.dtype(d)) for n, s, d in self._input_specs]
+        return [
+            TensorPlaceholder(n, tuple(s), np.dtype(d), original_name=self._original_param_names[i])
+            for i, (n, s, d) in enumerate(self._input_specs)
+        ]
 
     @property
     def outputs(self):
@@ -167,30 +170,6 @@ class KernelGenIR:
             out_idx for out_idx in self._alias_map
             if out_idx >= self._user_return_len
         }
-
-    def resolve_input_arrays(self, original_inputs):
-        """Map NEFF input names to numpy arrays.
-
-        NEFF inputs use ``in_tensor_N`` names.  *original_inputs* is keyed
-        by bare parameter names (``A``, ``B``).  ``_original_param_names``
-        (positionally aligned with ``_input_specs``) bridges the two.
-        """
-        if len(original_inputs) != len(self._input_specs):
-            raise RuntimeError(
-                f"Expected {len(self._input_specs)} tensor arguments, "
-                f"got {len(original_inputs)}"
-            )
-        return {
-            spec[0]: original_inputs[self._original_param_names[i]]
-            for i, spec in enumerate(self._input_specs)
-        }
-
-    def get_alias_input_name(self, alias):
-        """Return the NEFF input name for an aliased parameter."""
-        for i, param_name in enumerate(self._original_param_names):
-            if param_name == alias.param_name:
-                return self._input_specs[i][0]
-        return alias.param_name
 
     def content_hash(self, compiler_args: str) -> str:
         """Compute a content hash from the MLIR text and compiler args."""
