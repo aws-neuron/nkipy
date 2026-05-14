@@ -345,10 +345,9 @@ class NKIPyKernel:
         mlir_text = kctx._get_ir_text()
         kctx._cleanup()
 
-        # Use NEFF-compatible names: the kernelgen NEFF uses "in_tensor_N"
-        # for inputs and "output" / "output_N" for outputs (determined by the
-        # NKI compiler C++ pipeline from unnamed MLIR block arguments and the
-        # nki.output_names attribute set by the linalg-to-nisa pass).
+        # BIR emission assigns "in_tensor_N" for inputs and "output" /
+        # "output_N" for outputs regardless of caller-provided names, so IR
+        # input specs must match what the NEFF will contain.
         num_outputs = len(result_kg_tensors)
         input_info = [
             (f"in_tensor_{i}", shape, dtype)
