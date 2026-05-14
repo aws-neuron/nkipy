@@ -110,7 +110,7 @@ Our approach (decoupled):
 │                                                                          │
 │  Model B (activating):                                                   │
 │  ┌────────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────┐  ┌──────┐  │
-│  │ Wait sleep │→ │ NRT init │→ │   Gloo   │→ │  P2P weight  │→ │Serve │  │
+│  │ Wait sleep │→ │NRT switch│→ │   Gloo   │→ │  P2P weight  │→ │Serve │  │
 │  │    ~2s     │  │          │  │   init   │  │ transfer ~2s │  │      │  │
 │  │            │  │          │  │   ~1s    │  └──────────────┘  └──────┘  │
 │  └────────────┘  └──────────┘  └──────────┘                              │
@@ -119,8 +119,9 @@ Our approach (decoupled):
                         Total: ~5s
 ```
 
-An external scheduler orchestrates sleep/wake transitions via HTTP endpoints.
-We assume at least one engine of a given model is always active for serving. When scaling up that model, the active **sender engine** pushes weights directly into the standby **receiver engine's** device memory via per-rank RDMA writes over EFA. This is possible because model weights remain unchanged during inference — the sender's device memory always holds a valid, up-to-date copy that can be read at any time without coordination. This bypasses disk I/O entirely and allows the sender engine to continue serving requests during the transfer.
+The wake-up path in our approach uses **NRT switch** rather than the full **NRT init** required in traditional cold starts. NRT init performs a complete firmware reset of NeuronCores — zeroing device memory, reinitializing hardware state, and reprovisioning the runtime — which takes 5–20s. In the traditional approach, NRT init is unavoidable because the prior core state is unknown: the previous engine may have crashed, been force-killed, or left stale data in device memory. Without a full reset, subsequent computations risk reading corrupted weights or residual state from the previous tenant, producing silently incorrect inference results. NRT switch bypasses the firmware reset entirely because the standby pool guarantees that cores were left in a known-good state by the previous engine's clean shutdown (`nrt_close()`). The result is a 0.2s device acquisition instead of a 5–20s reboot. This optimization is only possible because our standby pool design controls the full engine lifecycle: every sleep performs a clean release, so every subsequent wake can safely skip the reset.
+
+An external scheduler orchestrates sleep/wake transitions via HTTP endpoints. We assume at least one engine of a given model is always active for serving. When scaling up that model, the active **sender engine** pushes weights directly into the standby **receiver engine's** device memory via per-rank RDMA writes over EFA. This is possible because model weights remain unchanged during inference — the sender's device memory always holds a valid, up-to-date copy that can be read at any time without coordination. This bypasses disk I/O entirely and allows the sender engine to continue serving requests during the transfer.
 
 
 ```
@@ -195,7 +196,6 @@ The receiver orchestrates the entire transfer. It sends two HTTP requests to the
   │  Sender performs one-sided RDMA WRITE:                        │
   │    ◀═══════════════ weights (bulk data) ═══════════════       │
   │    Written directly into receiver's device memory             │
-  │    No receiver CPU involvement during transfer                │
   │                                                               │
   │  Sender: 200 OK ◀──────────────────────────────── Sender      │
   └─────────┬────────────────────────────────────────┬────────────┘
@@ -243,7 +243,7 @@ Each engine exposes HTTP endpoints for lifecycle management. These fall into two
 
 **Why traditional schedulers cannot reschedule at runtime.** The fundamental issue is initialization latency. Every time NeuronCores are reallocated to a different model, the new engine must go through software initialization (imports, NRT init, NEFF compilation, weight loading) — 2–3 minutes during which the NeuronCores sit idle, unable to serve any traffic. This 2–3 minute reallocation time exceeds the timescale of traffic fluctuations — by the time a new engine is ready, the traffic burst that triggered it has likely subsided. Reactive scheduling is therefore pointless, and the scheduler cannot respond to real-time demand. Instead, traditional infrastructure (e.g., Mantle) avoids rescheduling entirely by provisioning dedicated hardware for each model ahead of time, incurring ~5 minutes of hardware provisioning latency. The scheduler is trapped: provision conservatively and risk under-serving during traffic spikes, or provision aggressively and pay for idle resources that were allocated for demand that never materialized.
 
-**Why our approach enables real-time rescheduling.** Our system reduces the reallocation cost from 2–3 minutes to ~5 seconds. Because initialization is decoupled from the wake-up path (done once at deploy time), switching NeuronCores to a different model only requires NRT init (~0.2s), Gloo init (~1s), and P2P weight transfer (~2–4s). The fundamental change is that 5 seconds is shorter than the timescale of traffic fluctuations. Traffic bursts typically last tens of seconds to minutes — with a 5-second reallocation, the scheduler can observe a spike, reallocate, and begin serving before the burst subsides. With a 3-minute reallocation, the burst is likely over before the new engine is ready, making reactive scheduling pointless. This is what transforms scheduling from a prediction problem into a reaction problem: the reallocation latency is now below the response threshold, so the scheduler can act on observed demand rather than forecasted demand.
+**Why our approach enables real-time rescheduling.** Our system reduces the reallocation cost from 2–3 minutes to ~5 seconds. Because initialization is decoupled from the wake-up path (done once at deploy time), switching NeuronCores to a different model only requires NRT switch (~0.2s), Gloo init (~1s), and P2P weight transfer (~2–4s). The fundamental change is that 5 seconds is shorter than the timescale of traffic fluctuations. Traffic bursts typically last tens of seconds to minutes — with a 5-second reallocation, the scheduler can observe a spike, reallocate, and begin serving before the burst subsides. With a 3-minute reallocation, the burst is likely over before the new engine is ready, making reactive scheduling pointless. This is what transforms scheduling from a prediction problem into a reaction problem: the reallocation latency is now below the response threshold, so the scheduler can act on observed demand rather than forecasted demand.
 
 **Auto-scaler (future work):** The scheduler monitors per-model request rates and queue depths in real time. When a model's load exceeds its current serving capacity, the auto-scaler triggers `/wake_up` on additional standby engines for that model. When load drops, it calls `/sleep` to release resources back to the pool. The exact scaling policy (thresholds, cooldown periods, preemptive warm-up) is an area of ongoing work.
 
@@ -304,7 +304,6 @@ The sender continues serving inference requests while pushing weights to a recei
 
 | Engine | Wake | P2P Transfer | Inference | Sleep |
 |--------|------|---|---|---|
-| 9000 | 9.6s (cold) | 3.23s | Correct | ~2s |
 | 9001 | 6.5s | 4.60s | Correct | ~2s |
 | 9002 | 5.1s | 3.23s | Correct | ~2s |
 | 9003 | 6.8s | 3.28s | Correct | ~2s |
@@ -338,7 +337,7 @@ The sender continues serving inference requests while pushing weights to a recei
 
 | Phase | Latency | Notes |
 |---|---|---|
-| NRT init (skip firmware reset) | ~0.2s | |
+| NRT switch | ~0.2s | |
 | Gloo distributed init | ~1s | |
 | RDMA MR registration | 2.36s | |
 | Sender RDMA connect (overlapped) | 2.0s | Hidden behind MR registration |
@@ -356,7 +355,7 @@ Effective aggregate throughput: ~14 GB/s across 32 ranks (limited by single-NIC 
 | Wake-up latency (warm, LLaMA-3-70B TP=32) | **7.0s** |
 | Wake-up latency (warm, Qwen3-30B TP=32) | **5.1s** |
 | Sleep latency | **~2s** |
-| Inference impact during push | **0 stalls** |
+| Inference impact during push | **No impact** |
 | Max standby engines per instance | **100+** |
 | P2P consistency (10-engine test) | **10/10 correct** |
 | Multi-model consistency (100-engine test) | **15/15 correct** |
