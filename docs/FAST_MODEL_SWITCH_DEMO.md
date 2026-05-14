@@ -56,9 +56,47 @@ We reduce cold-start latency from minutes to seconds through three key design pr
 
 ### 2.2 System Overview
 
-#### 2.2.1 Standby Engine Pool
+An external scheduler orchestrates sleep/wake transitions via HTTP endpoints. We assume at least one engine of a given model is always active for serving. When scaling up that model, the active **sender engine** pushes weights directly into the standby **receiver engine's** device memory via per-rank RDMA writes over EFA. This is possible because model weights remain unchanged during inference — the sender's device memory always holds a valid, up-to-date copy that can be read at any time without coordination. This bypasses disk I/O entirely and allows the sender engine to continue serving requests during the transfer.
 
-A traditional cold start serializes every phase — hardware provisioning, software initialization, kernel compilation, and weight loading — into a single blocking pipeline. Each phase must complete before the next can begin, and every scale-up event pays the full cost from scratch. This makes on-demand scaling impractical for latency-sensitive serving.
+```
+                          ┌───────────┐
+                          │   Users   │
+                          └───────────┘
+                     requests │   ▲ generations
+                              ▼   │
+┌────────────────────────────────────────────────────────────────┐
+│                    LLM Serving Scheduler                       │
+│                                                                │
+│  ┌─────────────┐    ┌───────────────┐    ┌──────────────┐      │
+│  │   Request   │───▶│ Load Monitor  │───▶│ Auto-scaler  │      │
+│  │   Router    │    │               │    │ /wake_up     │      │
+│  │             │◀───│ (per-model    │    │ /sleep       │      │
+│  └──────┬──────┘    │  metrics)     │    └──────┬───────┘      │
+│         │           └───────────────┘           │              │
+└─────────┼───────────────────────────────────────┼──────────────┘
+          │  /v1/completions                      │  /wake_up, /sleep
+          │                                       │  /v1/completions
+          ▼                                       ▼
+┌────────────────────────┐    RDMA WRITE    ┌────────────────────────┐
+│   Instance A           │═════════════════▶│   Instance B           │
+│                        │   EFA 800 Gbps   │                        │
+│  Active engine:        │                  │  Standby engine:       │
+│  Model B (serving)     │  Per-rank push   │  Model B (waking)      │
+│  ┌──────────────────┐  │                  │  ┌──────────────────┐  │
+│  │ NeuronCore 0    │──┼────────────────────┼─▶│ NeuronCore 0    │  │
+│  │ NeuronCore 1    │──┼────────────────────┼─▶│ NeuronCore 1    │  │
+│  │     ...         │  │                    │  │     ...         │  │
+│  │ NeuronCore 31   │──┼────────────────────┼─▶│ NeuronCore 31   │  │
+│  └──────────────────┘  │                  │  └──────────────────┘  │
+│                        │                  │                        │
+│  Standby pool:         │                  │  Standby pool:         │
+│  100+ sleeping engines │                  │  100+ sleeping engines │
+└────────────────────────┘                  └────────────────────────┘
+```
+
+### 2.3 Standby Engine Pool
+
+**Traditional cold start is a serialized pipeline.** A traditional cold start serializes every phase — hardware provisioning, software initialization, kernel compilation, and weight loading — into a single blocking pipeline. Each phase must complete before the next can begin, and every scale-up event pays the full cost from scratch. This makes on-demand scaling impractical for latency-sensitive serving.
 
 ```
 Traditional cold start (serialized):
@@ -72,8 +110,7 @@ Traditional cold start (serialized):
                               Total: 8–10 minutes
 ```
 
-In our design, each instance in the cluster runs a **standby engine pool** — 100+ pre-initialized engines of different models sharing the same NeuronCores. Only one engine is active at a time; others sleep in a minimal state (zero device resources). Sleeping engines hold only CPU-resident state (Python process, compiled NEFFs in memory, framework metadata) and consume no NeuronCore or device memory resources. This makes it feasible to initialize hundreds of engines concurrently at deploy time — the bottleneck is CPU and host memory (~3 GB RAM per sleeping engine), not accelerator capacity.
-
+**Our approach decouples initialization from the critical path.** Each instance in the cluster runs a **standby engine pool** — 100+ pre-initialized engines of different models sharing the same NeuronCores. Only one engine is active at a time; others sleep in a minimal state (zero device resources). Sleeping engines hold only CPU-resident state (Python process, compiled NEFFs in memory, framework metadata) and consume no NeuronCore or device memory resources. This makes it feasible to initialize hundreds of engines concurrently at deploy time — the bottleneck is CPU and host memory (~3 GB RAM per sleeping engine), not accelerator capacity.
 
 ```
 Our approach (decoupled):
@@ -119,48 +156,9 @@ Our approach (decoupled):
                         Total: ~5s
 ```
 
-The wake-up path in our approach uses **NRT switch** rather than the full **NRT init** required in traditional cold starts. NRT init performs a complete firmware reset of NeuronCores — zeroing device memory, reinitializing hardware state, and reprovisioning the runtime — which takes 5–20s. In the traditional approach, NRT init is unavoidable because the prior core state is unknown: the previous engine may have crashed, been force-killed, or left stale data in device memory. Without a full reset, subsequent computations risk reading corrupted weights or residual state from the previous tenant, producing silently incorrect inference results. NRT switch bypasses the firmware reset entirely because the standby pool guarantees that cores were left in a known-good state by the previous engine's clean shutdown (`nrt_close()`). The result is a 0.2s device acquisition instead of a 5–20s reboot. This optimization is only possible because our standby pool design controls the full engine lifecycle: every sleep performs a clean release, so every subsequent wake can safely skip the reset.
+**NRT switch vs NRT init.** The wake-up path uses **NRT switch** rather than the full **NRT init** required in traditional cold starts. NRT init performs a complete firmware reset of NeuronCores — zeroing device memory, reinitializing hardware state, and reprovisioning the runtime — which takes 5–20s. In the traditional approach, NRT init is unavoidable because the prior core state is unknown: the previous engine may have crashed, been force-killed, or left stale data in device memory. Without a full reset, subsequent computations risk reading corrupted weights or residual state from the previous tenant, producing silently incorrect inference results. NRT switch bypasses the firmware reset entirely because the standby pool guarantees that cores were left in a known-good state by the previous engine's clean shutdown (`nrt_close()`). The result is a 0.2s device acquisition instead of a 5–20s reboot. This optimization is only possible because our standby pool design controls the full engine lifecycle: every sleep performs a clean release, so every subsequent wake can safely skip the reset.
 
-An external scheduler orchestrates sleep/wake transitions via HTTP endpoints. We assume at least one engine of a given model is always active for serving. When scaling up that model, the active **sender engine** pushes weights directly into the standby **receiver engine's** device memory via per-rank RDMA writes over EFA. This is possible because model weights remain unchanged during inference — the sender's device memory always holds a valid, up-to-date copy that can be read at any time without coordination. This bypasses disk I/O entirely and allows the sender engine to continue serving requests during the transfer.
-
-
-```
-                          ┌───────────┐
-                          │   Users   │
-                          └───────────┘
-                     requests │   ▲ generations
-                              ▼   │
-┌────────────────────────────────────────────────────────────────┐
-│                    LLM Serving Scheduler                       │
-│                                                                │
-│  ┌─────────────┐    ┌───────────────┐    ┌──────────────┐      │
-│  │   Request   │───▶│ Load Monitor  │───▶│ Auto-scaler  │      │
-│  │   Router    │    │               │    │ /wake_up     │      │
-│  │             │◀───│ (per-model    │    │ /sleep       │      │
-│  └──────┬──────┘    │  metrics)     │    └──────┬───────┘      │
-│         │           └───────────────┘           │              │
-└─────────┼───────────────────────────────────────┼──────────────┘
-          │  /v1/completions                      │  /wake_up, /sleep
-          │                                       │  /v1/completions
-          ▼                                       ▼
-┌────────────────────────┐    RDMA WRITE    ┌────────────────────────┐
-│   Instance A           │═════════════════▶│   Instance B           │
-│                        │   EFA 800 Gbps   │                        │
-│  Active engine:        │                  │  Standby engine:       │
-│  Model B (serving)     │  Per-rank push   │  Model B (waking)      │
-│  ┌──────────────────┐  │                  │  ┌──────────────────┐  │
-│  │ NeuronCore 0    │──┼────────────────────┼─▶│ NeuronCore 0    │  │
-│  │ NeuronCore 1    │──┼────────────────────┼─▶│ NeuronCore 1    │  │
-│  │     ...         │  │                    │  │     ...         │  │
-│  │ NeuronCore 31   │──┼────────────────────┼─▶│ NeuronCore 31   │  │
-│  └──────────────────┘  │                  │  └──────────────────┘  │
-│                        │                  │                        │
-│  Standby pool:         │                  │  Standby pool:         │
-│  100+ sleeping engines │                  │  100+ sleeping engines │
-└────────────────────────┘                  └────────────────────────┘
-```
-
-### 2.3 P2P Weight Transfer
+### 2.4 P2P Weight Transfer
 
 The data plane uses a custom RDMA library ("Relay") built on AWS EFA. Each TP rank on both sender and receiver has its own RDMA endpoint that distributes transfers across all available NICs for maximum bandwidth utilization. The sender pushes weights directly from device memory while continuing to serve inference — zero downtime on the sender side.
 
@@ -218,7 +216,7 @@ The receiver orchestrates the entire transfer. It sends two HTTP requests to the
 - **Non-blocking push**: The sender runs RDMA writes in a background thread. The inference loop is never blocked — the sender continues serving requests throughout the entire transfer.
 - **Deferred resource cleanup**: After transfer completes, connection teardown and memory deregistration run asynchronously in the background, completely off the critical path.
 
-### 2.4 Engine HTTP Endpoints
+### 2.5 Engine HTTP Endpoints
 
 Each engine exposes HTTP endpoints for lifecycle management. These fall into two categories:
 
@@ -239,13 +237,13 @@ Each engine exposes HTTP endpoints for lifecycle management. These fall into two
 
 **Sleep state**: A sleeping engine holds ~3 GB of host memory (Python process + framework state) but **zero** device resources — NeuronCores are fully released and available for other engines.
 
-### 2.5 LLM Serving Scheduler
+### 2.6 LLM Serving Scheduler
 
 **Why traditional schedulers cannot reschedule at runtime.** The fundamental issue is initialization latency. Every time NeuronCores are reallocated to a different model, the new engine must go through software initialization (imports, NRT init, NEFF compilation, weight loading) — 2–3 minutes during which the NeuronCores sit idle, unable to serve any traffic. This 2–3 minute reallocation time exceeds the timescale of traffic fluctuations — by the time a new engine is ready, the traffic burst that triggered it has likely subsided. Reactive scheduling is therefore pointless, and the scheduler cannot respond to real-time demand. Instead, traditional infrastructure (e.g., Mantle) avoids rescheduling entirely by provisioning dedicated hardware for each model ahead of time, incurring ~5 minutes of hardware provisioning latency. The scheduler is trapped: provision conservatively and risk under-serving during traffic spikes, or provision aggressively and pay for idle resources that were allocated for demand that never materialized.
 
 **Why our approach enables real-time rescheduling.** Our system reduces the reallocation cost from 2–3 minutes to ~5 seconds. Because initialization is decoupled from the wake-up path (done once at deploy time), switching NeuronCores to a different model only requires NRT switch (~0.2s), Gloo init (~1s), and P2P weight transfer (~2–4s). The fundamental change is that 5 seconds is shorter than the timescale of traffic fluctuations. Traffic bursts typically last tens of seconds to minutes — with a 5-second reallocation, the scheduler can observe a spike, reallocate, and begin serving before the burst subsides. With a 3-minute reallocation, the burst is likely over before the new engine is ready, making reactive scheduling pointless. This is what transforms scheduling from a prediction problem into a reaction problem: the reallocation latency is now below the response threshold, so the scheduler can act on observed demand rather than forecasted demand.
 
-**Auto-scaler (future work):** The scheduler monitors per-model request rates and queue depths in real time. When a model's load exceeds its current serving capacity, the auto-scaler triggers `/wake_up` on additional standby engines for that model. When load drops, it calls `/sleep` to release resources back to the pool. The exact scaling policy (thresholds, cooldown periods, preemptive warm-up) is an area of ongoing work.
+**Auto-scaler (future work):** The scheduler monitors per-model request rates and queue depths in real time. When a model's load exceeds its current serving capacity, the auto-scaler triggers `/wake_up` on additional standby engines for that model. When load drops, it calls `/sleep` to release resources back to the pool. The exact scaling policy (thresholds, cooldown periods, preemptive warm-up) is an area of ongoing work. More details in [SERVING_SCHEDULER_DESIGN.md](SERVING_SCHEDULER_DESIGN.md).
 
 ---
 
