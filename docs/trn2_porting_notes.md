@@ -245,6 +245,18 @@ adds ~41s.
 | RDMA throughput | 60.2 Gbps/rank | ~95 Gbps/rank | Host-staged, limited by NIC sharing |
 | /sleep | 2.3s | ~2s | Comparable (with delay) |
 
+### Host-Staged P2P Architecture
+
+On Trn2, EFA NICs and NeuronCore HBM sit in separate PCIe domains. Direct
+device-to-device RDMA only achieves ~3.5 Gbps per rank, while host memory RDMA
+reaches ~30 Gbps per rank. The host-staged path (`NKIPY_HOST_STAGING=1`) routes
+data through host memory:
+
+```
+Sender device (HBM)  ──DMA──▶  Sender host (RAM)  ──RDMA──▶  Receiver host (RAM)  ──DMA──▶  Receiver device (HBM)
+       ~13 Gbps                         ~30 Gbps                          ~13 Gbps
+```
+
 ### Optimizations applied
 
 1. **Host-staged RDMA** (`NKIPY_HOST_STAGING=1`): Routes transfers through
@@ -254,6 +266,37 @@ adds ~41s.
 3. **Sender MR pre-registration**: Host staging buffer registered at model
    load time, saving 1.0s per transfer
 4. **NIC rotation**: All 16 EFA NICs utilized across 32 workers (vs 4 before)
+5. **Early-prepare pre-DMA**: The receiver fires a lightweight
+   `/nkipy/p2p_prepare` signal to the sender at the very start of the wake-up
+   flow (before Gloo init, NRT init, and tensor allocation). This gives the
+   sender ~4 seconds of head start to DMA all weights from device to host
+   staging buffer. By the time the actual push request arrives, the data is
+   already in host memory and RDMA can proceed at full speed with zero wait.
+   Without early-prepare, the sender DMA and receiver setup run sequentially,
+   adding 2+ seconds to the critical path.
+
+**PCIe bus contention constraint**: RDMA and DMA cannot run concurrently on
+the same host without severe PCIe bus contention (throughput drops from ~30
+Gbps to ~9 Gbps). The implementation waits for all DMA to complete before
+starting any RDMA writes.
+
+### /wake_up latency with early-prepare pre-DMA (9.1–10.3s total)
+
+Same setup as above, with early-prepare optimization enabled:
+
+| Phase | Time |
+|-------|------|
+| Gloo init | 1.0s |
+| NRT init + tensor alloc | 0.2s |
+| MR registration (receiver) | 2.7s |
+| Sender RDMA (2 chunks, 4.6 GB) | 1.3s |
+| Receiver host→device DMA | 2.9s |
+| Kernel load + barrier | 0.5–2.0s |
+| **Total wake-up** | **9.1–10.3s** |
+
+The NRT init time dropped from 17.2s to 0.2s by fixing the
+`NEURON_RT_ROOT_COMM_ID` collective issue (see Issue 6). Combined with
+early-prepare pre-DMA, total wake-up went from 30.3s to 9.1–10.3s.
 
 ### Remaining optimization opportunities
 
