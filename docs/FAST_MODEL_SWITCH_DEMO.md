@@ -2,41 +2,73 @@
 
 ## 1. Motivation
 
-### Over-Provision or Cold-Start Latency When Scaling Up LLM in Multi-Model Serving
+### 1.1 Background: Multi-Model Serving Is the Norm
 
-Production LLM serving increasingly requires multiple models on shared cluster. Traffic patterns are bursty — a model may see 10x load during peak and near-zero at off-peak. On Trainium instances, operators face a choice: keep every model always-loaded (expensive) or load models on-demand (slow).
+Production LLM platforms serve tens to hundreds of models simultaneously — diverse in model family (LLaMA, Qwen, Mistral, DeepSeek, …), size (8B to 600B+), and fine-tuned variants per customer. This is the fundamental operating reality, not an edge case.
 
-The **always-loaded** approach over-provisions instances to each model, keeping it running and ready to serve at all times. This eliminates cold-start latency entirely and requests are served immediately. However, in practice, most models sit idle most of the time — a fleet serving 10 models may see only 1–2 active at any moment, yet pays for all 10 continuously. This makes always-loaded impractical as the model catalog grows.
+AWS Mantle — the inference infrastructure behind Amazon Bedrock (100+ foundation models) — dynamically allocates a shared accelerator fleet across hundreds of deployments with independent, highly bursty traffic patterns. Production LLM traces show strong diurnal and weekly periodicity, with request volumes capable of doubling within minutes and fluctuating by orders of magnitude between peak working hours and off-peak periods (Wang et al., "BurstGPT", 2024). Fixed hardware allocation per model is economically untenable at this scale. The infrastructure must reallocate accelerators across models in real time, making fast model switching a prerequisite — not an optimization — for viable multi-model serving.
 
-The **on-demand** path avoids this cost by loading models only when traffic arrives, but introduces a **cold start** bottleneck. When a request arrives for a model that isn't currently loaded, the system must initialize an engine and load weights before serving the first token. On Neuron, this cold-start latency has several components:
+### 1.2 The Multi-Model Scaling Dilemma
 
-### Cold-start Latency Breakdown on Neuron
+Given that multi-model serving is fundamental, operators face a concrete resource allocation problem. Traffic patterns are bursty — a model may see orders-of-magnitude more load during peak hours and near-zero at off-peak. On Trainium instances, the choice is: keep every model always-loaded (expensive) or load models on-demand (slow).
 
-We profiled cold-start latency across two trn1.32xlarge instances (each with 32 NeuronCores, 4 instance store NVMe drives, 8 EFA NICs) running LLaMA-3-70B with TP=32 under the vLLM serving framework. The model checkpoint size is 139 GB.
+The **always-loaded** approach dedicates instances to each model, keeping it running and ready to serve at all times. This eliminates cold-start latency entirely and requests are served immediately. However, in practice, most models sit idle most of the time — a fleet serving 10 models may see only 1–2 active at any moment, yet pays for all 10 continuously. This makes always-loaded impractical as the model catalog grows.
+
+The **on-demand** path avoids this cost by loading models only when traffic arrives, but introduces a **cold start** bottleneck. When a request arrives for a model that isn't currently loaded, the system must initialize an engine and load weights before serving the first token.
+
+### 1.3 Why Cold Start Is Fundamentally Slow
+
+A traditional cold start serializes every phase — hardware provisioning, software initialization, kernel compilation, and weight loading — into a single blocking pipeline. Each phase must complete before the next can begin, and every scale-up event pays the full cost from scratch.
+
+```
+Traditional cold start (serialized):
+
+┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌───────┐
+│ Hardware │  │ Imports  │  │ NRT init │  │   NEFF   │  │  Weight  │  │       │
+│   init   │→ │ + spawn  │→ │ + Gloo   │→ │ compile  │→ │   load   │→ │ Serve │
+└──────────┘  └──────────┘  └──────────┘  └──────────┘  └──────────┘  └───────┘
+                              Total: ~7–13 minutes
+```
+
+This makes on-demand scaling impractical for latency-sensitive serving — by the time a new engine is ready, the traffic burst that triggered it has likely subsided.
+
+### 1.4 Cold-start Latency Breakdown on Neuron
+
+We profiled cold-start latency on a trn2.48xlarge instance (32 logical NeuronCores with LNC=2, 4 instance store NVMe drives, 16 EFA NICs) running **LLaMA-3.1-70B** with TP=32 under the vLLM serving framework. The model checkpoint size is 139 GB.
 
 <table>
 <tr><th>Category</th><th>Phase</th><th>Latency</th><th>Bottleneck</th></tr>
 <tr><td rowspan="5"><b>Software init</b></td>
-    <td>Python imports + framework init + worker spawn</td><td>~22s</td><td>vLLM, PyTorch, plugin loading, fork 32 worker processes (measured)</td></tr>
-<tr><td>Gloo distributed init</td><td>~1s</td><td>Establish Gloo mesh across 32 ranks (measured: ~1s without CPU contention)</td></tr>
-<tr><td>NeuronCore runtime init</td><td>5–20s</td><td>Firmware reset, device allocation via NRT (measured: 5–20s first init)</td></tr>
-<tr><td>NEFF kernel compilation</td><td>14–83s</td><td>Neuron compiler traces + compiles kernels (measured: ~9.2s/bucket; 8 buckets → ~14s cached, ~83s cold)</td></tr>
-<tr><td>NEFF kernel load + warmup</td><td>~18s</td><td>Load pre-compiled NEFF, profile, allocate KV cache (measured)</td></tr>
-<tr><td rowspan="3"><b>Weight loading</b></td>
-    <td>From local NVMe</td><td>~35s</td><td>Instance store NVMe aggregate ~4 GB/s for 139 GB (measured: ~1 GB/s per drive × 4 drives)</td></tr>
-<tr><td>From FSx for Lustre</td><td>70–140s</td><td>Shared bandwidth (~1 GB/s/TiB); degrades under concurrent access</td></tr>
-<tr><td>From S3</td><td>105–175s</td><td>Download to local disk (~2–3 GB/s, 50–70s) + load from disk (~35s); sequential</td></tr>
+    <td>Python imports + framework init + worker spawn</td><td>~20s</td><td>vLLM, PyTorch, plugin loading, fork 32 worker processes</td></tr>
+<tr><td>Gloo distributed init</td><td>~1s</td><td>Establish Gloo mesh across 32 ranks</td></tr>
+<tr><td>NeuronCore runtime init</td><td>~19s</td><td>Firmware reset + device allocation across 32 workers (measured: 4–16s per worker, 19s wall)</td></tr>
+<tr><td>NEFF kernel compilation</td><td>14–83s</td><td>Neuron compiler traces + compiles kernels (~14s cached, ~83s cold)</td></tr>
+<tr><td>NEFF kernel load + warmup</td><td>~20s</td><td>Load pre-compiled NEFF, profile, allocate KV cache</td></tr>
+<tr><td rowspan="2"><b>Weight loading</b></td>
+    <td>From local NVMe</td><td>~13s</td><td>Instance store NVMe aggregate ~11 GB/s for 139 GB (~2.8 GB/s per drive × 4 drives)</td></tr>
+<tr><td>From FSx for Lustre</td><td>~121s</td><td>Measured: 139 GB at 1.15 GB/s (4.5 TiB PERSISTENT_2, 32 shards in parallel)</td></tr>
 <tr><td><b>Hardware init</b></td>
     <td>Provisioning accelerator</td><td>~5min</td><td>Readying NeuronCores for new engine (e.g., ~5min in Mantle)</td></tr>
-<tr><td rowspan="3"><b>Total</b></td>
-    <td>Cold start (local NVMe)</td><td><b>~7min</b></td><td></td></tr>
-<tr><td>Cold start (FSx)</td><td><b>~8–9min</b></td><td></td></tr>
-<tr><td>Cold start (S3)</td><td><b>~9–10min</b></td><td></td></tr>
+<tr><td rowspan="2"><b>Total</b></td>
+    <td>Cold start (local NVMe, cached kernels)</td><td><b>~6.5min</b></td><td></td></tr>
+<tr><td>Cold start (FSx, cached kernels)</td><td><b>~8.3min</b></td><td></td></tr>
 </table>
 
-Weight loading dominates: reading 139 GB of Neuron-compiled checkpoint from disk is bounded by storage bandwidth. trn1.32xlarge has 4 instance store NVMe drives (~1 GB/s each, ~4 GB/s aggregate as measured by `dd iflag=direct`), giving a best-case load time of ~35s. In practice, checkpoint format overhead and 32-worker contention push this to 44s+. From networked storage (FSx/S3), it can exceed 2–3 minutes. Engine startup overhead (imports, worker spawn, Gloo init) adds another 15–23s before weight loading even begins.
+**Measured end-to-end** (FSx, cached kernels, no hardware provisioning): **195s** (~3.3 min) from process start to first token. Weight loading from FSx dominates at 121s (62% of total). Engine startup overhead (imports, worker spawn, Gloo+NRT init) adds ~40s before weight loading begins.
 
-The operational challenge: **How do we scale up LLM model serving on demand with second-level cold-start latency?**
+### 1.5 Checkpoint Read Latency from FSx
+
+Measured on **trn2.48xlarge** with FSx for Lustre (4.5 TiB PERSISTENT_2, 4 OSTs). Page cache dropped before each test; 32 shards read in parallel (one per TP rank).
+
+| Model | Checkpoint Size | Cold Read Time | Throughput |
+|---|---|---|---|
+| Qwen3-30B-A3B (TP=32) | 59 GB | 51s | 1.15 GB/s |
+| LLaMA-3.1-70B (TP=32) | 139 GB | 121s | 1.15 GB/s |
+| Qwen3-235B-A22B (TP=32) | 401 GB | **386s** | 1.04 GB/s |
+
+### 1.6 The Operational Challenge
+
+**How do we scale up LLM model serving on demand with second-level cold-start latency?**
 
 ---
 
@@ -50,13 +82,17 @@ We reduce cold-start latency from minutes to seconds through three key design pr
 
 **2. Standby engine pool with shared hardware.** Each instance hosts 100+ standby engines of different models sharing the same NeuronCores, with only one active at a time. This is made possible by the decoupling in principle 1: since sleeping engines hold only CPU-resident state (no device resources), hundreds can coexist on a single instance. Because the hardware is already provisioned and shared across all engines in the pool, scaling up a new model does not require provisioning new accelerator hardware — it simply switches which engine holds the NeuronCores. This eliminates the ~5min hardware init latency entirely. Every instance in the cluster independently initializes its own standby pool, so the number of instances that can serve any given model scales linearly with cluster size.
 
-**3. P2P RDMA weight transfer.** Instead of reading weights from disk (bounded by NVMe at ~4 GB/s) or network storage (FSx/S3), we push weights directly from an active engine's device memory over EFA (e.g., 800 Gbps on trn1.32xlarge). This reduces weight loading from 35–175s to ~2s and eliminates the requirement for a local checkpoint entirely.
+**3. P2P RDMA weight transfer.** Instead of reading weights from disk (bounded by NVMe at ~4 GB/s) or network storage (FSx/S3), we push weights directly from an active engine's device memory over EFA (e.g., 3.2 Tbps on trn2.48xlarge). This reduces weight loading from 51–386s to ~5s and eliminates the requirement for a local checkpoint entirely.
 
 **Expected result**: Cold start drops from **8–10 minutes** to **< 10 seconds** for LLaMA-3-70B at TP=32.
 
 ### 2.2 System Overview
 
-An external scheduler orchestrates sleep/wake transitions via HTTP endpoints. We assume at least one engine of a given model is always active for serving. When scaling up that model, the active **sender engine** pushes weights directly into the standby **receiver engine's** device memory via per-rank RDMA writes over EFA. This is possible because model weights remain unchanged during inference — the sender's device memory always holds a valid, up-to-date copy that can be read at any time without coordination. This bypasses disk I/O entirely and allows the sender engine to continue serving requests during the transfer.
+The system has three components:
+
+- **Standby engine pool (§2.3)**: Each instance maintains 100+ pre-initialized engines sharing the same NeuronCores, with only one active at a time. Scaling up a model means switching which engine holds the cores (~9s), not provisioning new hardware (~5min).
+- **P2P weight transfer (§2.4)**: When a standby engine wakes, an active engine of the same model on another instance pushes weights directly into the receiver's device memory via per-rank RDMA over EFA. The sender continues serving during the transfer — model weights are immutable during inference, so no coordination is needed.
+- **LLM serving scheduler (§2.5)**: An external scheduler monitors per-model load and orchestrates scaling decisions. It routes user requests to active engines and triggers `/wake_up` or `/sleep` on standby engines based on real-time demand.
 
 ```
                           ┌───────────┐
@@ -96,25 +132,9 @@ An external scheduler orchestrates sleep/wake transitions via HTTP endpoints. We
 
 ### 2.3 Standby Engine Pool
 
-**Traditional cold start is a serialized pipeline.** A traditional cold start serializes every phase — hardware provisioning, software initialization, kernel compilation, and weight loading — into a single blocking pipeline. Each phase must complete before the next can begin, and every scale-up event pays the full cost from scratch. This makes on-demand scaling impractical for latency-sensitive serving.
+Each instance in the cluster runs a **standby engine pool** — 100+ pre-initialized engines of different models sharing the same NeuronCores. Only one engine is active at a time; others sleep in a minimal state (zero device resources). Sleeping engines hold only CPU-resident state (Python process, compiled NEFFs in memory, framework metadata) and consume no NeuronCore or device memory resources. This makes it feasible to initialize hundreds of engines concurrently at deploy time — the bottleneck is CPU and host memory (~3 GB RAM per sleeping engine), not accelerator capacity.
 
 ```
-Traditional cold start (serialized):
-
-┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────┐ ┌───────┐
-│ Hardware │ │ Imports  │ │ NRT init │ │   NEFF   │ │ Weight load  │ │       │
-│   init   │→│ + spawn  │→│ + Gloo   │→│ compile  │→│ (from disk)  │→│ Serve │
-│          │ │  ~22s    │ │  ~6–21s  │ │  ~83s    │ │   35–175s    │ │       │
-│  ~5min   │ │          │ │          │ │          │ │              │ │       │
-└──────────┘ └──────────┘ └──────────┘ └──────────┘ └──────────────┘ └───────┘
-                              Total: 8–10 minutes
-```
-
-**Our approach decouples initialization from the critical path.** Each instance in the cluster runs a **standby engine pool** — 100+ pre-initialized engines of different models sharing the same NeuronCores. Only one engine is active at a time; others sleep in a minimal state (zero device resources). Sleeping engines hold only CPU-resident state (Python process, compiled NEFFs in memory, framework metadata) and consume no NeuronCore or device memory resources. This makes it feasible to initialize hundreds of engines concurrently at deploy time — the bottleneck is CPU and host memory (~3 GB RAM per sleeping engine), not accelerator capacity.
-
-```
-Our approach (decoupled):
-
 ┌──────────────────────────────────────────────────────────────────────────┐
 │ Deploy time: standby engine pool (per instance)                          │
 │                                                                          │
@@ -148,15 +168,15 @@ Our approach (decoupled):
 │  Model B (activating):                                                   │
 │  ┌────────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────┐  ┌──────┐  │
 │  │ Wait sleep │→ │NRT switch│→ │   Gloo   │→ │  P2P weight  │→ │Serve │  │
-│  │    ~2s     │  │          │  │   init   │  │ transfer ~2s │  │      │  │
+│  │    ~2s     │  │          │  │   init   │  │ transfer ~5s │  │      │  │
 │  │            │  │          │  │   ~1s    │  └──────────────┘  └──────┘  │
 │  └────────────┘  └──────────┘  └──────────┘                              │
 │                                                                          │
 └──────────────────────────────────────────────────────────────────────────┘
-                        Total: ~5s
+                        Total: <10s
 ```
 
-**NRT switch vs NRT init.** The wake-up path uses **NRT switch** rather than the full **NRT init** required in traditional cold starts. NRT init performs a complete firmware reset of NeuronCores — zeroing device memory, reinitializing hardware state, and reprovisioning the runtime — which takes 5–20s. In the traditional approach, NRT init is unavoidable because the prior core state is unknown: the previous engine may have crashed, been force-killed, or left stale data in device memory. Without a full reset, subsequent computations risk reading corrupted weights or residual state from the previous tenant, producing silently incorrect inference results. NRT switch bypasses the firmware reset entirely because the standby pool guarantees that cores were left in a known-good state by the previous engine's clean shutdown (`nrt_close()`). The result is a 0.2s device acquisition instead of a 5–20s reboot. This optimization is only possible because our standby pool design controls the full engine lifecycle: every sleep performs a clean release, so every subsequent wake can safely skip the reset.
+**NRT switch vs NRT init.** Traditional cold starts require **NRT init** — a full firmware reset (~19s) that zeroes device memory and reprovisions the runtime. This is necessary because the prior core state is unknown (crash, force-kill, stale data). Our standby pool guarantees cores are always left in a known-good state via clean shutdown (`nrt_close()`), so the wake-up path uses **NRT switch** which skips the firmware reset entirely: 0.2s device acquisition instead of ~19s.
 
 ### 2.4 P2P Weight Transfer
 
@@ -216,9 +236,11 @@ The receiver orchestrates the entire transfer. It sends two HTTP requests to the
 - **Non-blocking push**: The sender runs RDMA writes in a background thread. The inference loop is never blocked — the sender continues serving requests throughout the entire transfer.
 - **Deferred resource cleanup**: After transfer completes, connection teardown and memory deregistration run asynchronously in the background, completely off the critical path.
 
-### 2.5 Engine HTTP Endpoints
+### 2.5 Engine Interface and Scheduling
 
-Each engine exposes HTTP endpoints for lifecycle management. These fall into two categories:
+#### 2.5.1 Engine HTTP Endpoints
+
+Each engine exposes HTTP endpoints for lifecycle management:
 
 **Scheduler-facing endpoints** — initiated by the LLM Serving Scheduler based on per-model workload metrics:
 
@@ -235,62 +257,100 @@ Each engine exposes HTTP endpoints for lifecycle management. These fall into two
 | `POST /nkipy/p2p_preconnect` | Exchange RDMA connection metadata (Phase 1) |
 | `POST /nkipy/p2p_push_weights` | Trigger one-sided RDMA weight write (Phase 2) |
 
-**Sleep state**: A sleeping engine holds ~3 GB of host memory (Python process + framework state) but **zero** device resources — NeuronCores are fully released and available for other engines.
+#### 2.5.2 LLM Serving Scheduler
 
-### 2.6 LLM Serving Scheduler
+**Why traditional schedulers cannot reschedule at runtime.** Every reallocation requires a full cold start (2–8 minutes depending on model size), during which NeuronCores sit idle. This exceeds the timescale of traffic bursts — by the time a new engine is ready, the spike has likely subsided. Traditional infrastructure (e.g., Mantle) therefore avoids rescheduling entirely, instead provisioning dedicated hardware per model periodically (e.g., every 5 minutes). The scheduler is trapped: provision conservatively and risk under-serving during spikes, or provision aggressively and pay for idle resources.
 
-**Why traditional schedulers cannot reschedule at runtime.** The fundamental issue is initialization latency. Every time NeuronCores are reallocated to a different model, the new engine must go through software initialization (imports, NRT init, NEFF compilation, weight loading) — 2–3 minutes during which the NeuronCores sit idle, unable to serve any traffic. This 2–3 minute reallocation time exceeds the timescale of traffic fluctuations — by the time a new engine is ready, the traffic burst that triggered it has likely subsided. Reactive scheduling is therefore pointless, and the scheduler cannot respond to real-time demand. Instead, traditional infrastructure (e.g., Mantle) avoids rescheduling entirely by provisioning dedicated hardware for each model ahead of time, incurring ~5 minutes of hardware provisioning latency. The scheduler is trapped: provision conservatively and risk under-serving during traffic spikes, or provision aggressively and pay for idle resources that were allocated for demand that never materialized.
+**Why our approach enables real-time rescheduling.** We reduce reallocation to ~9 seconds (NRT switch 0.2s + Gloo 1s + P2P transfer ~6s). Since traffic bursts typically last tens of seconds to minutes, the scheduler can now observe a spike, reallocate, and begin serving before the burst subsides. This transforms scheduling from a prediction problem into a reaction problem — the scheduler acts on observed demand rather than forecasted demand.
 
-**Why our approach enables real-time rescheduling.** Our system reduces the reallocation cost from 2–3 minutes to ~5 seconds. Because initialization is decoupled from the wake-up path (done once at deploy time), switching NeuronCores to a different model only requires NRT switch (~0.2s), Gloo init (~1s), and P2P weight transfer (~2–4s). The fundamental change is that 5 seconds is shorter than the timescale of traffic fluctuations. Traffic bursts typically last tens of seconds to minutes — with a 5-second reallocation, the scheduler can observe a spike, reallocate, and begin serving before the burst subsides. With a 3-minute reallocation, the burst is likely over before the new engine is ready, making reactive scheduling pointless. This is what transforms scheduling from a prediction problem into a reaction problem: the reallocation latency is now below the response threshold, so the scheduler can act on observed demand rather than forecasted demand.
-
-**Auto-scaler (future work):** The scheduler monitors per-model request rates and queue depths in real time. When a model's load exceeds its current serving capacity, the auto-scaler triggers `/wake_up` on additional standby engines for that model. When load drops, it calls `/sleep` to release resources back to the pool. The exact scaling policy (thresholds, cooldown periods, preemptive warm-up) is an area of ongoing work. More details in [SERVING_SCHEDULER_DESIGN.md](SERVING_SCHEDULER_DESIGN.md).
+**Auto-scaler (future work):** The scheduler monitors per-model request rates and queue depths in real time, triggering `/wake_up` on standby engines when load exceeds capacity, and `/sleep` when load drops. The exact scaling policy (thresholds, cooldown periods, preemptive warm-up) is ongoing work. More details in [SERVING_SCHEDULER_DESIGN.md](SERVING_SCHEDULER_DESIGN.md).
 
 ---
 
-## 3. Performance Results on Trn1 Instances
+## 3. Performance Results
 
-### 3.1 End-to-End Wake-Up Latency
+### 3.1 End-to-End Latency
 
-| Model | Traditional Cold Start | Our Approach |
+| Model | Instance | Traditional Cold Start | Wake-Up | Sleep |
+|---|---|---|---|---|
+| LLaMA-3-70B (TP=32) | trn1.32xlarge | ~8 min | **7.0s** | **~2s** |
+| | trn2.48xlarge | ~8 min | **7.4–8.4s** | **~3.2s** |
+| Qwen3-30B-A3B (TP=32) | trn1.32xlarge | ~7 min | **5.1s** | **~2s** |
+| | trn2.48xlarge | ~7 min | **4.7–6.3s** | **~2.4s** |
+| Qwen3-235B-A22B (TP=32) | trn2.48xlarge | ~13 min | **~19.9s** | **~3.6s** |
+
+### 3.2 Latency Breakdown
+
+**Trn1 (LLaMA-3-70B, TP=32, trn1.32xlarge, cross-instance, direct device RDMA):**
+
+| Phase | Latency | Notes |
 |---|---|---|
-| LLaMA-3-70B (TP=32) | ~8 min | **7.0s** |
-| Qwen3-30B-A3B (TP=32) | ~7 min | **5.1s** |
+| NRT switch | 0.2s | |
+| Gloo distributed init | 1.0s | |
+| RDMA MR registration | 2.4s | Receiver registers device buffers |
+| Sender RDMA connect (overlapped) | 2.0s | Hidden behind MR registration |
+| RDMA write (4.3 GB/rank) | 0.6s | Direct device→device, ~95 Gbps/rank |
+| NEFF kernel reload | 0.8s | |
+| **Total wake-up** | **7.0s** | |
 
-### 3.2 Sleep Latency
+Effective aggregate throughput: ~14 GB/s across 32 ranks (limited by single-NIC per rank on trn1).
 
-| Model | Sleep Latency |
-|---|---|
-| LLaMA-3-70B (TP=32) | **~2s** |
-| Qwen3-30B-A3B (TP=32) | **~2s** |
+**Trn2 (LLaMA-3.1-70B, TP=32, trn2.48xlarge, cross-node, direct device RDMA):**
 
-In production, engines serve traffic for minutes to hours between switches. RDMA resource cleanup runs asynchronously in the background and completes well before the next sleep, so the ~2s fast path is the expected case.
-
-### 3.3 Scalability: Standby Engine Density
-
-| Metric | Per Engine | At 100 Engines (measured) |
+| Phase | Latency | Notes |
 |---|---|---|
-| Host memory | 3.0 GB | 303 GB |
-| TCP ports (sleeping) | 1 | 100 |
-| Python processes (server + 32 workers) | 33 | 3300 |
-| Total pool launch time | — | ~215s |
+| Gloo distributed init | 1.0s | |
+| NRT init + tensor alloc | 0.1s | Fast path (skip firmware reset) |
+| RDMA MR registration | 2.4s | Receiver registers device buffers (chunked) |
+| Sender RDMA connect (overlapped) | 2.0s | Hidden behind MR registration |
+| RDMA write (4.3 GB/rank) | 3.4s | Direct device→device, chunked |
+| Kernel load + barrier | 1.1s | |
+| **Total wake-up** | **7.4–8.4s** | |
 
-Each sleeping engine holds 1 TCP port for its HTTP server (Gloo is destroyed during sleep). Engines are launched one at a time with a 2-second delay between consecutive launches to avoid CPU and TCP contention. Each engine initializes in the background (~15s), so multiple engines are initializing concurrently. Total time to bring up the full pool: 100 × 2s = ~200s, plus ~15s for the last engine to finish.
+Effective aggregate throughput: ~24 GB/s across 32 ranks × 16 EFA NICs.
 
-**Measured**: 100 engines (50 Qwen3 + 50 LLaMA) on trn1.32xlarge uses 303/495 GB host memory (61%). The trn1.32xlarge has 512 GB total host RAM, of which ~495 GB is available after OS and system services.
+**Trn2 (Qwen3-235B-A22B, TP=32, trn2.48xlarge, cross-node, host-staged RDMA):**
 
-### 3.4 Non-Blocking Inference During P2P Weight Transfer
-
-The sender continues serving inference requests while pushing weights to a receiver. End-to-end latency measured per request (prompt + full generation, max_tokens=128):
-
-| Phase | Avg E2E Latency | Max E2E Latency |
+| Phase | Latency | Notes |
 |---|---|---|
-| Before push (baseline) | 775 ms | 787 ms |
-| During push | 800 ms | 829 ms |
-| After push | 800 ms | 808 ms |
+| Gloo distributed init | 0.9s | |
+| NRT init + tensor alloc | 0.4s | |
+| Sender DMA (device→host) | (overlapped) | Pre-DMA fired at wake start, hidden behind Gloo+NRT+MR reg |
+| Receiver MR registration | 8.4s | Alloc + register 12.5 GB host staging buffer |
+| RDMA write (12.5 GB/rank) | 1.7s | Host→host, ~60 Gbps/rank |
+| Receiver DMA (host→device) | 8.3s | 8-thread parallel batch DMA |
+| Kernel load + barrier | 0.1s | |
+| **Total wake-up** | **19.9s** | |
 
-3% latency increase during push, well within normal variance. The RDMA push runs in background threads with no lock contention on the inference path.
+Note: Qwen3-235B-A22B uses host-staged RDMA because the large per-rank weight size (14 GB) exceeds the device memory region registration limit for direct device RDMA. The 401 GB transfer achieves ~174 Gbps aggregate throughput across 32 ranks × 16 EFA NICs. Sender DMA (~7.8s) is fully overlapped with receiver setup (Gloo + NRT + MR registration) via early-prepare (`/nkipy/p2p_prepare`).
 
-### 3.5 Scalability: 100-Engine Multi-Model Test
+**P2P RDMA vs FSx cold load:**
+
+| Model | FSx Cold Read | P2P Transfer | Speedup |
+|---|---|---|---|
+| Qwen3-30B-A3B (TP=32) | 51s | 3.2s | **16×** |
+| LLaMA-3.1-70B (TP=32) | 121s | 5.8s | **21×** |
+| Qwen3-235B-A22B (TP=32) | 386s | 18.4s | **21×** |
+
+### 3.3 Scalability
+
+#### 3.3.1 Standby Engine Density
+
+| Metric | Trn1 (100 engines) | Trn2 (500 engines) |
+|---|---|---|
+| Host memory per engine | 3.0 GB | ~2.7 GB |
+| Total memory used | 303 GB / 495 GB (61%) | 1,329 GB / 1,991 GB (67%) |
+| TCP ports (sleeping) | 1 per engine | 1 per engine |
+| Python processes (server + 32 workers) | 3,300 | 16,500 |
+| Total pool launch time | ~215s | ~22 min |
+
+Each sleeping engine holds minimal TCP ports (Gloo destroyed during sleep). Engines are launched with a 1–2 second delay between consecutive launches to avoid CPU and TCP contention.
+
+**Trn1**: 100 engines (50 Qwen3 + 50 LLaMA) on trn1.32xlarge (512 GB host RAM).
+
+**Trn2**: 500 engines (LLaMA-3.1-70B, TP=32) on trn2.48xlarge (2 TB host RAM). At 500 engines, 611 GB memory still available — theoretical limit is ~730 engines per instance.
+
+#### 3.3.2 100-Engine Multi-Model Test (Trn1)
 
 100 standby engines (50 Qwen3-30B-A3B + 50 LLaMA-3-70B) on a single trn1.32xlarge (Instance B), with senders on Instance A. Sequential wake/infer/sleep cycles across both models.
 
@@ -329,35 +389,30 @@ The sender continues serving inference requests while pushing weights to a recei
 | Wake Qwen3 sender | 4.3s | Reload QWen on sender instance|
 | Wake Qwen3 receiver | 5.1s | P2P from Qwen3 sender |
 
-### 3.6 Latency Breakdown
+### 3.4 Non-Blocking Inference During P2P Weight Transfer (Trn1)
 
-**Wake-up latency breakdown (LLaMA-3-70B, TP=32, cross-instance):**
+The sender continues serving inference requests while pushing weights to a receiver. End-to-end latency measured per request (prompt + full generation, max_tokens=128):
 
-| Phase | Latency | Notes |
+| Phase | Avg E2E Latency | Max E2E Latency |
 |---|---|---|
-| NRT switch | ~0.2s | |
-| Gloo distributed init | ~1s | |
-| RDMA MR registration | 2.36s | |
-| Sender RDMA connect (overlapped) | 2.0s | Hidden behind MR registration |
-| RDMA write (4.3 GB/rank) | 0.63s | |
-| HTTP + gather | 0.09s | |
-| NEFF kernel reload | ~0.8s | |
-| **Total wake-up** | **~7.0s** | |
+| Before push (baseline) | 775 ms | 787 ms |
+| During push | 800 ms | 829 ms |
+| After push | 800 ms | 808 ms |
 
-Effective aggregate throughput: ~14 GB/s across 32 ranks (limited by single-NIC per rank on trn1).
+3% latency increase during push, well within normal variance. The RDMA push runs in background threads with no lock contention on the inference path.
 
-### 3.7 Summary
+### 3.5 Summary
 
-| Metric | Value |
-|---|---|
-| Wake-up latency (warm, LLaMA-3-70B TP=32) | **7.0s** |
-| Wake-up latency (warm, Qwen3-30B TP=32) | **5.1s** |
-| Sleep latency | **~2s** |
-| Inference impact during push | **No impact** |
-| Max standby engines per instance | **100+** |
-| P2P consistency (10-engine test) | **10/10 correct** |
-| Multi-model consistency (100-engine test) | **15/15 correct** |
-| Bidirectional P2P | **Verified** (A→B and B→A) |
+| Metric | Trn1 | Trn2 |
+|---|---|---|
+| Wake-up latency (LLaMA-3-70B, TP=32) | **7.0s** | **7.4–8.4s** |
+| Wake-up latency (Qwen3-30B, TP=32) | **5.1s** | **4.7–6.3s** |
+| Wake-up latency (Qwen3-235B, TP=32) | — | **~19.9s** |
+| Sleep latency | **~2s** | **~2.4–3.6s** |
+| Inference impact during push | None | — |
+| Max standby engines per instance | 100+ | **500** (2.7 GB/engine) |
+| P2P consistency | 15/15 correct | Correct |
+| Bidirectional P2P | Verified | — |
 
 ---
 
@@ -465,6 +520,14 @@ The error is propagated to the caller as a 503 response with detailed latency br
 - **After**: `[128256, 256]` per rank = 65.7 MB — fits in a single MR, transfers via RDMA
 
 This also reduced checkpoint disk from 214 GB to 139 GB (35% savings).
+
+### 4.15 NRT Init Blocks Scalability on Trn2
+
+**Discovery**: The 500-engine scalability test on Trn2 failed immediately — every engine after the first crashed with `NRT_FAILURE: nrt_allocate_neuron_cores: Logical Neuron Core(s) not available`. The first engine claims all 32 logical NCs during `init_device()`, leaving none for subsequent sleeping engines.
+
+**Root cause**: `init_device()` eagerly called `get_spike_singleton()` which does `nrt_init()` and allocates the NeuronCore specified by `NEURON_RT_VISIBLE_CORES`. This happened before `load_model()` could determine the engine has no checkpoint (standby mode).
+
+**Fix**: Make NRT initialization conditional on having a checkpoint. Standby engines (no `NKIPY_CHECKPOINT`) skip `get_spike_singleton()` in `init_device()` — NRT will be lazily initialized during `nkipy_wake_up()` when the engine actually needs a NeuronCore. Kernel compilation (`_compile_kernels()`) uses NKI trace/compile which is CPU-only and doesn't require NRT.
 
 ---
 
