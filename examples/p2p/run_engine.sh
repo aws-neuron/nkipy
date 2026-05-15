@@ -18,14 +18,14 @@
 #   # Qwen3 receiver on same node with core offset:
 #   ./run_engine.sh --model Qwen/Qwen3-30B-A3B --tp 8 --core-offset 16 --port 8001
 #
-#   # LLaMA-3.1-70B sender on trn2.48xlarge (cross-node, host-staged P2P):
+#   # LLaMA-3.1-70B sender on trn2.48xlarge (cross-node):
 #   ./run_engine.sh --model /fsx/models/llama-3.1-70b --tp 32 \
 #       --checkpoint /fsx/models/llama_3.1_70b_TP32 \
-#       --host-staging --lnc 2 --skip-cte --hf-offline --activate-venv
+#       --lnc 2 --skip-cte --hf-offline --activate-venv
 #
-#   # LLaMA-3.1-70B receiver on trn2.48xlarge (cross-node, core offset):
+#   # LLaMA-3.1-70B receiver on trn2.48xlarge (cross-node):
 #   ./run_engine.sh --model /fsx/models/llama-3.1-70b --tp 32 \
-#       --core-offset 32 --host-staging --lnc 2 \
+#       --core-offset 32 --lnc 2 \
 #       --skip-cte --hf-offline --activate-venv
 #
 #   # TinyLlama sender:

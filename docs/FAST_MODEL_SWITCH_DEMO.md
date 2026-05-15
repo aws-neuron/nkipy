@@ -1,4 +1,4 @@
-# Fast On-demand Model Serving Scaling Up on Neuron
+# On-Demand Multi-Model LLM Serving with Second-Level Cold Start on Neuron
 
 ## 1. Motivation
 
@@ -64,7 +64,7 @@ Measured on **trn2.48xlarge** with FSx for Lustre (4.5 TiB PERSISTENT_2, 4 OSTs)
 |---|---|---|---|
 | Qwen3-30B-A3B (TP=32) | 59 GB | 51s | 1.15 GB/s |
 | LLaMA-3.1-70B (TP=32) | 139 GB | 121s | 1.15 GB/s |
-| Qwen3-235B-A22B (TP=32) | 401 GB | **386s** | 1.04 GB/s |
+| Qwen3-235B-A22B (TP=32) | 448 GB | **386s** | 1.16 GB/s |
 
 ### 1.6 The Operational Challenge
 
@@ -322,7 +322,7 @@ Effective aggregate throughput: ~24 GB/s across 32 ranks × 16 EFA NICs.
 | Kernel load + barrier | 0.1s | |
 | **Total wake-up** | **19.9s** | |
 
-Note: Qwen3-235B-A22B uses host-staged RDMA because the large per-rank weight size (14 GB) exceeds the device memory region registration limit for direct device RDMA. The 401 GB transfer achieves ~174 Gbps aggregate throughput across 32 ranks × 16 EFA NICs. Sender DMA (~7.8s) is fully overlapped with receiver setup (Gloo + NRT + MR registration) via early-prepare (`/nkipy/p2p_prepare`).
+Note: Qwen3-235B-A22B uses host-staged RDMA because the large per-rank weight size (14 GB) exceeds the device memory region registration limit for direct device RDMA. The 448 GB transfer achieves ~174 Gbps aggregate throughput across 32 ranks × 16 EFA NICs. Sender DMA (~7.8s) is fully overlapped with receiver setup (Gloo + NRT + MR registration) via early-prepare (`/nkipy/p2p_prepare`).
 
 **P2P RDMA vs FSx cold load:**
 

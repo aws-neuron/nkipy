@@ -245,58 +245,103 @@ adds ~41s.
 | RDMA throughput | 60.2 Gbps/rank | ~95 Gbps/rank | Host-staged, limited by NIC sharing |
 | /sleep | 2.3s | ~2s | Comparable (with delay) |
 
-### Host-Staged P2P Architecture
+### Cross-Node P2P: Direct Device RDMA Works
 
-On Trn2, EFA NICs and NeuronCore HBM sit in separate PCIe domains. Direct
-device-to-device RDMA only achieves ~3.5 Gbps per rank, while host memory RDMA
-reaches ~30 Gbps per rank. The host-staged path (`NKIPY_HOST_STAGING=1`) routes
-data through host memory:
+Initial testing showed direct device RDMA achieving only ~3.5 Gbps/rank on
+Trn2 (early NRT firmware). With current firmware (NRT 2.30.51.0), **direct
+device RDMA performs equivalently to host-staged** for cross-node transfers:
+
+| Model | Direct Device RDMA | Host-Staged RDMA |
+|-------|---|---|
+| Qwen3-30B-A3B (TP=32) | P2P: 3.5s, Wake: 4.7–6.3s | P2P: 3.5–3.6s, Wake: 6.1–6.4s |
+| LLaMA-3.1-70B (TP=32) | P2P: 5.8s, Wake: 7.4–8.4s | P2P: 5.8–5.9s, Wake: 7.4–8.4s |
+
+Direct device RDMA is simpler (no DMA staging), so it is the **default path**.
+
+### When to use host-staged RDMA
+
+The host-staged path (`NKIPY_HOST_STAGING=1`) routes data through pinned host
+memory: device→host DMA, host RDMA, host→device DMA.
 
 ```
 Sender device (HBM)  ──DMA──▶  Sender host (RAM)  ──RDMA──▶  Receiver host (RAM)  ──DMA──▶  Receiver device (HBM)
        ~13 Gbps                         ~30 Gbps                          ~13 Gbps
 ```
 
-### Optimizations applied
+Use it only when:
+- **Direct device RDMA fails or shows degraded throughput** (e.g., older NRT
+  firmware where device RDMA achieves only ~3.5 Gbps/rank)
+- **Large per-rank weight size** — models with >7 GB per rank (e.g.,
+  Qwen3-235B-A22B at TP=32 with 14 GB/rank) fail `ibv_reg_mr` for device
+  memory addresses. Host-staged avoids this by registering host memory instead.
+- **Debugging transfer issues** — host-staged provides more granular timing
+  breakdowns (sender DMA, RDMA, receiver DMA separately)
 
-1. **Host-staged RDMA** (`NKIPY_HOST_STAGING=1`): Routes transfers through
-   pinned host memory — RDMA achieves 60 Gbps/rank (vs 3.5 Gbps direct device)
-2. **Batch parallel DMA** (`spike.batch_dma_read/write`): 8-thread parallel
+When host-staged is enabled, additional optimizations apply:
+1. **Batch parallel DMA** (`spike.batch_dma_read/write`): 8-thread parallel
    NRT DMA copies reduce device↔host from 5.5s to 2.7s (2x speedup)
-3. **Sender MR pre-registration**: Host staging buffer registered at model
+2. **Sender MR pre-registration**: Host staging buffer registered at model
    load time, saving 1.0s per transfer
-4. **NIC rotation**: All 16 EFA NICs utilized across 32 workers (vs 4 before)
-5. **Early-prepare pre-DMA**: The receiver fires a lightweight
-   `/nkipy/p2p_prepare` signal to the sender at the very start of the wake-up
-   flow (before Gloo init, NRT init, and tensor allocation). This gives the
-   sender ~4 seconds of head start to DMA all weights from device to host
-   staging buffer. By the time the actual push request arrives, the data is
-   already in host memory and RDMA can proceed at full speed with zero wait.
-   Without early-prepare, the sender DMA and receiver setup run sequentially,
-   adding 2+ seconds to the critical path.
+3. **Early-prepare pre-DMA**: Receiver fires `/nkipy/p2p_prepare` at the
+   start of wake-up, giving sender ~4s head start to DMA weights to host
+4. **PCIe bus contention avoidance**: RDMA and DMA are serialized (concurrent
+   operation drops throughput from ~30 Gbps to ~9 Gbps)
 
-**PCIe bus contention constraint**: RDMA and DMA cannot run concurrently on
-the same host without severe PCIe bus contention (throughput drops from ~30
-Gbps to ~9 Gbps). The implementation waits for all DMA to complete before
-starting any RDMA writes.
+### Optimizations applied (all paths)
 
-### /wake_up latency with early-prepare pre-DMA (9.1–10.3s total)
+1. **NIC rotation**: All 16 EFA NICs utilized across 32 workers (vs 4 before)
+2. **NRT collective init fix**: Cleared `NEURON_RT_ROOT_COMM_ID` to avoid
+   collective handshake, reducing NRT init from 17.2s to <0.1s
 
-Same setup as above, with early-prepare optimization enabled:
+### /wake_up latency (cross-node, direct device RDMA)
+
+**LLaMA-3.1-70B, TP=32, 2x trn2.48xlarge:**
 
 | Phase | Time |
 |-------|------|
-| Gloo init | 1.0s |
-| NRT init + tensor alloc | 0.2s |
-| MR registration (receiver) | 2.7s |
-| Sender RDMA (2 chunks, 4.6 GB) | 1.3s |
-| Receiver host→device DMA | 2.9s |
-| Kernel load + barrier | 0.5–2.0s |
-| **Total wake-up** | **9.1–10.3s** |
+| Gloo init | 0.9–1.0s |
+| NRT init + tensor alloc | 0.1s |
+| P2P transfer | 5.8s |
+| Kernel load + barrier | 1.0–1.2s |
+| **Total wake-up** | **7.4–8.4s** |
 
-The NRT init time dropped from 17.2s to 0.2s by fixing the
-`NEURON_RT_ROOT_COMM_ID` collective issue (see Issue 6). Combined with
-early-prepare pre-DMA, total wake-up went from 30.3s to 9.1–10.3s.
+**Qwen3-30B-A3B, TP=32, 2x trn2.48xlarge:**
+
+| Phase | Time |
+|-------|------|
+| Gloo init | 0.9–1.0s |
+| NRT init + tensor alloc | 0.0s |
+| P2P transfer | 3.5s |
+| Kernel load + barrier | 0.0–1.3s |
+| **Total wake-up** | **4.7–6.3s** |
+
+**Qwen3-235B-A22B, TP=32 (LNC=2), 2x trn2.48xlarge, host-staged RDMA:**
+
+| Phase | Time |
+|-------|------|
+| Gloo init | 0.93s |
+| NRT init + tensor alloc | 0.4s |
+| P2P transfer | 18.4s |
+| Kernel load + barrier | 0.13s |
+| **Total wake-up** | **~19.9s** |
+
+401 GB transferred at ~174 Gbps aggregate. Uses host-staged RDMA because
+direct device `ibv_reg_mr` fails for the 14 GB per-rank weight size.
+Sleep latency: ~3.6s (after async munmap optimization; was ~8s before).
+
+**Sleep latency optimization for large models.** Prior to optimization, Qwen3-235B sleep took ~8s due to synchronous `munmap` of 12.5 GB/rank pinned host staging buffers (kernel page table cleanup with 32 ranks contending). Fix: defer `munmap` to a background thread — staging buffers hold no device resources after MR deregistration, so they can be freed asynchronously. The background cleanup completes before the next `wake_up` (which joins the thread to avoid OOM).
+
+| Phase | Before | After |
+|---|---|---|
+| GC collect | 0.49s | 0.49s |
+| Spike reset | 0.45s | 0.45s |
+| Endpoint clear | **2–6s** | **0.2s** (async munmap) |
+| Gloo destroy | 0.5–2.3s | 1.5–2.1s |
+| **Server wall time** | **7.9s** | **3.6s** |
+
+The NRT init time dropped from 17.2s to <0.1s by fixing the
+`NEURON_RT_ROOT_COMM_ID` collective issue (see Issue 6). Total wake-up went
+from 30.3s to 5–8s.
 
 ### Remaining optimization opportunities
 
@@ -339,3 +384,11 @@ NKIPY_HOST_STAGING=1          # Host-staged RDMA (default on Trn2)
 Metrics to capture:
 - `/nkipy/wake_up` total latency (P2P transfer + NRT init + gloo)
 - `/nkipy/sleep` total latency
+
+## Scalability: 500 Sleeping Engines on trn2.48xlarge
+
+Successfully launched 500 standby engines (LLaMA-3.1-70B, TP=32, LNC=2) on a single trn2.48xlarge in 22 minutes.
+
+**Key fix**: `init_device()` must skip `get_spike_singleton()` for standby engines (no `NKIPY_CHECKPOINT`). NRT init eagerly allocates the NeuronCore specified by `NEURON_RT_VISIBLE_CORES` — the first engine claims all 32 logical NCs, blocking all subsequent engines. Deferring NRT to `wake_up()` allows unlimited sleeping engines.
+
+**Resource usage at 500 engines**: 1,380 GB / 1,991 GB memory (~2.7 GB/engine), 1.1M file descriptors, 6,698 TCP ports. ~611 GB still free — theoretical limit ~730 engines per instance.

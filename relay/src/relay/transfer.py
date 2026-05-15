@@ -185,32 +185,39 @@ def receive_from_peer_staged(
     push_endpoint: str = "/nkipy/p2p_push_weights",
     preconnect_endpoint: str = "/nkipy/p2p_preconnect",
 ) -> None:
-    """Host-staged receive: RDMA into host buffer, then DMA host->device.
+    """Host-staged receive: RDMA into fixed staging buffer, then DMA to device.
 
-    On Trn2, registering host memory for RDMA is much faster than device memory,
-    and RDMA to host achieves ~100+ Gbps vs ~3.5 Gbps to device.
+    Uses a fixed-size staging buffer (default 1 GB, set via NKIPY_STAGING_SIZE_MB)
+    registered once as a single MR. Transfers weights in super-chunks that fit
+    within the buffer, pipelining RDMA[N+1] with DMA[N] using double-buffering.
 
-    Uses chunked transfer to overlap RDMA receive with DMA host->device:
-    sender pushes in N chunks, receiver DMAs each chunk while next arrives.
+    This reduces MR registration from O(total_weights) to O(staging_size):
+    e.g. 12.5 GB model → 8.4s registration becomes 1 GB buffer → 0.7s.
     """
     import concurrent.futures
     from spike import get_spike_singleton
     from .staging import HostStagingBuffer, compute_offsets
 
-    num_chunks = int(os.environ.get("NKIPY_RECV_CHUNKS", "2"))
+    staging_size_mb = int(os.environ.get("NKIPY_STAGING_SIZE_MB", "1024"))
+    staging_size = staging_size_mb * 1024 * 1024
 
     t0 = time.time()
     sizes = [size for _, _, size, _ in buffers_with_tensors]
     total_bytes = sum(sizes)
-    offsets = compute_offsets(sizes)
     n = len(buffers_with_tensors)
 
-    # Reuse pre-allocated staging buffer if available (saves mmap allocation)
+    # Use two halves for double-buffering: RDMA into one half, DMA from the other.
+    # If any single tensor exceeds half the buffer, disable double-buffering.
+    max_single = max(sizes) if sizes else 0
+    double_buffer = max_single <= staging_size // 2
+    half_size = staging_size // 2 if double_buffer else staging_size
+
+    # Allocate fixed staging buffer (reuse from previous cycle if same size)
     prereg = getattr(ep, '_receiver_staging', None)
-    if prereg and prereg.total_size == total_bytes:
+    if prereg and prereg.total_size == staging_size:
         staging = prereg.staging
     else:
-        staging = HostStagingBuffer(total_bytes)
+        staging = HostStagingBuffer(staging_size)
     t_alloc = time.time()
 
     # Setup RDMA endpoint
@@ -234,35 +241,74 @@ def receive_from_peer_staged(
         _pool.shutdown(wait=False)
     t_preconnect = time.time()
 
-    # Register HOST staging buffer as single contiguous MR (overlaps with preconnect)
-    ep.buf_info = [(f"staged_{i}", sizes[i]) for i in range(len(sizes))]
-    ep.xfer_descs = ep.ep.register_contiguous_buffer(
-        staging.ptr, total_bytes, offsets, sizes)
+    # Register the FIXED staging buffer as a single MR (fast: ~0.7s for 1 GB)
+    # register_contiguous_buffer with one region gives us a single desc whose
+    # mr_id/lkeys/rkeys we reuse for all super-chunks.
+    ep.buf_info = [("staging_fixed", staging_size)]
+    base_descs = ep.ep.register_contiguous_buffer(
+        staging.ptr, staging_size, [0], [staging_size])
+    ep.xfer_descs = base_descs
+    base_desc = base_descs[0]
     if preconnect_future is not None:
         preconnect_future.result()
     t_reg = time.time()
 
-    # Send transfer descriptors to sender
-    serialized = ep.ep.get_serialized_descs(ep.xfer_descs)
-    my_info = (meta_hex, serialized.hex())
-    gathered = [None] * dist.get_world_size() if dist.get_rank() == 0 else None
-    dist.gather_object(my_info, gathered, dst=0)
-    t_gather = time.time()
+    # Partition buffers into super-chunks that fit within half_size.
+    # Each super-chunk is a contiguous range of buffers whose total size <= half_size.
+    super_chunks = []  # [(start_idx, end_idx), ...]
+    sc_start = 0
+    sc_bytes = 0
+    for i, sz in enumerate(sizes):
+        if sc_bytes + sz > half_size and sc_bytes > 0:
+            super_chunks.append((sc_start, i))
+            sc_start = i
+            sc_bytes = 0
+        sc_bytes += sz
+    if sc_start < n:
+        super_chunks.append((sc_start, n))
 
     spike = get_spike_singleton()
-    chunk_size = (n + num_chunks - 1) // num_chunks
     dma_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     dma_future = None
     t_rdma_total = 0.0
     t_dma_total = 0.0
 
-    for chunk_idx in range(num_chunks):
-        c_start = chunk_idx * chunk_size
-        c_end = min(c_start + chunk_size, n)
-        if c_start >= n:
-            break
+    from relay import _relay as _relay_mod; _XferDesc = _relay_mod.XferDesc
 
-        # Request sender to push this chunk
+    for sc_idx, (sc_start, sc_end) in enumerate(super_chunks):
+        # Determine which half of the double-buffer to use for this super-chunk
+        half_offset = (sc_idx % 2) * half_size if double_buffer else 0
+
+        # Without double-buffering, must wait for previous DMA before RDMA
+        # overwrites the same buffer. With double-buffering, we can defer the
+        # wait until after RDMA (different halves won't conflict).
+        if not double_buffer and dma_future is not None:
+            dma_future.result()
+            dma_future = None
+
+        # Build XferDescs pointing into the current half of the staging buffer.
+        # Reuse the single MR registration — just vary the address within it.
+        chunk_sizes = sizes[sc_start:sc_end]
+        chunk_offsets = compute_offsets(chunk_sizes)
+        abs_offsets = [half_offset + o for o in chunk_offsets]
+
+        chunk_descs = []
+        for i, (co, cs) in enumerate(zip(chunk_offsets, chunk_sizes)):
+            desc = _XferDesc()
+            desc.addr = staging.ptr + half_offset + co
+            desc.size = cs
+            desc.mr_id = base_desc.mr_id
+            desc.lkeys = base_desc.lkeys
+            desc.rkeys = base_desc.rkeys
+            chunk_descs.append(desc)
+
+        # Send descs to sender for this super-chunk
+        serialized = ep.ep.get_serialized_descs(chunk_descs)
+        my_info = (meta_hex, serialized.hex())
+        gathered = [None] * dist.get_world_size() if dist.get_rank() == 0 else None
+        dist.gather_object(my_info, gathered, dst=0)
+
+        # Request sender to push this super-chunk
         if dist.get_rank() == 0:
             base = peer_url.rstrip("/")
             resp = requests.post(
@@ -272,30 +318,28 @@ def receive_from_peer_staged(
                         {"remote_metadata": m, "remote_descs": d}
                         for m, d in gathered
                     ],
-                    "chunk_start": c_start,
-                    "chunk_end": c_end,
-                    "is_last_chunk": chunk_idx == num_chunks - 1 or c_end >= n,
+                    "chunk_start": sc_start,
+                    "chunk_end": sc_end,
+                    "is_last_chunk": sc_idx == len(super_chunks) - 1,
                 },
             )
             resp.raise_for_status()
         dist.barrier()
-        t_chunk_rdma = time.time()
-        t_rdma_total += (t_chunk_rdma - (t_reg if chunk_idx == 0 else t_chunk_rdma))
 
-        # Wait for previous DMA to complete before starting new one
-        if dma_future is not None:
+        # With double-buffering, wait for previous DMA before reusing that half
+        if double_buffer and dma_future is not None:
             dma_future.result()
+            dma_future = None
 
-        # Start DMA for this chunk (overlaps with next chunk's RDMA)
+        # DMA this super-chunk from staging half to device
         dma_ops = [(buffers_with_tensors[i][3].tensor_ref,
-                    staging.slice_as_numpy(offsets[i], sizes[i]))
-                   for i in range(c_start, c_end)]
-        if chunk_idx < num_chunks - 1 and c_end < n:
+                    staging.slice_as_numpy(abs_offsets[i - sc_start], sizes[i]))
+                   for i in range(sc_start, sc_end)]
+
+        if sc_idx < len(super_chunks) - 1:
             dma_future = dma_executor.submit(spike.batch_dma_write, dma_ops)
         else:
-            # Last chunk: DMA synchronously
             spike.batch_dma_write(dma_ops)
-            dma_future = None
 
     # Wait for final DMA
     if dma_future is not None:
@@ -303,12 +347,12 @@ def receive_from_peer_staged(
     dma_executor.shutdown(wait=False)
     t_dma = time.time()
 
-    # Cache staging buffer for reuse on next wake cycle (saves mmap allocation).
+    # Cache the fixed staging buffer for reuse on next wake cycle.
     from .staging import PreregisteredStaging
     prereg_obj = PreregisteredStaging.__new__(PreregisteredStaging)
-    prereg_obj.sizes = sizes
-    prereg_obj.offsets = offsets
-    prereg_obj.total_size = total_bytes
+    prereg_obj.sizes = [staging_size]
+    prereg_obj.offsets = [0]
+    prereg_obj.total_size = staging_size
     prereg_obj.staging = staging
     prereg_obj.xfer_descs = ep.xfer_descs
     ep._receiver_staging = prereg_obj
@@ -318,12 +362,13 @@ def receive_from_peer_staged(
     throughput_gbps = (total_bytes * 8) / elapsed / 1e9 if elapsed > 0 else 0
     if not dist.is_initialized() or dist.get_rank() == 0:
         logger.info(
-            "Rank %d: staged recv (chunked, %d chunks) %d bufs %.2f MB — "
+            "Rank %d: staged recv (fixed %d MB, %d super-chunks) %d bufs %.2f MB — "
             "alloc %.3fs preconnect %.3fs mr_reg %.3fs "
-            "gather %.3fs transfer+dma %.3fs total %.3fs (%.2f Gbps)",
-            dist.get_rank(), num_chunks, len(buffers_with_tensors), total_bytes / 1e6,
+            "transfer+dma %.3fs total %.3fs (%.2f Gbps)",
+            dist.get_rank(), staging_size_mb, len(super_chunks),
+            len(buffers_with_tensors), total_bytes / 1e6,
             t_alloc - t0, t_preconnect - t_alloc, t_reg - t_preconnect,
-            t_gather - t_reg, t_dma - t_gather, elapsed, throughput_gbps)
+            t_dma - t_reg, elapsed, throughput_gbps)
 
 
 def preconnect_to_peer(
@@ -625,7 +670,13 @@ def push_weights_to_peer_staged(model, per_rank_info=None, chunk_start=None,
     ok, conn_id = relay_ep.add_remote_endpoint(bytes.fromhex(remote_metadata_hex))
     assert ok, "Failed to connect to remote endpoint"
     all_remote_descs = relay_ep.deserialize_descs(bytes.fromhex(remote_descs_hex))
-    if chunk_start is not None:
+    # When receiver uses fixed staging buffer, it sends exactly the descs for
+    # this chunk (not the full model). Use remote descs as-is when their count
+    # matches the local chunk; otherwise slice with chunk_start:chunk_end for
+    # backwards compatibility with full-buffer mode.
+    if len(all_remote_descs) == len(xfer_descs):
+        remote_descs = all_remote_descs
+    elif chunk_start is not None:
         remote_descs = all_remote_descs[chunk_start:chunk_end]
     else:
         remote_descs = all_remote_descs
