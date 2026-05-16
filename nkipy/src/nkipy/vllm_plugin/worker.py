@@ -66,7 +66,8 @@ class NKIPyWorker(WorkerBase):
         import signal
 
         core_offset = int(os.environ.get("NKIPY_CORE_OFFSET", "0"))
-        os.environ["NEURON_RT_VISIBLE_CORES"] = str(self.local_rank + core_offset)
+        self._core_id = self.local_rank + core_offset
+        os.environ["NEURON_RT_VISIBLE_CORES"] = str(self._core_id)
 
         if "NEURON_RT_ROOT_COMM_ID" not in os.environ:
             os.environ["NEURON_RT_ROOT_COMM_ID"] = f"localhost:{61239 + core_offset}"
@@ -92,8 +93,11 @@ class NKIPyWorker(WorkerBase):
         if dist.is_initialized():
             dist.barrier()
 
-        from spike import get_spike_singleton
-        get_spike_singleton()
+        # Only claim NeuronCores if we have a checkpoint to load (sender engine).
+        # Standby engines defer core allocation to wake_up time via get_spike_singleton().
+        if os.environ.get("NKIPY_CHECKPOINT"):
+            from spike import get_spike_singleton
+            get_spike_singleton()
 
         from .model_runner import NKIPyModelRunner
 
@@ -256,7 +260,8 @@ class NKIPyWorker(WorkerBase):
         if self._sleeping:
             self._destroy_gloo()
 
-        # Pre-register sender MRs for P2P push.
+        # Pre-register sender MRs for P2P push (saves ~2.3s per push).
+        # Sender engines stay awake so slow dereg during sleep is not a concern.
         if mr._nkipy_model is not None:
             if os.environ.get("NKIPY_HOST_STAGING", "0") == "1":
                 self._preregister_host_staging(mr._nkipy_model)
@@ -486,23 +491,31 @@ class NKIPyWorker(WorkerBase):
 
         dist.barrier()
         t_pre_nrt = _time.time()
-        # Try fast path first (skip firmware reset). If it fails, retry with
-        # reset enabled. The fast path works after clean shutdowns (spike_reset
-        # releases cores). The retry handles corrupted state from dirty kills
-        # where cores need a full firmware reset to recover.
-        os.environ["NEURON_RT_RESET_CORES"] = "0"
+        # Only skip firmware reset if cores were cleanly released (marker exists).
+        # First wake-up of a standby engine has no prior NRT session, so full
+        # reset is required.
+        can_fast_init = os.path.exists(_NRT_CLOSED_MARKER)
+        if can_fast_init:
+            os.environ["NEURON_RT_RESET_CORES"] = "0"
+        else:
+            os.environ.pop("NEURON_RT_RESET_CORES", None)
         nrt_error = None
         try:
             get_spike_singleton()
         except Exception as e:
-            logger.warning("Rank %d: NRT fast-init failed, retrying with reset: %s", self.rank, e)
-            os.environ.pop("NEURON_RT_RESET_CORES", None)
-            try:
-                get_spike_singleton()
-                nrt_error = None
-            except Exception as e2:
-                nrt_error = e2
-                logger.error("Rank %d: NRT init failed (with reset): %s", self.rank, e2)
+            if can_fast_init:
+                logger.warning("Rank %d: NRT fast-init failed, retrying with reset: %s", self.rank, e)
+                from spike import reset as spike_reset
+                spike_reset()
+                os.environ.pop("NEURON_RT_RESET_CORES", None)
+                try:
+                    get_spike_singleton()
+                except Exception as e2:
+                    nrt_error = e2
+                    logger.error("Rank %d: NRT init failed (with reset): %s", self.rank, e2)
+            else:
+                nrt_error = e
+                logger.error("Rank %d: NRT init failed: %s", self.rank, e)
         t_nrt = _time.time()
         # All ranks must participate in the barrier even on failure,
         # otherwise healthy ranks hang waiting for failed ones.
@@ -617,8 +630,11 @@ class NKIPyWorker(WorkerBase):
 
         # Sender engines: pre-register MRs so push_to_peer skips registration.
         if os.environ.get("NKIPY_CHECKPOINT"):
-            from relay import preregister_weights
-            preregister_weights(model)
+            if os.environ.get("NKIPY_HOST_STAGING", "0") == "1":
+                self._preregister_host_staging(model)
+            else:
+                from relay import preregister_weights
+                preregister_weights(model)
         t_prereg = _time.time()
 
         t_end = _time.time()

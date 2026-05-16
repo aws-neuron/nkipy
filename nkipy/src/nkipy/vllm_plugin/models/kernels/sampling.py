@@ -6,7 +6,13 @@ import nki.language as nl
 import nkipy.distributed.collectives as cc
 import numpy as np
 
-os.environ.setdefault("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
+def _default_platform_target() -> str:
+    try:
+        with open("/sys/devices/virtual/dmi/id/product_name") as f:
+            return "trn2" if "trn2" in f.readline().split(".")[0] else "trn1"
+    except OSError:
+        return "trn1"
+os.environ.setdefault("NEURON_PLATFORM_TARGET_OVERRIDE", _default_platform_target())
 import torch.distributed as dist
 
 from nkipy.core import (
