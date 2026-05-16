@@ -118,6 +118,7 @@ class NKIPyWorker(WorkerBase):
         """Pre-register host staging buffer for receiver to eliminate MR reg at wake time."""
         import time as _time
         from relay import rank_endpoint
+        from relay.endpoint import _VAHandle
         from relay.staging import HostStagingBuffer, PreregisteredStaging, compute_offsets
 
         t0 = _time.time()
@@ -130,8 +131,8 @@ class NKIPyWorker(WorkerBase):
 
         relay_ep = rank_endpoint._ensure_endpoint()
         relay_ep.start_passive_accept()
-        xfer_descs = relay_ep.register_contiguous_buffer(
-            staging.ptr, total_bytes, offsets, sizes)
+        handles = [_VAHandle(staging.ptr + off, sz) for off, sz in zip(offsets, sizes)]
+        xfer_descs = relay_ep.register_memory(handles)
         t_reg = _time.time()
 
         prereg = PreregisteredStaging.__new__(PreregisteredStaging)

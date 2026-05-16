@@ -22,7 +22,15 @@ logger = logging.getLogger(__name__)
 # This is the same approach used by vllm-neuron.
 # Enable HBM MR registration for RDMA on Trn2 (ibv_reg_mr on device memory).
 os.environ.setdefault("NEURON_RT_REGISTER_HBM_MR", "1")
-os.environ.setdefault("NKIPY_HOST_STAGING", "0")
+# Host-staged RDMA is required on Trn2 (direct device RDMA is ~3.5 Gbps/rank);
+# on Trn1, direct device RDMA works at full speed so host staging is unnecessary.
+def _default_host_staging() -> str:
+    try:
+        with open("/sys/devices/virtual/dmi/id/product_name") as f:
+            return "1" if "trn2" in f.readline().split(".")[0] else "0"
+    except OSError:
+        return "0"
+os.environ.setdefault("NKIPY_HOST_STAGING", _default_host_staging())
 try:
     import torch_neuronx  # noqa: F401 — registers neuron backend
 except ImportError:
