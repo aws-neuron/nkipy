@@ -512,6 +512,18 @@ PYBIND11_MODULE(_relay, m) {
           },
           "Deregister a memory region", py::arg("mr_id"))
       .def(
+          "deregv",
+          [](Endpoint& self, std::vector<uint64_t> const& mr_ids) {
+            bool ok;
+            {
+              py::gil_scoped_release release;
+              InsidePythonGuard guard;
+              ok = self.deregv(mr_ids);
+            }
+            return ok;
+          },
+          "Deregister multiple memory regions in batch", py::arg("mr_ids"))
+      .def(
           "write",
           [](Endpoint& self, uint64_t conn_id, uint64_t mr_id, uint64_t ptr,
              size_t size, py::bytes meta_blob) {

@@ -234,13 +234,11 @@ def receive_from_peer_staged(
         _pool.shutdown(wait=False)
     t_preconnect = time.time()
 
-    # Register HOST staging buffer with per-tensor MRs (overlaps with preconnect)
+    # Register HOST staging buffer — single MR for the contiguous region
     ep.buf_info = [(f"staged_{i}", sizes[i]) for i in range(len(sizes))]
-    handles = [
-        _VAHandle(staging.ptr + off, sz)
-        for off, sz in zip(offsets, sizes)
-    ]
-    ep.xfer_descs = ep.ep.register_memory(handles)
+    ep.xfer_descs = ep.ep.register_contiguous_buffer(
+        staging.ptr, total_bytes, offsets, sizes
+    )
     if preconnect_future is not None:
         preconnect_future.result()
     t_reg = time.time()
@@ -456,7 +454,10 @@ class WeightServer:
 
 
 def preregister_weights(model) -> None:
-    """Pre-register all model weight buffers for RDMA in chunks.
+    """Pre-register all model weight buffers for RDMA.
+
+    Uses single-MR contiguous registration when the model allocates from
+    an arena, otherwise falls back to chunked registration.
 
     Call once after model tensors are allocated (load or wake-up).
     Subsequent ``push_to_peer`` / ``receive_from_peer`` calls will
@@ -468,7 +469,11 @@ def preregister_weights(model) -> None:
                     dist.get_rank() if dist.is_initialized() else 0, len(rank_endpoint.xfer_descs))
         return
     t0 = time.time()
-    rank_endpoint.register_chunked(bufs, MAX_RDMA_BUFS)
+    arena = getattr(model, '_weight_arena', None)
+    if arena is not None:
+        rank_endpoint.register_contiguous(bufs, arena.va, arena.size)
+    else:
+        rank_endpoint.register_chunked(bufs, MAX_RDMA_BUFS)
     elapsed = time.time() - t0
     if not dist.is_initialized() or dist.get_rank() == 0:
         logger.info("Rank %d: pre-registered %d weight MRs in %.3fs",
@@ -604,12 +609,12 @@ def push_weights_to_peer_staged(model, per_rank_info=None, chunk_start=None,
         prereg = None
         all_xfer_descs = None
 
-    # Register MRs for each sub-region (skip if pre-registered)
-    from .endpoint import _VAHandle
+    # Register MRs — single MR for contiguous staging buffer (skip if pre-registered)
     relay_ep = rank_endpoint._ensure_endpoint()
     if all_xfer_descs is None:
-        handles = [_VAHandle(staging.ptr + off, sz) for off, sz in zip(all_offsets, all_sizes)]
-        all_xfer_descs = relay_ep.register_memory(handles)
+        all_xfer_descs = relay_ep.register_contiguous_buffer(
+            staging.ptr, full_size, all_offsets, all_sizes
+        )
 
     # Slice descs/offsets for the chunk
     if chunk_start is not None:

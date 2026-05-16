@@ -309,6 +309,19 @@ bool Endpoint::dereg(uint64_t mr_id) {
   return true;
 }
 
+bool Endpoint::deregv(std::vector<uint64_t> const& mr_ids) {
+  std::unique_lock<std::shared_mutex> lock(mr_mu_);
+  for (auto mr_id : mr_ids) {
+    auto it = mr_id_to_mr_.find(mr_id);
+    if (it == mr_id_to_mr_.end()) continue;
+    auto mr = it->second;
+    relay_deregmr(ep_, mr->mhandle_);
+    delete mr;
+    mr_id_to_mr_.erase(it);
+  }
+  return true;
+}
+
 bool Endpoint::writev(uint64_t conn_id, std::vector<uint64_t> mr_id_v,
                       std::vector<void*> src_v, std::vector<size_t> size_v,
                       std::vector<FifoItem> slot_item_v, size_t num_iovs) {

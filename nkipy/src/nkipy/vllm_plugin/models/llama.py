@@ -3,6 +3,7 @@
 """NKIPy Llama3 model for Neuron (supports TinyLlama)."""
 
 import logging
+import os
 import time
 
 import numpy as np
@@ -152,23 +153,25 @@ class Llama3Model:
         logger.info("Weights loaded into existing tensors in %.2fs", time.time() - t)
 
     def _allocate_empty_tensors(self):
-        """Allocate device tensors WITHOUT initialization (for P2P receive).
+        """Allocate device tensors from a contiguous arena (for P2P receive).
 
-        Key optimization: Allocate device memory without writing zeros.
-        P2P RDMA will directly write weights to uninitialized memory,
-        avoiding double-write that causes memory fragmentation and slow spike_reset().
+        All weight tensors are sliced from a single large device allocation.
+        This enables single-MR RDMA registration (1 ibv_reg_mr instead of 483),
+        reducing receiver MR registration from ~3.2s to ~0.01s.
         """
+        from spike import get_spike_singleton
+
         cfg = self.config
         tp = dist.get_world_size()
         n_local_kv_heads = max(1, cfg.num_kv_heads // tp)
         n_local_heads = cfg.num_heads // tp
         cache_shape = (cfg.max_batch_size, cfg.max_seq_len, n_local_kv_heads, cfg.head_dim)
 
-        # Cache tensors still need zeros (they're not filled by P2P)
         cache_k = np.zeros(cache_shape, dtype=cfg.dtype)
         cache_v = np.zeros(cache_shape, dtype=cfg.dtype)
 
         qkv_dim = (n_local_heads + 2 * n_local_kv_heads) * cfg.head_dim
+        itemsize = np.dtype(cfg.dtype).itemsize
         shapes = {
             "qkv_weight": (cfg.hidden_size, qkv_dim),
             "o_weight": (n_local_heads * cfg.head_dim, cfg.hidden_size),
@@ -178,36 +181,54 @@ class Llama3Model:
             "post_attention_weight": (cfg.hidden_size,),
         }
 
-        # OPTIMIZATION: Allocate weight tensors first (uninitialized),
-        # then cache tensors (zeros) to avoid memory fragmentation.
-        # Interleaving uninitialized + zero-writes causes NRT cleanup issues.
-        self.layer_tensors = []
+        # Compute per-tensor sizes in allocation order (same as weight_buffers)
+        alloc_plan = []
         for lid in range(cfg.num_layers):
-            layer = {}
             for wk, prefix in LAYER_WEIGHT_KEYS:
-                # Use allocate_uninitialized instead of from_numpy(zeros)
-                # P2P RDMA will fill these directly
-                layer[wk] = DeviceTensor.allocate_uninitialized(
-                    shapes[wk], cfg.dtype, f"{prefix}_L{lid}")
-            # Cache tensors will be added in second pass
-            self.layer_tensors.append(layer)
+                size = int(np.prod(shapes[wk])) * itemsize
+                alloc_plan.append((lid, wk, prefix, shapes[wk], size))
+        # norm_weight, lm_head_weight, tok_embedding
+        norm_shape = (cfg.hidden_size,)
+        lm_head_shape = (cfg.hidden_size, cfg.vocab_size // tp)
+        cols_per_rank = cfg.hidden_size // tp
+        tok_shape = (cfg.vocab_size, cols_per_rank)
+        alloc_plan.append((None, "norm_weight", None, norm_shape, int(np.prod(norm_shape)) * itemsize))
+        alloc_plan.append((None, "lm_head_weight", None, lm_head_shape, int(np.prod(lm_head_shape)) * itemsize))
+        alloc_plan.append((None, "tok_embedding", None, tok_shape, int(np.prod(tok_shape)) * itemsize))
 
-        # Second pass: allocate cache tensors (need zeros, not P2P-filled)
+        total_bytes = sum(size for *_, size in alloc_plan)
+        spike = get_spike_singleton()
+
+        # Sender: contiguous arena for single-MR registration (never does spike_reset).
+        # Receiver: individual allocations to avoid ibv_reg_mr regression after NRT reinit.
+        use_arena = os.environ.get("NKIPY_CHECKPOINT") is not None
+        if use_arena:
+            self._weight_arena = spike.allocate_tensor(size=total_bytes, core_id=0, name="weight_arena")
+
+        offset = 0
+        self.layer_tensors = [{} for _ in range(cfg.num_layers)]
+        for lid, wk, prefix, shape, size in alloc_plan:
+            name = f"{prefix}_L{lid}" if lid is not None else wk
+            if use_arena:
+                tensor_ref = spike.slice_from_tensor(self._weight_arena, offset=offset, size=size)
+            else:
+                tensor_ref = spike.allocate_tensor(size=size, core_id=0, name=name)
+            dt = DeviceTensor(tensor_ref=tensor_ref, shape=shape, dtype=cfg.dtype, name=name)
+            if lid is not None:
+                self.layer_tensors[lid][wk] = dt
+            elif wk == "norm_weight":
+                self.norm_weight = dt
+            elif wk == "lm_head_weight":
+                self.lm_head_weight = dt
+            elif wk == "tok_embedding":
+                self.tok_embedding_device = dt
+            offset += size
+
+        # Cache tensors (not part of P2P) — allocated separately
         for lid in range(cfg.num_layers):
             layer = self.layer_tensors[lid]
             layer["cache_k"] = DeviceTensor.from_numpy(cache_k, f"cache_k_L{lid}")
             layer["cache_v"] = DeviceTensor.from_numpy(cache_v, f"cache_v_L{lid}")
-
-        # Model head weights also uninitialized (filled by P2P)
-        self.norm_weight = DeviceTensor.allocate_uninitialized(
-            (cfg.hidden_size,), cfg.dtype, "norm_weight")
-        self.lm_head_weight = DeviceTensor.allocate_uninitialized(
-            (cfg.hidden_size, cfg.vocab_size // tp), cfg.dtype, "lm_head_weight")
-
-        # Token embedding — hidden-dim-parallel sharded across TP.
-        cols_per_rank = cfg.hidden_size // tp
-        self.tok_embedding_device = DeviceTensor.allocate_uninitialized(
-            (cfg.vocab_size, cols_per_rank), cfg.dtype, "tok_embedding")
 
     @classmethod
     def compute_weight_sizes(cls, config) -> list:

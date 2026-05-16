@@ -70,22 +70,18 @@ class PreregisteredStaging:
     """Host staging buffer with pre-registered RDMA MRs.
 
     Allocated once at engine init; reused across wake/sleep cycles.
-    Registers each sub-region of the contiguous buffer as a separate MR.
+    Registers the contiguous buffer as a single MR.
     """
 
     def __init__(self, sizes: List[int], endpoint):
-        from .endpoint import _VAHandle
-
         self.sizes = sizes
         self.offsets = compute_offsets(sizes)
         self.total_size = sum(sizes)
         self.staging = HostStagingBuffer(self.total_size)
 
-        handles = [
-            _VAHandle(self.staging.ptr + off, sz)
-            for off, sz in zip(self.offsets, self.sizes)
-        ]
-        self.xfer_descs = endpoint.register_memory(handles)
+        self.xfer_descs = endpoint.register_contiguous_buffer(
+            self.staging.ptr, self.total_size, self.offsets, self.sizes
+        )
 
     def close(self):
         self.staging.close()

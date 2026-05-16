@@ -121,6 +121,40 @@ class RankEndpoint:
             handles.append(_VAHandle(va, size_bytes))
         self.xfer_descs = ep.register_memory(handles)
 
+    def register_contiguous(
+        self,
+        buffers: Sequence[Tuple[str, int, int]],
+        arena_base: int,
+        arena_size: int,
+    ) -> None:
+        """Register buffers that share a contiguous arena as a single MR.
+
+        Instead of N individual ibv_reg_mr calls, registers the entire arena
+        once and creates per-buffer XferDescs via offset arithmetic.
+
+        Parameters
+        ----------
+        buffers : sequence of (name, va, size_bytes)
+        arena_base : int
+            Virtual address of the contiguous arena start.
+        arena_size : int
+            Total size of the arena in bytes.
+        """
+        self._wait_dereg()
+        if self.xfer_descs:
+            return
+        ep = self._ensure_endpoint()
+        self.buf_info = []
+        offsets = []
+        sizes = []
+        for name, va, size_bytes in buffers:
+            self.buf_info.append((name, size_bytes))
+            offsets.append(va - arena_base)
+            sizes.append(size_bytes)
+        self.xfer_descs = ep.register_contiguous_buffer(
+            arena_base, arena_size, offsets, sizes
+        )
+
     def register_chunked(self, buffers: Sequence[Tuple[str, int, int]],
                          chunk_size: int) -> None:
         """Register buffers in chunks to stay within EFA MR limits.
@@ -156,11 +190,11 @@ class RankEndpoint:
         self.xfer_descs = []
         self.buf_info = []
         if old_descs:
-            def _bg_dereg(ep, descs):
-                for desc in descs:
-                    ep.dereg(desc.mr_id)
+            mr_ids = self._unique_mr_ids(old_descs)
+            def _bg_dereg(ep, mr_ids):
+                ep.deregv(mr_ids)
             t = threading.Thread(
-                target=_bg_dereg, args=(ep, list(old_descs)), daemon=True
+                target=_bg_dereg, args=(ep, mr_ids), daemon=True
             )
             t.start()
             self._dereg_threads.append(t)
@@ -171,19 +205,28 @@ class RankEndpoint:
             handles.append(_VAHandle(va, size_bytes))
         self.xfer_descs = ep.register_memory(handles)
 
+    @staticmethod
+    def _unique_mr_ids(descs) -> list:
+        """Extract unique MR IDs from transfer descriptors."""
+        seen = set()
+        ids = []
+        for desc in descs:
+            if desc.mr_id not in seen:
+                seen.add(desc.mr_id)
+                ids.append(desc.mr_id)
+        return ids
+
     def dereg_sync(self) -> None:
         """Deregister memory and destroy the endpoint (blocking)."""
         self._wait_all_dereg()
         if self.ep is not None and self.xfer_descs:
-            for desc in self.xfer_descs:
-                self.ep.dereg(desc.mr_id)
+            self.ep.deregv(self._unique_mr_ids(self.xfer_descs))
         self.xfer_descs = []
         self.buf_info = []
         self.ep = None
 
     def dereg_async(self) -> None:
         """Kick off RDMA deregistration and endpoint teardown in a background thread."""
-        # Collect all pending dereg threads + current descs into one final thread.
         pending = list(self._dereg_threads)
         self._dereg_threads = []
         if self._dereg_thread is not None:
@@ -194,13 +237,13 @@ class RankEndpoint:
         self.xfer_descs = []
         self.buf_info = []
         if ep is not None:
-            def _bg(ep, descs, pending):
+            mr_ids = self._unique_mr_ids(descs)
+            def _bg(ep, mr_ids, pending):
                 for t in pending:
                     t.join()
-                for desc in descs:
-                    ep.dereg(desc.mr_id)
+                ep.deregv(mr_ids)
             self._dereg_thread = threading.Thread(
-                target=_bg, args=(ep, descs, pending), daemon=True
+                target=_bg, args=(ep, mr_ids, pending), daemon=True
             )
             self._dereg_thread.start()
 
@@ -219,10 +262,10 @@ class RankEndpoint:
         self.xfer_descs = []
 
         nc = self._nc_idx if self._nc_idx is not None else _get_nc_idx()
+        mr_ids = self._unique_mr_ids(old_descs)
 
         def _bg_reset():
-            for desc in old_descs:
-                old_ep.dereg(desc.mr_id)
+            old_ep.deregv(mr_ids)
             new_ep = _relay.Endpoint(nc)
             buf_handles = [_VAHandle(desc.addr, desc.size) for desc in old_descs]
             new_descs = new_ep.register_memory(buf_handles)
