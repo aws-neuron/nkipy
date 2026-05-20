@@ -52,15 +52,13 @@ intermediate ops.
 
 ```
 NKIPyKernelGen/
-├── nkigen/           # Python package (tracer, knob API, transforms)
-├── mlir/                      # MLIR dialects (NKIPy, NISA) and C++ passes
-│   └── lib/Transforms/        # Pass implementations (15 passes)
-├── examples/                  # Example kernels and usage patterns
-├── tests/                     # Test suite (~150+ tests)
+├── nkigen/                    # Python package (tracer, knob API, transforms)
+├── mlir/                      # MLIR dialects and C++ passes
+│   └── lib/Transforms/        # Pass implementations
+├── tests/                     # Test suite
 │   ├── unit/                  #   Unit tests for ops and execution engine
 │   ├── passes/                #   MLIR pass tests (tiling, layout, etc.)
-│   ├── e2e/                   #   End-to-end compilation tests
-│   └── python/                #   Python-level pass and rewrite tests
+│   └── e2e/                   #   End-to-end compilation tests
 └── scripts/                   # Environment setup and build scripts
 ```
 
