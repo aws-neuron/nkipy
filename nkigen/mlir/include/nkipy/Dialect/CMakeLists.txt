@@ -1,0 +1,20 @@
+set(LLVM_TARGET_DEFINITIONS NkipyOps.td)
+mlir_tablegen(NkipyOps.h.inc -gen-op-decls)
+mlir_tablegen(NkipyOps.cpp.inc -gen-op-defs)
+mlir_tablegen(NkipyDialect.h.inc -gen-dialect-decls -dialect=nkipy)
+mlir_tablegen(NkipyDialect.cpp.inc -gen-dialect-defs -dialect=nkipy)
+add_public_tablegen_target(MLIRNkipyOpsIncGen)
+add_dependencies(mlir-headers MLIRNkipyOpsIncGen)
+
+set(LLVM_TARGET_DEFINITIONS NkipyAttrs.td)
+mlir_tablegen(NkipyAttrs.h.inc -gen-attrdef-decls)
+mlir_tablegen(NkipyAttrs.cpp.inc -gen-attrdef-defs)
+add_public_tablegen_target(MLIRNkipyAttrsIncGen)
+
+set(LLVM_TARGET_DEFINITIONS NkipyAttrs.td)
+mlir_tablegen(NkipyEnums.h.inc -gen-enum-decls)
+mlir_tablegen(NkipyEnums.cpp.inc -gen-enum-defs)
+add_public_tablegen_target(MLIRNkipyEnumsIncGen)
+
+add_mlir_doc(NkipyDialect NkipyDialect Nkipy/ -gen-dialect-doc)
+add_mlir_doc(NkipyOps NkipyOps Nkipy/ -gen-op-doc)

@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+*.whl
+
+# Built MLIR bindings (generated during build)
+nkigen/_mlir/
+
+# Top-level repo's .gitignore has `lib/` (for Python venv lib/ dirs); don't
+# silently exclude the MLIR C++ pass sources in mlir/lib/.
+!mlir/lib/
+
+# Virtual environments
+venv/
+.env
+
+# Testing
+.pytest_cache/
+.coverage
+tests/**/outputs/
+tests/**/artifacts/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# LLVM lit test outputs
+.lit_test_times.txt
+Output/
