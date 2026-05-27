@@ -69,7 +69,7 @@ class AliasInfo:
 
 @runtime_checkable
 class ComputationIR(Protocol):
-    """Protocol satisfied by both ``HLOModule`` and ``KernelGenIR``."""
+    """Protocol satisfied by both ``HLOModule`` and ``NkiGenIR``."""
 
     @property
     def inputs(self) -> List[TensorPlaceholder]: ...

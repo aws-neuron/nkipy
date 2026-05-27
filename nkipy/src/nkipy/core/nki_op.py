@@ -15,7 +15,7 @@ This module provides three ways to use NKI kernels in NKIPy:
    - Useful for explicit control over specialization
 
 3. nki_custom_op for cross-backend custom ops:
-   - Accepts both @nki.jit (HLO backend) and kernel_builder (kernelgen backend)
+   - Accepts both @nki.jit (HLO backend) and kernel_builder (nkigen backend)
    - Dispatches to the correct implementation based on the active backend
 
 Supports two NKI frontends:
@@ -369,13 +369,13 @@ def wrap_nki_kernel(
 
 
 # ---------------------------------------------------------------------------
-# Kernelgen custom op support
+# NkiGen custom op support
 # ---------------------------------------------------------------------------
 
 
-def _generate_kernelgen_custom_call(kernel_builder, input_specs, output_specs, *args):
-    """Compile a kernel_builder function and inline it during kernelgen tracing."""
-    from nkipy_kernelgen.builder import apply_custom_op
+def _generate_nkigen_custom_call(kernel_builder, input_specs, output_specs, *args):
+    """Compile a kernel_builder function and inline it during nkigen tracing."""
+    from nkigen.builder import apply_custom_op
 
     return apply_custom_op(
         kernel_builder=kernel_builder,
@@ -403,7 +403,7 @@ def nki_custom_op(
     Args:
         nki_kernel: ``@nki.jit`` decorated kernel for the HLO backend.
         kernel_builder: ``nki.compiler.kernel_builder`` function for the
-            kernelgen backend.  Requires ``input_specs`` and ``output_specs``.
+            nkigen backend.  Requires ``input_specs`` and ``output_specs``.
         input_specs: List of ``((shape), dtype_str)`` for each input.
             Required when ``kernel_builder`` is provided.
         output_specs: List of ``((shape), dtype_str)`` for each output.
@@ -458,19 +458,19 @@ class NKICustomOpHandle:
                 )
             return _generate_nki_custom_call(self._nki_kernel, *args)
 
-        if backend == "kernelgen":
+        if backend == "nkigen":
             if self._kernel_builder is None:
                 raise RuntimeError(
-                    "nki_custom_op has no kernel_builder for the kernelgen "
+                    "nki_custom_op has no kernel_builder for the nkigen "
                     "backend. Provide a kernel_builder function via "
                     "kernel_builder=."
                 )
-            return _generate_kernelgen_custom_call(
+            return _generate_nkigen_custom_call(
                 self._kernel_builder, self._input_specs, self._output_specs,
                 *args,
             )
 
         raise RuntimeError(
             f"nki_custom_op is not supported on backend '{backend}'. "
-            f"Use the 'hlo' or 'kernelgen' backend."
+            f"Use the 'hlo' or 'nkigen' backend."
         )

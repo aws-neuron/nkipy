@@ -1,8 +1,8 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the unified kernelgen backend integration.
+"""Tests for the unified nkigen backend integration.
 
-Ported from NeuronPy/tests/unit/test_kernelgen_backend.py with adaptations
+Ported from NeuronPy/tests/unit/test_nkigen_backend.py with adaptations
 for the current nkipy implementation.
 """
 
@@ -14,7 +14,7 @@ import pytest
 from nkipy import knob
 from nkipy.core.nki_op import nki_custom_op
 from nkipy.core.backend import get_backend, tracing
-from nkipy.core.backend.kernelgen import KernelGenIR, KernelGenTraceContext
+from nkipy.core.backend.nkigen import NkiGenIR, NkiGenTraceContext
 
 
 class TestKnobDispatch:
@@ -44,7 +44,7 @@ class TestKnobDispatch:
             with tracing(HLOTraceContext(code)):
                 result = knob(arr, mem_space="Sbuf")
             assert len(w) == 1
-            assert "only effective with backend='kernelgen'" in str(w[0].message)
+            assert "only effective with backend='nkigen'" in str(w[0].message)
             assert result is arr
 
 
@@ -129,59 +129,59 @@ class TestNKICustomOpDispatch:
             with pytest.raises(RuntimeError, match="no nki_kernel"):
                 op(np.ones((128, 128), dtype=np.float32))
 
-    def test_kernelgen_without_kernel_builder_raises(self):
-        """nki_custom_op with only nki_kernel raises on kernelgen."""
+    def test_nkigen_without_kernel_builder_raises(self):
+        """nki_custom_op with only nki_kernel raises on nkigen."""
 
-        class _FakeKernelgenCtx:
-            backend_name = "kernelgen"
+        class _FakeNkigenCtx:
+            backend_name = "nkigen"
 
         op = nki_custom_op(nki_kernel=lambda: None)
-        with tracing(_FakeKernelgenCtx()):
+        with tracing(_FakeNkigenCtx()):
             with pytest.raises(RuntimeError, match="no kernel_builder"):
                 op(np.ones((128, 128), dtype=np.float32))
 
 
-class TestKernelGenTraceContext:
-    """Test KernelGenTraceContext basics."""
+class TestNkiGenTraceContext:
+    """Test NkiGenTraceContext basics."""
 
     @pytest.fixture(autouse=True)
-    def _skip_if_no_kernelgen(self):
+    def _skip_if_no_nkigen(self):
         try:
-            import nkipy_kernelgen  # noqa: F401
+            import nkigen  # noqa: F401
         except ImportError:
-            pytest.skip("nkipy-kernelgen not installed")
+            pytest.skip("nkigen not installed")
 
     def test_backend_name(self):
-        ctx = KernelGenTraceContext()
-        assert ctx.backend_name == "kernelgen"
+        ctx = NkiGenTraceContext()
+        assert ctx.backend_name == "nkigen"
         ctx._cleanup()
 
     def test_tracing_context_activates(self):
-        ctx = KernelGenTraceContext()
+        ctx = NkiGenTraceContext()
         assert get_backend() == "cpu"
         with tracing(ctx):
-            assert get_backend() == "kernelgen"
+            assert get_backend() == "nkigen"
         assert get_backend() == "cpu"
         ctx._cleanup()
 
 
-class TestSpecializeKernelgen:
-    """Test NKIPyKernel._specialize_kernelgen with device compilation and execution."""
+class TestSpecializeNkigen:
+    """Test NKIPyKernel._specialize_nkigen with device compilation and execution."""
 
     @pytest.fixture(autouse=True)
-    def _skip_if_no_kernelgen(self):
+    def _skip_if_no_nkigen(self):
         try:
-            import nkipy_kernelgen  # noqa: F401
+            import nkigen  # noqa: F401
         except ImportError:
-            pytest.skip("nkipy-kernelgen not installed")
+            pytest.skip("nkigen not installed")
 
     @staticmethod
     def _run(func, *np_args):
         from utils import NEURON_AVAILABLE, on_device_test, trace_and_compile
         if NEURON_AVAILABLE:
-            return on_device_test(func, "kernelgen", *np_args)
+            return on_device_test(func, "nkigen", *np_args)
         else:
-            trace_and_compile(func, "kernelgen", *np_args)
+            trace_and_compile(func, "nkigen", *np_args)
             return None
 
     def test_with_knob(self):
@@ -220,7 +220,7 @@ class TestSpecializeKernelgen:
         def add_kernel(a, b):
             return a + b
 
-        kernel = NKIPyKernel.trace(add_kernel, backend="kernelgen")
+        kernel = NKIPyKernel.trace(add_kernel, backend="nkigen")
         a = np.random.randn(64, 64)  # float64
         b = np.random.randn(64, 64)  # float64
 
@@ -234,7 +234,7 @@ class TestSpecializeKernelgen:
                "not yet wired through NKIPyTensorRef path"
     )
     def test_custom_op_with_kernel_builder(self):
-        """nki_custom_op with real kernel_builder traces through kernelgen backend."""
+        """nki_custom_op with real kernel_builder traces through nkigen backend."""
         from nkipy.core.trace import NKIPyKernel
 
         silu_op = nki_custom_op(
@@ -246,39 +246,39 @@ class TestSpecializeKernelgen:
         def kernel(x):
             return silu_op(x)
 
-        k = NKIPyKernel.trace(kernel, backend="kernelgen")
+        k = NKIPyKernel.trace(kernel, backend="nkigen")
         ir = k.specialize(np.random.randn(256, 256).astype("float32"))
-        assert isinstance(ir, KernelGenIR)
+        assert isinstance(ir, NkiGenIR)
         assert "__custom_op__silu_kernel" in ir._mlir_text
         assert "nkipy.custom_op_bodies" in ir._mlir_text
 
 
-class TestKernelgenInplaceUpdate:
-    """Test in-place update (dynamic_update_slice) support for kernelgen.
+class TestNkigenInplaceUpdate:
+    """Test in-place update (dynamic_update_slice) support for nkigen.
 
     Each test traces → compiles → runs on device and compares
     numerical results against NumPy.  Alias metadata is verified as well.
     """
 
     @pytest.fixture(autouse=True)
-    def _skip_if_no_kernelgen(self):
+    def _skip_if_no_nkigen(self):
         try:
-            import nkipy_kernelgen  # noqa: F401
+            import nkigen  # noqa: F401
         except ImportError:
-            pytest.skip("nkipy-kernelgen not installed")
+            pytest.skip("nkigen not installed")
 
     @staticmethod
     def _trace_and_run(func, *np_args):
-        """Trace a kernelgen kernel, return (ir, device_result_or_None)."""
+        """Trace a nkigen kernel, return (ir, device_result_or_None)."""
         from nkipy.core.trace import NKIPyKernel
         from utils import NEURON_AVAILABLE, on_device_test, trace_and_compile
 
-        kernel = NKIPyKernel.trace(func, backend="kernelgen")
+        kernel = NKIPyKernel.trace(func, backend="nkigen")
         ir = kernel.specialize(*np_args)
         if NEURON_AVAILABLE:
-            result = on_device_test(func, "kernelgen", *np_args)
+            result = on_device_test(func, "nkigen", *np_args)
         else:
-            trace_and_compile(func, "kernelgen", *np_args)
+            trace_and_compile(func, "nkigen", *np_args)
             result = None
         return ir, result
 
@@ -300,7 +300,7 @@ class TestKernelgenInplaceUpdate:
         if result is not None:
             baremetal_assert_allclose(result, expected)
 
-        assert isinstance(ir, KernelGenIR)
+        assert isinstance(ir, NkiGenIR)
         assert len(ir.aliases) == 1
         assert ir.aliases[0].param_name == "a"
         assert ir.aliases[0].param_index == 0

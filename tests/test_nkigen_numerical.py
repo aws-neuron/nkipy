@@ -1,6 +1,6 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Numerical correctness and full-pipeline tests for the kernelgen backend.
+"""Numerical correctness and full-pipeline tests for the nkigen backend.
 
 Two levels of verification:
 1. LLVM JIT smoke test — trace via nkipy, run through MLIR passes, execute
@@ -8,37 +8,37 @@ Two levels of verification:
 2. NEFF compilation — trace via nkipy with knob() annotations, compile all
    the way to NEFF to catch pass-pipeline and mem_space enum issues.
 
-Requires nkipy_kernelgen (pass pipeline, LLVM JIT infrastructure).
+Requires nkigen (pass pipeline, LLVM JIT infrastructure).
 """
 
 import numpy as np
 import pytest
 
 try:
-    from nkipy_kernelgen.llvm import LLVMModule
+    from nkigen.llvm import LLVMModule
 
-    HAS_KERNELGEN = True
+    HAS_NKIGEN = True
 except ImportError:
-    HAS_KERNELGEN = False
+    HAS_NKIGEN = False
 
 from nkipy.core.trace import NKIPyKernel
 from nkipy.core.knob import knob
 
 pytestmark = pytest.mark.skipif(
-    not HAS_KERNELGEN, reason="nkipy-kernelgen not installed"
+    not HAS_NKIGEN, reason="nkigen not installed"
 )
 
 
 def _trace_and_run_llvm(func, *np_args):
-    """Trace via nkipy kernelgen, execute via LLVM JIT, return result."""
-    kernel = NKIPyKernel.trace(func, backend="kernelgen")
+    """Trace via nkipy nkigen, execute via LLVM JIT, return result."""
+    kernel = NKIPyKernel.trace(func, backend="nkigen")
     ir = kernel.specialize(*np_args)
     mod = LLVMModule(ir._mlir_text, ir._func_name)
     return mod(*np_args)
 
 
 def _trace_and_compile_to_neff(func, *np_args):
-    """Trace a kernelgen kernel and compile all the way to NEFF.
+    """Trace a nkigen kernel and compile all the way to NEFF.
 
     Exercises the full nkipy.core.knob -> builder.annotate() -> MLIR pass
     pipeline -> NISA -> neuronx-cc -> NEFF path. Raises on any failure.
@@ -48,10 +48,10 @@ def _trace_and_compile_to_neff(func, *np_args):
 
     from nkipy.core import compile as nkipy_compile
 
-    kernel = NKIPyKernel.trace(func, backend="kernelgen")
+    kernel = NKIPyKernel.trace(func, backend="nkigen")
     kernel.specialize(*np_args)
 
-    artifacts_dir = tempfile.mkdtemp(prefix="kernelgen_neff_test_")
+    artifacts_dir = tempfile.mkdtemp(prefix="nkigen_neff_test_")
     try:
         nkipy_compile.compile_to_neff(
             kernel,

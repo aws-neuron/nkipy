@@ -49,7 +49,7 @@ def _sanitize_array_dtype(arr: np.ndarray, name: str = "") -> np.ndarray:
 def _convert_args(sig, boundargs, convert_arg):
     """Convert bound arguments to traced tensor refs.
 
-    Shared by both HLO and kernelgen specialization paths.
+    Shared by both HLO and nkigen specialization paths.
 
     Each argument is passed through *convert_arg* which replaces ndarrays
     with backend-specific tensor refs and returns non-tensor values unchanged.
@@ -102,8 +102,8 @@ class NKIPyKernel:
     def specialize(self, *args, **kwargs):
         if self.backend == "hlo":
             return self._specialize_hlo(*args, **kwargs)
-        elif self.backend == "kernelgen":
-            return self._specialize_kernelgen(*args, **kwargs)
+        elif self.backend == "nkigen":
+            return self._specialize_nkigen(*args, **kwargs)
         elif self.backend == "cpu":
             warnings.warn(
                 "CPU backend does not require specialization", stacklevel=2
@@ -260,14 +260,14 @@ class NKIPyKernel:
         result_tensors = [r.backend_tensor for r in ret]
         code.set_results(result_tensors)
 
-    def _specialize_kernelgen(self, *args, **kwargs):
-        """Trace the kernel to MLIR linalg/tensor IR via the kernelgen backend."""
-        from nkipy.core.backend.kernelgen import KernelGenTraceContext
-        from nkipy.core.ops._register_kernelgen import register_all_kernelgen_impls
+    def _specialize_nkigen(self, *args, **kwargs):
+        """Trace the kernel to MLIR linalg/tensor IR via the nkigen backend."""
+        from nkipy.core.backend.nkigen import NkiGenTraceContext
+        from nkipy.core.ops._register_nkigen import register_all_nkigen_impls
 
-        register_all_kernelgen_impls()
+        register_all_nkigen_impls()
 
-        kctx = KernelGenTraceContext()
+        kctx = NkiGenTraceContext()
 
         sig = inspect.signature(self.func)
         boundargs = sig.bind(*args, **kwargs)
@@ -362,9 +362,9 @@ class NKIPyKernel:
             for i, t in enumerate(result_kg_tensors)
         ]
 
-        from nkipy.core.backend.kernelgen import KernelGenIR
+        from nkipy.core.backend.nkigen import NkiGenIR
 
-        self._code = KernelGenIR(
+        self._code = NkiGenIR(
             mlir_text=mlir_text,
             func_name=self.func.__name__,
             input_specs=input_info,

@@ -198,9 +198,9 @@ class Compiler:
             )
         return output_path
 
-    def _compile_kernelgen(self, ir, work_dir: Path, output_file: str) -> Path:
-        """Compile a KernelGenIR module to NEFF via nkipy_kernelgen."""
-        from nkipy_kernelgen.compile import compile_to_neff
+    def _compile_nkigen(self, ir, work_dir: Path, output_file: str) -> Path:
+        """Compile a NkiGenIR module to NEFF via nkigen."""
+        from nkigen.compile import compile_to_neff
 
         target_str = self._resolve_target().value
 
@@ -220,7 +220,7 @@ class Compiler:
         output_path = work_dir / output_file
         if not output_path.exists():
             raise self._compilation_error(
-                f"KernelGen compilation failed: {output_file} not generated."
+                f"NkiGen compilation failed: {output_file} not generated."
             )
         return output_path
 
@@ -233,7 +233,7 @@ class Compiler:
     ) -> Path:
         """Compile an IR module to a NEFF file.
 
-        Dispatches to ``_compile_hlo`` or ``_compile_kernelgen`` based on
+        Dispatches to ``_compile_hlo`` or ``_compile_nkigen`` based on
         the IR type.
         """
         if isinstance(ir, HLOModule):
@@ -241,14 +241,14 @@ class Compiler:
                 ir, work_dir, output_file, use_neuronx_cc_python_interface
             )
 
-        from nkipy.core.backend.kernelgen import KernelGenIR
+        from nkipy.core.backend.nkigen import NkiGenIR
 
-        if isinstance(ir, KernelGenIR):
-            return self._compile_kernelgen(ir, work_dir, output_file)
+        if isinstance(ir, NkiGenIR):
+            return self._compile_nkigen(ir, work_dir, output_file)
 
         raise RuntimeError(
             f"Unknown IR type: {type(ir).__name__}. "
-            "Expected HLOModule or KernelGenIR."
+            "Expected HLOModule or NkiGenIR."
         )
 
     def compile_in_directory(

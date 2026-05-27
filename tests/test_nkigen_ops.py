@@ -1,8 +1,8 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the kernelgen backend integration.
+"""Tests for the nkigen backend integration.
 
-Each test traces a kernel with backend="kernelgen", compiles to NEFF,
+Each test traces a kernel with backend="nkigen", compiles to NEFF,
 runs on Neuron device, and compares the numerical result against NumPy.
 When no device is available, falls back to compile-only validation.
 """
@@ -11,11 +11,11 @@ import numpy as np
 import pytest
 
 try:
-    import nkipy_kernelgen  # noqa: F401
+    import nkigen  # noqa: F401
 
-    HAS_KERNELGEN = True
+    HAS_NKIGEN = True
 except ImportError:
-    HAS_KERNELGEN = False
+    HAS_NKIGEN = False
 
 from utils import (
     NEURON_AVAILABLE,
@@ -25,10 +25,10 @@ from utils import (
 )
 
 pytestmark = pytest.mark.skipif(
-    not HAS_KERNELGEN, reason="nkipy-kernelgen not installed"
+    not HAS_NKIGEN, reason="nkigen not installed"
 )
 
-TRACE_MODE = "kernelgen"
+TRACE_MODE = "nkigen"
 
 
 def _run_kernel(kernel_fn, *args):
@@ -40,7 +40,7 @@ def _run_kernel(kernel_fn, *args):
         return None
 
 
-class TestKernelGenBasicOps:
+class TestNkiGenBasicOps:
     """Test basic arithmetic operations compile and run correctly."""
 
     def test_add(self):
@@ -103,7 +103,7 @@ class TestKernelGenBasicOps:
             baremetal_assert_allclose(result, A @ B)
 
 
-class TestKernelGenUnaryOps:
+class TestNkiGenUnaryOps:
     """Test unary operations compile and run correctly."""
 
     def test_exp(self):
@@ -143,7 +143,7 @@ class TestKernelGenUnaryOps:
             baremetal_assert_allclose(result, -A)
 
 
-class TestKernelGenTransformOps:
+class TestNkiGenTransformOps:
     """Test transform operations compile and run correctly."""
 
     @pytest.mark.xfail(reason="linalg.transpose not lowered to NISA yet", run=True, strict=False)
@@ -196,7 +196,7 @@ class TestKernelGenTransformOps:
             baremetal_assert_allclose(result, np.stack([A, B], axis=0))
 
 
-class TestKernelGenReductions:
+class TestNkiGenReductions:
     """Test reduction operations compile and run correctly."""
 
     def test_sum(self):
@@ -219,7 +219,7 @@ class TestKernelGenReductions:
             baremetal_assert_allclose(result, np.mean(A, axis=0, keepdims=True))
 
 
-class TestKernelGenComparisonOps:
+class TestNkiGenComparisonOps:
     """Test comparison and logical operations compile and run correctly."""
 
     def test_equal(self):
@@ -279,7 +279,7 @@ class TestKernelGenComparisonOps:
             baremetal_assert_allclose(result, expected)
 
 
-class TestKernelGenWhere:
+class TestNkiGenWhere:
     """Test np.where compiles and runs correctly."""
 
     def test_where_same_type(self):
@@ -305,7 +305,7 @@ class TestKernelGenWhere:
             baremetal_assert_allclose(result, np.where(A > 0.0, A, B))
 
 
-class TestKernelGenComposedKernel:
+class TestNkiGenComposedKernel:
     """Test non-trivial kernels that compose multiple ops."""
 
     @pytest.mark.xfail(reason="broadcast add with rank-1 bias not lowered to NISA yet", run=True, strict=False)
@@ -348,7 +348,7 @@ class TestKernelGenComposedKernel:
             baremetal_assert_allclose(result, np.clip(A, 0.0, 1.0))
 
 
-class TestKernelGenAnnotations:
+class TestNkiGenAnnotations:
     """Test knob() annotations compile to NEFF and run correctly."""
 
     def test_knob_mem_space(self):

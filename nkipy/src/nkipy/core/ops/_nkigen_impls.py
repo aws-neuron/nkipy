@@ -1,6 +1,6 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""KernelGen backend implementations for NKIPy ops.
+"""NkiGen backend implementations for NKIPy ops.
 
 Trivial ops use _unary/_binary factories that delegate to the builder.
 Non-trivial ops with custom logic are explicit functions below.
@@ -11,7 +11,7 @@ from __future__ import annotations
 import numpy as np
 
 from nkipy.core.tensor import NKIPyTensorRef
-from nkipy.core.backend.kernelgen import KernelGenTensor
+from nkipy.core.backend.nkigen import NkiGenTensor
 
 _builder_module = None
 
@@ -19,7 +19,7 @@ _builder_module = None
 def _builder():
     global _builder_module
     if _builder_module is None:
-        import nkipy_kernelgen.builder as _mod
+        import nkigen.builder as _mod
         _builder_module = _mod
     return _builder_module
 
@@ -31,7 +31,7 @@ def _unwrap(x):
 
 
 def _wrap(handle):
-    kt = KernelGenTensor(handle, handle.shape, handle.dtype)
+    kt = NkiGenTensor(handle, handle.shape, handle.dtype)
     return NKIPyTensorRef(kt)
 
 
@@ -269,7 +269,7 @@ def dynamic_update_slice(x, value, start_indices, update_shape):
         value_h = b.full(tuple(update_shape), value, x_h.dtype)
     elif isinstance(value, np.ndarray):
         raise NotImplementedError(
-            "Assigning a raw np.ndarray constant in kernelgen is not supported. "
+            "Assigning a raw np.ndarray constant in nkigen is not supported. "
             "Use a traced tensor expression instead."
         )
     else:

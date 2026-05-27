@@ -22,7 +22,7 @@ def baremetal_jit(
 
     Args:
         kernel_func: The kernel function to decorate (when used without parentheses)
-        backend: Compilation backend ("hlo" or "kernelgen")
+        backend: Compilation backend ("hlo" or "nkigen")
         additional_compiler_args: Additional arguments to pass to the compiler
         target: Compilation target (default: CompilationTarget.DEFAULT)
 
@@ -37,8 +37,8 @@ def baremetal_jit(
         # Compiles on first call with this signature
         result = my_kernel(input_a, input_b)
 
-        # Or with kernelgen backend:
-        @baremetal_jit(backend="kernelgen")
+        # Or with nkigen backend:
+        @baremetal_jit(backend="nkigen")
         def my_kernel(A, B):
             return A @ B
     """

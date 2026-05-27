@@ -30,7 +30,7 @@ NEURON_AVAILABLE = is_neuron_compatible()
 
 
 def _trace_mode_to_backend(trace_mode):
-    if trace_mode in ("hlo", "kernelgen"):
+    if trace_mode in ("hlo", "nkigen"):
         return trace_mode
     raise ValueError(f"Unknown trace mode: {trace_mode}")
 
@@ -44,7 +44,7 @@ def trace_and_compile(kernel_fn, trace_mode, *args, **kwargs):
 
     Args:
         kernel_fn: The kernel function to test
-        trace_mode: "hlo" or "kernelgen"
+        trace_mode: "hlo" or "nkigen"
         *args: Input arrays for the kernel
         **kwargs: Additional arguments
     """
@@ -72,7 +72,7 @@ def on_device_test(kernel_fn, trace_mode, *args, artifacts_dir=None, **kwargs):
 
     Args:
         kernel_fn: The kernel function to execute
-        trace_mode: "hlo" or "kernelgen"
+        trace_mode: "hlo" or "nkigen"
         *args: Input arrays for the kernel
         artifacts_dir: Directory for compilation artifacts (for parallel test isolation)
         **kwargs: Additional arguments

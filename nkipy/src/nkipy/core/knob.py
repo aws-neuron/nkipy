@@ -3,7 +3,7 @@
 """Public knob() API for annotating tensors with hardware placement and tiling hints.
 
 Dispatches based on the active tracing backend:
-- kernelgen: emits nkipy.AnnotateOp into MLIR
+- nkigen: emits nkipy.AnnotateOp into MLIR
 - hlo: warns and ignores
 - cpu / no trace: no-op pass-through
 """
@@ -24,7 +24,7 @@ def knob(
 ):
     """Annotate a tensor with hardware placement and tiling hints.
 
-    Only effective when using the kernelgen backend.  When used with the HLO
+    Only effective when using the nkigen backend.  When used with the HLO
     backend, issues a warning and returns the tensor unchanged.
 
     Args:
@@ -41,7 +41,7 @@ def knob(
 
     backend = get_backend()
 
-    if backend == "kernelgen":
+    if backend == "nkigen":
         from nkipy.core.tensor import NKIPyTensorRef
 
         if not isinstance(tensor, NKIPyTensorRef):
@@ -50,7 +50,7 @@ def knob(
         if mem_space is None and partition_dim is None and tile_size is None and reduction_tile is None:
             return tensor
 
-        import nkipy_kernelgen.builder as B
+        import nkigen.builder as B
 
         B.annotate(
             tensor.backend_tensor.handle,
@@ -62,7 +62,7 @@ def knob(
         return tensor
     elif backend == "hlo":
         warnings.warn(
-            "knob() annotations are only effective with backend='kernelgen'. "
+            "knob() annotations are only effective with backend='nkigen'. "
             "Ignoring annotation.",
             stacklevel=2,
         )

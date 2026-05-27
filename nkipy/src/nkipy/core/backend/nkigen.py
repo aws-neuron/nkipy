@@ -1,9 +1,9 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""KernelGen backend for NKIPy.
+"""NkiGen backend for NKIPy.
 
-This module provides the kernelgen backend by delegating to
-``nkipy_kernelgen.builder`` for all MLIR construction.  No MLIR types
+This module provides the nkigen backend by delegating to
+``nkigen.builder`` for all MLIR construction.  No MLIR types
 are imported or exposed — the builder API is the sole interface.
 """
 
@@ -18,13 +18,13 @@ from nkipy.core.backend import AliasInfo, TensorPlaceholder
 
 
 # ---------------------------------------------------------------------------
-# KernelGenTensor -- analogue of HLOTensor
+# NkiGenTensor -- analogue of HLOTensor
 # ---------------------------------------------------------------------------
 
-class KernelGenTensor:
-    """Backend tensor for the kernelgen backend.
+class NkiGenTensor:
+    """Backend tensor for the nkigen backend.
 
-    Wraps an opaque ``TensorHandle`` from ``nkipy_kernelgen.builder``
+    Wraps an opaque ``TensorHandle`` from ``nkigen.builder``
     with the metadata that ``NKIPyTensorRef`` expects.
     """
 
@@ -39,23 +39,23 @@ class KernelGenTensor:
         self.is_parameter = is_parameter
         self.parameter_id = parameter_id
         self.name = name
-        self.id = KernelGenTensor._next_id
-        KernelGenTensor._next_id += 1
+        self.id = NkiGenTensor._next_id
+        NkiGenTensor._next_id += 1
 
 
 # ---------------------------------------------------------------------------
-# KernelGenTraceContext
+# NkiGenTraceContext
 # ---------------------------------------------------------------------------
 
-class KernelGenTraceContext:
-    """Trace context that delegates to ``nkipy_kernelgen.builder.IRBuilder``."""
+class NkiGenTraceContext:
+    """Trace context that delegates to ``nkigen.builder.IRBuilder``."""
 
-    backend_name = "kernelgen"
+    backend_name = "nkigen"
 
     def __init__(self):
-        from nkipy_kernelgen.builder import IRBuilder
+        from nkigen.builder import IRBuilder
         self._builder = IRBuilder()
-        self._parameters: List[KernelGenTensor] = []
+        self._parameters: List[NkiGenTensor] = []
         self.current_source_location = None
 
     @property
@@ -74,7 +74,7 @@ class KernelGenTraceContext:
         for i, (h, (shape, dtype)) in enumerate(
             zip(handles, zip(arg_shapes, arg_dtypes))
         ):
-            kt = KernelGenTensor(
+            kt = NkiGenTensor(
                 h, shape, dtype,
                 is_parameter=True, parameter_id=i, name=f"arg{i}"
             )
@@ -103,20 +103,20 @@ class KernelGenTraceContext:
 # Module-level context accessor
 # ---------------------------------------------------------------------------
 
-def get_kernelgen_context() -> KernelGenTraceContext:
-    """Return the active ``KernelGenTraceContext``, or raise if none is active."""
+def get_nkigen_context() -> NkiGenTraceContext:
+    """Return the active ``NkiGenTraceContext``, or raise if none is active."""
     from nkipy.core.backend import _active_ctx
-    if _active_ctx is None or _active_ctx.backend_name != "kernelgen":
-        raise RuntimeError("No active kernelgen trace context")
+    if _active_ctx is None or _active_ctx.backend_name != "nkigen":
+        raise RuntimeError("No active nkigen trace context")
     return _active_ctx
 
 
 # ---------------------------------------------------------------------------
-# KernelGenIR -- make MLIR IR compatible with execution pipeline
+# NkiGenIR -- make MLIR IR compatible with execution pipeline
 # ---------------------------------------------------------------------------
 
 
-class KernelGenIR:
+class NkiGenIR:
     """Adapter that makes an MLIR module compatible with the execution pipeline.
 
     Provides the same interface as ``HLOModule`` (``.inputs``, ``.outputs``,
