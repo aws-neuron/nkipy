@@ -9,7 +9,7 @@ This module patches the function in-process so that libfabric's EFA
 provider can register Neuron device memory for RDMA (P2P) transfers.
 
 Usage:
-    from nkipy.vllm_plugin.nrt_dmabuf_fix import patch_nrt_dmabuf
+    from relay.nrt_dmabuf_fix import patch_nrt_dmabuf
     patch_nrt_dmabuf()  # call before NIXL agent creation
 """
 

@@ -64,7 +64,7 @@ class NixlEndpoint:
         if self.agent is not None:
             return self.agent
 
-        from nkipy.vllm_plugin.nrt_dmabuf_fix import patch_nrt_dmabuf
+        from .nrt_dmabuf_fix import patch_nrt_dmabuf
         patch_nrt_dmabuf()
 
         from nixl._api import nixl_agent, nixl_agent_config

@@ -34,7 +34,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../../nkipy/src")
 
 def apply_dmabuf_fix():
     """Apply the nrt_get_dmabuf_fd hotpatch."""
-    from nkipy.vllm_plugin.nrt_dmabuf_fix import patch_nrt_dmabuf
+    from relay.nrt_dmabuf_fix import patch_nrt_dmabuf
     patch_nrt_dmabuf()
 
 
