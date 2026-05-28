@@ -178,61 +178,54 @@ Each instance in the cluster runs a **standby engine pool** — 100+ pre-initial
 
 ### 2.4 P2P Weight Transfer
 
-The data plane uses a custom RDMA library ("Relay") built on AWS EFA. Each TP rank on both sender and receiver has its own RDMA endpoint that distributes transfers across all available NICs for maximum bandwidth utilization. The sender pushes weights directly from device memory while continuing to serve inference — zero downtime on the sender side.
+The data plane uses **NIXL** (Network Interface eXchange Library) with the **LIBFABRIC** backend over AWS EFA for direct device-to-device RDMA. Each TP rank on both sender and receiver has its own NIXL agent that manages memory registration and transfer operations. The sender pushes weights directly from device memory while continuing to serve inference — zero downtime on the sender side.
 
-**Transfer protocol (receiver-initiated):**
+**Transfer protocol (single-round-trip, receiver-initiated):**
 
-The receiver orchestrates the entire transfer. It sends two HTTP requests to the sender: one to establish the RDMA connection, and one to trigger the weight push. The sender is purely reactive — it connects, writes, and returns. Only the RDMA WRITE moves bulk weight data; the HTTP calls carry only lightweight metadata (endpoint addresses, buffer descriptors).
+The receiver orchestrates the entire transfer in a single HTTP request. It registers its device memory, gathers RDMA metadata from all ranks, and POSTs it to the sender. The sender adds the receiver as a remote agent, performs RDMA WRITE into the receiver's device memory, and returns. Only one HTTP call is needed — the bulk data moves via one-sided RDMA WRITE.
 
 ```
          Receiver                                 Sender
          ────────                                 ──────
             │                                        │
   ┌─────────┴────────────────────────────────────────┴────────────┐
-  │ Phase 1: Setup                                                │
+  │ Step 1: Receiver setup (all ranks in parallel)                │
   │                                                               │
-  │  Receiver tells sender "here is my RDMA address, connect"     │
+  │  Each rank:                                                   │
+  │    - Register device buffers with NIXL (VRAM, LIBFABRIC)      │
+  │    - Obtain agent metadata (RDMA addresses)                   │
+  │  Rank 0 gathers metadata + buffer VAs from all ranks          │
+  └─────────┬────────────────────────────────────────┬────────────┘
+            │                                        │
+  ┌─────────┴────────────────────────────────────────┴────────────┐
+  │ Step 2: Transfer (single HTTP round-trip)                     │
   │                                                               │
-  │  Receiver: POST /preconnect ────────────────────▶ Sender      │
+  │  Rank 0: POST /nkipy/push {per_rank metadata} ──▶ Sender     │
   │                                                               │
-  │  Both sides work in parallel:                                 │
-  │    Receiver: register weight buffers with NIC                 │
-  │    Sender:   establish RDMA connection to receiver            │
+  │  Sender (all ranks in parallel):                              │
+  │    - Add receiver as remote NIXL agent                        │
+  │    - RDMA WRITE: local VRAM ═══════════════▶ receiver VRAM    │
+  │    - Direct device-to-device, no CPU copies                   │
   │                                                               │
   │  Sender: 200 OK ◀──────────────────────────────── Sender      │
   └─────────┬────────────────────────────────────────┬────────────┘
             │                                        │
   ┌─────────┴────────────────────────────────────────┴────────────┐
-  │ Phase 2: Weight Transfer                                      │
+  │ Step 3: Done                                                  │
   │                                                               │
-  │  Receiver tells sender "push weights into these buffers"      │
-  │                                                               │
-  │  Receiver: POST /push_weights ──────────────────▶ Sender      │
-  │                                                               │
-  │  Sender performs one-sided RDMA WRITE:                        │
-  │    ◀═══════════════ weights (bulk data) ═══════════════       │
-  │    Written directly into receiver's device memory             │
-  │                                                               │
-  │  Sender: 200 OK ◀──────────────────────────────── Sender      │
-  └─────────┬────────────────────────────────────────┬────────────┘
-            │                                        │
-  ┌─────────┴────────────────────────────────────────┴────────────┐
-  │ Phase 3: Cleanup (async, off critical path)                   │
-  │                                                               │
-  │  Receiver: deregister memory      Sender: close RDMA          │
-  │  regions in background            connection in background    │
-  │                                                               │
-  │  Neither side blocks — cleanup runs asynchronously while      │
-  │  both engines continue normal operation.                      │
+  │  Receiver: weights are in device memory, ready for inference  │
+  │  Memory registration persists until sleep (no cleanup needed  │
+  │  on critical path — destroyed during next sleep cycle)        │
   └───────────────────────────────────────────────────────────────┘
 ```
 
 **Key design decisions:**
 
-- **One-sided RDMA WRITE**: The sender writes directly into the receiver's registered memory regions. No receiver CPU involvement during transfer — the receiver simply waits for completion.
-- **Overlapped setup**: Connection establishment and memory registration run in parallel via an async preconnect phase. The critical path is the maximum of the two, not the sum.
-- **Non-blocking push**: The sender runs RDMA writes in a background thread. The inference loop is never blocked — the sender continues serving requests throughout the entire transfer.
-- **Deferred resource cleanup**: After transfer completes, connection teardown and memory deregistration run asynchronously in the background, completely off the critical path.
+- **One-sided RDMA WRITE**: The sender writes directly into the receiver's registered device memory regions. No receiver CPU involvement during transfer — the receiver simply waits for the HTTP response.
+- **Single contiguous MR registration**: All weight buffers are registered as one contiguous VRAM region (one `ibv_reg_mr` / dmabuf FD instead of N), minimizing registration overhead.
+- **Persistent registration**: Memory regions stay registered until sleep. Repeated wake-ups with the same memory layout skip registration entirely (fast-path no-op).
+- **Epoch-tagged agents**: Each wake cycle creates a fresh NIXL agent with an incremented epoch suffix (e.g., `nkipy_host_r0_e3`). The sender adds each new receiver as a distinct remote agent — no need to invalidate stale connections.
+- **Non-blocking sender**: The sender's inference loop is never blocked. RDMA writes execute on the NIXL progress thread; the HTTP handler returns only after completion.
 
 ### 2.5 Engine Interface and Scheduling
 
@@ -245,15 +238,14 @@ Each engine exposes HTTP endpoints for lifecycle management:
 | Endpoint | Action |
 |----------|--------|
 | `POST /nkipy/wake_up` | Allocate tensors, receive weights via P2P, reload kernels |
-| `POST /nkipy/sleep` | Release NeuronCores, destroy Gloo, enter standby |
-| `GET /nkipy/health` | Returns engine state (sleeping/active) |
+| `POST /nkipy/sleep` | Release NeuronCores, destroy NIXL agent + Gloo, enter standby |
+| `GET /nkipy/health` | Returns engine state (sleeping/active/transitioning) |
 
-**Internal endpoints** — used by the P2P weight transfer protocol between engines:
+**Internal endpoint** — used by the P2P weight transfer protocol between engines:
 
 | Endpoint | Action |
 |----------|--------|
-| `POST /nkipy/p2p_preconnect` | Exchange RDMA connection metadata (Phase 1) |
-| `POST /nkipy/p2p_push_weights` | Trigger one-sided RDMA weight write (Phase 2) |
+| `POST /nkipy/push` | Receiver POSTs its RDMA metadata; sender performs RDMA WRITE and returns |
 
 #### 2.5.2 LLM Serving Scheduler
 
@@ -285,13 +277,14 @@ Each engine exposes HTTP endpoints for lifecycle management:
 |---|---|---|
 | NRT switch | 0.2s | |
 | Gloo distributed init | 1.0s | |
-| **RDMA MR registration** | 2.4s | Receiver registers device buffers |
-| Sender RDMA connect (overlapped) | 2.0s | Hidden behind MR registration |
-| RDMA write (4.3 GB/rank) | 0.6s | Direct device→device, ~95 Gbps/rank |
+| Tensor allocation | 0.1s | Empty weight buffers on device |
+| **VRAM MR registration** | 2.4s | Single contiguous region per rank |
+| Metadata gather + POST | 0.1s | Rank 0 gathers, POSTs to sender |
+| **RDMA WRITE** (4.3 GB/rank) | 2.4s | Direct device→device |
 | NEFF kernel reload | 0.8s | |
 | **Total wake-up** | **7.0s** | |
 
-Effective aggregate throughput: ~14 GB/s across 32 ranks (limited by single-NIC per rank on trn1).
+Effective aggregate throughput: ~14 GB/s across 32 ranks (single EFA NIC per rank on trn1).
 
 **Trn2 (LLaMA-3.1-70B, TP=32, trn2.48xlarge, cross-node, direct device RDMA):**
 
@@ -299,28 +292,27 @@ Effective aggregate throughput: ~14 GB/s across 32 ranks (limited by single-NIC 
 |---|---|---|
 | Gloo distributed init | 1.0s | |
 | NRT init + tensor alloc | 0.1s | Fast path (skip firmware reset) |
-| **RDMA MR registration** | 2.4s | Receiver registers device buffers (chunked) |
-| Sender RDMA connect (overlapped) | 2.0s | Hidden behind MR registration |
-| **RDMA write** (4.3 GB/rank) | 3.4s | Direct device→device, chunked |
+| **VRAM MR registration** | 2.4s | Single contiguous region per rank |
+| Metadata gather + POST | 0.1s | Rank 0 gathers, POSTs to sender |
+| **RDMA WRITE** (4.3 GB/rank) | 3.4s | Direct device→device via NIXL LIBFABRIC |
 | Kernel load + barrier | 1.1s | |
 | **Total wake-up** | **7.4–8.4s** | |
 
 Effective aggregate throughput: ~24 GB/s across 32 ranks × 16 EFA NICs.
 
-**Trn2 (Qwen3-235B-A22B, TP=32, trn2.48xlarge, cross-node, host-staged RDMA):**
+**Trn2 (Qwen3-235B-A22B, TP=32, trn2.48xlarge, cross-node, direct device RDMA):**
 
 | Phase | Latency | Notes |
 |---|---|---|
 | Gloo distributed init | 0.9s | |
 | NRT init + tensor alloc | 0.4s | |
-| Sender DMA (device→host) | (overlapped) | Pre-DMA fired at wake start, hidden behind Gloo+NRT+MR reg |
-| **Receiver MR registration** | 8.4s | Alloc + register 12.5 GB host staging buffer |
-| RDMA write (12.5 GB/rank) | 1.7s | Host→host, ~60 Gbps/rank |
-| **Receiver DMA** (host→device) | 8.3s | 8-thread parallel batch DMA |
+| **VRAM MR registration** | 4.2s | 14 GB contiguous region per rank |
+| Metadata gather + POST | 0.1s | |
+| **RDMA WRITE** (14 GB/rank) | 13.2s | Direct device→device, 448 GB total |
 | Kernel load + barrier | 0.1s | |
-| **Total wake-up** | **19.9s** | |
+| **Total wake-up** | **~19.9s** | |
 
-Note: Qwen3-235B-A22B uses host-staged RDMA because the large per-rank weight size (14 GB) exceeds the device memory region registration limit for direct device RDMA. The 448 GB transfer achieves ~174 Gbps aggregate throughput across 32 ranks × 16 EFA NICs. Sender DMA (~7.8s) is fully overlapped with receiver setup (Gloo + NRT + MR registration) via early-prepare (`/nkipy/p2p_prepare`).
+Effective aggregate throughput: ~174 Gbps across 32 ranks × 16 EFA NICs. All transfers use direct device RDMA — no host staging or CPU copies on the data path.
 
 **P2P RDMA vs FSx cold load:**
 
@@ -328,7 +320,7 @@ Note: Qwen3-235B-A22B uses host-staged RDMA because the large per-rank weight si
 |---|---|---|---|
 | Qwen3-30B-A3B (TP=32) | 51s | 3.2s | **16×** |
 | LLaMA-3.1-70B (TP=32) | 121s | 5.8s | **21×** |
-| Qwen3-235B-A22B (TP=32) | 386s | 18.4s | **21×** |
+| Qwen3-235B-A22B (TP=32) | 386s | 13.3s | **29×** |
 
 ### 3.3 Scalability
 
@@ -422,7 +414,7 @@ The sender continues serving inference requests while pushing weights to a recei
 
 **Discovery**: Sleep latency was 46.5s instead of the expected ~1s. Root cause: the NeuronCore firmware reset (`spike_reset()`) takes 7–25s when RDMA memory regions are still registered, vs 0.12s when MRs are deregistered first.
 
-**Fix**: Deregister all MRs asynchronously immediately after transfer completes. Sleep path waits for deregistration if still in progress. If sleep is called >60s after wake (typical in production), MR deregistration has already finished and sleep takes ~2s.
+**Fix**: Destroy the NIXL agent (which deregisters all VRAM) before calling `spike_reset()`. The sleep path calls `endpoint.destroy()` first, then releases NeuronCores. Since the agent is destroyed synchronously before `spike_reset()`, sleep latency is consistently ~2s.
 
 ### 4.2 NRT Init Firmware Reset Dominates Wake Latency (5–15s)
 
@@ -452,17 +444,17 @@ The sender continues serving inference requests while pushing weights to a recei
 
 ### 4.6 RDMA Resource Leak on Ctrl+C
 
-**Discovery**: Killing an engine with Ctrl+C left RDMA resources registered, causing the next `spike_reset()` on the same cores to take 25s+ (same root cause as 4.1).
+**Discovery**: Killing an engine with Ctrl+C left NIXL VRAM registrations active, causing the next `spike_reset()` on the same cores to take 25s+ (same root cause as 4.1).
 
-**Fix**: Register cleanup handlers that deregister RDMA MRs **before** calling `spike_reset()`. Ordering is critical — RDMA cleanup must precede firmware reset.
+**Fix**: Register cleanup handlers (atexit + SIGINT/SIGTERM) that call `endpoint.destroy()` **before** `spike_reset()`. Ordering is critical — NIXL agent destruction must precede firmware reset.
 
-### 4.7 Sender RDMA QP Exhaustion After Repeated Pushes
+### 4.7 Stale Remote Agent Accumulation After Repeated Pushes
 
-**Discovery**: The sender crashed with `Assertion '*qp' failed` in `RDMAChannelImpl::initQP()` after ~11 consecutive pushes. Each push created a new RDMA Queue Pair connection to the receiver, but connections were never freed — they accumulated until the EFA device's QP pool was exhausted.
+**Discovery**: After many consecutive pushes to different receiver instances, the sender's NIXL agent accumulated remote agent metadata entries that were never cleaned up.
 
-**Root cause**: With pre-registered MRs, `push_to_peer()` kept the sender's `RankEndpoint` alive across pushes (to avoid 2.3s re-registration). But the endpoint accumulated stale QP connections from all previous receivers. The relay library has no per-connection `disconnect()` API.
+**Root cause**: Each receiver creates a fresh agent with a new epoch on every wake cycle (e.g., `nkipy_host_r0_e0`, `nkipy_host_r0_e1`, ...). The sender calls `add_remote_agent()` for each new receiver, but never removes old entries.
 
-**Fix**: After each push completes, call `reset_endpoint_async()` which destroys the old endpoint (freeing all QPs) and re-registers MRs on a fresh endpoint in a background thread. The 54s re-registration runs concurrently with the receiver's sleep/next-wake cycle. The next `preconnect_to_peer()` call blocks on `_ensure_endpoint()` until the background reset finishes — if less than 60s have passed since the last push, the preconnect waits; in production (>60s between pushes), no waiting occurs.
+**Fix**: Epoch-tagged agent names make each receiver identity unique. The `add_remote_agent()` call is idempotent — if the same agent name is already known, it's a no-op. Old entries are tiny metadata pointers (~KB) so accumulation is bounded by the total number of distinct receivers the sender has ever served, not the number of push operations. At 500 standby engines this is ~16 KB of metadata — negligible.
 
 ### 4.8 Partial NRT Init Leaves NeuronCores in Split-Brain State
 
@@ -480,16 +472,16 @@ The sender continues serving inference requests while pushing weights to a recei
 
 ### 4.10 Concurrent Wake/Sleep Requests Cause Race Conditions
 
-**Discovery**: If a scheduler sends `/wake_up` while a previous `/sleep` is still processing (MR deregistration takes 60s), both operations run simultaneously and corrupt internal state.
+**Discovery**: If a scheduler sends `/wake_up` while a previous `/sleep` is still processing (NIXL agent destruction + spike_reset), both operations run simultaneously and corrupt internal state.
 
 **Fix**: A `_nkipy_transitioning` flag in the server guards against concurrent lifecycle operations. The second request receives HTTP 409 (Conflict) immediately. Health checks during transitions return `{"status": "transitioning"}` without blocking.
 
 ### 4.11 P2P Transfer Failure Orphans RDMA State
 
-**Discovery**: If the sender crashes or the network fails mid-transfer, the receiver's RDMA MRs, Gloo process groups, and NRT runtime are left allocated. The receiver appears healthy but cannot wake again because resources are stuck.
+**Discovery**: If the sender crashes or the network fails mid-transfer, the receiver's NIXL agent, Gloo process groups, and NRT runtime are left allocated. The receiver appears healthy but cannot wake again because resources are stuck.
 
 **Fix**: Wrap the P2P receive in a try/except that explicitly:
-1. Deregisters RDMA MRs (`dereg_async`)
+1. Deregisters VRAM asynchronously (`endpoint.deregister_async()`)
 2. Releases NeuronCores (`spike_reset`)
 3. Destroys Gloo process groups
 4. Returns the engine to sleeping state
@@ -511,15 +503,15 @@ The error is propagated to the caller as a 503 response with detailed latency br
 2. **Retry with reset**: If fast path fails, retry without the env var (allows firmware reset, takes 2-5s on clean systems)
 3. **Operational requirement**: After dirty kills, a machine reboot is required to clear the neuron kernel module's stale state. The cleanup script should always use graceful shutdown (SIGTERM → wait → SIGKILL only as last resort).
 
-### 4.14 Token Embedding Exceeds RDMA MR Limit
+### 4.14 Token Embedding Redundancy Wastes Transfer Bandwidth
 
-**Discovery**: LLaMA-3-70B's token embedding is 2.1 GB — too large for a single RDMA MR registration (EFA limit ~1 GB). The transfer would fail without special handling.
+**Discovery**: LLaMA-3-70B's token embedding is 2.1 GB and was replicated identically across all 32 ranks. Transferring 2.1 GB × 32 = 67 GB of redundant data wasted bandwidth and inflated checkpoint size.
 
 **Fix**: Shard the embedding along the hidden dimension:
 - **Before**: `[128256, 8192]` full copy per rank = 2.1 GB × 32 = 67 GB redundant
-- **After**: `[128256, 256]` per rank = 65.7 MB — fits in a single MR, transfers via RDMA
+- **After**: `[128256, 256]` per rank = 65.7 MB — unique per rank, transfers via RDMA
 
-This also reduced checkpoint disk from 214 GB to 139 GB (35% savings).
+This reduced checkpoint from 214 GB to 139 GB (35% savings) and eliminates 67 GB of redundant RDMA traffic.
 
 ### 4.15 NRT Init Blocks Scalability on Trn2
 
