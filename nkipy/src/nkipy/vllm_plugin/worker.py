@@ -18,11 +18,6 @@ from vllm.v1.worker.worker_base import WorkerBase
 
 logger = logging.getLogger(__name__)
 
-_KERNEL_NAMES = (
-    "kernel_cte", "kernel_tkg",
-    "kernel_cte_greedy_sampling", "kernel_tkg_greedy_sampling",
-)
-
 _NRT_CLOSED_MARKER = "/tmp/nkipy_nrt_closed"
 
 
@@ -86,7 +81,6 @@ class NKIPyWorker(WorkerBase):
         self._init_distributed()
         self._patch_get_accelerator()
 
-        import torch.distributed as dist
         if dist.is_initialized():
             dist.barrier()
 
@@ -224,10 +218,10 @@ class NKIPyWorker(WorkerBase):
             except Exception:
                 pass
 
-        # Pre-register sender VRAM for NIXL RDMA push.
+        # Pre-register sender VRAM for RDMA push.
         if mr._nkipy_model is not None:
-            from relay import nixl_preregister_weights
-            nixl_preregister_weights(mr._nkipy_model)
+            from relay import preregister_weights
+            preregister_weights(mr._nkipy_model)
             if self.rank == 0:
                 logger.info("NKIPY: Pre-registered sender MRs")
 
@@ -291,9 +285,9 @@ class NKIPyWorker(WorkerBase):
         t_gc = _time.time()
 
         # Destroy NIXL agent and deregister VRAM before spike_reset
-        from relay import nixl_endpoint as _nep
-        if _nep.registered:
-            _nep.destroy()
+        from relay import endpoint as _ep
+        if _ep.registered:
+            _ep.destroy()
         t_wait = _time.time()
 
         spike_reset()
@@ -404,17 +398,16 @@ class NKIPyWorker(WorkerBase):
 
         if actual_peer:
             from relay import (
-                nixl_receive_from_peer, nixl_endpoint, collect_weight_buffers,
+                receive_from_peer, endpoint as _ep, collect_weight_buffers,
             )
             t_collect = _time.time()
             try:
                 bufs = collect_weight_buffers(model)
-                nixl_receive_from_peer(nixl_endpoint, bufs, actual_peer)
+                receive_from_peer(_ep, bufs, actual_peer)
             except Exception as e:
                 logger.error("Rank %d: P2P receive failed: %s — cleaning up", self.rank, e)
                 from spike import reset as spike_reset
-                from relay import nixl_endpoint as _nep
-                _nep.deregister_async()
+                _ep.deregister_async()
                 spike_reset()
                 open(_NRT_CLOSED_MARKER, "w").close()
                 self._destroy_gloo()
@@ -423,7 +416,6 @@ class NKIPyWorker(WorkerBase):
                                     "p2p_error": str(e),
                                     "total_s": round(_time.time() - t_start, 4)}}
             t_p2p = _time.time()
-            t_ack = t_p2p
         else:
             # No peer - load weights from checkpoint
             from safetensors.torch import load_file
@@ -438,12 +430,10 @@ class NKIPyWorker(WorkerBase):
                 model._load_weights_into_existing_tensors(weights)
                 t_collect = _time.time()
                 t_p2p = t_collect
-                t_ack = t_collect
             else:
                 logger.warning("Rank %d: No peer_url and no NKIPY_CHECKPOINT - model has no weights!", self.rank)
                 t_collect = t_alloc
                 t_p2p = t_alloc
-                t_ack = t_alloc
 
         # Reload kernels from cached NEFFs
         if self._kernel_cache is not None:
@@ -474,8 +464,8 @@ class NKIPyWorker(WorkerBase):
 
         # Sender engines: pre-register VRAM so push skips registration.
         if os.environ.get("NKIPY_CHECKPOINT"):
-            from relay import nixl_preregister_weights
-            nixl_preregister_weights(model)
+            from relay import preregister_weights
+            preregister_weights(model)
         t_prereg = _time.time()
 
         t_end = _time.time()
@@ -488,8 +478,7 @@ class NKIPyWorker(WorkerBase):
             "alloc_tensors_s": round(t_alloc - t_nrt_barrier, 4),
             "collect_bufs_s": round(t_collect - t_alloc, 4),
             "p2p_transfer_s": round(t_p2p - t_collect, 4),
-            "rdma_ack_s": round(t_ack - t_p2p, 4),
-            "kernel_load_s": round(t_kernels - t_ack, 4),
+            "kernel_load_s": round(t_kernels - t_p2p, 4),
             "kernel_barrier_s": round(t_kernel_barrier - t_kernels, 4),
             "tok_embedding_s": round(t_tok - t_kernel_barrier, 4),
             "prereg_mrs_s": round(t_prereg - t_tok, 4),
@@ -506,16 +495,16 @@ class NKIPyWorker(WorkerBase):
         Called by the HTTP server when a receiver POSTs its agent metadata
         and buffer VAs. All ranks do the RDMA WRITE synchronously.
         """
-        from relay import nixl_push_weights_to_peer, nixl_endpoint, nixl_preregister_weights
+        from relay import push_weights_to_peer, endpoint as _ep, preregister_weights
 
         model = self.model_runner._nkipy_model
         if model is None:
             return {"status": "error", "message": "model not loaded"}
 
-        if not nixl_endpoint.registered:
-            nixl_preregister_weights(model)
+        if not _ep.registered:
+            preregister_weights(model)
 
-        nixl_push_weights_to_peer(model, per_rank_info)
+        push_weights_to_peer(model, per_rank_info)
         return {"status": "done"}
 
     def nkipy_get_tok_embedding(self) -> bytes | None:

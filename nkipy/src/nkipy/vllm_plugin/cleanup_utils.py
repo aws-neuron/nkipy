@@ -10,11 +10,11 @@ logger = logging.getLogger(__name__)
 def release_neuron_cores_and_rdma():
     """Best-effort release of Neuron cores and NIXL RDMA resources."""
     try:
-        from relay import nixl_endpoint
-        if nixl_endpoint.registered:
-            nixl_endpoint.destroy()
+        from relay import endpoint
+        if endpoint.registered:
+            endpoint.destroy()
     except Exception as e:
-        logger.warning("Failed to clean up NIXL endpoint: %s", e)
+        logger.warning("Failed to clean up RDMA endpoint: %s", e)
 
     try:
         from multiprocessing import resource_tracker

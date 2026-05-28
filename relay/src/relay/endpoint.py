@@ -1,11 +1,11 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""NIXL-backed endpoint for peer-to-peer device memory transfers.
+"""RDMA endpoint for peer-to-peer device memory transfers.
 
-Provides :class:`NixlEndpoint`, which implements the same lifecycle as
-:class:`RankEndpoint` but uses NIXL's LIBFABRIC backend for direct
-device-to-device RDMA (no host staging required on Trn2).
+Provides :class:`Endpoint` which manages NIXL agent lifecycle, VRAM
+memory registration, and remote agent connection state for direct
+device-to-device RDMA via the LIBFABRIC backend.
 """
 
 import logging
@@ -28,7 +28,7 @@ def _get_nc_idx() -> int:
     return int(vis.split(",")[0])
 
 
-class NixlEndpoint:
+class Endpoint:
     """Per-rank NIXL agent for VRAM RDMA transfers.
 
     Manages NIXL agent lifecycle, VRAM memory registration, and remote agent

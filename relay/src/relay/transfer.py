@@ -23,10 +23,10 @@ from typing import List, Sequence, Tuple
 
 import torch.distributed as dist
 
-from .nixl_endpoint import NixlEndpoint, logger
+from .endpoint import Endpoint, logger
 
 # Module-level singleton
-nixl_endpoint = NixlEndpoint()
+endpoint = Endpoint()
 
 
 def collect_weight_buffers(model) -> List[Tuple[str, int, int]]:
@@ -52,7 +52,7 @@ def _poll_xfer(agent, xfer, timeout: float = 120.0) -> str:
 
 
 def receive_from_peer(
-    ep: NixlEndpoint,
+    ep: Endpoint,
     buffers: Sequence[Tuple[str, int, int]],
     peer_url: str,
     push_endpoint: str = "/nkipy/push",
@@ -127,7 +127,7 @@ def receive_from_peer(
 
 
 def push_to_peer(
-    ep: NixlEndpoint,
+    ep: Endpoint,
     buffers: Sequence[Tuple[str, int, int]],
     per_rank_info: list,
 ) -> None:
@@ -135,7 +135,7 @@ def push_to_peer(
 
     Parameters
     ----------
-    ep : NixlEndpoint
+    ep : Endpoint
     buffers : sequence of (name, va, size_bytes)
     per_rank_info : list of dict
         ``[{"agent_metadata": hex, "agent_name": str, "buffer_vas": [(va, sz), ...]}, ...]``
@@ -199,14 +199,14 @@ def push_to_peer(
 # ------------------------------------------------------------------
 
 
-def preregister_weights(model, ep: NixlEndpoint | None = None) -> None:
+def preregister_weights(model, ep: Endpoint | None = None) -> None:
     """Pre-register all model weight buffers as VRAM for NIXL RDMA.
 
     Call once after model tensors are allocated. Subsequent push_to_peer
     calls will skip registration.
     """
     if ep is None:
-        ep = nixl_endpoint
+        ep = endpoint
     if ep.registered:
         rank = dist.get_rank() if dist.is_initialized() else 0
         logger.info("Rank %d: NIXL VRAM already registered, skipping", rank)
@@ -224,10 +224,10 @@ def preregister_weights(model, ep: NixlEndpoint | None = None) -> None:
 def push_weights_to_peer(model, per_rank_info: list) -> None:
     """All ranks push model weights to the corresponding peer rank."""
     bufs = collect_weight_buffers(model)
-    push_to_peer(nixl_endpoint, bufs, per_rank_info)
+    push_to_peer(endpoint, bufs, per_rank_info)
 
 
 def receive_weights(model, peer_url: str) -> None:
     """All ranks receive model weights from *peer_url* via NIXL P2P."""
     bufs = collect_weight_buffers(model)
-    receive_from_peer(nixl_endpoint, bufs, peer_url)
+    receive_from_peer(endpoint, bufs, peer_url)
