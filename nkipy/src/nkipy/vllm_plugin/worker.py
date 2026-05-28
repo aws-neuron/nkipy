@@ -58,8 +58,9 @@ class NKIPyWorker(WorkerBase):
         self._kernel_cache = None  # {name: (neff_path, cache_key)}
         self._model_class = None
         self._config = None
-        self._push_thread: threading.Thread | None = None
-        self._push_error: BaseException | None = None
+        self._push_threads: list[threading.Thread] = []
+        self._push_errors: list[BaseException] = []
+        self._push_lock = threading.Lock()
 
     def init_device(self) -> None:
         import atexit
@@ -259,11 +260,25 @@ class NKIPyWorker(WorkerBase):
         # to free ~482 TCP ports. Gloo will be recreated on wake_up.
         if self._sleeping:
             self._destroy_gloo()
+            # Release NeuronCores claimed implicitly by import torch_neuronx
+            # (NEURON_RT_REGISTER_HBM_MR=1 triggers NRT init at import time on Trn2).
+            # spike_reset() only closes the spike-owned NRT session. If spike was
+            # never initialized (standby path), we must init then close to properly
+            # release the NRT session opened by torch_neuronx/PJRT import.
+            try:
+                from spike import get_spike_singleton, reset as spike_reset
+                get_spike_singleton()
+                spike_reset()
+            except Exception:
+                pass
 
         # Pre-register sender MRs for P2P push (saves ~2.3s per push).
         # Sender engines stay awake so slow dereg during sleep is not a concern.
         if mr._nkipy_model is not None:
-            if os.environ.get("NKIPY_HOST_STAGING", "0") == "1":
+            if os.environ.get("NKIPY_USE_NIXL", "0") == "1":
+                from relay import nixl_preregister_weights as nixl_prereg
+                nixl_prereg(mr._nkipy_model)
+            elif os.environ.get("NKIPY_HOST_STAGING", "0") == "1":
                 self._preregister_host_staging(mr._nkipy_model)
             else:
                 from relay import preregister_weights
@@ -308,12 +323,18 @@ class NKIPyWorker(WorkerBase):
 
         t_start = _time.time()
 
-        # Wait for any in-flight background push before tearing down.
-        if self._push_thread is not None and self._push_thread.is_alive():
+        # Wait for any in-flight background pushes before tearing down.
+        with self._push_lock:
+            threads = list(self._push_threads)
+        if threads:
             if self.rank == 0:
-                logger.info("Rank %d: Waiting for background push to finish before sleep", self.rank)
-            self._push_thread.join()
-        self._push_thread = None
+                logger.info("Rank %d: Waiting for %d background push(es) to finish before sleep",
+                            self.rank, len(threads))
+            for t in threads:
+                t.join()
+            with self._push_lock:
+                self._push_threads = []
+                self._push_errors = []
 
         from spike import reset as spike_reset
         from nkipy.runtime.device_kernel import _LOADED_KERNELS
@@ -350,6 +371,11 @@ class NKIPyWorker(WorkerBase):
         #   2. Receiver: dereg_async running → wait for completion
         #   3. No MRs active → fast path
         dereg_waited = False
+        if os.environ.get("NKIPY_USE_NIXL", "0") == "1":
+            from relay import nixl_endpoint as _nep
+            if _nep.registered:
+                _nep.destroy()
+                dereg_waited = True
         if rank_endpoint.registered:
             if self.rank == 0:
                 logger.info("Rank %d: Deregistering active MRs before spike_reset (%d descs)",
@@ -547,27 +573,43 @@ class NKIPyWorker(WorkerBase):
         t_alloc = _time.time()
 
         if actual_peer:
-            from relay import (
-                receive_from_peer, receive_from_peer_staged,
-                rank_endpoint, collect_weight_buffers,
-            )
+            use_nixl = os.environ.get("NKIPY_USE_NIXL", "0") == "1"
             t_collect = _time.time()
             try:
-                if os.environ.get("NKIPY_HOST_STAGING", "0") == "1":
+                if use_nixl:
+                    from relay import (
+                        nixl_receive_from_peer as nixl_receive,
+                        nixl_endpoint, collect_weight_buffers as nixl_collect,
+                    )
+                    bufs = nixl_collect(model)
+                    nixl_receive(nixl_endpoint, bufs, actual_peer)
+                elif os.environ.get("NKIPY_HOST_STAGING", "0") == "1":
+                    from relay import (
+                        receive_from_peer_staged, rank_endpoint,
+                    )
                     bufs_with_tensors = model.weight_buffers_with_tensors()
                     receive_from_peer_staged(rank_endpoint, bufs_with_tensors, actual_peer)
                 else:
+                    from relay import (
+                        receive_from_peer, rank_endpoint, collect_weight_buffers,
+                    )
                     bufs = collect_weight_buffers(model)
                     receive_from_peer(rank_endpoint, bufs, actual_peer)
             except Exception as e:
                 logger.error("Rank %d: P2P receive failed: %s — cleaning up", self.rank, e)
                 from spike import reset as spike_reset
-                rank_endpoint.dereg_async()
+                if use_nixl:
+                    from relay import nixl_endpoint as _nep
+                    _nep.deregister_async()
+                else:
+                    from relay import rank_endpoint
+                    rank_endpoint.dereg_async()
                 spike_reset()
                 open(_NRT_CLOSED_MARKER, "w").close()
-                rank_endpoint.ep = None
-                rank_endpoint.xfer_descs = []
-                rank_endpoint.buf_info = []
+                if not use_nixl:
+                    rank_endpoint.ep = None
+                    rank_endpoint.xfer_descs = []
+                    rank_endpoint.buf_info = []
                 self._destroy_gloo()
                 return {"status": "error", "error": f"P2P transfer failed: {e}",
                         "latency": {"gloo_init_s": round(t_gloo - t_start, 4),
@@ -575,9 +617,9 @@ class NKIPyWorker(WorkerBase):
                                     "total_s": round(_time.time() - t_start, 4)}}
             t_p2p = _time.time()
 
-            # With host-staged DMA, data integrity is guaranteed by the
-            # DMA engine. Skip the slow read-back acknowledgment.
-            if os.environ.get("NKIPY_HOST_STAGING", "0") != "1":
+            # NIXL transfers are synchronous RDMA WRITEs — no ack needed.
+            # Host-staged DMA integrity is guaranteed by the DMA engine.
+            if not use_nixl and os.environ.get("NKIPY_HOST_STAGING", "0") != "1":
                 self._acknowledge_rdma_writes(model)
             t_ack = _time.time()
         else:
@@ -630,7 +672,10 @@ class NKIPyWorker(WorkerBase):
 
         # Sender engines: pre-register MRs so push_to_peer skips registration.
         if os.environ.get("NKIPY_CHECKPOINT"):
-            if os.environ.get("NKIPY_HOST_STAGING", "0") == "1":
+            if os.environ.get("NKIPY_USE_NIXL", "0") == "1":
+                from relay import nixl_preregister_weights as nixl_prereg
+                nixl_prereg(model)
+            elif os.environ.get("NKIPY_HOST_STAGING", "0") == "1":
                 self._preregister_host_staging(model)
             else:
                 from relay import preregister_weights
@@ -693,7 +738,8 @@ class NKIPyWorker(WorkerBase):
 
         Returns immediately so the worker busy loop can continue serving
         execute_model requests.  The server polls nkipy_push_status to
-        detect completion.
+        detect completion.  Multiple concurrent pushes to different receivers
+        are supported — each runs in its own background thread.
         """
         from relay import push_weights_to_peer
 
@@ -709,8 +755,6 @@ class NKIPyWorker(WorkerBase):
             descs_lens = [len(r.get("remote_descs", "")) for r in per_rank_info]
             logger.info("push_weights: rank0 received descs lens: %s (first 5)", descs_lens[:5])
 
-        self._push_error = None
-
         def _bg_push():
             try:
                 push_weights_to_peer(
@@ -720,25 +764,47 @@ class NKIPyWorker(WorkerBase):
                     is_last_chunk=is_last_chunk,
                 )
             except BaseException as exc:
-                self._push_error = exc
+                with self._push_lock:
+                    self._push_errors.append(exc)
                 logger.exception("Background push_weights failed on rank %d", self.rank)
 
-        self._push_thread = threading.Thread(target=_bg_push, daemon=True)
-        self._push_thread.start()
+        t = threading.Thread(target=_bg_push, daemon=True)
+        t.start()
+        with self._push_lock:
+            self._push_threads.append(t)
         return {"status": "started"}
 
     def nkipy_push_status(self) -> dict:
-        """Check whether the background push is still running."""
-        t = self._push_thread
-        if t is None:
-            return {"status": "idle"}
-        if t.is_alive():
-            return {"status": "running"}
-        self._push_thread = None
-        if self._push_error is not None:
-            err = self._push_error
-            self._push_error = None
-            return {"status": "error", "message": str(err)}
+        """Check whether background push thread(s) are still running."""
+        with self._push_lock:
+            alive = [t for t in self._push_threads if t.is_alive()]
+            if alive:
+                self._push_threads = alive
+                return {"status": "running"}
+            self._push_threads = []
+            if self._push_errors:
+                err = self._push_errors[0]
+                self._push_errors = []
+                return {"status": "error", "message": str(err)}
+        return {"status": "done"}
+
+    def nkipy_nixl_push(self, per_rank_info: list[dict]) -> dict:
+        """Push weights to receiver via NIXL RDMA WRITE.
+
+        Called by the HTTP server when a receiver POSTs its agent metadata
+        and buffer VAs. All ranks do the RDMA WRITE synchronously (the
+        16-rail transfer completes in <100ms for typical model sizes).
+        """
+        from relay import nixl_push_weights_to_peer, nixl_endpoint, nixl_preregister_weights
+
+        model = self.model_runner._nkipy_model
+        if model is None:
+            return {"status": "error", "message": "model not loaded"}
+
+        if not nixl_endpoint.registered:
+            nixl_preregister_weights(model)
+
+        nixl_push_weights_to_peer(model, per_rank_info)
         return {"status": "done"}
 
     def nkipy_get_tok_embedding(self) -> bytes | None:

@@ -253,8 +253,6 @@ class SendChannelGroup : public ChannelGroup {
     size_t message_size = req->local_mem->size;
     auto chunks = splitMessageToChunks(message_size);
 
-    // LOG(INFO) << "SendChannelGroup: Splitting message into " << chunks.size()
-    //           << " chunks (message_size: " << message_size << ")";
     size_t num_channels = normalChannelCount();
     tracker_->updateExpectedAckCount(req->wr_id, chunks.size());
     for (size_t i = 0; i < chunks.size(); ++i) {
@@ -274,11 +272,8 @@ class SendChannelGroup : public ChannelGroup {
           req->remote_mem->addr + chunk.offset, chunk.size,
           req->remote_mem->rkey_array, req->remote_mem->type);
 
-      // Create send request for this chunk
-      // Only the last chunk needs signaled for completion notification
-      bool is_last_chunk = (i == chunks.size() - 1);
       auto chunk_req = std::make_shared<RDMASendRequest>(
-          chunk_local_mem, chunk_remote_mem, req->imm_data, is_last_chunk);
+          chunk_local_mem, chunk_remote_mem, req->imm_data, true);
       chunk_req->channel_id = chunk_channel_id;
       chunk_req->from_rank_id = req->from_rank_id;
       chunk_req->to_rank_id = req->to_rank_id;

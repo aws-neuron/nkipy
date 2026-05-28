@@ -163,6 +163,15 @@ def register_nkipy_routes(app: FastAPI) -> None:
                 break
         return results[0]
 
+    @app.post("/nkipy/nixl_push")
+    async def nixl_push(request: Request):
+        body = await request.json()
+        core = _get_engine_core(app)
+        results = await core.collective_rpc_async(
+            "nkipy_nixl_push", args=(body["per_rank"],),
+        )
+        return JSONResponse(results[0])
+
     @app.get("/nkipy/tok_embedding")
     async def tok_embedding():
         global _tok_embedding_cache

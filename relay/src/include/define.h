@@ -42,7 +42,9 @@ static constexpr int kNumGpuRtStreams = 4;
 static constexpr int kRankIDPlaceHolder = 9999;
 static constexpr uint8_t kPortNum = 1;
 
-// Use max 4 to accommodate AWS p5 instance
+// Number of data QPs per connection and RDMA contexts (NICs) per endpoint.
+// On trn2.48xlarge: 16 NICs total; each endpoint uses kNICContextNumber NICs.
+// Multiple endpoints sharing the same NIC group increase per-NIC QP count.
 static constexpr int kQpNumPerChannel = 4;
 static constexpr int kNICContextNumber = 4;
 static constexpr int kControlChannelID = 0;
@@ -51,7 +53,7 @@ static constexpr int kMaxSendWr = 1024;
 static constexpr int kMaxRecvWr = 1024;
 static constexpr int kMaxSendSeg = 2;
 static constexpr int kMaxRecvSeg = 2;
-static constexpr uint64_t kMessageChunkSizeKB = 256;  // 256 KB
+static constexpr uint64_t kMessageChunkSizeKB = 256;  // 256 KB chunks
 static constexpr uint64_t kMaxSplitNum = 16;
 static constexpr uint32_t kBatchPostRecvWr = 32;
 static constexpr uint32_t kBatchPollCqe = 32;

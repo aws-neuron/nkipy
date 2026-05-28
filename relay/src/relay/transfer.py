@@ -289,8 +289,7 @@ def receive_from_peer_staged(
                    for i in range(c_start, c_end)]
 
         def _dma_write_batch(ops, _spike=spike):
-            for tensor_ref, buf in ops:
-                _spike.tensor_write_from_pybuffer(tensor_ref, buf)
+            _spike.batch_dma_write(ops)
 
         if chunk_idx < num_chunks - 1 and c_end < n:
             dma_future = dma_executor.submit(_dma_write_batch, dma_ops)
@@ -409,10 +408,12 @@ def push_to_peer(
 
     if is_last_chunk:
         if pre_registered:
-            # Reset endpoint to free QPs from this connection while keeping
-            # MRs registered for subsequent pushes.  Without this, QPs
-            # accumulate across pushes and eventually exhaust RDMA resources.
-            ep.reset_endpoint_async()
+            # QPs accumulate across concurrent pushes but are cleaned up when
+            # the sender sleeps (dereg_sync destroys the endpoint).  Skipping
+            # reset_endpoint_async() here allows multiple receivers to be
+            # served concurrently without blocking each other.  At N<=5 this
+            # means ~25 QPs/rank which is well within EFA device limits.
+            pass
         else:
             ep.dereg_async()
     t_dereg = time.time()
@@ -549,8 +550,7 @@ def start_pre_dma_to_staging(model) -> None:
             dma_ops = [(all_bufs[i][3].tensor_ref,
                         staging.slice_as_numpy(all_offsets[i], all_sizes[i]))
                        for i in range(s_start, s_end)]
-            for tensor_ref, buf in dma_ops:
-                spike.tensor_read_to_pybuffer(tensor_ref, buf)
+            spike.batch_dma_read(dma_ops)
             stages_done[stage] = True
 
     t = threading.Thread(target=_bg_dma, daemon=True)
@@ -695,13 +695,12 @@ def push_weights_to_peer_staged(model, per_rank_info=None, chunk_start=None,
     import concurrent.futures
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
-    # Stage 0: DMA (blocking)
+    # Stage 0: DMA (blocking, parallel via batch_dma_read)
     s0_end = min(stage_size, n)
     dma_ops_0 = [(bufs_with_tensors[i][3].tensor_ref,
                   staging.slice_as_numpy(chunk_offsets[i], chunk_sizes[i]))
                  for i in range(s0_end)]
-    for tensor_ref, buf in dma_ops_0:
-        spike.tensor_read_to_pybuffer(tensor_ref, buf)
+    spike.batch_dma_read(dma_ops_0)
 
     for stage in range(1, num_stages):
         s_start = stage * stage_size
@@ -714,8 +713,7 @@ def push_weights_to_peer_staged(model, per_rank_info=None, chunk_start=None,
                       staging.slice_as_numpy(chunk_offsets[i], chunk_sizes[i]))
                      for i in range(s_start, s_end)]
         def _dma_read_batch(ops, _spike=spike):
-            for tensor_ref, buf in ops:
-                _spike.tensor_read_to_pybuffer(tensor_ref, buf)
+            _spike.batch_dma_read(ops)
         dma_future = executor.submit(_dma_read_batch, dma_ops_s)
 
         # RDMA write previous stage (overlapped with DMA)
