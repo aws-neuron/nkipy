@@ -85,7 +85,7 @@ Optional configuration:
    via NIXL/libfabric striping.
 
 4. **Coordination**: Receiver POSTs its NIXL agent metadata + buffer VAs
-   to the sender's `/nkipy/nixl_push` HTTP endpoint. The sender performs
+   to the sender's `/nkipy/push` HTTP endpoint. The sender performs
    the RDMA WRITE and returns when complete.
 
 ### Architecture (push model)
@@ -95,7 +95,7 @@ Receiver (waking up)                    Sender (active)
 ─────────────────────                   ───────────────────
 1. register VRAM with NIXL
 2. gather metadata + buffer VAs
-3. POST /nkipy/nixl_push ──────────►  4. add_remote_agent()
+3. POST /nkipy/push ──────────►  4. add_remote_agent()
                                         5. RDMA WRITE local→remote
                            ◄────────── 6. HTTP 200 (done)
 7. barrier, deregister

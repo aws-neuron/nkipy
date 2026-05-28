@@ -1,69 +1,26 @@
-import importlib
-import pathlib
-import sys
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
 
-_build_dir = pathlib.Path(__file__).resolve().parent.parent.parent / "build"
-if _build_dir.is_dir() and str(_build_dir) not in sys.path:
-    sys.path.insert(0, str(_build_dir))
-
-try:
-    _relay = importlib.import_module("_relay")
-except ImportError:
-    _relay = None
-
-from .endpoint import RankEndpoint
-from .transfer import (
-    WeightServer,
+from .nixl_endpoint import NixlEndpoint
+from .nixl_transfer import (
+    nixl_endpoint,
     collect_weight_buffers,
-    fetch_tok_embedding,
-    preconnect_to_peer,
-    preregister_weights,
-    push_to_peer,
-    push_weights_to_peer,
-    rank_endpoint,
-    receive_from_peer,
-    receive_from_peer_staged,
-    receive_weights,
-    start_pre_dma_to_staging,
+    receive_from_peer as nixl_receive_from_peer,
+    push_to_peer as nixl_push_to_peer,
+    push_weights_to_peer as nixl_push_weights_to_peer,
+    preregister_weights as nixl_preregister_weights,
+    receive_weights as nixl_receive_weights,
 )
 
 __all__ = [
-    "RankEndpoint",
-    "WeightServer",
+    "NixlEndpoint",
+    "nixl_endpoint",
     "collect_weight_buffers",
-    "fetch_tok_embedding",
-    "preconnect_to_peer",
-    "preregister_weights",
-    "push_to_peer",
-    "push_weights_to_peer",
-    "rank_endpoint",
-    "receive_from_peer",
-    "receive_from_peer_staged",
-    "receive_weights",
-    "start_pre_dma_to_staging",
+    "nixl_receive_from_peer",
+    "nixl_push_to_peer",
+    "nixl_push_weights_to_peer",
+    "nixl_preregister_weights",
+    "nixl_receive_weights",
 ]
 
-try:
-    from .nixl_endpoint import NixlEndpoint
-    from .nixl_transfer import (
-        nixl_endpoint,
-        receive_from_peer as nixl_receive_from_peer,
-        push_to_peer as nixl_push_to_peer,
-        push_weights_to_peer as nixl_push_weights_to_peer,
-        preregister_weights as nixl_preregister_weights,
-        receive_weights as nixl_receive_weights,
-    )
-
-    __all__ += [
-        "NixlEndpoint",
-        "nixl_endpoint",
-        "nixl_receive_from_peer",
-        "nixl_push_to_peer",
-        "nixl_push_weights_to_peer",
-        "nixl_preregister_weights",
-        "nixl_receive_weights",
-    ]
-except ImportError:
-    pass
-
-__version__ = "0.0.1.post4"
+__version__ = "0.0.2"

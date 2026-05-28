@@ -36,12 +36,6 @@ class WakeUpRequest(BaseModel):
     peer_url: str | None = None
 
 
-class PushWeightsRequest(BaseModel):
-    per_rank: list[dict]
-    chunk_start: int | None = None
-    chunk_end: int | None = None
-    is_last_chunk: bool = True
-
 
 def _get_engine_core(app: FastAPI):
     """Get the engine core client from the app state."""
@@ -128,47 +122,12 @@ def register_nkipy_routes(app: FastAPI) -> None:
         finally:
             _nkipy_transitioning = False
 
-    @app.post("/nkipy/p2p_prepare")
-    async def p2p_prepare():
-        core = _get_engine_core(app)
-        await core.collective_rpc_async("nkipy_prepare_push")
-        return JSONResponse({"status": "preparing"})
-
-    @app.post("/nkipy/p2p_preconnect")
-    async def p2p_preconnect(request: Request):
-        body = await request.json()
-        core = _get_engine_core(app)
-        await core.collective_rpc_async(
-            "nkipy_preconnect", args=(body["per_rank"],),
-        )
-        return JSONResponse({"status": "connected"})
-
-    @app.post("/nkipy/p2p_push_weights")
-    async def p2p_push_weights(req: PushWeightsRequest):
-        core = _get_engine_core(app)
-        # Start the RDMA push in background threads on all workers.
-        # This returns immediately so workers can keep serving requests.
-        results = await core.collective_rpc_async(
-            "nkipy_push_weights",
-            args=(req.per_rank, req.chunk_start, req.chunk_end, req.is_last_chunk),
-        )
-        # Poll until the background push completes on all workers.
-        while True:
-            await asyncio.sleep(0.1)
-            statuses = await core.collective_rpc_async("nkipy_push_status")
-            if all(s.get("status") != "running" for s in statuses):
-                for s in statuses:
-                    if s.get("status") == "error":
-                        raise HTTPException(500, s.get("message", "push failed"))
-                break
-        return results[0]
-
-    @app.post("/nkipy/nixl_push")
-    async def nixl_push(request: Request):
+    @app.post("/nkipy/push")
+    async def push(request: Request):
         body = await request.json()
         core = _get_engine_core(app)
         results = await core.collective_rpc_async(
-            "nkipy_nixl_push", args=(body["per_rank"],),
+            "nkipy_push", args=(body["per_rank"],),
         )
         return JSONResponse(results[0])
 

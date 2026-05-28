@@ -28,12 +28,9 @@ def _is_trn2() -> bool:
         return False
 
 _TRN2 = _is_trn2()
-# HBM MR registration is only needed on Trn2 for host-staged RDMA.
+# NIXL's libfabric EFA provider needs HBM MR registration for dmabuf on Trn2.
 if _TRN2:
     os.environ.setdefault("NEURON_RT_REGISTER_HBM_MR", "1")
-# Host-staged RDMA is required on Trn2 (direct device RDMA is ~3.5 Gbps/rank);
-# on Trn1, direct device RDMA works at full speed so host staging is unnecessary.
-os.environ.setdefault("NKIPY_HOST_STAGING", "1" if _TRN2 else "0")
 try:
     import torch_neuronx  # noqa: F401 — registers neuron backend
 except ImportError:

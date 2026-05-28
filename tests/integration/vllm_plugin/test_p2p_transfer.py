@@ -7,14 +7,10 @@ Launches two vLLM+NKIPy servers on different NeuronCore groups:
   Engine B (cores 16-23, no checkpoint) — starts sleeping
 
 Then validates:
-  1. Wake Engine B via P2P RDMA from Engine A
+  1. Wake Engine B via NIXL RDMA push from Engine A
   2. Run inference on Engine B via /v1/completions
   3. Sleep Engine B, wake again (tests sleep/wake cycle)
   4. Run inference again (proves second wake works)
-
-The host-staged variant (NKIPY_HOST_STAGING=1) tests the Trn2 path where
-device→host DMA and host RDMA are used instead of direct device RDMA.
-This exercises the early-prepare pre-DMA optimization (/nkipy/p2p_prepare).
 """
 
 import glob
@@ -33,8 +29,6 @@ _HAS_NEURON = len(glob.glob("/dev/neuron*")) > 0
 _QWEN3_CHECKPOINT = os.path.expanduser(
     "~/models/Qwen3-30b-a3b"
 )
-_IS_TRN2 = os.path.exists("/sys/devices/virtual/neuron_device/neuron0/architecture") and \
-    open("/sys/devices/virtual/neuron_device/neuron0/architecture").read().strip() == "trn2"
 
 
 def _free_port():
@@ -56,8 +50,7 @@ def _wait_for_server(port, timeout=600):
     return False
 
 
-def _start_vllm_server(port, checkpoint=None, core_offset=0, tp=8,
-                       host_staging=False):
+def _start_vllm_server(port, checkpoint=None, core_offset=0, tp=8):
     """Start vLLM with NKIPy plugin server."""
     import tempfile
 
@@ -68,11 +61,10 @@ def _start_vllm_server(port, checkpoint=None, core_offset=0, tp=8,
         "NKIPY_CORE_OFFSET": str(core_offset),
         "OMP_NUM_THREADS": "1",
         "VLLM_RPC_TIMEOUT": "600000",
+        "NEURON_RT_MAP_HBM": "1",
     })
     if checkpoint:
         env["NKIPY_CHECKPOINT"] = checkpoint
-    if host_staging:
-        env["NKIPY_HOST_STAGING"] = "1"
 
     cmd = [
         "python", "-m", "nkipy.vllm_plugin.server",
@@ -93,18 +85,21 @@ def _start_vllm_server(port, checkpoint=None, core_offset=0, tp=8,
     return proc
 
 
-def _run_p2p_test(host_staging=False):
-    """Core test logic shared between direct-RDMA and host-staged paths."""
+@pytest.mark.integration
+@pytest.mark.skipif(
+    not (_HAS_NEURON and os.path.isdir(_QWEN3_CHECKPOINT)),
+    reason="Requires Neuron devices and Qwen3 checkpoint",
+)
+def test_p2p_weight_transfer():
+    """P2P weight transfer via NIXL direct device RDMA."""
     port_a = _free_port()
     port_b = _free_port()
 
     engine_a = _start_vllm_server(
         port_a, checkpoint=_QWEN3_CHECKPOINT, core_offset=0,
-        host_staging=host_staging,
     )
     engine_b = _start_vllm_server(
         port_b, checkpoint=None, core_offset=16,
-        host_staging=host_staging,
     )
 
     try:
@@ -127,18 +122,6 @@ def _run_p2p_test(host_staging=False):
             timeout=10,
         )
         assert resp.status_code == 503, f"Expected 503, got {resp.status_code}"
-
-        # --- Verify p2p_prepare endpoint exists on sender ---
-        print("=== Verify p2p_prepare endpoint ===")
-        resp = requests.post(f"{url_a}/nkipy/p2p_prepare", timeout=10)
-        assert resp.status_code == 200, f"p2p_prepare failed: {resp.text}"
-        prepare_status = resp.json().get("status")
-        if host_staging:
-            assert prepare_status == "preparing", (
-                f"Expected 'preparing', got {prepare_status!r}")
-        else:
-            assert prepare_status == "skipped", (
-                f"Expected 'skipped' (no host staging), got {prepare_status!r}")
 
         # --- Step 1: Wake Engine B via P2P from Engine A ---
         print("=== Wake Engine B via P2P ===")
@@ -215,30 +198,3 @@ def _run_p2p_test(host_staging=False):
                     os.unlink(proc._log_path)
                 except OSError:
                     pass
-
-
-@pytest.mark.integration
-@pytest.mark.skipif(
-    not (_HAS_NEURON and os.path.isdir(_QWEN3_CHECKPOINT)),
-    reason="Requires Neuron devices and Qwen3 checkpoint",
-)
-def test_p2p_weight_transfer():
-    """P2P weight transfer via direct device RDMA (Trn1 path)."""
-    _run_p2p_test(host_staging=False)
-
-
-@pytest.mark.integration
-@pytest.mark.skipif(
-    not (_HAS_NEURON and os.path.isdir(_QWEN3_CHECKPOINT)),
-    reason="Requires Neuron devices and Qwen3 checkpoint",
-)
-def test_p2p_weight_transfer_host_staged():
-    """P2P weight transfer via host-staged RDMA with pre-DMA (Trn2 path).
-
-    Validates:
-    - /nkipy/p2p_prepare triggers early device->host DMA
-    - Host-staged RDMA transfer completes successfully
-    - Inference correctness after transfer
-    - Sleep/wake cycle stability with pre-DMA state cleanup
-    """
-    _run_p2p_test(host_staging=True)

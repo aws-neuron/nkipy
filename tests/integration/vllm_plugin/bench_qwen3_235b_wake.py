@@ -6,10 +6,7 @@
 Measures end-to-end wake-up and sleep latency for Qwen3-235B-A22B with TP=32
 across two trn2.48xlarge instances.
 
-Supports multiple P2P backends:
-  - nixl:        Direct device RDMA via NIXL (NKIPY_USE_NIXL=1)
-  - host-staged: Host-staged RDMA (NKIPY_HOST_STAGING=1)
-  - direct:      Direct device RDMA via C++ relay (default)
+Uses NIXL LIBFABRIC backend for direct device-to-device RDMA.
 
 Topology:
   LOCAL  (sender):   1 vLLM engine, TP=32, cores 0-31, holds checkpoint
@@ -21,14 +18,7 @@ Reports full latency breakdown including:
   - Kernel loading
 
 Usage:
-    # NIXL backend:
-    python tests/integration/vllm_plugin/bench_qwen3_235b_wake.py --backend nixl
-
-    # Host-staged (existing):
-    python tests/integration/vllm_plugin/bench_qwen3_235b_wake.py --backend host-staged
-
-    # Repeat N times:
-    python tests/integration/vllm_plugin/bench_qwen3_235b_wake.py --backend nixl --iterations 3
+    python tests/integration/vllm_plugin/bench_qwen3_235b_wake.py --iterations 3
 
 Environment variables:
     BENCH_REMOTE_HOST   Remote instance IP (default: 10.3.215.3)
@@ -74,17 +64,9 @@ def _wait_for_server(host, port, timeout=900):
     return False
 
 
-_BACKEND = "host-staged"  # set by main()
-
-
 def _backend_env_vars():
-    """Return env vars specific to the selected backend."""
-    if _BACKEND == "nixl":
-        return {"NKIPY_USE_NIXL": "1", "NEURON_RT_MAP_HBM": "1"}
-    elif _BACKEND == "host-staged":
-        return {"NKIPY_HOST_STAGING": "1"}
-    else:  # direct
-        return {}
+    """Return env vars for NIXL backend."""
+    return {"NEURON_RT_MAP_HBM": "1"}
 
 
 def _start_local_sender():
@@ -234,19 +216,14 @@ def _fmt_breakdown(breakdown):
 
 
 def main():
-    global _BACKEND
-    parser = argparse.ArgumentParser(description="Qwen3-235B cross-instance wake benchmark")
+    parser = argparse.ArgumentParser(description="Cross-instance wake/sleep benchmark (NIXL)")
     parser.add_argument("--iterations", type=int, default=3,
                         help="Number of wake/sleep cycles to measure")
-    parser.add_argument("--backend", choices=["nixl", "host-staged", "direct"],
-                        default="host-staged",
-                        help="P2P transfer backend (default: host-staged)")
     parser.add_argument("--skip-inference", action="store_true",
                         help="Skip inference correctness check (faster)")
     parser.add_argument("--reuse-engines", action="store_true",
                         help="Don't start/stop engines (assume already running)")
     args = parser.parse_args()
-    _BACKEND = args.backend
 
     if not args.reuse_engines and not os.path.isdir(_CHECKPOINT):
         print(f"ERROR: Checkpoint not found: {_CHECKPOINT}")
@@ -300,7 +277,7 @@ def main():
         # === Benchmark: Wake/Sleep cycles ===
         print("=" * 70)
         print(f"BENCHMARK: Qwen3-235B-A22B cross-instance wake/sleep (TP={_TP})")
-        print(f"  Backend:  {_BACKEND}")
+        print(f"  Backend:  nixl")
         print(f"  Sender:   {_LOCAL_IP}:{_SENDER_PORT}")
         print(f"  Receiver: {_REMOTE_HOST}:{_RECEIVER_PORT}")
         print(f"  Per-rank shard: ~{447*1024/32:.0f} MB ({447*1024*8/32/1000:.1f} Gbps at 1s)")
@@ -355,13 +332,8 @@ def main():
             print("SUMMARY")
             print("=" * 70)
             latencies = [r["latency"] for r in results]
-            backend_label = {
-                "nixl": "NIXL direct device RDMA (NKIPY_USE_NIXL=1)",
-                "host-staged": "Host-staged RDMA (NKIPY_HOST_STAGING=1)",
-                "direct": "Direct device RDMA via C++ relay",
-            }[_BACKEND]
             print(f"  Model: {_MODEL} (TP={_TP})")
-            print(f"  Backend: {backend_label}")
+            print(f"  Backend: NIXL direct device RDMA")
             print(f"  Per-rank shard: ~{14*1024:.0f} MB")
             print(f"  Iterations: {len(results)}")
             print(f"\n  WAKE LATENCY:")

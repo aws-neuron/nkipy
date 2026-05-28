@@ -25,7 +25,7 @@ import torch.distributed as dist
 
 from .nixl_endpoint import NixlEndpoint, logger
 
-# Module-level singleton (parallel to rank_endpoint in transfer.py)
+# Module-level singleton
 nixl_endpoint = NixlEndpoint()
 
 
@@ -55,7 +55,7 @@ def receive_from_peer(
     ep: NixlEndpoint,
     buffers: Sequence[Tuple[str, int, int]],
     peer_url: str,
-    push_endpoint: str = "/nkipy/nixl_push",
+    push_endpoint: str = "/nkipy/push",
 ) -> None:
     """All ranks receive buffers from a peer engine via NIXL RDMA WRITE (push).
 

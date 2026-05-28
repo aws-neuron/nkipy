@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for the NKIPy vLLM plugin components."""
 
-import os
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -185,120 +184,6 @@ class TestNKIPyWorker(unittest.TestCase):
         mem = NKIPyWorker.determine_available_memory(worker)
         assert mem == 1 * (1024 ** 3)
 
-    @patch.dict(os.environ, {"NKIPY_HOST_STAGING": "0"})
-    def test_prepare_push_skipped_without_host_staging(self):
-        from nkipy.vllm_plugin.worker import NKIPyWorker
-
-        worker = NKIPyWorker.__new__(NKIPyWorker)
-        result = worker.nkipy_prepare_push()
-        assert result == {"status": "skipped"}
-
-    @patch.dict(os.environ, {"NKIPY_HOST_STAGING": "1"})
-    def test_prepare_push_skipped_without_model(self):
-        from nkipy.vllm_plugin.worker import NKIPyWorker
-
-        worker = NKIPyWorker.__new__(NKIPyWorker)
-        worker.model_runner = MagicMock()
-        worker.model_runner._nkipy_model = None
-        result = worker.nkipy_prepare_push()
-        assert result == {"status": "skipped"}
-
-    @patch.dict(os.environ, {"NKIPY_HOST_STAGING": "1"})
-    def test_prepare_push_calls_start_pre_dma(self):
-        from nkipy.vllm_plugin.worker import NKIPyWorker
-
-        worker = NKIPyWorker.__new__(NKIPyWorker)
-        worker.model_runner = MagicMock()
-        mock_model = MagicMock()
-        worker.model_runner._nkipy_model = mock_model
-
-        with patch("relay.start_pre_dma_to_staging") as mock_pre_dma:
-            result = worker.nkipy_prepare_push()
-            mock_pre_dma.assert_called_once_with(mock_model)
-            assert result == {"status": "preparing"}
-
-    @patch.dict(os.environ, {"NKIPY_HOST_STAGING": "1"})
-    def test_wake_up_sends_prepare_signal_rank0(self):
-        """Rank 0 sends fire-and-forget prepare signal at wake_up start."""
-        import time as _time
-        from nkipy.vllm_plugin.worker import NKIPyWorker
-
-        worker = NKIPyWorker.__new__(NKIPyWorker)
-        worker._sleeping = True
-        worker.rank = 0
-
-        mock_post = MagicMock()
-        with patch.dict("sys.modules", {"requests": MagicMock(post=mock_post)}):
-            # The wake_up will fail early (no spike, no gloo) but the prepare
-            # signal should have been submitted before any of that.
-            try:
-                worker.nkipy_wake_up("http://sender:8000")
-            except Exception:
-                pass
-
-            # Give the background thread a moment to execute
-            _time.sleep(0.2)
-            mock_post.assert_called_once_with(
-                "http://sender:8000/nkipy/p2p_prepare", timeout=5
-            )
-
-    @patch.dict(os.environ, {"NKIPY_HOST_STAGING": "1"})
-    def test_wake_up_no_prepare_for_non_rank0(self):
-        """Non-rank-0 workers should not send prepare signal."""
-        from nkipy.vllm_plugin.worker import NKIPyWorker
-
-        worker = NKIPyWorker.__new__(NKIPyWorker)
-        worker._sleeping = True
-        worker.rank = 5
-
-        mock_post = MagicMock()
-        with patch.dict("sys.modules", {"requests": MagicMock(post=mock_post)}):
-            try:
-                worker.nkipy_wake_up("http://sender:8000")
-            except Exception:
-                pass
-
-            mock_post.assert_not_called()
-
-    @patch.dict(os.environ, {"NKIPY_HOST_STAGING": "0"})
-    def test_wake_up_no_prepare_without_host_staging(self):
-        """Without NKIPY_HOST_STAGING=1, no prepare signal is sent."""
-        from nkipy.vllm_plugin.worker import NKIPyWorker
-
-        worker = NKIPyWorker.__new__(NKIPyWorker)
-        worker._sleeping = True
-        worker.rank = 0
-
-        mock_post = MagicMock()
-        with patch.dict("sys.modules", {"requests": MagicMock(post=mock_post)}):
-            try:
-                worker.nkipy_wake_up("http://sender:8000")
-            except Exception:
-                pass
-
-            mock_post.assert_not_called()
-
-
-class TestPreDmaStaging(unittest.TestCase):
-    """Test start_pre_dma_to_staging early-exit logic."""
-
-    @patch("relay.transfer.rank_endpoint")
-    def test_noop_without_sender_staging(self, mock_ep):
-        """No-op if _sender_staging is not set on rank_endpoint."""
-        mock_ep._sender_staging = None
-        # Should return before importing spike
-        from relay.transfer import start_pre_dma_to_staging
-        start_pre_dma_to_staging(MagicMock())
-
-    @patch("relay.transfer.rank_endpoint")
-    def test_noop_if_already_running(self, mock_ep):
-        """No-op if a pre-DMA thread is already in progress."""
-        mock_ep._sender_staging = MagicMock()
-        mock_ep._pre_dma_thread = MagicMock()  # Already running
-        from relay.transfer import start_pre_dma_to_staging
-        start_pre_dma_to_staging(MagicMock())
-        # _pre_dma_thread should remain the mock (not overwritten)
-        assert mock_ep._pre_dma_thread is not None
 
 
 if __name__ == "__main__":
