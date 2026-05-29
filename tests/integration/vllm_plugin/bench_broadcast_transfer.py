@@ -46,10 +46,12 @@ _REMOTE_HOST = os.environ.get("BENCH_REMOTE_HOST", "10.3.215.3")
 _MODEL = os.environ.get("BENCH_MODEL", "Qwen/Qwen3-30B-A3B")
 _CHECKPOINT = os.environ.get("BENCH_CHECKPOINT", "/fsx/zhuangw/models/qwen3_30b_a3b_TP32")
 _TP = int(os.environ.get("BENCH_TP", "32"))
+_NUM_RECEIVERS = int(os.environ.get("BENCH_NUM_RECEIVERS", "2"))
 _VENV_PYTHON = "/fsx/zhuangw/nkipy/.venv/bin/python"
 _SENDER_PORT = 8100
-_RECEIVER_PORTS = [9100, 9200]
-_RECEIVER_CORE_OFFSETS = [0, 32]
+# Derive per-receiver ports and core offsets from TP and num receivers
+_RECEIVER_PORTS = [9100 + i * 100 for i in range(_NUM_RECEIVERS)]
+_RECEIVER_CORE_OFFSETS = [i * _TP for i in range(_NUM_RECEIVERS)]
 
 
 def _wait_for_server(host, port, timeout=900):
@@ -102,7 +104,7 @@ def _start_local_sender():
 def _start_remote_receiver(port, core_offset):
     venv_bin = os.path.dirname(_VENV_PYTHON)
     nixl_port = 21000 + core_offset
-    master_port = 29500 + core_offset
+    master_port = 40000 + core_offset * 100
     env_vars = (
         f"PATH={venv_bin}:$PATH "
         f"VLLM_PLUGINS=nkipy "
