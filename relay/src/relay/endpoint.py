@@ -78,7 +78,8 @@ class Endpoint:
         else:
             rank = int(os.environ.get("RANK", "0"))
         short_host = socket.gethostname().split(".")[0][-8:]
-        agent_name = f"nkipy_{short_host}_r{rank}_e{self._epoch}"
+        port = self._listen_port + rank
+        agent_name = f"nkipy_{short_host}_p{port}_r{rank}_e{self._epoch}"
 
         config = nixl_agent_config(
             enable_prog_thread=True,
