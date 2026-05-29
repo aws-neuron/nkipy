@@ -351,8 +351,18 @@ def main():
         print(f"    Transfer completed: {t_transfer:.2f}s "
               f"(status={result.get('status')}, n_receivers={result.get('n_receivers')})")
 
-        # Step 4: Verify inference on both receivers
-        print("\n  Step 4: Verifying inference on both receivers...")
+        # Step 4: Finalize transfer (tok_embedding device→CPU conversion)
+        print("\n  Step 4: Finalizing transfer on both receivers...")
+        for i, port in enumerate(_RECEIVER_PORTS):
+            resp = requests.post(
+                f"http://{_REMOTE_HOST}:{port}/nkipy/finalize_transfer", timeout=60)
+            if resp.status_code != 200:
+                print(f"    ERROR: Finalize {port} failed ({resp.status_code}): {resp.text[:200]}")
+            else:
+                print(f"    Receiver {i+1}: finalized")
+
+        # Step 5: Verify inference on both receivers
+        print("\n  Step 5: Verifying inference on both receivers...")
         all_correct = True
         for i, port in enumerate(_RECEIVER_PORTS):
             output = _infer(_REMOTE_HOST, port)

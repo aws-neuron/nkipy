@@ -137,6 +137,13 @@ def register_nkipy_routes(app: FastAPI) -> None:
             return JSONResponse({"status": "error", "error": str(e)[:500]},
                                 status_code=500)
 
+    @app.post("/nkipy/finalize_transfer")
+    async def finalize_transfer():
+        """Finalize model state after broadcast weight transfer."""
+        core = _get_engine_core(app)
+        results = await core.collective_rpc_async("nkipy_finalize_transfer")
+        return JSONResponse(results[0])
+
     @app.get("/nkipy/rdma_metadata")
     async def rdma_metadata():
         """Return per-rank NIXL agent metadata and buffer VAs.

@@ -535,6 +535,22 @@ class NKIPyWorker(WorkerBase):
             dtype = str(data.dtype)
         return {"raw": raw, "shape": shape, "dtype": dtype}
 
+    def nkipy_finalize_transfer(self) -> dict:
+        """Finalize model state after broadcast weight transfer.
+
+        Re-reads tok_embedding from device memory (which was just filled
+        via RDMA) into a CPU tensor for inference. Called by the broadcast
+        orchestrator after /nkipy/transfer completes.
+        """
+        model = self.model_runner._nkipy_model
+        if model is None:
+            return {"status": "error", "message": "model not loaded"}
+
+        if model.tok_embedding_device is not None:
+            model.tok_embedding = model.tok_embedding_device.torch()
+
+        return {"status": "ok"}
+
     def nkipy_get_rdma_metadata(self) -> dict:
         """Return per-rank NIXL agent metadata and buffer VAs.
 
