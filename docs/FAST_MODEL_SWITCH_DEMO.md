@@ -82,7 +82,7 @@ We reduce cold-start latency from minutes to seconds through three key design pr
 
 **3. P2P RDMA weight transfer.** Instead of reading weights from disk (bounded by NVMe at ~4 GB/s) or network storage (FSx/S3), we push weights directly from an active engine's device memory over EFA (e.g., 3.2 Tbps on trn2.48xlarge). This reduces weight loading from 51–386s to ~5s and eliminates the requirement for a local checkpoint entirely.
 
-**Expected result**: Cold start drops from **8–10 minutes** to **< 10 seconds** for LLaMA-3-70B at TP=32.
+**Expected result**: Cold start drops from **8–13 minutes** to **< 10 seconds** for all models up to 235B parameters at TP=32.
 
 ### 2.2 System Overview
 
@@ -263,11 +263,11 @@ Each engine exposes HTTP endpoints for lifecycle management:
 
 | Model | Instance | Traditional Cold Start | Wake-Up | Sleep |
 |---|---|---|---|---|
-| LLaMA-3-70B (TP=32) | trn1.32xlarge | ~8 min | **7.0s** | **~2s** |
-| | trn2.48xlarge | ~8 min | **7.4–8.4s** | **~2s** |
+| LLaMA-3.1-70B (TP=32) | trn1.32xlarge | ~8 min | **7.0s** | **~2s** |
+| | trn2.48xlarge | ~8 min | **4.4–6.2s** | **~2.5s** |
 | Qwen3-30B-A3B (TP=32) | trn1.32xlarge | ~7 min | **5.1s** | **~2s** |
 | | trn2.48xlarge | ~7 min | **4.7–6.3s** | **~2s** |
-| Qwen3-235B-A22B (TP=32) | trn2.48xlarge | ~13 min | **~19.9s** | **~3.6s** |
+| Qwen3-235B-A22B (TP=32) | trn2.48xlarge | ~13 min | **6.6–9.0s** | **~2.5s** |
 
 ### 3.2 Latency Breakdown
 
@@ -290,37 +290,34 @@ Effective aggregate throughput: ~14 GB/s across 32 ranks (single EFA NIC per ran
 
 | Phase | Latency | Notes |
 |---|---|---|
-| Gloo distributed init | 1.0s | |
-| NRT init + tensor alloc | 0.1s | Fast path (skip firmware reset) |
-| **VRAM MR registration** | 2.4s | Single contiguous region per rank |
-| Metadata gather + POST | 0.1s | Rank 0 gathers, POSTs to sender |
-| **RDMA WRITE** (4.3 GB/rank) | 3.4s | Direct device→device via NIXL LIBFABRIC |
-| Kernel load + barrier | 1.1s | |
-| **Total wake-up** | **7.4–8.4s** | |
+| Gloo distributed init | 0.2s | |
+| NRT init + tensor alloc | 0.5s | Fast path (skip firmware reset) |
+| **P2P transfer** (4.3 GB/rank) | 3.9s | Direct device→device via NIXL LIBFABRIC |
+| Kernel load + barrier | 0.3s | |
+| tok_embedding | 0.1s | |
+| **Total wake-up** | **4.4–6.2s** (avg 5.0s) | |
 
-Effective aggregate throughput: ~24 GB/s across 32 ranks × 16 EFA NICs.
+Effective aggregate throughput: 139 GB in 3.9s = ~285 Gbps across 32 ranks × 16 EFA NICs (~33 Gbps per rank).
 
 **Trn2 (Qwen3-235B-A22B, TP=32, trn2.48xlarge, cross-node, direct device RDMA):**
 
 | Phase | Latency | Notes |
 |---|---|---|
-| Gloo distributed init | 0.9s | |
-| NRT init + tensor alloc | 0.4s | |
-| **VRAM MR registration** | 4.2s | 14 GB contiguous region per rank |
-| Metadata gather + POST | 0.1s | |
-| **RDMA WRITE** (14 GB/rank) | 13.2s | Direct device→device, 448 GB total |
-| Kernel load + barrier | 0.1s | |
-| **Total wake-up** | **~19.9s** | |
+| Gloo distributed init | 0.7s | |
+| NRT init + tensor alloc | 0.5s | Fast path (skip firmware reset) |
+| **P2P transfer** (14 GB/rank) | 5.7s | Direct device→device via NIXL LIBFABRIC |
+| Kernel load + barrier | 0.5s | |
+| **Total wake-up** | **6.6–9.0s** (avg 7.6s) | |
 
-Effective aggregate throughput: ~174 Gbps across 32 ranks × 16 EFA NICs. All transfers use direct device RDMA — no host staging or CPU copies on the data path.
+Effective aggregate throughput: 448 GB in 5.7s = ~630 Gbps across 32 ranks × 16 EFA NICs (~22 Gbps per rank). All transfers use direct device RDMA — no host staging or CPU copies on the data path.
 
 **P2P RDMA vs FSx cold load:**
 
 | Model | FSx Cold Read | P2P Transfer | Speedup |
 |---|---|---|---|
 | Qwen3-30B-A3B (TP=32) | 51s | 3.2s | **16×** |
-| LLaMA-3.1-70B (TP=32) | 121s | 5.8s | **21×** |
-| Qwen3-235B-A22B (TP=32) | 386s | 13.3s | **29×** |
+| LLaMA-3.1-70B (TP=32) | 121s | 3.9s | **31×** |
+| Qwen3-235B-A22B (TP=32) | 386s | 5.7s | **68×** |
 
 ### 3.3 Scalability
 
@@ -397,10 +394,10 @@ The sender continues serving inference requests while pushing weights to a recei
 
 | Metric | Trn1 | Trn2 |
 |---|---|---|
-| Wake-up latency (LLaMA-3-70B, TP=32) | **7.0s** | **7.4–8.4s** |
+| Wake-up latency (LLaMA-3.1-70B, TP=32) | **7.0s** | **4.4–6.2s** |
 | Wake-up latency (Qwen3-30B, TP=32) | **5.1s** | **4.7–6.3s** |
-| Wake-up latency (Qwen3-235B, TP=32) | — | **~19.9s** |
-| Sleep latency | **~2s** | **~2.4–3.6s** |
+| Wake-up latency (Qwen3-235B, TP=32) | — | **6.6–9.0s** |
+| Sleep latency | **~2s** | **~2.5s** |
 | Inference impact during push | None | — |
 | Max standby engines per instance | 100+ | **500** (2.7 GB/engine) |
 | P2P consistency | 15/15 correct | Correct |
@@ -550,9 +547,10 @@ P2P transfer is rock-solid at 3.21–3.25s with zero degradation across engines.
 | | P2P RDMA (this work) | Checkpoint from local disk | Checkpoint from S3/EFS | CPU Offload |
 |---|---|---|---|---|
 | **Prerequisite** | Active sender loaded | Compiled checkpoint on local NVMe | Compiled checkpoint in S3 | Weights in CPU RAM |
-| **Switch latency (70B, TP=32)** | 7s | 44–86s | 90–180s | 30–60s |
+| **Switch latency (70B, TP=32)** | 5s | 44–86s | 90–180s | 30–60s |
 | **Switch latency (30B MoE, TP=32)** | 5s | ~45s | ~90s | ~20s |
-| **Bandwidth** | 100 Gbps EFA | 3.4 GB/s NVMe | 1–2 GB/s network | 25 GB/s PCIe |
+| **Switch latency (235B MoE, TP=32)** | 7.6s | ~120s | ~400s | N/A (448 GB RAM) |
+| **Bandwidth** | 630 Gbps EFA (aggregate) | 3.4 GB/s NVMe | 1–2 GB/s network | 25 GB/s PCIe |
 | **Sender impact** | 0 stalls | N/A | N/A | N/A |
 | **Standby cost** | 3 GB RAM | Full instance | Full instance | Full instance + CPU RAM |
 | **Multi-model switching** | ~12s | 60–120s | 120–240s | 40–80s |
