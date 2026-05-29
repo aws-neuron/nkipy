@@ -263,10 +263,13 @@ def broadcast_to_peers(
 
     # Issue all RDMA WRITEs
     xfers = []
-    for per_rank_info in receivers:
+    for recv_idx, per_rank_info in enumerate(receivers):
         my_receiver = per_rank_info[rank]
         receiver_meta = my_receiver["agent_metadata"]
         receiver_name = my_receiver["agent_name"]
+        if rank == 0:
+            logger.info("Rank 0: adding remote agent %d: name=%s, meta_len=%d",
+                        recv_idx, receiver_name, len(receiver_meta) // 2)
         ep.add_remote_agent(bytes.fromhex(receiver_meta), name=receiver_name)
 
         remote_nc = my_receiver.get("nc_idx", nc)

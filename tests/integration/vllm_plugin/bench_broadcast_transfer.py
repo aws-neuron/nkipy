@@ -328,65 +328,31 @@ def main():
         for i, port in enumerate(_RECEIVER_PORTS):
             meta = _get_rdma_metadata(_REMOTE_HOST, port)
             if meta is None or meta.get("status") != "ok":
-                print(f"    ERROR: Could not get metadata from receiver {i+1}: {meta}")
+                print(f"    ERROR: Could not get metadata from receiver {i+1}")
                 sys.exit(1)
-            per_rank = meta["per_rank"]
-            metadata_list.append(per_rank)
-            # Diagnostic: check metadata sizes
-            meta_sizes = [len(r["agent_metadata"]) // 2 for r in per_rank]
-            print(f"    Receiver {i+1}: {len(per_rank)} ranks, "
-                  f"meta sizes: {meta_sizes[0]}B (rank 0), "
-                  f"agent_name: {per_rank[0].get('agent_name')}")
+            metadata_list.append(meta["per_rank"])
+            print(f"    Receiver {i+1}: got {len(meta['per_rank'])} rank entries")
         t_meta = time.time() - t0
         print(f"    Metadata gather: {t_meta:.2f}s")
 
-        # Step 3: Batched POST to sender
+        # Step 3: Batched POST to sender (broadcast to both receivers)
         print(f"\n  Step 3: POST /nkipy/transfer with {len(metadata_list)} receivers...")
-        payload = {"receivers": metadata_list}
-        payload_size = len(str(payload))
-        print(f"    Payload size: {payload_size/1024:.1f} KB")
         t0 = time.time()
         resp = requests.post(
             f"http://localhost:{_SENDER_PORT}/nkipy/transfer",
-            json=payload,
+            json={"receivers": metadata_list},
             timeout=300,
         )
         t_transfer = time.time() - t0
         if resp.status_code != 200:
             print(f"    ERROR: Transfer failed ({resp.status_code}): {resp.text[:500]}")
-            # Check sender log
-            import glob
-            sender_logs = sorted(glob.glob("/tmp/bench_bcast_sender_*.log"), key=os.path.getmtime)
-            if sender_logs:
-                print(f"    Sender log tail:")
-                with open(sender_logs[-1]) as f:
-                    lines = f.readlines()
-                    for line in lines[-20:]:
-                        if "ERROR" in line or "NIXL" in line:
-                            print(f"      {line.rstrip()}")
             sys.exit(1)
         result = resp.json()
         print(f"    Transfer completed: {t_transfer:.2f}s "
               f"(status={result.get('status')}, n_receivers={result.get('n_receivers')})")
 
-        # Step 4: Load tok_embedding on receivers (not transferred via RDMA)
-        print("\n  Step 4: Loading tok_embedding on receivers from sender...")
-        for i, port in enumerate(_RECEIVER_PORTS):
-            try:
-                # Fetch tok_embedding from sender and verify it's available
-                emb_resp = requests.get(
-                    f"http://localhost:{_SENDER_PORT}/nkipy/tok_embedding", timeout=30)
-                if emb_resp.status_code == 200:
-                    print(f"    Receiver {i+1}: tok_embedding available "
-                          f"({len(emb_resp.content)/1e6:.1f} MB) — "
-                          f"NOTE: receivers load from local model files")
-                else:
-                    print(f"    Receiver {i+1}: tok_embedding fetch: {emb_resp.status_code}")
-            except Exception as e:
-                print(f"    Receiver {i+1}: tok_embedding error: {e}")
-
-        # Step 5: Verify inference on both receivers
-        print("\n  Step 5: Verifying inference on both receivers...")
+        # Step 4: Verify inference on both receivers
+        print("\n  Step 4: Verifying inference on both receivers...")
         all_correct = True
         for i, port in enumerate(_RECEIVER_PORTS):
             output = _infer(_REMOTE_HOST, port)
