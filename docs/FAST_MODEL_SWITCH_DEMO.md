@@ -261,32 +261,17 @@ Each engine exposes HTTP endpoints for lifecycle management:
 
 ### 3.1 End-to-End Latency
 
-| Model | Instance | Traditional Cold Start | Wake-Up | Sleep |
-|---|---|---|---|---|
-| LLaMA-3.1-70B (TP=32) | trn1.32xlarge | ~8 min | **7.0s** | **~2s** |
-| | trn2.48xlarge | ~8 min | **4.4–6.2s** | **~2.5s** |
-| Qwen3-30B-A3B (TP=32) | trn1.32xlarge | ~7 min | **5.1s** | **~2s** |
-| | trn2.48xlarge | ~7 min | **4.7–6.3s** | **~2s** |
-| Qwen3-235B-A22B (TP=32) | trn2.48xlarge | ~13 min | **6.6–9.0s** | **~2.5s** |
+Measured on **trn2.48xlarge** (32 logical NeuronCores, 16 EFA NICs, 2 TB RAM).
+
+| Model | Traditional Cold Start | Wake-Up | Sleep |
+|---|---|---|---|
+| Qwen3-30B-A3B (TP=32) | ~7 min | **4.7–6.3s** | **~2s** |
+| LLaMA-3.1-70B (TP=32) | ~8 min | **4.4–6.2s** | **~2.5s** |
+| Qwen3-235B-A22B (TP=32) | ~13 min | **6.6–9.0s** | **~2.5s** |
 
 ### 3.2 Latency Breakdown
 
-**Trn1 (LLaMA-3-70B, TP=32, trn1.32xlarge, cross-instance, direct device RDMA):**
-
-| Phase | Latency | Notes |
-|---|---|---|
-| NRT switch | 0.2s | |
-| Gloo distributed init | 1.0s | |
-| Tensor allocation | 0.1s | Empty weight buffers on device |
-| **VRAM MR registration** | 2.4s | Single contiguous region per rank |
-| Metadata gather + POST | 0.1s | Rank 0 gathers, POSTs to sender |
-| **RDMA WRITE** (4.3 GB/rank) | 2.4s | Direct device→device |
-| NEFF kernel reload | 0.8s | |
-| **Total wake-up** | **7.0s** | |
-
-Effective aggregate throughput: ~14 GB/s across 32 ranks (single EFA NIC per rank on trn1).
-
-**Trn2 (LLaMA-3.1-70B, TP=32, trn2.48xlarge, cross-node, direct device RDMA):**
+**LLaMA-3.1-70B (TP=32, trn2.48xlarge, cross-instance, direct device RDMA):**
 
 | Phase | Latency | Notes |
 |---|---|---|
@@ -299,7 +284,7 @@ Effective aggregate throughput: ~14 GB/s across 32 ranks (single EFA NIC per ran
 
 Effective aggregate throughput: 139 GB in 3.9s = ~285 Gbps across 32 ranks × 16 EFA NICs (~33 Gbps per rank).
 
-**Trn2 (Qwen3-235B-A22B, TP=32, trn2.48xlarge, cross-node, direct device RDMA):**
+**Qwen3-235B-A22B (TP=32, trn2.48xlarge, cross-instance, direct device RDMA):**
 
 | Phase | Latency | Notes |
 |---|---|---|
@@ -323,85 +308,31 @@ Effective aggregate throughput: 448 GB in 5.7s = ~630 Gbps across 32 ranks × 16
 
 #### 3.3.1 Standby Engine Density
 
-| Metric | Trn1 (100 engines) | Trn2 (500 engines) |
-|---|---|---|
-| Host memory per engine | 3.0 GB | ~2.7 GB |
-| Total memory used | 303 GB / 495 GB (61%) | 1,329 GB / 1,991 GB (67%) |
-| TCP ports (sleeping) | 1 per engine | 1 per engine |
-| Python processes (server + 32 workers) | 3,300 | 16,500 |
-| Total pool launch time | ~215s | ~22 min |
+Measured on **trn2.48xlarge** (2 TB host RAM, 32 logical NeuronCores).
+
+| Metric | Value (500 engines) |
+|---|---|
+| Host memory per engine | ~2.7 GB |
+| Total memory used | 1,329 GB / 1,991 GB (67%) |
+| TCP ports (sleeping) | 1 per engine |
+| Python processes (server + 32 workers) | 16,500 |
+| Total pool launch time | ~22 min |
 
 Each sleeping engine holds minimal TCP ports (Gloo destroyed during sleep). Engines are launched with a 1–2 second delay between consecutive launches to avoid CPU and TCP contention.
 
-**Trn1**: 100 engines (50 Qwen3 + 50 LLaMA) on trn1.32xlarge (512 GB host RAM).
+500 engines (LLaMA-3.1-70B, TP=32) on a single trn2.48xlarge. At 500 engines, 611 GB memory still available — theoretical limit is ~730 engines per instance.
 
-**Trn2**: 500 engines (LLaMA-3.1-70B, TP=32) on trn2.48xlarge (2 TB host RAM). At 500 engines, 611 GB memory still available — theoretical limit is ~730 engines per instance.
 
-<!--
-#### 3.3.2 100-Engine Multi-Model Test (Trn1)
+### 3.4 Summary
 
-100 standby engines (50 Qwen3-30B-A3B + 50 LLaMA-3-70B) on a single trn1.32xlarge (Instance B), with senders on Instance A. Sequential wake/infer/sleep cycles across both models.
-
-**Setup:**
-- Instance A (172.31.44.131): Qwen3 sender (port 8000) + LLaMA sender (port 8001, time-shared)
-- Instance B (172.31.40.200): 50 Qwen3 standby (ports 9000-9049) + 50 LLaMA standby (ports 9050-9099)
-
-**Phase 1 — Qwen3 sequential (10 engines):**
-
-| Engine | Wake | P2P Transfer | Inference | Sleep |
-|--------|------|---|---|---|
-| 9001 | 6.5s | 4.60s | Correct | ~2s |
-| 9002 | 5.1s | 3.23s | Correct | ~2s |
-| 9003 | 6.8s | 3.28s | Correct | ~2s |
-| 9004 | 5.0s | 3.23s | Correct | ~2s |
-| 9005–9009 | 5.1–5.2s | 3.2s | Correct | ~2s |
-
-**Phase 2 — LLaMA sequential (5 engines):**
-
-| Engine | Wake | P2P Transfer | Inference | Sleep |
-|--------|------|---|---|---|
-| 9050 | 7.2s | 4.92s | Correct | ~2s |
-| 9051 | 7.0s | 4.88s | Correct | ~2s |
-| 9052 | 7.0s | 4.96s | Correct | ~2s |
-| 9053 | 6.5s | 5.00s | Correct | ~2s |
-| 9054 | 7.2s | 4.97s | Correct | ~2s |
-
-**Phase 3 — Cross-model switching:**
-
-| Step | Latency | Details |
-|------|---------|---------|
-| Sleep Qwen3 sender | ~2s | Release NeuronCores |
-| Wake LLaMA sender | 6.6s | Reload LLaMA on sender instance |
-| Wake LLaMA receiver | 7.2s | P2P transfer from LLaMA sender |
-| Sleep LLaMA sender | ~2s | Release NeuronCores |
-| Wake Qwen3 sender | 4.3s | Reload QWen on sender instance|
-| Wake Qwen3 receiver | 5.1s | P2P from Qwen3 sender |
--->
-
-### 3.4 Non-Blocking Inference During P2P Weight Transfer (Trn1)
-
-The sender continues serving inference requests while pushing weights to a receiver. End-to-end latency measured per request (prompt + full generation, max_tokens=128):
-
-| Phase | Avg E2E Latency | Max E2E Latency |
-|---|---|---|
-| Before push (baseline) | 775 ms | 787 ms |
-| During push | 800 ms | 829 ms |
-| After push | 800 ms | 808 ms |
-
-3% latency increase during push, well within normal variance. The RDMA push runs in background threads with no lock contention on the inference path.
-
-### 3.5 Summary
-
-| Metric | Trn1 | Trn2 |
-|---|---|---|
-| Wake-up latency (LLaMA-3.1-70B, TP=32) | **7.0s** | **4.4–6.2s** |
-| Wake-up latency (Qwen3-30B, TP=32) | **5.1s** | **4.7–6.3s** |
-| Wake-up latency (Qwen3-235B, TP=32) | — | **6.6–9.0s** |
-| Sleep latency | **~2s** | **~2.5s** |
-| Inference impact during push | None | — |
-| Max standby engines per instance | 100+ | **500** (2.7 GB/engine) |
-| P2P consistency | 15/15 correct | Correct |
-| Bidirectional P2P | Verified | — |
+| Metric | Value |
+|---|---|
+| Wake-up latency (Qwen3-30B-A3B, TP=32) | **4.7–6.3s** |
+| Wake-up latency (LLaMA-3.1-70B, TP=32) | **4.4–6.2s** |
+| Wake-up latency (Qwen3-235B-A22B, TP=32) | **6.6–9.0s** |
+| Sleep latency | **~2.5s** |
+| Max standby engines per instance | **500** (2.7 GB/engine) |
+| P2P correctness | Verified (all iterations) |
 
 ---
 
@@ -522,27 +453,7 @@ This reduced checkpoint from 214 GB to 139 GB (35% savings) and eliminates 67 GB
 
 ## Appendix
 
-### A.1 10-Engine Sequential Wake Test
-
-10 standby engines on a single trn1.32xlarge, woken sequentially from a sender on a separate instance. Each engine: wake, verify inference correctness, sleep.
-
-| Engine | P2P Transfer | Total Wake | Inference |
-|--------|---|---|---|
-| 1 (cold start) | 3.22s | 21.63s | Correct |
-| 2 | 3.25s | 4.75s | Correct |
-| 3 | 3.23s | 5.03s | Correct |
-| 4 | 3.23s | 4.99s | Correct |
-| 5 | 3.23s | 5.07s | Correct |
-| 6 | 3.21s | 5.01s | Correct |
-| 7 | 3.23s | 5.10s | Correct |
-| 8 | 3.21s | 5.04s | Correct |
-| 9 | 3.22s | 5.06s | Correct |
-| 10 | 3.24s | 5.11s | Correct |
-| **Warm avg** | **3.23s** | **5.02s** | **10/10** |
-
-P2P transfer is rock-solid at 3.21–3.25s with zero degradation across engines.
-
-### A.2 Comparison with Alternatives
+### A.1 Comparison with Alternatives
 
 | | P2P RDMA (this work) | Checkpoint from local disk | Checkpoint from S3/EFS | CPU Offload |
 |---|---|---|---|---|
