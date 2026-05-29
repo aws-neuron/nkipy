@@ -127,9 +127,25 @@ def register_nkipy_routes(app: FastAPI) -> None:
         body = await request.json()
         receivers = body.get("receivers") or [body["per_rank"]]
         core = _get_engine_core(app)
-        results = await core.collective_rpc_async(
-            "nkipy_transfer", args=(receivers,),
-        )
+        try:
+            results = await core.collective_rpc_async(
+                "nkipy_transfer", args=(receivers,),
+            )
+            return JSONResponse(results[0])
+        except Exception as e:
+            logger.error("transfer failed: %s", e)
+            return JSONResponse({"status": "error", "error": str(e)[:500]},
+                                status_code=500)
+
+    @app.get("/nkipy/rdma_metadata")
+    async def rdma_metadata():
+        """Return per-rank NIXL agent metadata and buffer VAs.
+
+        Used by broadcast orchestrator to gather metadata from multiple
+        receivers and batch them into a single /nkipy/transfer POST.
+        """
+        core = _get_engine_core(app)
+        results = await core.collective_rpc_async("nkipy_get_rdma_metadata")
         return JSONResponse(results[0])
 
     @app.get("/nkipy/tok_embedding")

@@ -535,6 +535,39 @@ class NKIPyWorker(WorkerBase):
             dtype = str(data.dtype)
         return {"raw": raw, "shape": shape, "dtype": dtype}
 
+    def nkipy_get_rdma_metadata(self) -> dict:
+        """Return per-rank NIXL agent metadata and buffer VAs.
+
+        Used by broadcast orchestrator to gather metadata from multiple
+        receivers and batch into a single /nkipy/transfer call.
+        """
+        from relay import endpoint as _ep, collect_weight_buffers
+
+        model = self.model_runner._nkipy_model
+        if model is None:
+            return {"status": "error", "message": "model not loaded"}
+
+        bufs = collect_weight_buffers(model)
+        if not _ep.registered:
+            _ep.register(bufs)
+
+        nc = int(os.environ.get("NEURON_RT_VISIBLE_CORES", "0").split(",")[0])
+        local_info = {
+            "agent_metadata": _ep.get_metadata().hex(),
+            "agent_name": _ep.agent_name,
+            "nc_idx": nc,
+            "buffer_vas": [(va, sz) for _, va, sz in bufs],
+        }
+
+        # Gather from all ranks (rank 0 returns the full list)
+        world = dist.get_world_size()
+        gathered = [None] * world if self.rank == 0 else None
+        dist.gather_object(local_info, gathered, dst=0)
+
+        if self.rank == 0:
+            return {"status": "ok", "per_rank": gathered}
+        return {"status": "ok"}
+
     def nkipy_health(self) -> dict:
         """Return P2P health status."""
         return {"status": "ok", "backend": "nkipy", "sleeping": self._sleeping}
