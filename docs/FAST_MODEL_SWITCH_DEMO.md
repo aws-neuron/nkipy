@@ -267,11 +267,23 @@ Measured on **trn2.48xlarge** (32 logical NeuronCores, 16 EFA NICs, 2 TB RAM).
 
 | Model | Traditional Cold Start | Wake-Up | Sleep |
 |---|---|---|---|
-| Qwen3-30B-A3B (TP=32) | ~7 min | **4.7–6.3s** | **~2s** |
+| Qwen3-30B-A3B (TP=32) | ~7 min | **3.9–5.8s** | **~2.5s** |
 | LLaMA-3.1-70B (TP=32) | ~8 min | **4.4–6.2s** | **~2.5s** |
 | Qwen3-235B-A22B (TP=32) | ~13 min | **6.6–9.0s** | **~2.5s** |
 
 ### 3.2 Latency Breakdown
+
+**Qwen3-30B-A3B (TP=32, trn2.48xlarge, cross-instance, direct device RDMA):**
+
+| Phase | Latency | Notes |
+|---|---|---|
+| Gloo distributed init | 0.5s | |
+| NRT init + tensor alloc | 0.4s | Fast path (skip firmware reset) |
+| **P2P transfer** (1.8 GB/rank) | 3.4s | Direct device→device via NIXL LIBFABRIC |
+| Kernel load + barrier | 0.4s | |
+| **Total wake-up** | **3.9–5.8s** (avg 4.8s) | |
+
+Effective aggregate throughput: 59 GB in 3.4s = ~139 Gbps across 32 ranks × 16 EFA NICs (~37 Gbps per rank).
 
 **LLaMA-3.1-70B (TP=32, trn2.48xlarge, cross-instance, direct device RDMA):**
 
@@ -302,7 +314,7 @@ Effective aggregate throughput: 448 GB in 5.7s = ~630 Gbps across 32 ranks × 16
 
 | Model | FSx Cold Read | P2P Transfer | Speedup |
 |---|---|---|---|
-| Qwen3-30B-A3B (TP=32) | 51s | 3.2s | **16×** |
+| Qwen3-30B-A3B (TP=32) | 51s | 3.4s | **15×** |
 | LLaMA-3.1-70B (TP=32) | 121s | 3.9s | **31×** |
 | Qwen3-235B-A22B (TP=32) | 386s | 5.7s | **68×** |
 
@@ -329,7 +341,7 @@ Each sleeping engine holds minimal TCP ports (Gloo destroyed during sleep). Engi
 
 | Metric | Value |
 |---|---|
-| Wake-up latency (Qwen3-30B-A3B, TP=32) | **4.7–6.3s** |
+| Wake-up latency (Qwen3-30B-A3B, TP=32) | **3.9–5.8s** |
 | Wake-up latency (LLaMA-3.1-70B, TP=32) | **4.4–6.2s** |
 | Wake-up latency (Qwen3-235B-A22B, TP=32) | **6.6–9.0s** |
 | Sleep latency | **~2.5s** |
