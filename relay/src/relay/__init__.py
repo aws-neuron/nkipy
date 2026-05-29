@@ -7,7 +7,8 @@ from .transfer import (
     collect_weight_buffers,
     receive_from_peer,
     push_to_peer,
-    push_weights_to_peer,
+    broadcast_to_peers,
+    transfer_weights,
     preregister_weights,
     receive_weights,
 )
@@ -18,7 +19,8 @@ __all__ = [
     "collect_weight_buffers",
     "receive_from_peer",
     "push_to_peer",
-    "push_weights_to_peer",
+    "broadcast_to_peers",
+    "transfer_weights",
     "preregister_weights",
     "receive_weights",
 ]

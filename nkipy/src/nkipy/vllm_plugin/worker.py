@@ -489,13 +489,19 @@ class NKIPyWorker(WorkerBase):
             print(f"wake_up latency breakdown (rank {self.rank}): {latency}", flush=True)
         return {"status": "awake", "latency": latency}
 
-    def nkipy_push(self, per_rank_info: list[dict]) -> dict:
-        """Push weights to receiver via RDMA WRITE.
+    def nkipy_transfer(self, receivers: list[list[dict]]) -> dict:
+        """Push weights to one or more receivers via parallel RDMA WRITE.
 
-        Called by the HTTP server when a receiver POSTs its agent metadata
-        and buffer VAs. All ranks do the RDMA WRITE synchronously.
+        Called by the HTTP server when receivers POST their agent metadata
+        and buffer VAs. All ranks do RDMA WRITEs synchronously.
+
+        Parameters
+        ----------
+        receivers : list of per_rank_info lists
+            Each entry is [{"agent_metadata": ..., "agent_name": ..., ...}, ...]
+            with one dict per rank. Multiple entries = broadcast to N receivers.
         """
-        from relay import push_weights_to_peer, endpoint as _ep, preregister_weights
+        from relay import transfer_weights, endpoint as _ep, preregister_weights
 
         model = self.model_runner._nkipy_model
         if model is None:
@@ -504,8 +510,8 @@ class NKIPyWorker(WorkerBase):
         if not _ep.registered:
             preregister_weights(model)
 
-        push_weights_to_peer(model, per_rank_info)
-        return {"status": "done"}
+        transfer_weights(model, receivers)
+        return {"status": "done", "n_receivers": len(receivers)}
 
     def nkipy_get_tok_embedding(self) -> bytes | None:
         """Return serialized tok_embedding (rank 0 shard only).

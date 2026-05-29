@@ -55,7 +55,7 @@ def receive_from_peer(
     ep: Endpoint,
     buffers: Sequence[Tuple[str, int, int]],
     peer_url: str,
-    push_endpoint: str = "/nkipy/push",
+    push_endpoint: str = "/nkipy/transfer",
 ) -> None:
     """All ranks receive buffers from a peer engine via NIXL RDMA WRITE (push).
 
@@ -96,7 +96,7 @@ def receive_from_peer(
         base = peer_url.rstrip("/")
         resp = requests.post(
             f"{base}{push_endpoint}",
-            json={"per_rank": gathered},
+            json={"receivers": [gathered]},
             timeout=300,
         )
         resp.raise_for_status()
@@ -221,10 +221,86 @@ def preregister_weights(model, ep: Endpoint | None = None) -> None:
                     rank, len(bufs), elapsed)
 
 
-def push_weights_to_peer(model, per_rank_info: list) -> None:
-    """All ranks push model weights to the corresponding peer rank."""
+def transfer_weights(model, receivers: list[list]) -> None:
+    """Push model weights to one or more receivers in parallel.
+
+    Parameters
+    ----------
+    receivers : list of per_rank_info lists
+        Each entry is a per_rank_info list (one dict per rank) for a single
+        receiver engine. For broadcast, pass multiple entries.
+    """
     bufs = collect_weight_buffers(model)
-    push_to_peer(endpoint, bufs, per_rank_info)
+    if len(receivers) == 1:
+        push_to_peer(endpoint, bufs, receivers[0])
+    else:
+        broadcast_to_peers(endpoint, bufs, receivers)
+
+
+def broadcast_to_peers(
+    ep: Endpoint,
+    buffers: Sequence[Tuple[str, int, int]],
+    receivers: list[list],
+) -> None:
+    """All ranks push buffers to multiple receivers via parallel RDMA WRITEs.
+
+    Issues RDMA WRITEs to all receivers concurrently and polls until all
+    complete. Maximum recommended broadcast degree is 5.
+    """
+    t0 = time.time()
+    rank = dist.get_rank()
+    total_bytes = sum(sz for _, _, sz in buffers)
+
+    if not ep.registered:
+        ep.register(buffers)
+    t_reg = time.time()
+
+    nc = ep._nc_idx if ep._nc_idx is not None else int(
+        os.environ.get("NEURON_RT_VISIBLE_CORES", "0").split(",")[0]
+    )
+    local_desc_list = [(va, sz, nc) for _, va, sz in buffers]
+    local_descs = ep.agent.get_xfer_descs(local_desc_list, "VRAM")
+
+    # Issue all RDMA WRITEs
+    xfers = []
+    for per_rank_info in receivers:
+        my_receiver = per_rank_info[rank]
+        receiver_meta = my_receiver["agent_metadata"]
+        receiver_name = my_receiver["agent_name"]
+        ep.add_remote_agent(bytes.fromhex(receiver_meta), name=receiver_name)
+
+        remote_nc = my_receiver.get("nc_idx", nc)
+        remote_vas = my_receiver["buffer_vas"]
+        remote_desc_list = [(va, sz, remote_nc) for va, sz in remote_vas]
+        remote_descs = ep.agent.get_xfer_descs(remote_desc_list, "VRAM")
+
+        xfer = ep.agent.initialize_xfer("WRITE", local_descs, remote_descs, receiver_name)
+        status = ep.agent.transfer(xfer)
+        xfers.append((xfer, receiver_name, status))
+    t_issue = time.time()
+
+    # Poll all transfers to completion
+    for xfer, receiver_name, status in xfers:
+        if status == "PROC":
+            status = _poll_xfer(ep.agent, xfer)
+        if status != "DONE":
+            raise RuntimeError(
+                f"Rank {rank}: RDMA WRITE to {receiver_name} failed with status={status}"
+            )
+        xfer.release()
+    t_done = time.time()
+
+    elapsed = t_done - t0
+    total_pushed = total_bytes * len(receivers)
+    throughput_gbps = (total_pushed * 8) / elapsed / 1e9 if elapsed > 0 else 0
+    if rank == 0:
+        logger.info(
+            "Rank %d: broadcast to %d receivers, %.2f MB each — "
+            "reg %.3fs issue %.3fs poll %.3fs total %.3fs (%.1f Gbps aggregate)",
+            rank, len(receivers), total_bytes / 1e6,
+            t_reg - t0, t_issue - t_reg, t_done - t_issue,
+            elapsed, throughput_gbps,
+        )
 
 
 def receive_weights(model, peer_url: str) -> None:

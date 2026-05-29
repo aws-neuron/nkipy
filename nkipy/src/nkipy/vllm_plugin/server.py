@@ -122,12 +122,13 @@ def register_nkipy_routes(app: FastAPI) -> None:
         finally:
             _nkipy_transitioning = False
 
-    @app.post("/nkipy/push")
-    async def push(request: Request):
+    @app.post("/nkipy/transfer")
+    async def transfer(request: Request):
         body = await request.json()
+        receivers = body.get("receivers") or [body["per_rank"]]
         core = _get_engine_core(app)
         results = await core.collective_rpc_async(
-            "nkipy_push", args=(body["per_rank"],),
+            "nkipy_transfer", args=(receivers,),
         )
         return JSONResponse(results[0])
 

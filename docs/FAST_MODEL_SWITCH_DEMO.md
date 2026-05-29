@@ -200,7 +200,7 @@ The receiver orchestrates the entire transfer in a single HTTP request. It regis
   ┌─────────┴────────────────────────────────────────┴────────────┐
   │ Step 2: Transfer (single HTTP round-trip)                     │
   │                                                               │
-  │  Rank 0: POST /nkipy/push {per_rank metadata} ──▶ Sender     │
+  │  Rank 0: POST /nkipy/transfer {receivers metadata} ▶ Sender   │
   │                                                               │
   │  Sender (all ranks in parallel):                              │
   │    - Add receiver as remote NIXL agent                        │
@@ -245,7 +245,7 @@ Each engine exposes HTTP endpoints for lifecycle management:
 
 | Endpoint | Action |
 |----------|--------|
-| `POST /nkipy/push` | Receiver POSTs its RDMA metadata; sender performs RDMA WRITE and returns |
+| `POST /nkipy/transfer` | Receivers POST RDMA metadata; sender performs parallel RDMA WRITEs to 1–N receivers and returns |
 
 #### 2.5.2 LLM Serving Scheduler
 
