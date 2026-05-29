@@ -259,6 +259,8 @@ Each engine exposes HTTP endpoints for lifecycle management:
 
 ## 3. Performance Results
 
+> **Platform**: All results are measured on **trn2.48xlarge** exclusively. The NIXL LIBFABRIC backend relies on the dmabuf ioctl for VRAM registration, which has only been validated on Trn2's kernel driver. Trn1 support is untested and not planned (trn1 instances are being deprecated).
+
 ### 3.1 End-to-End Latency
 
 Measured on **trn2.48xlarge** (32 logical NeuronCores, 16 EFA NICs, 2 TB RAM).
