@@ -341,14 +341,15 @@ Each sleeping engine holds minimal TCP ports (Gloo destroyed during sleep). Engi
 
 When scaling up multiple engines simultaneously, the sender broadcasts weights to N receivers in a single `/nkipy/push_weights` call. All RDMA WRITEs are issued concurrently.
 
-**LLaMA-3-8B (TP=8, 1 sender → 8 receivers, trn2.48xlarge):**
+**LLaMA-3-8B (TP=8, 1 sender → 8 receivers, all receivers on same trn2.48xlarge):**
 
 | Phase | Latency | Notes |
 |---|---|---|
-| Wake (alloc tensors) | 3.0s | All 8 receivers wake in parallel |
-| RDMA metadata gather | 7.5s | Parallel (includes VRAM MR registration) |
+| Wake + MR register | 8.2s | 8 engines contend on shared NRT/EFA resources |
 | **Broadcast transfer** | **2.8s** | 128 GB total, 367 Gbps aggregate |
-| **Total wake-up** | **~13s** | 8 engines activated simultaneously |
+| **Total wake-up** | **~11s** | 8 engines on same instance |
+
+> **Note**: The 8.2s wake phase is inflated by resource contention — 8 engines on the same instance compete for NRT init and EFA MR registration. In production, receivers are distributed across separate instances where each engine wakes without contention (~1-2s). Expected production broadcast latency: **~5s** (wake ~2s + transfer ~3s).
 
 **Broadcast scaling (all models, trn2.48xlarge):**
 
