@@ -337,7 +337,34 @@ Each sleeping engine holds minimal TCP ports (Gloo destroyed during sleep). Engi
 500 engines (LLaMA-3.1-70B, TP=32) on a single trn2.48xlarge. At 500 engines, 611 GB memory still available — theoretical limit is ~730 engines per instance.
 
 
-### 3.4 Summary
+### 3.4 Broadcast Weight Transfer (1-to-N)
+
+When scaling up multiple engines simultaneously, the sender broadcasts weights to N receivers in a single `/nkipy/push_weights` call. All RDMA WRITEs are issued concurrently.
+
+**LLaMA-3-8B (TP=8, 1 sender → 8 receivers, trn2.48xlarge):**
+
+| Metric | Value |
+|---|---|
+| Per-rank shard | 2 GB |
+| Total data pushed | 128 GB (8 receivers × 8 ranks × 2 GB) |
+| Transfer time | **2.79s** |
+| Aggregate throughput | **367 Gbps** |
+| Inference correctness | 8/8 PASS |
+
+**Broadcast scaling (all models, trn2.48xlarge):**
+
+| Model | TP | Receivers | Transfer time | Aggregate throughput |
+|---|---|---|---|---|
+| LLaMA-3-8B | 8 | 1 | 0.55s | 29 Gbps |
+| LLaMA-3-8B | 8 | 8 | 2.79s | 367 Gbps |
+| Qwen3-30B-A3B | 32 | 1 | 0.55s | 31 Gbps |
+| Qwen3-30B-A3B | 32 | 2 | 0.91s | 48 Gbps |
+| LLaMA-3.1-70B | 32 | 1 | 0.55s | 54 Gbps |
+| LLaMA-3.1-70B | 32 | 2 | 1.84s | 54 Gbps |
+
+Broadcast overhead is sub-linear: pushing to 8 receivers takes ~5× longer than 1 receiver (not 8×), because the EFA network has sufficient bandwidth to serve multiple concurrent RDMA WRITEs.
+
+### 3.5 Summary
 
 | Metric | Value |
 |---|---|
