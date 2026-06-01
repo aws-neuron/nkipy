@@ -152,88 +152,109 @@ exactly three knobs, plus an indexed-read op:
 
 The **Knob** column in the pipeline tables below maps each pass to the knob it
 implements — `tile_op`, `layout`, `fuse_op`, or — for shared
-hardware-rewrite / bufferization / cleanup passes.
+preparation / bufferization / cleanup passes.
 
 ## Compilation Pipeline
 
 Defined in `nkigen/transforms/nkipy_opt.py` → `apply_complete_knob_pipeline()`.
-Passes 1–25 are C++ (run via the `nkipy-opt` binary); pass 26 is Python (uses
-the `nki` wheel's MLIR bindings). C++ pass sources live in
-`mlir/lib/Transforms/`. Each phase below is a group of subpasses that run in
-the listed order.
+Passes 1–25 are C++ (run via the `nkipy-opt` binary); pass 26 is the backend
+(Python, using the `nki` wheel's MLIR bindings). C++ pass sources live in
+`mlir/lib/Transforms/`. The pipeline is five transform phases over
+linalg/memref MLIR, followed by a backend that emits the target form. Each
+phase is a group of subpasses that run in the listed order.
 
-### Phase 0 — Linalg rewrites for NISA constraints
+### Phase 1 — IR Preparation (passes 1–6)
 
-The `canonicalize-linalg-for-nisa` pass group: rewrites that adapt the program
-to NISA hardware before tiling. Stop after it by name
-(`stop_after="canonicalize-linalg-for-nisa"`).
+Linalg-level rewrites that adapt the program to NISA hardware constraints, plus
+the layout inference and partition-dim canonicalization that set tiling up.
+Operates on linalg-on-tensors IR. Passes 1–3 are the
+`canonicalize-linalg-for-nisa` pass group (stop after it by name with
+`stop_after="canonicalize-linalg-for-nisa"`).
 
 | # | Pass | Knob | What it does |
 |---|------|------|--------------|
 | 1 | `remove-redundant-zero-fill` | — | Drop `linalg.fill(0)` feeding matmul (NISA matmul auto-zeros PSUM) |
 | 2 | `prepare-arithmetic` | — | `linalg.div(A,B)` → `mul(A, reciprocal(B))` (NISA has no divide) |
 | 3 | `decompose-batch-matmul` | — | `linalg.batch_matmul` → `scf.for` + 2D `linalg.matmul` |
-
-### Phase 1 — Layout inference, partition-dim canonicalization, tiling, fusion
-
-The `tile_op` / `layout` / `fuse_op` knobs are all realized here, on tensor IR.
-
-| # | Pass | Knob | What it does |
-|---|------|------|--------------|
 | 4 | `infer-layout` | tile_op + layout | Infer tile_size / mem_space / partition_dim for unannotated ops |
 | 5 | `canonicalize-partition-dim` | layout | Insert `linalg.transpose` so `partition_dim=0` everywhere |
 | 6 | `assign-linalg-op-ids` | tile_op | Stamp a unique `nkipy.op_id` on each linalg op |
+
+### Phase 2 — Tiling (`tile_op` knob, passes 7–8)
+
+Realize the `tile_op` knob: tile each linalg op into `scf.for` loops over its
+tile sizes, via the transform dialect.
+
+| # | Pass | Knob | What it does |
+|---|------|------|--------------|
 | 7 | `knob-driven-tiling` | tile_op | Emit transform-dialect IR that tiles each op per its tile sizes |
 | 8 | `apply-and-strip-transforms` | tile_op | Run `@__transform_main`, then erase the transform module |
-| 9 | `knob-driven-fusion` | fuse_op | Fuse sibling `scf.for` loops sharing a `nkipy.fuse_op` |
-| 10 | `canonicalize-loop-step` | tile_op | Normalize `scf.for` steps to 1 |
 
-### Phase 2 — Bufferization
+### Phase 3 — Loop Fusion (`fuse_op` knob, pass 9)
+
+Realize the `fuse_op` knob: fuse the tiled sibling loops the user grouped with
+`knob.fuse(...)` into a single loop nest.
 
 | # | Pass | Knob | What it does |
 |---|------|------|--------------|
+| 9 | `knob-driven-fusion` | fuse_op | Fuse sibling `scf.for` loops sharing a `nkipy.fuse_op` |
+
+### Phase 4 — Layout (`layout` knob, passes 10–20)
+
+Realize the `layout` knob. Passes 10–14 are **bufferization**: normalize loop
+steps and lower tensors to memrefs, since memory placement is a property of
+buffers, not values — this is the preparation the `layout` knob needs. Passes
+15–20 then apply NISA memory spaces, canonicalize reshapes by memory space, and
+legalize SBUF allocs to their physical layout.
+
+| # | Pass | Knob | What it does |
+|---|------|------|--------------|
+| 10 | `canonicalize-loop-step` | tile_op | Normalize `scf.for` steps to 1 |
 | 11 | `one-shot-bufferize` | — | Tensor IR → memref IR (upstream MLIR) |
 | 12 | `canonicalize` | — | Fold/simplify memref ops |
-
-### Phase 3 — Memory-space annotation + reshape canonicalization
-
-| # | Pass | Knob | What it does |
-|---|------|------|--------------|
 | 13 | `eliminate-uninitialized-copies` | — | Drop `memref.copy` from never-written allocs (e.g. PSUM init) |
 | 14 | `canonicalize` | — | Clean up dead subview chains |
 | 15 | `annotate-memory-space` | layout | Apply NISA mem-space attrs; mark func args SharedHbm; erase `nkipy.layout` |
 | 16 | `canonicalize-reshape` | layout | Classify `expand`/`collapse_shape` by mem_space + partition_dim (view vs alloc+copy) |
 | 17 | `eliminate-same-memspace-copy` | — | Remove redundant same-space copies (e.g. SBUF→SBUF) |
 | 18 | `canonicalize` | — | DCE dead allocs from eliminated copies |
+| 19 | `legalize-layout` | layout | Transform SBUF allocs to physical multi-D layout (partition dim ≤ 128) |
+| 20 | `canonicalize` | — | Fold collapse_shape chains, simplify affine maps |
 
-### Phase 4 — Layout legalization, spill/reload, memref finalization
+### Phase 5 — Scheduling (passes 21–25)
+
+Spill/reload under SBUF pressure, insert deallocs, and do final cleanup so the
+IR is ready for the backend.
 
 | # | Pass | Knob | What it does |
 |---|------|------|--------------|
-| 19 | `legalize-layout` | layout | Transform SBUF allocs to physical multi-D layout (partition dim ≤ 128) |
-| 20 | `canonicalize` | — | Fold collapse_shape chains, simplify affine maps |
 | 21 | `simplify-linalg` | — | Decompose high-rank transposes to 2D; trivial-broadcast generics → named ops |
 | 22 | `insert-spill-reload` | layout | Insert SBUF↔HBM spill/reload on memory pressure (Belady's MIN) |
 | 23 | `insert-memref-dealloc` | — | Insert `memref.dealloc` at each alloc's scope end |
 | 24 | `cse` | — | Common subexpression elimination |
 | 25 | `canonicalize` | — | DCE unused subviews and final cleanup |
 
-### Phase 5 — NISA lowering (Python)
+### Backend — NISA lowering (pass 26)
 
-| # | Pass | Knob | What it does |
-|---|------|------|--------------|
-| 26 | `py:linalg-to-nisa` | — | Lower linalg/memref/scf to the NISA dialect via the `nki` bindings (see below) |
+Pass 26 is not a transform phase but a **backend**: it consumes the legalized
+linalg/memref IR and emits the target form. The current backend emits in-memory
+NISA dialect via the `nki` wheel's Python bindings (NISA lowering lives in
+Python because `nkipy-opt` does not link the NISA dialect). A second backend —
+emitting editable Python NKI source that users can hand-tune — is planned.
 
-The final pass pattern-matches `linalg.add/sub/mul` → `nisa.tensor_tensor_arith`,
+| # | Backend | What it does |
+|---|---------|--------------|
+| 26 | `py:linalg-to-nisa` | Lower linalg/memref/scf to the NISA dialect via the `nki` bindings |
+
+The backend pattern-matches `linalg.add/sub/mul` → `nisa.tensor_tensor_arith`,
 `linalg.matmul` → `nisa.matmul`, `memref.copy(HBM↔SBUF)` → `nisa.dma_copy`,
 `linalg.exp` → `nisa.activation(op=exp)`, scalar-broadcast ops →
 `nisa.tensor_scalar_arith`, `linalg.reciprocal` → `nisa.reciprocal`, transposes
 → `nisa.dma_transpose`, `memref.dealloc` → `nisa.release`. It also inlines
 custom-op bodies and adds the `nisa.target` attribute.
 
-> This single Python pass subsumes what used to be three separate C++ passes
-> (`linalg-to-nisa`, `resolve-custom-ops`, `prepare-for-nki`). NISA lowering
-> happens in Python because `nkipy-opt` does not link the NISA dialect.
+> This single backend pass subsumes what used to be three separate C++ passes
+> (`linalg-to-nisa`, `resolve-custom-ops`, `prepare-for-nki`).
 
 ## Inspecting Intermediate IR
 
