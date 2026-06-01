@@ -430,7 +430,22 @@ class NKIPyWorker(WorkerBase):
                 t_collect = _time.time()
                 t_p2p = t_collect
             else:
-                logger.warning("Rank %d: No peer_url and no NKIPY_CHECKPOINT - model has no weights!", self.rank)
+                # Broadcast path: register VRAM and gather metadata so the
+                # orchestrator can immediately call /nkipy/push_weights.
+                from relay import endpoint as _ep, collect_weight_buffers
+                bufs = collect_weight_buffers(model)
+                _ep.register(bufs)
+                nc = int(os.environ.get("NEURON_RT_VISIBLE_CORES", "0").split(",")[0])
+                local_info = {
+                    "agent_metadata": _ep.get_metadata().hex(),
+                    "agent_name": _ep.agent_name,
+                    "nc_idx": nc,
+                    "buffer_vas": [(va, sz) for _, va, sz in bufs],
+                }
+                world = dist.get_world_size()
+                gathered = [None] * world if self.rank == 0 else None
+                dist.gather_object(local_info, gathered, dst=0)
+                self._rdma_metadata = gathered
                 t_collect = t_alloc
                 t_p2p = t_alloc
 
@@ -489,7 +504,11 @@ class NKIPyWorker(WorkerBase):
         if self.rank == 0:
             logger.info("wake_up latency breakdown (rank %d): %s", self.rank, latency)
             print(f"wake_up latency breakdown (rank {self.rank}): {latency}", flush=True)
-        return {"status": "awake", "latency": latency}
+        result = {"status": "awake", "latency": latency}
+        if hasattr(self, '_rdma_metadata') and self._rdma_metadata is not None:
+            result["rdma_metadata"] = self._rdma_metadata
+            self._rdma_metadata = None
+        return result
 
     def nkipy_push_weights(self, receivers: list[list[dict]]) -> dict:
         """Push weights to one or more receivers via parallel RDMA WRITE.

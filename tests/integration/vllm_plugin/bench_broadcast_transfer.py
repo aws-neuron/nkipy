@@ -304,44 +304,33 @@ def main():
         print("TEST 3: True broadcast (batched /nkipy/push_weights)")
         print("=" * 70)
 
-        # Step 1: Wake both receivers WITHOUT peer_url (alloc only, no P2P)
-        print("\n  Step 1: Wake both receivers (alloc only, no peer_url)...")
+        # Step 1: Wake all receivers (alloc + register + return metadata)
+        print("\n  Step 1: Wake all receivers (alloc + MR register + metadata)...")
         t0 = time.time()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(_RECEIVER_PORTS)) as pool:
             futures = [
                 pool.submit(_wake, _REMOTE_HOST, port, None)
                 for port in _RECEIVER_PORTS
             ]
             alloc_results = [f.result() for f in futures]
         t_alloc = time.time() - t0
+
+        metadata_list = []
         for i, (port, result) in enumerate(zip(_RECEIVER_PORTS, alloc_results)):
-            if result:
-                lat = result.get("latency", {})
-                print(f"    Receiver {i+1}: {result['_client_elapsed_s']:.2f}s")
-            else:
+            if result is None:
                 print(f"    Receiver {i+1}: FAILED")
                 sys.exit(1)
-        print(f"    Alloc wall time: {t_alloc:.2f}s")
-
-        # Step 2: Get RDMA metadata from all receivers in parallel
-        print("\n  Step 2: Gathering RDMA metadata from all receivers (parallel)...")
-        t0 = time.time()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(_RECEIVER_PORTS)) as pool:
-            futures = {
-                pool.submit(_get_rdma_metadata, _REMOTE_HOST, port): i
-                for i, port in enumerate(_RECEIVER_PORTS)
-            }
-            metadata_list = [None] * len(_RECEIVER_PORTS)
-            for future in concurrent.futures.as_completed(futures):
-                i = futures[future]
-                meta = future.result()
-                if meta is None or meta.get("status") != "ok":
-                    print(f"    ERROR: Could not get metadata from receiver {i+1}")
-                    sys.exit(1)
-                metadata_list[i] = meta["per_rank"]
-                print(f"    Receiver {i+1}: got {len(meta['per_rank'])} rank entries")
-        t_meta = time.time() - t0
-        print(f"    Metadata gather: {t_meta:.2f}s")
+            lat = result.get("latency", {})
+            print(f"    Receiver {i+1}: {result['_client_elapsed_s']:.2f}s "
+                  f"(total={lat.get('total_s', '?')}s)")
+            rdma_meta = result.get("rdma_metadata")
+            if rdma_meta:
+                metadata_list.append(rdma_meta)
+            else:
+                print(f"    ERROR: Receiver {i+1} did not return rdma_metadata")
+                sys.exit(1)
+        print(f"    Wake + register wall time: {t_alloc:.2f}s")
+        t_meta = 0  # metadata is included in wake response
 
         # Step 3: Batched POST to sender (broadcast to both receivers)
         print(f"\n  Step 3: POST /nkipy/push_weights with {len(metadata_list)} receivers...")
@@ -380,9 +369,9 @@ def main():
         print("\n" + "=" * 70)
         print("SUMMARY")
         print("=" * 70)
-        print(f"  True broadcast (1× batched POST): {t_transfer:.2f}s transfer"
-              f" + {t_alloc:.2f}s alloc + {t_meta:.2f}s metadata"
-              f" = {t_alloc + t_meta + t_transfer:.2f}s total")
+        print(f"  True broadcast: {t_transfer:.2f}s transfer"
+              f" + {t_alloc:.2f}s wake (alloc+register)"
+              f" = {t_alloc + t_transfer:.2f}s total")
         print(f"  Broadcast correctness:             "
               f"{'ALL PASS' if all_correct else 'FAILED'}")
         print()
