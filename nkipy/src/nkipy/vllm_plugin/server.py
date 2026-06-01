@@ -122,26 +122,26 @@ def register_nkipy_routes(app: FastAPI) -> None:
         finally:
             _nkipy_transitioning = False
 
-    @app.post("/nkipy/transfer")
-    async def transfer(request: Request):
+    @app.post("/nkipy/push_weights")
+    async def push_weights(request: Request):
         body = await request.json()
         receivers = body.get("receivers") or [body["per_rank"]]
         core = _get_engine_core(app)
         try:
             results = await core.collective_rpc_async(
-                "nkipy_transfer", args=(receivers,),
+                "nkipy_push_weights", args=(receivers,),
             )
             return JSONResponse(results[0])
         except Exception as e:
-            logger.error("transfer failed: %s", e)
+            logger.error("push_weights failed: %s", e)
             return JSONResponse({"status": "error", "error": str(e)[:500]},
                                 status_code=500)
 
-    @app.post("/nkipy/finalize_transfer")
-    async def finalize_transfer():
-        """Finalize model state after broadcast weight transfer."""
+    @app.post("/nkipy/activate")
+    async def activate():
+        """Finalize model state after weight transfer and become ready."""
         core = _get_engine_core(app)
-        results = await core.collective_rpc_async("nkipy_finalize_transfer")
+        results = await core.collective_rpc_async("nkipy_activate")
         return JSONResponse(results[0])
 
     @app.get("/nkipy/rdma_metadata")

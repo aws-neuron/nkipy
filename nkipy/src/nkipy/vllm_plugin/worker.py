@@ -489,7 +489,7 @@ class NKIPyWorker(WorkerBase):
             print(f"wake_up latency breakdown (rank {self.rank}): {latency}", flush=True)
         return {"status": "awake", "latency": latency}
 
-    def nkipy_transfer(self, receivers: list[list[dict]]) -> dict:
+    def nkipy_push_weights(self, receivers: list[list[dict]]) -> dict:
         """Push weights to one or more receivers via parallel RDMA WRITE.
 
         Called by the HTTP server when receivers POST their agent metadata
@@ -535,12 +535,12 @@ class NKIPyWorker(WorkerBase):
             dtype = str(data.dtype)
         return {"raw": raw, "shape": shape, "dtype": dtype}
 
-    def nkipy_finalize_transfer(self) -> dict:
-        """Finalize model state after broadcast weight transfer.
+    def nkipy_activate(self) -> dict:
+        """Activate model after weight transfer.
 
         Re-reads tok_embedding from device memory (which was just filled
         via RDMA) into a CPU tensor for inference. Called by the broadcast
-        orchestrator after /nkipy/transfer completes.
+        orchestrator after /nkipy/push_weights completes.
         """
         model = self.model_runner._nkipy_model
         if model is None:

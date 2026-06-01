@@ -55,7 +55,7 @@ def receive_from_peer(
     ep: Endpoint,
     buffers: Sequence[Tuple[str, int, int]],
     peer_url: str,
-    push_endpoint: str = "/nkipy/transfer",
+    push_endpoint: str = "/nkipy/push_weights",
 ) -> None:
     """All ranks receive buffers from a peer engine via NIXL RDMA WRITE (push).
 

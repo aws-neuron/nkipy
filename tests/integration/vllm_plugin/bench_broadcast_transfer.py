@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Benchmark: Broadcast weight transfer (1 sender → N receivers).
 
-Tests /nkipy/transfer with batched metadata from multiple receivers.
+Tests /nkipy/push_weights with batched metadata from multiple receivers.
 
 Topology:
   LOCAL  (sender):   1 engine, TP=32, cores 0-31
@@ -13,7 +13,7 @@ Protocol for broadcast test:
   1. Both receivers wake WITHOUT peer_url (alloc empty tensors only)
   2. Both receivers register VRAM and expose metadata via GET /nkipy/rdma_metadata
   3. Orchestrator batches metadata from both receivers
-  4. Single POST /nkipy/transfer to sender with both receivers' metadata
+  4. Single POST /nkipy/push_weights to sender with both receivers' metadata
   5. Sender does parallel RDMA WRITE to both receivers
   6. Verify inference correctness on both receivers
 
@@ -299,9 +299,9 @@ def main():
                       f"(avg {sum(seq_latencies)/len(seq_latencies):.2f}s per receiver)")
             print()
 
-        # === Test 3: True broadcast (batched /nkipy/transfer) ===
+        # === Test 3: True broadcast (batched /nkipy/push_weights) ===
         print("\n" + "=" * 70)
-        print("TEST 3: True broadcast (batched /nkipy/transfer)")
+        print("TEST 3: True broadcast (batched /nkipy/push_weights)")
         print("=" * 70)
 
         # Step 1: Wake both receivers WITHOUT peer_url (alloc only, no P2P)
@@ -338,10 +338,10 @@ def main():
         print(f"    Metadata gather: {t_meta:.2f}s")
 
         # Step 3: Batched POST to sender (broadcast to both receivers)
-        print(f"\n  Step 3: POST /nkipy/transfer with {len(metadata_list)} receivers...")
+        print(f"\n  Step 3: POST /nkipy/push_weights with {len(metadata_list)} receivers...")
         t0 = time.time()
         resp = requests.post(
-            f"http://localhost:{_SENDER_PORT}/nkipy/transfer",
+            f"http://localhost:{_SENDER_PORT}/nkipy/push_weights",
             json={"receivers": metadata_list},
             timeout=300,
         )
@@ -357,7 +357,7 @@ def main():
         print("\n  Step 4: Finalizing transfer on both receivers...")
         for i, port in enumerate(_RECEIVER_PORTS):
             resp = requests.post(
-                f"http://{_REMOTE_HOST}:{port}/nkipy/finalize_transfer", timeout=60)
+                f"http://{_REMOTE_HOST}:{port}/nkipy/activate", timeout=60)
             if resp.status_code != 200:
                 print(f"    ERROR: Finalize {port} failed ({resp.status_code}): {resp.text[:200]}")
             else:
