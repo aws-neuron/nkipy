@@ -343,13 +343,15 @@ When scaling up multiple engines simultaneously, the sender broadcasts weights t
 
 **LLaMA-3-8B (TP=8, 1 sender → 8 receivers, trn2.48xlarge):**
 
-| Metric | Value |
-|---|---|
-| Per-rank shard | 2 GB |
-| Total data pushed | 128 GB (8 receivers × 8 ranks × 2 GB) |
-| Transfer time | **2.79s** |
-| Aggregate throughput | **367 Gbps** |
-| Inference correctness | 8/8 PASS |
+| Phase | Latency | Notes |
+|---|---|---|
+| Wake (alloc tensors) | 3.3s | All 8 receivers wake in parallel |
+| RDMA metadata gather | 18.1s | Sequential (8 receivers × ~2.3s each) |
+| **Broadcast transfer** | **2.79s** | 128 GB total, 367 Gbps aggregate |
+| **Total wake-up** | **~24s** | Dominated by sequential metadata gather |
+| **Total (optimized)** | **~9s** | With parallel metadata gather (~3s) |
+
+The metadata gather is currently sequential (HTTP calls to each receiver one at a time). Parallelizing this reduces it from 18s to ~3s, bringing the overall broadcast wake-up to **~9s** for 8 engines simultaneously.
 
 **Broadcast scaling (all models, trn2.48xlarge):**
 
