@@ -241,12 +241,12 @@ Each engine exposes HTTP endpoints for lifecycle management:
 | `POST /nkipy/sleep` | Release NeuronCores, destroy NIXL agent + Gloo, enter standby |
 | `GET /nkipy/health` | Returns engine state (sleeping/active/transitioning) |
 
-**Internal endpoint** — used by the P2P weight transfer protocol between engines:
+**Internal endpoints** — used by the P2P weight transfer protocol between engines:
 
 | Endpoint | Action |
 |----------|--------|
-| `POST /nkipy/push_weights` | Receivers POST RDMA metadata; sender performs parallel RDMA WRITEs to 1–N receivers and returns |
-| `POST /nkipy/commit_weights` | Commit received weights for inference (tok_embedding device→CPU) |
+| `POST /nkipy/push_weights` | Sender performs parallel RDMA WRITEs to 1–N receivers and returns |
+| `GET /nkipy/rdma_metadata` | Receiver exposes per-rank NIXL agent metadata for broadcast orchestration |
 
 #### 2.5.2 LLM Serving Scheduler
 
@@ -293,8 +293,7 @@ Effective aggregate throughput: 59 GB in 3.4s = ~139 Gbps across 32 ranks × 16 
 | Gloo distributed init | 0.2s | |
 | NRT init + tensor alloc | 0.5s | Fast path (skip firmware reset) |
 | **P2P transfer** (4.3 GB/rank) | 3.9s | Direct device→device via NIXL LIBFABRIC |
-| Kernel load + barrier | 0.3s | |
-| tok_embedding | 0.1s | |
+| Kernel load + barrier | 0.4s | |
 | **Total wake-up** | **4.4–6.2s** (avg 5.0s) | |
 
 Effective aggregate throughput: 139 GB in 3.9s = ~285 Gbps across 32 ranks × 16 EFA NICs (~33 Gbps per rank).
