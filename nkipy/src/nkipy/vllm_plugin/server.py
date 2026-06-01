@@ -19,7 +19,7 @@ import os
 from argparse import Namespace
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -27,7 +27,6 @@ logger = logging.getLogger(__name__)
 # Tracks sleep state in the API server process.
 _nkipy_sleeping = False
 _nkipy_transitioning = False  # guards against concurrent wake/sleep
-_tok_embedding_cache = None  # cached raw bytes + headers for /tok_embedding
 
 
 # --- Request schemas ---
@@ -64,7 +63,7 @@ def register_nkipy_routes(app: FastAPI) -> None:
     @app.post("/nkipy/sleep")
     async def sleep():
         import time as _time
-        global _nkipy_sleeping, _nkipy_transitioning, _tok_embedding_cache
+        global _nkipy_sleeping, _nkipy_transitioning
         if _nkipy_sleeping:
             return JSONResponse({"status": "already_sleeping"})
         if _nkipy_transitioning:
@@ -72,7 +71,6 @@ def register_nkipy_routes(app: FastAPI) -> None:
         _nkipy_transitioning = True
         t0 = _time.time()
         _nkipy_sleeping = True
-        _tok_embedding_cache = None
         try:
             core = _get_engine_core(app)
             results = await core.collective_rpc_async("nkipy_sleep")
@@ -137,42 +135,16 @@ def register_nkipy_routes(app: FastAPI) -> None:
             return JSONResponse({"status": "error", "error": str(e)[:500]},
                                 status_code=500)
 
-    @app.post("/nkipy/commit_weights")
-    async def commit_weights():
-        """Commit received weights for inference after RDMA transfer."""
-        core = _get_engine_core(app)
-        results = await core.collective_rpc_async("nkipy_commit_weights")
-        return JSONResponse(results[0])
-
     @app.get("/nkipy/rdma_metadata")
     async def rdma_metadata():
         """Return per-rank NIXL agent metadata and buffer VAs.
 
         Used by broadcast orchestrator to gather metadata from multiple
-        receivers and batch them into a single /nkipy/transfer POST.
+        receivers and batch them into a single /nkipy/push_weights POST.
         """
         core = _get_engine_core(app)
         results = await core.collective_rpc_async("nkipy_get_rdma_metadata")
         return JSONResponse(results[0])
-
-    @app.get("/nkipy/tok_embedding")
-    async def tok_embedding():
-        global _tok_embedding_cache
-        if _tok_embedding_cache is None:
-            # Populate cache on first request
-            core = _get_engine_core(app)
-            _tok_embedding_cache = (await core.collective_rpc_async("nkipy_get_tok_embedding"))[0]
-        data = _tok_embedding_cache
-        if data is None:
-            raise HTTPException(503, "Token embedding not available")
-        return Response(
-            content=data["raw"],
-            media_type="application/octet-stream",
-            headers={
-                "X-Shape": ",".join(str(d) for d in data["shape"]),
-                "X-Dtype": data["dtype"],
-            },
-        )
 
 
 async def run_server(args: Namespace) -> None:
@@ -188,30 +160,9 @@ async def run_server(args: Namespace) -> None:
         await init_app_state(engine_client, app.state, args)
 
         # Reject /v1/* requests while sleeping.
-        global _nkipy_sleeping, _tok_embedding_cache
+        global _nkipy_sleeping
         if not os.environ.get("NKIPY_CHECKPOINT"):
             _nkipy_sleeping = True
-        else:
-            # Pre-cache tok_embedding so /nkipy/tok_embedding serves instantly.
-            # With hidden-dim TP sharding, each rank stores
-            # vocab_size * (hidden_size / tp) — check the per-shard size.
-            from transformers import AutoConfig
-            hf_cfg = AutoConfig.from_pretrained(args.model)
-            tp = getattr(args, "tensor_parallel_size", 1) or 1
-            emb_bytes = hf_cfg.vocab_size * (hf_cfg.hidden_size // tp) * 2  # bf16
-            if emb_bytes > 0:
-                logger.info("tok_embedding shard too large for pre-cache (%.0f MB), will serve lazily",
-                            emb_bytes / 1e6)
-            else:
-                core = _get_engine_core(app)
-                try:
-                    _tok_embedding_cache = (await core.collective_rpc_async(
-                        "nkipy_get_tok_embedding", timeout=30))[0]
-                    logger.info("tok_embedding cached (%s)",
-                                f"{len(_tok_embedding_cache['raw'])/1e6:.1f} MB" if _tok_embedding_cache else "None")
-                except Exception as e:
-                    logger.warning("tok_embedding pre-cache failed: %s", e)
-                    _tok_embedding_cache = None
 
         # Wrap app with ASGI middleware to reject requests while sleeping.
         inner_app = app

@@ -380,6 +380,8 @@ class Qwen3Model:
 
     def embed_tokens(self, input_ids):
         """Hidden-dim-parallel embedding lookup with all-gather."""
+        if self.tok_embedding is None and self.tok_embedding_device is not None:
+            self.tok_embedding = self.tok_embedding_device.torch()
         return _tp_embedding_lookup(
             self.tok_embedding, torch.as_tensor(input_ids, dtype=torch.long),
         )
