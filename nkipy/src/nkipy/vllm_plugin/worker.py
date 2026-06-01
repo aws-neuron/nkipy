@@ -535,12 +535,11 @@ class NKIPyWorker(WorkerBase):
             dtype = str(data.dtype)
         return {"raw": raw, "shape": shape, "dtype": dtype}
 
-    def nkipy_activate(self) -> dict:
-        """Activate model after weight transfer.
+    def nkipy_commit_weights(self) -> dict:
+        """Commit received weights for inference after RDMA transfer.
 
-        Re-reads tok_embedding from device memory (which was just filled
-        via RDMA) into a CPU tensor for inference. Called by the broadcast
-        orchestrator after /nkipy/push_weights completes.
+        Re-reads tok_embedding from device memory (filled via RDMA) into
+        a CPU tensor. Called by the orchestrator after /nkipy/push_weights.
         """
         model = self.model_runner._nkipy_model
         if model is None:

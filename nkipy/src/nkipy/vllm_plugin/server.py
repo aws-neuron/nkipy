@@ -137,11 +137,11 @@ def register_nkipy_routes(app: FastAPI) -> None:
             return JSONResponse({"status": "error", "error": str(e)[:500]},
                                 status_code=500)
 
-    @app.post("/nkipy/activate")
-    async def activate():
-        """Finalize model state after weight transfer and become ready."""
+    @app.post("/nkipy/commit_weights")
+    async def commit_weights():
+        """Commit received weights for inference after RDMA transfer."""
         core = _get_engine_core(app)
-        results = await core.collective_rpc_async("nkipy_activate")
+        results = await core.collective_rpc_async("nkipy_commit_weights")
         return JSONResponse(results[0])
 
     @app.get("/nkipy/rdma_metadata")

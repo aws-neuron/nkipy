@@ -246,7 +246,7 @@ Each engine exposes HTTP endpoints for lifecycle management:
 | Endpoint | Action |
 |----------|--------|
 | `POST /nkipy/push_weights` | Receivers POST RDMA metadata; sender performs parallel RDMA WRITEs to 1–N receivers and returns |
-| `POST /nkipy/activate` | Finalize model state after weight transfer (tok_embedding device→CPU) |
+| `POST /nkipy/commit_weights` | Commit received weights for inference (tok_embedding device→CPU) |
 
 #### 2.5.2 LLM Serving Scheduler
 

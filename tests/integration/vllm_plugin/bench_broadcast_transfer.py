@@ -357,7 +357,7 @@ def main():
         print("\n  Step 4: Finalizing transfer on both receivers...")
         for i, port in enumerate(_RECEIVER_PORTS):
             resp = requests.post(
-                f"http://{_REMOTE_HOST}:{port}/nkipy/activate", timeout=60)
+                f"http://{_REMOTE_HOST}:{port}/nkipy/commit_weights", timeout=60)
             if resp.status_code != 200:
                 print(f"    ERROR: Finalize {port} failed ({resp.status_code}): {resp.text[:200]}")
             else:
