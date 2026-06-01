@@ -447,8 +447,11 @@ class NKIPyWorker(WorkerBase):
         t_kernel_barrier = _time.time()
 
         # Convert tok_embedding_device (sharded DeviceTensor) back to CPU for inference.
-        if model.tok_embedding is None and model.tok_embedding_device is not None:
-            model.tok_embedding = model.tok_embedding_device.torch()
+        # Skip if no weights were loaded (broadcast path fills device memory later;
+        # embed_tokens() will lazily convert on first inference).
+        if actual_peer or os.environ.get("NKIPY_CHECKPOINT"):
+            if model.tok_embedding is None and model.tok_embedding_device is not None:
+                model.tok_embedding = model.tok_embedding_device.torch()
         t_tok = _time.time()
 
         # Reset context_len so _ensure_kernels() will recompile for the

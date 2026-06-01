@@ -104,7 +104,7 @@ def _start_local_sender():
 def _start_remote_receiver(port, core_offset):
     venv_bin = os.path.dirname(_VENV_PYTHON)
     nixl_port = 21000 + core_offset
-    master_port = 40000 + core_offset * 100
+    master_port = 40000 + core_offset * 200
     env_vars = (
         f"PATH={venv_bin}:$PATH "
         f"VLLM_PLUGINS=nkipy "
