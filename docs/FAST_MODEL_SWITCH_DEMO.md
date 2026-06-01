@@ -345,13 +345,10 @@ When scaling up multiple engines simultaneously, the sender broadcasts weights t
 
 | Phase | Latency | Notes |
 |---|---|---|
-| Wake (alloc tensors) | 3.3s | All 8 receivers wake in parallel |
-| RDMA metadata gather | 18.1s | Sequential (8 receivers × ~2.3s each) |
-| **Broadcast transfer** | **2.79s** | 128 GB total, 367 Gbps aggregate |
-| **Total wake-up** | **~24s** | Dominated by sequential metadata gather |
-| **Total (optimized)** | **~9s** | With parallel metadata gather (~3s) |
-
-The metadata gather is currently sequential (HTTP calls to each receiver one at a time). Parallelizing this reduces it from 18s to ~3s, bringing the overall broadcast wake-up to **~9s** for 8 engines simultaneously.
+| Wake (alloc tensors) | 3.0s | All 8 receivers wake in parallel |
+| RDMA metadata gather | 7.5s | Parallel (includes VRAM MR registration) |
+| **Broadcast transfer** | **2.8s** | 128 GB total, 367 Gbps aggregate |
+| **Total wake-up** | **~13s** | 8 engines activated simultaneously |
 
 **Broadcast scaling (all models, trn2.48xlarge):**
 

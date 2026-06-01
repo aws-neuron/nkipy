@@ -323,17 +323,23 @@ def main():
                 sys.exit(1)
         print(f"    Alloc wall time: {t_alloc:.2f}s")
 
-        # Step 2: Get RDMA metadata from both receivers
-        print("\n  Step 2: Gathering RDMA metadata from both receivers...")
+        # Step 2: Get RDMA metadata from all receivers in parallel
+        print("\n  Step 2: Gathering RDMA metadata from all receivers (parallel)...")
         t0 = time.time()
-        metadata_list = []
-        for i, port in enumerate(_RECEIVER_PORTS):
-            meta = _get_rdma_metadata(_REMOTE_HOST, port)
-            if meta is None or meta.get("status") != "ok":
-                print(f"    ERROR: Could not get metadata from receiver {i+1}")
-                sys.exit(1)
-            metadata_list.append(meta["per_rank"])
-            print(f"    Receiver {i+1}: got {len(meta['per_rank'])} rank entries")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(_RECEIVER_PORTS)) as pool:
+            futures = {
+                pool.submit(_get_rdma_metadata, _REMOTE_HOST, port): i
+                for i, port in enumerate(_RECEIVER_PORTS)
+            }
+            metadata_list = [None] * len(_RECEIVER_PORTS)
+            for future in concurrent.futures.as_completed(futures):
+                i = futures[future]
+                meta = future.result()
+                if meta is None or meta.get("status") != "ok":
+                    print(f"    ERROR: Could not get metadata from receiver {i+1}")
+                    sys.exit(1)
+                metadata_list[i] = meta["per_rank"]
+                print(f"    Receiver {i+1}: got {len(meta['per_rank'])} rank entries")
         t_meta = time.time() - t0
         print(f"    Metadata gather: {t_meta:.2f}s")
 
