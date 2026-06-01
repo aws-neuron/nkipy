@@ -12,9 +12,124 @@ Public API:
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Protocol, Tuple, runtime_checkable
 
+import numpy as np
+
+# ---------------------------------------------------------------------------
+# Shared IR data types
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TensorPlaceholder:
+    """Lightweight tensor metadata used by the execution pipeline.
+
+    Attributes:
+        name: Identifier used to key this tensor in input/output dicts at runtime.
+        shape: Static shape of the tensor.
+        dtype: NumPy dtype of the tensor elements.
+        original_name: User-facing parameter name. Defaults to *name* when not set.
+    """
+
+    name: str
+    shape: Tuple[int, ...]
+    dtype: np.dtype
+    original_name: Optional[str] = None
+
+    def __post_init__(self):
+        if self.original_name is None:
+            self.original_name = self.name
+
+
+@dataclass(frozen=True)
+class AliasInfo:
+    """One input-output alias pair.
+
+    Attributes:
+        output_index: Position of this alias in the IR outputs list.
+        param_index: Position of the aliased parameter in the IR inputs list.
+        param_name: Name of the aliased input parameter.
+        is_user_returned: True when the user's kernel explicitly returns this
+            tensor.  False when the framework auto-appended it as an output
+            solely to write back an in-place mutation.
+    """
+
+    output_index: int
+    param_index: int
+    param_name: str
+    is_user_returned: bool
+
+
+# ---------------------------------------------------------------------------
+# IR Protocol — the interface that every backend IR must satisfy
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class ComputationIR(Protocol):
+    """Protocol satisfied by both ``HLOModule`` and ``NkiGenIR``."""
+
+    @property
+    def inputs(self) -> List[TensorPlaceholder]: ...
+
+    @property
+    def outputs(self) -> List[TensorPlaceholder]: ...
+
+    @property
+    def aliases(self) -> List[AliasInfo]:
+        """Input-output alias pairs for in-place mutations."""
+        ...
+
+    @property
+    def auto_aliased_indices(self) -> set[int]:
+        """Output indices implicitly appended for write-back, not user-returned."""
+        ...
+
+    def content_hash(self, compiler_args: str) -> str:
+        """Deterministic hash of IR content and compiler flags for caching."""
+        ...
+
+
+def prepare_io_mapping(
+    inputs: List[TensorPlaceholder],
+    aliases: List[AliasInfo],
+    original_inputs: Dict[str, np.ndarray],
+) -> Tuple[Dict[str, np.ndarray], Dict[int, str]]:
+    """Map parameter names to backend-specific input names and resolve aliases.
+
+    Args:
+        inputs: IR input placeholders (from ``ir.inputs``).
+        aliases: IR alias pairs (from ``ir.aliases``).
+        original_inputs: User-provided arrays keyed by parameter name.
+
+    Returns:
+        A tuple of (input_arrays, alias_input_names) where:
+        - input_arrays maps backend IR input names to numpy arrays.
+        - alias_input_names maps output index to the IR input name that the
+          aliased output should share a buffer with.
+    """
+    if len(original_inputs) != len(inputs):
+        raise RuntimeError(
+            f"Expected {len(inputs)} tensor arguments, "
+            f"got {len(original_inputs)}"
+        )
+    input_arrays = {
+        inp.name: original_inputs[inp.original_name]
+        for inp in inputs
+    }
+    alias_input_names = {
+        alias.output_index: inputs[alias.param_index].name
+        for alias in aliases
+    }
+    return input_arrays, alias_input_names
+
+
+# ---------------------------------------------------------------------------
 # Package-private active context — shared with submodules (e.g. hlo.py).
+# ---------------------------------------------------------------------------
+
 _active_ctx = None
 
 

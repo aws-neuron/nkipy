@@ -9,6 +9,7 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 
+from nkipy.core.backend import prepare_io_mapping
 from nkipy.runtime.device_kernel import DeviceKernel
 from nkipy.runtime.device_tensor import DeviceTensor
 
@@ -71,26 +72,20 @@ class BaremetalExecutor:
         }
 
         # Prepare inputs using DeviceTensor
-        inputs = {}
-        for intensor in compiled_kernel.ir.inputs:
-            real_name = (
-                intensor.name.split(".must_alias_input")[0]
-                if ".must_alias_input" in intensor.name
-                else intensor.name
-            )
-            np_tensor = original_inputs.get(real_name, boundargs.arguments[real_name])
-            inputs[intensor.name] = DeviceTensor.from_numpy(np_tensor)
+        ir = compiled_kernel.ir
+        input_arrays, alias_input_names = prepare_io_mapping(ir.inputs, ir.aliases, original_inputs)
+        inputs = {
+            name: DeviceTensor.from_numpy(arr)
+            for name, arr in input_arrays.items()
+        }
 
         # Prepare outputs — aliased outputs share the input device buffer
         outputs = device_kernel.allocate_output_tensors()
         outputs_dict = {t.name: t for t in outputs}
 
-        alias_by_output = {a.output_index: a for a in compiled_kernel.ir.aliases}
-        for i, outtensor in enumerate(compiled_kernel.ir.outputs):
-            if i in alias_by_output:
-                alias = alias_by_output[i]
-                input_name = f"{alias.param_name}.must_alias_input"
-                outputs_dict[outtensor.name] = inputs[input_name]
+        for i, outtensor in enumerate(ir.outputs):
+            if i in alias_input_names:
+                outputs_dict[outtensor.name] = inputs[alias_input_names[i]]
 
         return inputs, outputs_dict, original_inputs
 

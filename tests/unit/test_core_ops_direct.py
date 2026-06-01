@@ -342,7 +342,7 @@ class TestReduceErrors:
         """_build_reduction_hlo with unsupported op raises NotImplementedError."""
 
         def kernel(x):
-            from nkipy.core.ops.reduce import _build_reduction_hlo
+            from nkipy.core.ops._hlo_impls import _build_reduction_hlo
 
             return _build_reduction_hlo(x, np.cumsum)
 

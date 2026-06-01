@@ -2,209 +2,24 @@
 # SPDX-License-Identifier: Apache-2.0
 """Linear algebra operations: matmul, dot"""
 
-import numpy as np
-
 from nkipy.core.ops._registry import Op
 
 # -----------------------------------------------------------------------------
-# matmul
+# Primitive linalg ops
 # -----------------------------------------------------------------------------
 matmul = Op("matmul")
-
-
-@matmul.impl("hlo")
-def _matmul_hlo(x, y, out=None, dtype=None):
-    """Matrix multiplication (HLO).
-
-    Supports batched matrix multiplication with broadcasting.
-    Follows numpy semantics for 1D inputs: a 1D left operand is promoted to
-    2D by prepending a 1, a 1D right operand by appending a 1, and the extra
-    dimension is removed from the result after the dot.
-    """
-    from nkipy.core.backend.hlo import (
-        broadcast_to_shape_hlo,
-        find_common_type_hlo,
-        get_hlo_context,
-    )
-    from nkipy.core.tensor import NKIPyTensorRef
-
-    ctx = get_hlo_context()
-
-    result_dtype = find_common_type_hlo(x, y)
-
-    if isinstance(x, NKIPyTensorRef):
-        x = x.backend_tensor
-    if isinstance(y, NKIPyTensorRef):
-        y = y.backend_tensor
-
-    # Matmul requires at least 1D arrays
-    assert len(x.shape) >= 1 and len(y.shape) >= 1, "matmul requires at least 1D arrays"
-
-    # Handle 1D inputs by promoting to 2D (numpy matmul semantics).
-    # The added dimension is stripped from the result after the dot.
-    squeeze_lhs = False
-    squeeze_rhs = False
-
-    if len(x.shape) == 1 and len(y.shape) == 1:
-        # Vector dot product: contract dimension 0 of both
-        assert x.shape[0] == y.shape[0], "Incompatible shapes for dot product"
-        result_shape = ()
-        lhs_contracting_dims = [0]
-        rhs_contracting_dims = [0]
-        lhs_batch_dims = []
-        rhs_batch_dims = []
-    else:
-        # Promote 1D operands to 2D so the general path handles them.
-        if len(x.shape) == 1:
-            # (K,) -> (1, K)
-            x = ctx.build_op("reshape", [x], (1, x.shape[0]), x.dtype)
-            squeeze_lhs = True
-
-        if len(y.shape) == 1:
-            # (K,) -> (K, 1)
-            y = ctx.build_op("reshape", [y], (y.shape[0], 1), y.dtype)
-            squeeze_rhs = True
-
-        # General matrix multiplication (2D or batched)
-        assert x.shape[-1] == y.shape[-2], "Incompatible shapes for matmul"
-
-        # Broadcast batch dimensions if needed
-        x_batch_shape = x.shape[:-2]
-        y_batch_shape = y.shape[:-2]
-        batch_shape = tuple(np.broadcast_shapes(x_batch_shape, y_batch_shape))
-        result_shape = batch_shape + (x.shape[-2], y.shape[-1])
-
-        # If batch dimensions don't match, broadcast the operands first
-        target_x_shape = batch_shape + tuple(x.shape[-2:])
-        target_y_shape = batch_shape + tuple(y.shape[-2:])
-
-        if x.shape != target_x_shape:
-            x = broadcast_to_shape_hlo(ctx, x, target_x_shape)
-
-        if y.shape != target_y_shape:
-            y = broadcast_to_shape_hlo(ctx, y, target_y_shape)
-
-        # Contracting dimensions
-        lhs_contracting_dims = [len(target_x_shape) - 1]
-        rhs_contracting_dims = [len(target_y_shape) - 2]
-
-        # Batch dimensions
-        lhs_batch_dims = list(range(len(batch_shape)))
-        rhs_batch_dims = list(range(len(batch_shape)))
-
-    # Build dot operation with dimension numbers
-    result_tensor = ctx.build_op(
-        "dot",
-        [x, y],
-        result_shape,
-        result_dtype,
-        {
-            "lhs_contracting_dimensions": lhs_contracting_dims,
-            "rhs_contracting_dimensions": rhs_contracting_dims,
-            "lhs_batch_dimensions": lhs_batch_dims,
-            "rhs_batch_dimensions": rhs_batch_dims,
-        },
-    )
-
-    # Strip the dimensions that were added for 1D promotion.
-    if squeeze_lhs or squeeze_rhs:
-        final_shape = list(result_shape)
-        # squeeze_lhs removes the second-to-last dim (the prepended 1)
-        # squeeze_rhs removes the last dim (the appended 1)
-        # When both are true the result is already scalar from the 1D x 1D
-        # path above, so this branch won't fire for that case.
-        if squeeze_lhs:
-            final_shape.pop(-2)
-        if squeeze_rhs:
-            final_shape.pop(-1)
-        final_shape = tuple(final_shape)
-        result_tensor = ctx.build_op(
-            "reshape", [result_tensor], final_shape, result_dtype
-        )
-
-    return NKIPyTensorRef(result_tensor)
-
-
-# -----------------------------------------------------------------------------
-# dot
-# -----------------------------------------------------------------------------
 dot = Op("dot")
 
-
-@dot.impl("hlo")
-def _dot_hlo(x, y, out=None):
-    """Dot product (HLO).
-
-    Follows numpy.dot semantics:
-    - 1D x 1D: scalar inner product.
-    - 2D x 2D: matrix multiplication.
-    - N-D x 1D: sum product over the last axis of *x* and *y*.
-    - N-D x M-D (M>=2): sum product over the last axis of *x* and the
-      second-to-last axis of *y*.  Non-contracted dimensions are
-      outer-producted (NOT broadcast like matmul).
-    """
-    from nkipy.core.backend.hlo import (
-        find_common_type_hlo,
-        get_hlo_context,
-    )
-    from nkipy.core.tensor import NKIPyTensorRef
-
-    ctx = get_hlo_context()
-
-    result_dtype = find_common_type_hlo(x, y)
-
-    if isinstance(x, NKIPyTensorRef):
-        x = x.backend_tensor
-    if isinstance(y, NKIPyTensorRef):
-        y = y.backend_tensor
-
-    assert len(x.shape) >= 1 and len(y.shape) >= 1, "dot requires at least 1D arrays"
-
-    # Contracting dimensions: last of x, second-to-last of y (or 0 if y is 1D)
-    lhs_contracting_dims = [len(x.shape) - 1]
-    rhs_contracting_dims = [max(0, len(y.shape) - 2)]
-
-    assert x.shape[lhs_contracting_dims[0]] == y.shape[rhs_contracting_dims[0]], (
-        f"shapes {x.shape} and {y.shape} not aligned"
-    )
-
-    # No batch dimensions for dot – remaining dims are outer-producted.
-    lhs_batch_dims = []
-    rhs_batch_dims = []
-
-    # Result shape: non-contracted dims from x, then non-contracted dims from y
-    result_shape = tuple(
-        s for i, s in enumerate(x.shape) if i not in lhs_contracting_dims
-    ) + tuple(s for i, s in enumerate(y.shape) if i not in rhs_contracting_dims)
-
-    result_tensor = ctx.build_op(
-        "dot",
-        [x, y],
-        result_shape,
-        result_dtype,
-        {
-            "lhs_contracting_dimensions": lhs_contracting_dims,
-            "rhs_contracting_dimensions": rhs_contracting_dims,
-            "lhs_batch_dimensions": lhs_batch_dims,
-            "rhs_batch_dimensions": rhs_batch_dims,
-        },
-    )
-
-    return NKIPyTensorRef(result_tensor)
-
-
 # -----------------------------------------------------------------------------
-# norm - L2/Frobenius norm
+# Composed linalg ops
 # -----------------------------------------------------------------------------
+
 norm = Op("norm")
 
 
-@norm.impl("hlo")
-def _norm_hlo(x, ord=None, axis=None, keepdims=False):
-    """L2/Frobenius norm: sqrt(sum(x*x, axis)).
-
-    Only supports ord=None or ord='fro'.
-    """
+@norm.composed_impl
+def _norm(x, ord=None, axis=None, keepdims=False):
+    """L2/Frobenius norm: sqrt(sum(x*x, axis))."""
     from nkipy.core.ops.binary import multiply
     from nkipy.core.ops.reduce import sum
     from nkipy.core.ops.unary import sqrt
@@ -225,14 +40,11 @@ def _norm_hlo(x, ord=None, axis=None, keepdims=False):
     return sqrt(sum_squared)
 
 
-# -----------------------------------------------------------------------------
-# outer - outer product of two vectors
-# -----------------------------------------------------------------------------
 outer = Op("outer")
 
 
-@outer.impl("hlo")
-def _outer_hlo(a, b, out=None):
+@outer.composed_impl
+def _outer(a, b, out=None):
     """Outer product: reshape a to (n, 1), b to (1, m), multiply."""
     from nkipy.core.ops.binary import multiply
     from nkipy.core.ops.transform import reshape
@@ -242,75 +54,4 @@ def _outer_hlo(a, b, out=None):
     return multiply(a_flat, b_flat)
 
 
-# -----------------------------------------------------------------------------
-# trace - sum of diagonal elements
-# -----------------------------------------------------------------------------
 trace = Op("trace")
-
-
-@trace.impl("hlo")
-def _trace_hlo(a, offset=0, axis1=0, axis2=1, dtype=None):
-    """Sum of diagonal elements using iota indices.
-
-    Create iota for rows and cols, compare for equality (diagonal mask),
-    multiply with input, sum.
-    """
-    from nkipy.core.backend.hlo import get_hlo_context
-    from nkipy.core.ops.binary import equal, multiply
-    from nkipy.core.ops.indexing import where
-    from nkipy.core.ops.reduce import sum
-    from nkipy.core.tensor import NKIPyTensorRef
-
-    ctx = get_hlo_context()
-
-    if isinstance(a, NKIPyTensorRef):
-        a_bt = a.backend_tensor
-    else:
-        a_bt = a
-
-    # For 2D: create iota for rows and cols, mask diagonal, sum
-    shape = a_bt.shape
-    ndim = len(shape)
-
-    # Normalize negative axes
-    if axis1 < 0:
-        axis1 += ndim
-    if axis2 < 0:
-        axis2 += ndim
-
-    # Create iota along axis1 (row indices)
-    row_iota = ctx.build_op(
-        "iota", [], shape, np.dtype(np.int32), {"iota_dimension": axis1}
-    )
-    row_ref = NKIPyTensorRef(row_iota)
-
-    # Create iota along axis2 (col indices) and add offset
-    col_iota = ctx.build_op(
-        "iota", [], shape, np.dtype(np.int32), {"iota_dimension": axis2}
-    )
-    col_ref = NKIPyTensorRef(col_iota)
-
-    if offset != 0:
-        from nkipy.core.ops.binary import subtract
-
-        col_ref = subtract(col_ref, offset)
-
-    # Diagonal mask: row == col (with offset)
-    diag_mask = equal(row_ref, col_ref)
-
-    # Apply mask: where diagonal, use a; else 0
-    masked = where(diag_mask, a, 0.0)
-
-    # Sum along both matrix axes
-    # Sum axis2 first (higher index), then axis1
-    axes_to_reduce = sorted([axis1, axis2], reverse=True)
-    result = masked
-    for ax in axes_to_reduce:
-        result = sum(result, axis=ax)
-
-    if dtype is not None:
-        from nkipy.core.ops.transform import astype
-
-        result = astype(result, np.dtype(dtype))
-
-    return result

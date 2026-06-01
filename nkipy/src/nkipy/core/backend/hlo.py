@@ -8,6 +8,7 @@ tensors, and modules for code generation.
 
 from __future__ import annotations
 
+import hashlib
 import struct
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -15,6 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import ml_dtypes
 import numpy as np
 
+from nkipy.core.backend import AliasInfo, TensorPlaceholder
 from nkipy.third_party.xla import xla_data_pb2
 from nkipy.third_party.xla.service import hlo_pb2
 
@@ -311,27 +313,6 @@ class HLOTensor:
     id: Optional[int] = None
 
 
-@dataclass
-class TensorPlaceholder:
-    """Placeholder for tensor metadata."""
-
-    name: str
-    shape: Tuple[int, ...]
-    dtype: np.dtype
-
-
-@dataclass(frozen=True)
-class AliasInfo:
-    """One input-output alias pair."""
-
-    output_index: int  # Position in HLO output tuple
-    param_index: int  # Position in HLO parameter list
-    param_name: str  # Original parameter name (e.g., "a")
-    is_user_returned: (
-        bool  # False = auto-added output, True = user explicitly returned it
-    )
-
-
 # =============================================================================
 # HLO Module
 # =============================================================================
@@ -362,7 +343,13 @@ class HLOModule:
     def inputs(self) -> List[TensorPlaceholder]:
         """Return parameters as inputs for compatibility with IR Function interface."""
         return [
-            TensorPlaceholder(name=p.name, shape=p.shape, dtype=p.dtype)
+            TensorPlaceholder(
+                name=p.name,
+                shape=p.shape,
+                dtype=p.dtype,
+                # Neuron compiler appends ".must_alias_input" to mutated params
+                original_name=p.name.split(".must_alias_input")[0],
+            )
             for p in self.parameters
         ]
 
@@ -406,6 +393,12 @@ class HLOModule:
     def set_results(self, results: Union[HLOTensor, List[HLOTensor]]) -> None:
         """Set the output results of the module."""
         self.results = results if isinstance(results, list) else [results]
+
+    def content_hash(self, compiler_args: str) -> str:
+        h = hashlib.sha256()
+        h.update(self.to_proto().SerializeToString())
+        h.update(compiler_args.encode("utf-8"))
+        return h.hexdigest()[:12]
 
     # =========================================================================
     # Proto Generation
