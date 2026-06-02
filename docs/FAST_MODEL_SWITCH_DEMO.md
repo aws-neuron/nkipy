@@ -373,7 +373,9 @@ When scaling up multiple engines simultaneously, the sender broadcasts weights t
 | LLaMA-3-8B | 8 | 8 | **11.0s** | 2.79s | 367 Gbps |
 | Qwen3-30B-A3B | 32 | 1 | 4.8s | 0.55s | 31 Gbps |
 | LLaMA-3.1-70B | 32 | 1 | 5.0s | 0.55s | 54 Gbps |
-| LLaMA-3.1-70B | 32 | 2 | — | 1.84s | 54 Gbps |
+| LLaMA-3.1-70B | 32 | 2 | **10.0s** | 1.82s | 54 Gbps |
+| Qwen3-235B-A22B | 32 | 1 | 7.6s | 2.6s | 86% wire |
+| Qwen3-235B-A22B | 32 | 2 | **13.6s** | 5.74s | 86% wire |
 
 Broadcast overhead is sub-linear: pushing to 8 receivers takes ~5× longer than 1 receiver (not 8×), because the EFA network has sufficient bandwidth to serve multiple concurrent RDMA WRITEs. Total wake-up includes Gloo init, NRT init, tensor allocation, MR registration, and RDMA transfer.
 
