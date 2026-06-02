@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nkigen-lite"
+version = "0.1.0"
+description = "Lightweight IR-based kernel generation backend for NKIPy"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "NKIPy Team" }]
+
+dependencies = ["numpy>=1.26", "ml_dtypes>=0.2.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-xdist>=3.0"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nkigen_lite"]
