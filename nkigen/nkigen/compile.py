@@ -59,19 +59,6 @@ def compile_to_neff(
     with nki_ctx:
         mlir_module = nki_ir.Module.parse(nisa_mlir, nki_ctx)
 
-        all_arrays = [
-            np.zeros(shape, dtype=dtype) for _, shape, dtype in input_specs
-        ] + [
-            np.zeros(shape, dtype=dtype) for _, shape, dtype in output_specs
-        ]
-
-        argument_names = [
-            name for name, _, _ in input_specs
-        ] + [
-            name for name, _, _ in output_specs
-        ]
-        output_arg_names = [name for name, _, _ in output_specs]
-
         opts = CompileOptions(
             target=target,
             verbose=False,
@@ -83,8 +70,5 @@ def compile_to_neff(
         compile_mlir_to_neff(
             mlir_module,
             func_name,
-            all_arrays,
-            argument_names,
-            output_arg_names,
             opts,
         )

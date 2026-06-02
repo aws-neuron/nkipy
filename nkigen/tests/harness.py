@@ -390,27 +390,9 @@ def _compile_nisa_to_neff(
 
         input_names = [f"in_tensor_{i}" for i in range(len(inputs))]
 
-        output_names = ["output_0"]
-        for op in mlir.body.operations:
-            if "function_type" in op.attributes and "nki.output_names" in op.attributes:
-                names_attr = ir.ArrayAttr(op.attributes["nki.output_names"])
-                output_names = [
-                    str(ir.StringAttr(names_attr[i])).strip('"')
-                    for i in range(len(names_attr))
-                ]
-                break
-
-        output_placeholders = [np.zeros_like(ro) for ro in reference_output]
-        all_arrays = list(inputs) + output_placeholders
-        argument_names = input_names + output_names
-        output_arg_names = output_names
-
         compile_result = compile_mlir_to_neff(
             mlir,
             func_name,
-            all_arrays,
-            argument_names,
-            output_arg_names,
             opts,
         )
 

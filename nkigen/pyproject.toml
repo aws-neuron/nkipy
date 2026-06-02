@@ -26,3 +26,8 @@ include = ["nkigen*"]
 [tool.uv.sources]
 neuronx-cc = { index = "neuron" }
 nki = { index = "neuron" }
+
+[dependency-groups]
+dev = [
+    "pyyaml>=6.0.3",
+]
