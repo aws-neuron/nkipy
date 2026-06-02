@@ -292,11 +292,17 @@ Effective aggregate throughput: 59 GB in 3.4s = ~139 Gbps across 32 ranks × 16 
 |---|---|---|
 | Gloo distributed init | 0.2s | |
 | NRT init + tensor alloc | 0.5s | Fast path (skip firmware reset) |
-| **P2P transfer** (4.3 GB/rank) | 3.9s | Direct device→device via NIXL LIBFABRIC |
+| **P2P transfer** (4.6 GB/rank) | 3.6s | Breakdown below |
 | Kernel load + barrier | 0.4s | |
 | **Total wake-up** | **4.4–6.2s** (avg 5.0s) | |
 
-Effective aggregate throughput: 139 GB in 3.9s = ~285 Gbps across 32 ranks × 16 EFA NICs (~33 Gbps per rank).
+P2P transfer breakdown (receiver perspective):
+
+| Sub-phase | Latency | Notes |
+|---|---|---|
+| Receiver VRAM MR registration | 2.4s | 1 dmabuf FD + 1 ibv_reg_mr for 4.6 GB |
+| Metadata gather | 0.4s | dist.gather_object (32 ranks) |
+| **RDMA write** | **0.8s** | 146 GB, 1,422 Gbps (89% of 1,600 Gbps wire speed) |
 
 **Qwen3-235B-A22B (TP=32, trn2.48xlarge, cross-instance, direct device RDMA):**
 
