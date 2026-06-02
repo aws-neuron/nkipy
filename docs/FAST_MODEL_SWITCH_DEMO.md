@@ -302,13 +302,21 @@ Effective aggregate throughput: 139 GB in 3.9s = ~285 Gbps across 32 ranks × 16
 
 | Phase | Latency | Notes |
 |---|---|---|
-| Gloo distributed init | 0.7s | |
+| Gloo distributed init | 0.3s | |
 | NRT init + tensor alloc | 0.5s | Fast path (skip firmware reset) |
-| **P2P transfer** (14 GB/rank) | 5.7s | Direct device→device via NIXL LIBFABRIC |
-| Kernel load + barrier | 0.5s | |
+| **P2P transfer** (14 GB/rank) | 5.5s | Breakdown below |
+| Kernel load + barrier | 0.4s | |
 | **Total wake-up** | **6.6–9.0s** (avg 7.6s) | |
 
-Effective aggregate throughput: 448 GB in 5.7s = ~630 Gbps across 32 ranks × 16 EFA NICs (~22 Gbps per rank). All transfers use direct device RDMA — no host staging or CPU copies on the data path.
+P2P transfer breakdown (receiver perspective):
+
+| Sub-phase | Latency | Notes |
+|---|---|---|
+| Receiver VRAM MR registration | 2.6s | 1 dmabuf FD + 1 ibv_reg_mr for 14 GB |
+| Metadata gather | 0.3s | dist.gather_object (32 ranks) |
+| **RDMA write** | **2.6s** | 448 GB, 1,384 Gbps (86% of 1,600 Gbps wire speed) |
+
+All transfers use direct device RDMA — no host staging or CPU copies on the data path. The RDMA write achieves 86% of unidirectional EFA bandwidth; the primary optimization opportunity is reducing MR registration overhead.
 
 **P2P RDMA vs FSx cold load:**
 
