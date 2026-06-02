@@ -365,18 +365,17 @@ When scaling up multiple engines simultaneously, the sender broadcasts weights t
 
 > **Note**: The 8.2s wake phase is inflated by resource contention — 8 engines on the same instance compete for NRT init and EFA MR registration. In production, receivers are distributed across separate instances where each engine wakes without contention (~1-2s). Expected production broadcast latency: **~5s** (wake ~2s + transfer ~3s).
 
-**Broadcast scaling (all models, trn2.48xlarge):**
+**Broadcast scaling (all models, trn2.48xlarge, all receivers on same instance):**
 
-| Model | TP | Receivers | Transfer time | Aggregate throughput |
-|---|---|---|---|---|
-| LLaMA-3-8B | 8 | 1 | 0.55s | 29 Gbps |
-| LLaMA-3-8B | 8 | 8 | 2.79s | 367 Gbps |
-| Qwen3-30B-A3B | 32 | 1 | 0.55s | 31 Gbps |
-| Qwen3-30B-A3B | 32 | 2 | 0.91s | 48 Gbps |
-| LLaMA-3.1-70B | 32 | 1 | 0.55s | 54 Gbps |
-| LLaMA-3.1-70B | 32 | 2 | 1.84s | 54 Gbps |
+| Model | TP | Receivers | Total wake-up | Transfer time | Aggregate throughput |
+|---|---|---|---|---|---|
+| LLaMA-3-8B | 8 | 1 | 3.5s | 0.55s | 29 Gbps |
+| LLaMA-3-8B | 8 | 8 | **11.0s** | 2.79s | 367 Gbps |
+| Qwen3-30B-A3B | 32 | 1 | 4.8s | 0.55s | 31 Gbps |
+| LLaMA-3.1-70B | 32 | 1 | 5.0s | 0.55s | 54 Gbps |
+| LLaMA-3.1-70B | 32 | 2 | — | 1.84s | 54 Gbps |
 
-Broadcast overhead is sub-linear: pushing to 8 receivers takes ~5× longer than 1 receiver (not 8×), because the EFA network has sufficient bandwidth to serve multiple concurrent RDMA WRITEs.
+Broadcast overhead is sub-linear: pushing to 8 receivers takes ~5× longer than 1 receiver (not 8×), because the EFA network has sufficient bandwidth to serve multiple concurrent RDMA WRITEs. Total wake-up includes Gloo init, NRT init, tensor allocation, MR registration, and RDMA transfer.
 
 ### 3.5 Summary
 
