@@ -1605,7 +1605,7 @@ def annotate(
 
     ms_attr = None
     if mem_space is not None:
-        ms_map = {"Hbm": 0, "Psum": 1, "Sbuf": 2, "SharedHbm": 3}
+        ms_map = {"Hbm": 1, "Psum": 2, "Sbuf": 3, "SharedHbm": 4}
         ms_attr = ir.IntegerAttr.get(ir.IntegerType.get_signless(32), ms_map[mem_space])
 
     pd_attr = None
@@ -1616,9 +1616,12 @@ def annotate(
     if tile_size is not None:
         ts_attr = ir.DenseI64ArrayAttr.get(tile_size)
 
-    rt_attr = None
-    if reduction_tile is not None:
-        rt_attr = ir.DenseI64ArrayAttr.get(reduction_tile)
+    loop_tile = tile_size
+    if loop_tile is not None and reduction_tile is not None:
+        loop_tile = list(tile_size) + list(reduction_tile)
+    loop_tile_attr = None
+    if loop_tile is not None:
+        loop_tile_attr = ir.DenseI64ArrayAttr.get(loop_tile)
 
     if ms_attr is not None or pd_attr is not None or ts_attr is not None:
         nkipy_d.LayoutOp(
@@ -1629,11 +1632,10 @@ def annotate(
             loc=loc,
         )
 
-    if ts_attr is not None or rt_attr is not None:
+    if loop_tile_attr is not None:
         nkipy_d.TileOp(
             target=value,
-            loop_tile_size=ts_attr,
-            reduction_tile=rt_attr,
+            loop_tile_size=loop_tile_attr,
             loc=loc,
         )
     return x
