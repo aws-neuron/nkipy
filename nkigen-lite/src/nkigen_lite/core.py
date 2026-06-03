@@ -421,6 +421,10 @@ NP_UNARY = {
     "tanh": np.tanh,
     "sin": np.sin,
     "cos": np.cos,
+    "abs": np.abs,
+    "sign": np.sign,
+    "floor": np.floor,
+    "ceil": np.ceil,
 }
 
 NP_BINARY = {
@@ -430,6 +434,9 @@ NP_BINARY = {
     "div": np.true_divide,
     "maximum": np.maximum,
     "minimum": np.minimum,
+    "power": np.power,
+    "floor_divide": np.floor_divide,
+    "mod": np.mod,
 }
 
 NP_COMPARE = {

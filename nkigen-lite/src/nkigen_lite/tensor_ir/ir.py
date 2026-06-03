@@ -119,6 +119,18 @@ class Builder:
     def cos(self, x: Value) -> Value:
         return self._unary("cos", x)
 
+    def abs(self, x: Value) -> Value:
+        return self._unary("abs", x)
+
+    def sign(self, x: Value) -> Value:
+        return self._unary("sign", x)
+
+    def floor(self, x: Value) -> Value:
+        return self._unary("floor", x)
+
+    def ceil(self, x: Value) -> Value:
+        return self._unary("ceil", x)
+
     # -- comparison (returns bool) --
 
     def _compare(self, opcode: str, a: Value, b: Value) -> Value:
@@ -182,6 +194,15 @@ class Builder:
 
     def minimum(self, a: Value, b: Value) -> Value:
         return self._binary("minimum", a, b)
+
+    def power(self, a: Value, b: Value) -> Value:
+        return self._binary("power", a, b)
+
+    def floor_divide(self, a: Value, b: Value) -> Value:
+        return self._binary("floor_divide", a, b)
+
+    def mod(self, a: Value, b: Value) -> Value:
+        return self._binary("mod", a, b)
 
     # -- ternary --
 
@@ -352,11 +373,11 @@ class Builder:
 
     def matmul(self, a: Value, b: Value) -> Value:
         if a.type.rank < 1 or b.type.rank < 1:
-            raise ValueError("matmul: inputs must be at least 1-D")
+            raise TypeError("matmul: inputs must be at least 1-D")
         if a.type.dtype != b.type.dtype:
-            raise ValueError(f"matmul: dtype mismatch {a.type.dtype} vs {b.type.dtype}")
+            raise TypeError(f"matmul: dtype mismatch {a.type.dtype} vs {b.type.dtype}")
         if a.type.shape[-1] != b.type.shape[-2 if b.type.rank >= 2 else 0]:
-            raise ValueError(
+            raise TypeError(
                 f"matmul: contraction dim mismatch: "
                 f"{a.type.shape[-1]} vs {b.type.shape[-2 if b.type.rank >= 2 else 0]}"
             )
@@ -365,7 +386,7 @@ class Builder:
         try:
             batch = np.broadcast_shapes(a_batch, b_batch) if (a_batch or b_batch) else ()
         except ValueError:
-            raise ValueError(
+            raise TypeError(
                 f"matmul: batch shapes {a_batch} and {b_batch} are not broadcastable"
             )
         if a.type.rank >= 2 and b.type.rank >= 2:

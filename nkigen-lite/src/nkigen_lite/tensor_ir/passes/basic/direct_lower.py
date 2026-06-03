@@ -316,6 +316,11 @@ def _emit_ew_tile(
         elif op.opcode in UNARY_OPS:
             src = tile_map[op.inputs[0].name]
             tile_map[out_name] = emit_unary_op(nb, out_dtype, src, op.opcode)
+        elif op.opcode == "cast":
+            src = tile_map[op.inputs[0].name]
+            dst = nb.alloc(src.type.shape, out_dtype, MemorySpace.SBUF)
+            nb.tensor_copy(dst, src)
+            tile_map[out_name] = dst
         elif op.opcode == "constant":
             out_shape = op.results[0].type.shape
             const_layout = _canonical_layout(len(out_shape))

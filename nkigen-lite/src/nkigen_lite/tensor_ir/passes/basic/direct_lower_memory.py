@@ -492,32 +492,59 @@ def _emit_reshape_same_f(nb, x_hbm, y_hbm, in_shape, out_shape, dtype):
 def _emit_reshape_diff_f(nb, x_hbm, y_hbm, in_shape, out_shape, dtype):
     """Reshape with different last dim via scratch buffer."""
     total = prod(in_shape)
-    in_f = in_shape[-1]
     out_f = out_shape[-1]
     out_rank = len(out_shape)
-    scratch_shape = (total // in_f, in_f)
+
+    # For 1D inputs or inputs whose last dim exceeds SBUF capacity,
+    # re-interpret the source as 2D with a bounded row width.
+    MAX_F_BYTES = 128 * 1024  # conservative SBUF tile limit
+    ELEM_BYTES = 4  # f32
+    max_f = MAX_F_BYTES // ELEM_BYTES
+
+    in_f = in_shape[-1]
+    if len(in_shape) == 1 and in_f > max_f:
+        # Re-interpret as 2D: (total/max_f, max_f) — pick a row width
+        # that divides the total evenly and is <= max_f
+        row_width = out_f if out_f <= max_f else max_f
+        while total % row_width != 0:
+            row_width -= 1
+        effective_in_shape = (total // row_width, row_width)
+    else:
+        effective_in_shape = in_shape
+        row_width = in_f
+
+    scratch_shape = (total // row_width, row_width)
     scratch_hbm = nb.alloc(scratch_shape, dtype, MemorySpace.HBM)
 
     # Phase 1: copy source into scratch
-    in_p = in_shape[-2] if len(in_shape) >= 2 else 1
-    in_batch_dims = list(in_shape[:-2]) if len(in_shape) > 2 else []
-    in_n_batch = prod(in_batch_dims) if in_batch_dims else 1
-    tile_p_in = min(in_p, PARTITION_MAX)
+    eff_f = effective_in_shape[-1]
+    eff_p = effective_in_shape[-2] if len(effective_in_shape) >= 2 else 1
+    eff_batch_dims = list(effective_in_shape[:-2]) if len(effective_in_shape) > 2 else []
+    eff_n_batch = prod(eff_batch_dims) if eff_batch_dims else 1
+    tile_p_in = min(eff_p, PARTITION_MAX)
     row_offset = 0
-    for bf in range(in_n_batch):
-        batch_idx = unravel(bf, in_batch_dims) if in_batch_dims else ()
-        for p_i in range(ceildiv(in_p, tile_p_in)):
+    for bf in range(eff_n_batch):
+        batch_idx = unravel(bf, eff_batch_dims) if eff_batch_dims else ()
+        for p_i in range(ceildiv(eff_p, tile_p_in)):
             p_off = p_i * tile_p_in
-            p_size = min(tile_p_in, in_p - p_off)
+            p_size = min(tile_p_in, eff_p - p_off)
+            # Source slices use the original shape
             src_slices = [DimSlice(bi, 1) for bi in batch_idx]
-            if len(in_shape) >= 2:
-                src_slices.append(DimSlice(p_off, p_size))
-            src_slices.append(DimSlice(0, in_f))
-            tile = nb.dma_copy(nb.alloc((p_size, in_f), dtype, MemorySpace.SBUF), x_hbm, src_slices)
-            nb.dma_copy(scratch_hbm, tile, [DimSlice(row_offset, p_size), DimSlice(0, in_f)])
+            if len(in_shape) == 1:
+                # 1D source: use flat offset into the single dim
+                flat_off = row_offset * eff_f
+                src_slices = [DimSlice(flat_off, p_size * eff_f)]
+            else:
+                if len(in_shape) >= 2:
+                    src_slices.append(DimSlice(p_off, p_size))
+                src_slices.append(DimSlice(0, eff_f))
+            tile = nb.dma_copy(nb.alloc((p_size, eff_f), dtype, MemorySpace.SBUF), x_hbm, src_slices)
+            nb.dma_copy(scratch_hbm, tile, [DimSlice(row_offset, p_size), DimSlice(0, eff_f)])
             row_offset += p_size
 
-    # Phase 2: reload from scratch per output row
+    # Phase 2: reload from scratch per output row.
+    # scratch_shape = (total // row_width, row_width)
+    scratch_f = row_width
     out_p = out_shape[-2] if out_rank >= 2 else 1
     out_batch_dims = list(out_shape[:-2]) if out_rank > 2 else []
     out_n_batch = prod(out_batch_dims) if out_batch_dims else 1
@@ -530,19 +557,19 @@ def _emit_reshape_diff_f(nb, x_hbm, y_hbm, in_shape, out_shape, dtype):
             if out_rank >= 2:
                 flat_offset += p_i * out_strides[-2]
 
-            scratch_row = flat_offset // in_f
-            scratch_col = flat_offset % in_f
+            scratch_row = flat_offset // scratch_f
+            scratch_col = flat_offset % scratch_f
 
             dst_slices = [DimSlice(bi, 1) for bi in batch_idx]
             if out_rank >= 2:
                 dst_slices.append(DimSlice(p_i, 1))
             dst_slices.append(DimSlice(0, out_f))
 
-            if scratch_col == 0 and out_f <= in_f:
+            if scratch_col == 0 and out_f <= scratch_f:
                 s_sl = [DimSlice(scratch_row, 1), DimSlice(0, out_f)]
                 tile = nb.dma_copy(nb.alloc((1, out_f), dtype, MemorySpace.SBUF), scratch_hbm, s_sl)
                 nb.dma_copy(y_hbm, tile, dst_slices)
-            elif scratch_col + out_f <= in_f:
+            elif scratch_col + out_f <= scratch_f:
                 s_sl = [DimSlice(scratch_row, 1), DimSlice(scratch_col, out_f)]
                 tile = nb.dma_copy(nb.alloc((1, out_f), dtype, MemorySpace.SBUF), scratch_hbm, s_sl)
                 nb.dma_copy(y_hbm, tile, dst_slices)
@@ -551,7 +578,7 @@ def _emit_reshape_diff_f(nb, x_hbm, y_hbm, in_shape, out_shape, dtype):
                 out_col = 0
                 cur_row, cur_col = scratch_row, scratch_col
                 while remaining > 0:
-                    chunk = min(remaining, in_f - cur_col)
+                    chunk = min(remaining, scratch_f - cur_col)
                     s_sl = [DimSlice(cur_row, 1), DimSlice(cur_col, chunk)]
                     tile = nb.dma_copy(nb.alloc((1, chunk), dtype, MemorySpace.SBUF), scratch_hbm, s_sl)
                     d_sl = [DimSlice(bi, 1) for bi in batch_idx]

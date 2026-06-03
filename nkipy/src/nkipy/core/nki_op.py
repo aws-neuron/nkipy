@@ -470,6 +470,12 @@ class NKICustomOpHandle:
                 *args,
             )
 
+        if backend == "nkigen-lite":
+            raise RuntimeError(
+                "nki_custom_op is not yet supported on backend 'nkigen-lite'. "
+                "Use the 'hlo' or 'nkigen' backend for custom NKI ops."
+            )
+
         raise RuntimeError(
             f"nki_custom_op is not supported on backend '{backend}'. "
             f"Use the 'hlo' or 'nkigen' backend."

@@ -30,7 +30,7 @@ NEURON_AVAILABLE = is_neuron_compatible()
 
 
 def _trace_mode_to_backend(trace_mode):
-    if trace_mode in ("hlo", "nkigen"):
+    if trace_mode in ("hlo", "nkigen", "nkigen-lite"):
         return trace_mode
     raise ValueError(f"Unknown trace mode: {trace_mode}")
 

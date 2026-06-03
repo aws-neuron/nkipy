@@ -104,6 +104,8 @@ class NKIPyKernel:
             return self._specialize_hlo(*args, **kwargs)
         elif self.backend == "nkigen":
             return self._specialize_nkigen(*args, **kwargs)
+        elif self.backend == "nkigen-lite":
+            return self._specialize_nkigen_lite(*args, **kwargs)
         elif self.backend == "cpu":
             warnings.warn(
                 "CPU backend does not require specialization", stacklevel=2
@@ -366,6 +368,127 @@ class NKIPyKernel:
 
         self._code = NkiGenIR(
             mlir_text=mlir_text,
+            func_name=self.func.__name__,
+            input_specs=input_info,
+            output_specs=output_info,
+            alias_map=alias_map,
+            user_return_len=user_return_len,
+            original_param_names=arg_names,
+        )
+        return self._code
+
+    def _specialize_nkigen_lite(self, *args, **kwargs):
+        """Trace the kernel to nkigen_lite tensor_ir via the nkigen-lite backend."""
+        from nkipy.core.backend.nkigen_lite import (
+            NkiGenLiteIR,
+            NkiGenLiteTraceContext,
+        )
+        from nkipy.core.ops._register_nkigen_lite import register_all_nkigen_lite_impls
+
+        register_all_nkigen_lite_impls()
+
+        kctx = NkiGenLiteTraceContext(name=self.func.__name__)
+
+        sig = inspect.signature(self.func)
+        boundargs = sig.bind(*args, **kwargs)
+        boundargs.apply_defaults()
+
+        arg_shapes = []
+        arg_dtypes = []
+        arg_names = []
+
+        def _collect_array(name, arg):
+            arg = _sanitize_array_dtype(arg, name)
+            arg_shapes.append(arg.shape)
+            arg_dtypes.append(arg.dtype)
+            arg_names.append(name)
+            return arg
+
+        for name, arg in boundargs.arguments.items():
+            param = sig.parameters[name]
+            if param.kind == param.VAR_POSITIONAL:
+                sanitized = []
+                for item in arg:
+                    sanitized.append(
+                        _collect_array(name, item)
+                        if isinstance(item, np.ndarray)
+                        else item
+                    )
+                boundargs.arguments[name] = tuple(sanitized)
+            elif param.kind == param.VAR_KEYWORD:
+                for k, v in arg.items():
+                    if isinstance(v, np.ndarray):
+                        arg[k] = _collect_array(k, v)
+            elif isinstance(arg, np.ndarray):
+                arg = _collect_array(name, arg)
+                boundargs.arguments[name] = arg
+
+        # Create parameters via the trace context
+        param_tensors = []
+        for i, (shape, dtype, name) in enumerate(zip(arg_shapes, arg_dtypes, arg_names)):
+            pt = kctx.add_parameter(shape, dtype, name=name)
+            param_tensors.append(pt)
+
+        param_tensor_refs = []
+
+        with tracing(kctx):
+            param_idx = 0
+
+            def _make_lite_ref(name, arg):
+                nonlocal param_idx
+                if isinstance(arg, np.ndarray):
+                    ref = NKIPyTensorRef(param_tensors[param_idx], name=name)
+                    param_tensor_refs.append((name, param_idx, ref))
+                    param_idx += 1
+                    return ref
+                return arg
+
+            converted_args, converted_kwargs = _convert_args(
+                sig, boundargs, _make_lite_ref
+            )
+
+            raw_ret = self.func(*converted_args, **converted_kwargs)
+
+            ret, user_return_len, alias_map = self._detect_mutations(
+                raw_ret, param_tensor_refs
+            )
+
+            # Collect output Values and set graph outputs
+            output_values = {}
+            for i, r in enumerate(ret):
+                if isinstance(r, NKIPyTensorRef):
+                    out_name = f"output_{i}" if len(ret) > 1 else "output"
+                    output_values[out_name] = r.backend_tensor.handle
+                else:
+                    raise RuntimeError(f"Unexpected return type: {type(r)}")
+
+            kctx.set_outputs(output_values)
+
+        # Build IR metadata.
+        # Unlike HLO/nkigen (which use "in_tensor_N" / "output_N" naming),
+        # nkigen-lite compiled NEFFs use the original parameter names
+        # from the graph directly.
+        from nkipy.core.backend.nkigen_lite import lite_dtype_to_np
+
+        num_outputs = len(ret)
+        input_info = [
+            (name, shape, dtype)
+            for name, shape, dtype in zip(arg_names, arg_shapes, arg_dtypes)
+        ]
+        # Output names in nkigen-lite NEFFs use the graph output key + "_out"
+        # suffix, since the lowering pipeline exposes output buffers as HBM
+        # inputs. The NEFF advertises these as its "output tensors".
+        output_info = [
+            (
+                "output_out" if num_outputs == 1 else f"output_{i}_out",
+                r.backend_tensor.shape,
+                r.backend_tensor.dtype,
+            )
+            for i, r in enumerate(ret)
+        ]
+
+        self._code = NkiGenLiteIR(
+            graph=kctx.graph,
             func_name=self.func.__name__,
             input_specs=input_info,
             output_specs=output_info,

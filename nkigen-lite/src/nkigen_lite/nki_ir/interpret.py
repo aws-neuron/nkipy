@@ -462,7 +462,9 @@ def interpret(
             env[op.result.name] = result
 
         elif op.opcode == "tensor_copy":
-            env[op.result.name] = _get(op.inputs[1]).copy()
+            src_data = _get(op.inputs[1])
+            dst_dtype = to_np_dtype(op.result.type.dtype)
+            env[op.result.name] = src_data.astype(dst_dtype)
 
         elif op.opcode == "dma_transpose":
             src = _get(op.inputs[1])

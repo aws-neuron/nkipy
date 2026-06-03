@@ -529,21 +529,21 @@ class TestBuilderMatmul:
         b = Builder()
         a = b.add_input("a", (4, 8), DType.F32)
         w = b.add_input("w", (9, 16), DType.F32)
-        with pytest.raises(ValueError, match="contraction dim"):
+        with pytest.raises(TypeError, match="contraction dim"):
             b.matmul(a, w)
 
     def test_matmul_dtype_mismatch(self):
         b = Builder()
         a = b.add_input("a", (4, 8), DType.F32)
         w = b.add_input("w", (8, 16), DType.F16)
-        with pytest.raises(ValueError, match="dtype mismatch"):
+        with pytest.raises(TypeError, match="dtype mismatch"):
             b.matmul(a, w)
 
     def test_matmul_batch_mismatch(self):
         b = Builder()
         a = b.add_input("a", (2, 4, 8), DType.F32)
         w = b.add_input("w", (3, 8, 16), DType.F32)
-        with pytest.raises(ValueError, match="batch shapes.*not broadcastable"):
+        with pytest.raises(TypeError, match="batch shapes.*not broadcastable"):
             b.matmul(a, w)
 
 

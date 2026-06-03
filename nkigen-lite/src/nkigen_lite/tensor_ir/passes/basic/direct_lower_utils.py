@@ -279,6 +279,10 @@ UNARY_OPS: dict[str, nki_ir.NisaActivationOp | None] = {
     "sigmoid": nki_ir.NisaActivationOp.SIGMOID,
     "silu": nki_ir.NisaActivationOp.SILU,
     "reciprocal": nki_ir.NisaActivationOp.RECIPROCAL,
+    "abs": nki_ir.NisaActivationOp.ABS,
+    "sign": nki_ir.NisaActivationOp.SIGN,
+    "sin": nki_ir.NisaActivationOp.SIN,
+    "floor": None,  # handled by _emit_floor special case
 }
 
 REDUCE_OPS: dict[str, nki_ir.NisaReduceOp] = {
@@ -305,7 +309,8 @@ COMBINE_INIT: dict[str, float] = {
 ELEMENTWISE_OPCODES = frozenset({
     "add", "sub", "mul", "maximum", "minimum",
     "neg", "exp", "log", "sqrt", "rsqrt", "tanh", "relu", "gelu",
-    "sigmoid", "silu", "reciprocal", "constant",
+    "sigmoid", "silu", "reciprocal", "abs", "sign", "sin", "floor",
+    "constant", "cast",
 })
 
 
@@ -358,10 +363,55 @@ def emit_binary_op(nb: Builder, out_dtype: DType, a: Value, b: Value, opcode: st
 
 def emit_unary_op(nb: Builder, out_dtype: DType, src: Value, opcode: str) -> Value:
     """Emit a unary elementwise op."""
-    act_op = UNARY_OPS[opcode]
-    dst = nb.alloc(src.type.shape, out_dtype, MemorySpace.SBUF)
-    if act_op is None:
+    if opcode == "floor":
+        return _emit_floor(nb, out_dtype, src)
+    if opcode == "neg":
+        dst = nb.alloc(src.type.shape, out_dtype, MemorySpace.SBUF)
         p = src.type.shape[0]
         neg_one = nb.constant(-1.0, (p, 1), src.type.dtype, MemorySpace.SBUF)
         return nb.tensor_scalar_arith(dst, src, neg_one, nki_ir.NisaArithOp.MULTIPLY)
+    act_op = UNARY_OPS[opcode]
+    dst = nb.alloc(src.type.shape, out_dtype, MemorySpace.SBUF)
     return nb.activation(dst, src, act_op)
+
+
+def _emit_floor(nb: Builder, out_dtype: DType, src: Value) -> Value:
+    """Emit floor(x) as a multi-instruction NISA sequence.
+
+    NISA has no native floor instruction.  We implement it via integer
+    truncation with sign-based correction (same pattern as neuronx-cc):
+
+      1. trunc_i32 = tensor_copy(x)        — f32 → i32 truncates toward zero
+      2. trunc_f   = tensor_copy(trunc_i32) — i32 → f32 back to float
+      3. diff      = x - trunc_f            — fractional residual
+      4. correction = relu(-sign(diff))     — 1 when x < trunc (negative frac)
+      5. floor     = trunc_f - correction   — subtract 1 for negative fracs
+
+    This correctly handles negative values: floor(-2.3) → trunc=-2,
+    diff=-0.3, sign(diff)=-1, relu(-(-1))=1, result=-2-1=-3. ✓
+    """
+    shape = src.type.shape
+    # trunc(x) = cast(cast(x, i32), f32)
+    trunc_i32 = nb.alloc(shape, DType.I32, MemorySpace.SBUF)
+    nb.tensor_copy(trunc_i32, src)
+    trunc_f = nb.alloc(shape, out_dtype, MemorySpace.SBUF)
+    nb.tensor_copy(trunc_f, trunc_i32)
+    # correction: if x < trunc(x) then floor = trunc - 1
+    # x < trunc means frac is negative (i.e. x is negative and not integer)
+    # diff = x - trunc
+    diff = nb.alloc(shape, out_dtype, MemorySpace.SBUF)
+    nb.tensor_tensor_arith(diff, src, trunc_f, nki_ir.NisaArithOp.SUBTRACT)
+    # sign_diff = sign(diff): -1 if x<trunc, 0 if x==trunc, 1 if x>trunc
+    sign_diff = nb.alloc(shape, out_dtype, MemorySpace.SBUF)
+    nb.activation(sign_diff, diff, nki_ir.NisaActivationOp.SIGN)
+    # neg_part = relu(-sign_diff): 1 when x<trunc, 0 otherwise
+    neg_sign = nb.alloc(shape, out_dtype, MemorySpace.SBUF)
+    p = shape[0]
+    neg_one = nb.constant(-1.0, (p, 1), out_dtype, MemorySpace.SBUF)
+    nb.tensor_scalar_arith(neg_sign, sign_diff, neg_one, nki_ir.NisaArithOp.MULTIPLY)
+    correction = nb.alloc(shape, out_dtype, MemorySpace.SBUF)
+    nb.activation(correction, neg_sign, nki_ir.NisaActivationOp.RELU)
+    # floor = trunc - correction
+    result = nb.alloc(shape, out_dtype, MemorySpace.SBUF)
+    nb.tensor_tensor_arith(result, trunc_f, correction, nki_ir.NisaArithOp.SUBTRACT)
+    return result
