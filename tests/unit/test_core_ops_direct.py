@@ -340,6 +340,8 @@ class TestConvErrors:
 class TestReduceErrors:
     def test_reduce_unsupported_op(self, trace_mode):
         """_build_reduction_hlo with unsupported op raises NotImplementedError."""
+        if trace_mode != "hlo":
+            pytest.skip("HLO-specific internal API test")
 
         def kernel(x):
             from nkipy.core.ops._hlo_impls import _build_reduction_hlo
@@ -448,6 +450,8 @@ class TestTransformErrors:
 
     def test_topk_non_last_axis(self, trace_mode):
         """topk on non-last axis raises NotImplementedError in HLO."""
+        if trace_mode != "hlo":
+            pytest.skip("HLO-specific error behavior")
         from nkipy.core import tensor_apis
 
         def kernel(x):

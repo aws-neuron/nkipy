@@ -494,12 +494,27 @@ def reshape(x, newshape, order='C'):
 def expand_dims(x, axis):
     b = _builder()
     x_val = _unwrap(x)
+    ndim = len(x_val.type.shape)
     if isinstance(axis, (list, tuple)):
-        # Handle multiple axes
+        out_ndim = ndim + len(axis)
+        norm_axes = []
+        for a in axis:
+            if a < -out_ndim or a >= out_ndim:
+                raise ValueError(
+                    f"axis {a} is out of bounds for array of dimension {out_ndim}"
+                )
+            norm_axes.append(a % out_ndim)
+        if len(set(norm_axes)) != len(norm_axes):
+            raise ValueError(f"repeated axis in expand_dims")
         result = x_val
-        for ax in sorted(axis):
+        for ax in sorted(norm_axes):
             result = b.expand_dims(result, ax)
         return _wrap(result)
+    out_ndim = ndim + 1
+    if axis < -out_ndim or axis >= out_ndim:
+        raise ValueError(
+            f"axis {axis} is out of bounds for array of dimension {out_ndim}"
+        )
     return _wrap(b.expand_dims(x_val, axis))
 
 
