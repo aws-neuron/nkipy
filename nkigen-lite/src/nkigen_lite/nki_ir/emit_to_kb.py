@@ -35,6 +35,7 @@ from nkigen_lite.nki_ir.ir import (
     MemorySpace,
     NisaActivationOp,
     NisaArithOp,
+    NisaBitvecOp,
     NisaRangeSelectCmp,
     NisaReduceOp,
 )
@@ -123,6 +124,13 @@ _RANGE_CMP_TO_KB = {
     NisaRangeSelectCmp.IS_GE: nisa.range_select_cmp.IsGe,
     NisaRangeSelectCmp.IS_LE: nisa.range_select_cmp.IsLe,
     NisaRangeSelectCmp.IS_LT: nisa.range_select_cmp.IsLt,
+}
+
+_BITVEC_TO_KB = {
+    NisaBitvecOp.AND: nisa.bitvec_op.BitwiseAnd,
+    NisaBitvecOp.OR: nisa.bitvec_op.BitwiseOr,
+    NisaBitvecOp.XOR: nisa.bitvec_op.BitwiseXor,
+    NisaBitvecOp.NOT: nisa.bitvec_op.BitwiseNot,
 }
 
 
@@ -324,6 +332,15 @@ def _emit_op(op: Op, tiles: dict[str, object]) -> None:
         b = _get(op.inputs[2])
         nisa.tensor_tensor_arith(
             dst=dst, lhs=a, rhs=b, op=_ARITH_TO_KB[op.attrs["op"]],
+        )
+        tiles[op.result.name] = dst
+
+    elif op.opcode == "tensor_tensor_bitvec":
+        dst = _get(op.inputs[0])
+        a = _get(op.inputs[1])
+        b = _get(op.inputs[2])
+        nisa.tensor_tensor_bitvec(
+            dst=dst, lhs=a, rhs=b, op=_BITVEC_TO_KB[op.attrs["op"]],
         )
         tiles[op.result.name] = dst
 

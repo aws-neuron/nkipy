@@ -178,6 +178,14 @@ class NisaReduceOp(str, Enum):
     MIN = "Min"
 
 
+class NisaBitvecOp(str, Enum):
+    """Bitwise ops (maps to nisa.bitvec_op)."""
+    AND = "BitwiseAnd"
+    OR = "BitwiseOr"
+    XOR = "BitwiseXor"
+    NOT = "BitwiseNot"
+
+
 class NisaRangeSelectCmp(str, Enum):
     """Comparison ops for range_select (maps to nisa.range_select_cmp)."""
     IS_EQ = "IsEq"
@@ -1193,6 +1201,25 @@ class Builder:
                 f"operand shape {a.type.shape}"
             )
         return self._emit("tensor_tensor_arith", [dst, a, b], [dst.type], {"op": op}).result
+
+    def tensor_tensor_bitvec(self, dst: Value, a: Value, b: Value, op: NisaBitvecOp) -> Value:
+        """Vector engine tensor-tensor bitwise operation: dst = a op b.
+
+        Requires exact shape match. dst must be pre-allocated.
+        """
+        if a.type.memory == MemorySpace.HBM or b.type.memory == MemorySpace.HBM:
+            raise ValueError("tensor_tensor_bitvec: operands must be on-chip")
+        if a.type.shape != b.type.shape:
+            raise ValueError(
+                f"tensor_tensor_bitvec: shapes must match exactly, "
+                f"got {a.type.shape} vs {b.type.shape}"
+            )
+        if dst.type.shape != a.type.shape:
+            raise ValueError(
+                f"tensor_tensor_bitvec: dst shape {dst.type.shape} != "
+                f"operand shape {a.type.shape}"
+            )
+        return self._emit("tensor_tensor_bitvec", [dst, a, b], [dst.type], {"op": op}).result
 
     def tensor_scalar_arith(
         self,

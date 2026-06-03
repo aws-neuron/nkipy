@@ -20,6 +20,7 @@ from nkigen_lite.nki_ir.ir import (
     MemorySpace,
     NisaActivationOp,
     NisaArithOp,
+    NisaBitvecOp,
     NisaRangeSelectCmp,
     NisaReduceOp,
     TileType,
@@ -50,6 +51,12 @@ _NISA_ARITH_NP = {
     NisaArithOp.MAXIMUM: np.maximum,
     NisaArithOp.MINIMUM: np.minimum,
     NisaArithOp.POW: np.power,
+}
+
+_NISA_BITVEC_NP = {
+    NisaBitvecOp.AND: np.bitwise_and,
+    NisaBitvecOp.OR: np.bitwise_or,
+    NisaBitvecOp.XOR: np.bitwise_xor,
 }
 
 _NISA_REDUCE_NP = {
@@ -237,6 +244,12 @@ def eval_nisa_op(op: Op, get: callable, env: dict[str, np.ndarray]) -> bool:
         if arith not in _NISA_ARITH_NP:
             raise NotImplementedError(f"tensor_tensor op {arith!r}")
         env[op.result.name] = _NISA_ARITH_NP[arith](a, b)
+    elif op.opcode == "tensor_tensor_bitvec":
+        a, b = get(op.inputs[d]), get(op.inputs[d + 1])
+        bitvec = op.attrs["op"]
+        if bitvec not in _NISA_BITVEC_NP:
+            raise NotImplementedError(f"tensor_tensor_bitvec op {bitvec!r}")
+        env[op.result.name] = _NISA_BITVEC_NP[bitvec](a, b)
     elif op.opcode == "tensor_scalar_arith":
         x = get(op.inputs[d])
         operand0 = get(op.inputs[d + 1])

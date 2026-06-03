@@ -204,6 +204,17 @@ class Builder:
     def mod(self, a: Value, b: Value) -> Value:
         return self._binary("mod", a, b)
 
+    # -- bitwise --
+
+    def bitwise_and(self, a: Value, b: Value) -> Value:
+        return self._binary("bitwise_and", a, b)
+
+    def bitwise_or(self, a: Value, b: Value) -> Value:
+        return self._binary("bitwise_or", a, b)
+
+    def bitwise_xor(self, a: Value, b: Value) -> Value:
+        return self._binary("bitwise_xor", a, b)
+
     # -- ternary --
 
     def where(self, cond: Value, a: Value, b: Value) -> Value:

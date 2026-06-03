@@ -6,6 +6,7 @@ from nkigen_lite.nki_ir.ir import (
     TileType,
     NisaActivationOp,
     NisaArithOp,
+    NisaBitvecOp,
     NisaRangeSelectCmp,
     NisaReduceOp,
     Graph,

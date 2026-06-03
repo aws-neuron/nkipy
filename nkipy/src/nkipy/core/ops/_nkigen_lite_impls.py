@@ -185,46 +185,15 @@ def less_equal(x, y, out=None, dtype=None):
 
 # Bitwise ops — implemented as comparison + select patterns for nkigen-lite
 def bitwise_and(x, y, out=None, dtype=None):
-    return _binary_op("mul", x, y, out, dtype)
+    return _binary_op("bitwise_and", x, y, out, dtype)
 
 
 def bitwise_or(x, y, out=None, dtype=None):
-    # a | b = a + b - a * b (for boolean/integer)
-    b = _builder()
-    x_val = _unwrap(x)
-    y_val = _unwrap(y)
-    from nkigen_lite.core import Value
-    if not isinstance(x_val, Value):
-        x_val = _ensure_value(x_val, y_val)
-    if not isinstance(y_val, Value):
-        y_val = _ensure_value(y_val, x_val)
-    if x_val.type.dtype != y_val.type.dtype:
-        y_val = _cast_if_needed(y_val, x_val.type.dtype)
-    x_val, y_val = _broadcast_pair(x_val, y_val)
-    s = b.add(x_val, y_val)
-    p = b.mul(x_val, y_val)
-    result = b.sub(s, p)
-    return _wrap(result)
+    return _binary_op("bitwise_or", x, y, out, dtype)
 
 
 def bitwise_xor(x, y, out=None, dtype=None):
-    # a ^ b = a + b - 2 * a * b (for boolean/integer)
-    b = _builder()
-    x_val = _unwrap(x)
-    y_val = _unwrap(y)
-    from nkigen_lite.core import Value
-    if not isinstance(x_val, Value):
-        x_val = _ensure_value(x_val, y_val)
-    if not isinstance(y_val, Value):
-        y_val = _ensure_value(y_val, x_val)
-    if x_val.type.dtype != y_val.type.dtype:
-        y_val = _cast_if_needed(y_val, x_val.type.dtype)
-    x_val, y_val = _broadcast_pair(x_val, y_val)
-    s = b.add(x_val, y_val)
-    p = b.mul(x_val, y_val)
-    two_p = b.add(p, p)
-    result = b.sub(s, two_p)
-    return _wrap(result)
+    return _binary_op("bitwise_xor", x, y, out, dtype)
 
 
 # ---------------------------------------------------------------------------

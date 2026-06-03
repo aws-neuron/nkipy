@@ -31,6 +31,7 @@ from nkigen_lite.tensor_ir.passes.layout_solver import Layout
 
 from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
     BINARY_OPS,
+    BITWISE_OPS,
     ELEMENTWISE_OPCODES,
     UNARY_OPS,
     ceildiv,
@@ -322,7 +323,7 @@ def _emit_ew_tile(
         out_name = op.results[0].name
         out_dtype = op.results[0].type.dtype
 
-        if op.opcode in BINARY_OPS:
+        if op.opcode in BINARY_OPS or op.opcode in BITWISE_OPS:
             lhs = tile_map[op.inputs[0].name]
             rhs = tile_map[op.inputs[1].name]
             tile_map[out_name] = emit_binary_op(nb, out_dtype, lhs, rhs, op.opcode)
