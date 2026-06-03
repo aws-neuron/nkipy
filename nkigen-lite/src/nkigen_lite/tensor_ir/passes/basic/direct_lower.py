@@ -102,22 +102,26 @@ def lower_graph(graph: Graph, layouts: dict[str, Layout]) -> nki_ir.Graph:
     nb = Builder("direct_lower")
     hbm_map: dict[str, Value] = {}
 
+    def _nki_shape(shape):
+        """NKI requires at least rank-1 tensors."""
+        return shape if len(shape) > 0 else (1,)
+
     # Allocate HBM inputs
     for v in graph.inputs:
-        hbm_map[v.name] = nb.add_input(v.name, v.type.shape, v.type.dtype)
+        hbm_map[v.name] = nb.add_input(v.name, _nki_shape(v.type.shape), v.type.dtype)
 
     # Allocate HBM output buffers
     for out_name, out_val in graph.outputs.items():
         key = f"{out_name}_out"
         if key not in hbm_map:
-            hbm_map[key] = nb.add_input(key, out_val.type.shape, out_val.type.dtype)
+            hbm_map[key] = nb.add_input(key, _nki_shape(out_val.type.shape), out_val.type.dtype)
 
     # Allocate HBM intermediates for all op results
     for op in graph.ops:
         for r in op.results:
             if r.name not in hbm_map:
                 hbm_map[r.name] = nb.alloc(
-                    r.type.shape, r.type.dtype, MemorySpace.HBM
+                    _nki_shape(r.type.shape), r.type.dtype, MemorySpace.HBM
                 )
 
     # Segment and lower
@@ -159,6 +163,13 @@ def lower_graph(graph: Graph, layouts: dict[str, Layout]) -> nki_ir.Graph:
 
 def _emit_hbm_copy(nb: Builder, src: Value, dst: Value, shape: tuple[int, ...]):
     """Copy an entire HBM tensor to another HBM tensor, tiled."""
+    if len(shape) == 0:
+        # HBM buffers may be promoted from () to (1,)
+        src_slices = [DimSlice(0, 1)] * len(src.type.shape)
+        dst_slices = [DimSlice(0, 1)] * len(dst.type.shape)
+        tile = nb.dma_copy(nb.alloc((1, 1), src.type.dtype, MemorySpace.SBUF), src, src_slices)
+        nb.dma_copy(dst, tile, dst_slices)
+        return
     tile_p = min(shape[-2], PARTITION_MAX) if len(shape) >= 2 else 1
     tile_f = shape[-1] if len(shape) >= 2 else shape[0]
     p_extent = shape[-2] if len(shape) >= 2 else 1
@@ -239,6 +250,8 @@ def _split_on_layout_conflict(
 
 def _canonical_layout(rank: int) -> Layout:
     """Return a canonical row-major layout: last dim = F, penultimate = P, rest = I."""
+    if rank == 0:
+        return Layout(i_dims=(), p_dims=(), f_dims=())
     if rank == 1:
         return Layout(i_dims=(), p_dims=(), f_dims=(0,))
     f_dims = (rank - 1,)

@@ -256,8 +256,12 @@ class Compiler:
 
         target_str = self._resolve_target().value
 
-        # Lower tensor_ir → nki_ir
+        # Lower tensor_ir → nki_ir (canonicalize/decompose mutate ir._graph)
         nki_graph = lower_to_nki(ir._graph)
+
+        # Update output specs to reflect shape changes from lowering
+        # (e.g. scalar () → (1,) for NKI compatibility)
+        ir._sync_output_specs_from_nki_graph(nki_graph)
 
         # Build kernel function from nki_ir
         kernel_fn = build_kb_kernel(nki_graph)

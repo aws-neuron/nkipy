@@ -287,6 +287,9 @@ class Builder:
         return self._emit("broadcast_to", [x], [rt], {"shape": shape}).result
 
     def expand_dims(self, x: Value, axis: int) -> Value:
+        ndim = len(x.type.shape) + 1  # rank after insertion
+        if axis < 0:
+            axis = ndim + axis
         new_shape = list(x.type.shape)
         new_shape.insert(axis, 1)
         return self.reshape(x, tuple(new_shape))

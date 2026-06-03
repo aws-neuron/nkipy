@@ -560,11 +560,13 @@ def squeeze(x, axis=None):
     b = _builder()
     x_val = _unwrap(x)
     shape = x_val.type.shape
+    rank = len(shape)
     if axis is None:
         new_shape = tuple(d for d in shape if d != 1)
     else:
         if isinstance(axis, int):
             axis = (axis,)
+        axis = tuple(a % rank for a in axis)
         new_shape = tuple(d for i, d in enumerate(shape) if i not in axis)
     if new_shape == shape:
         return x if isinstance(x, NKIPyTensorRef) else _wrap(x_val)

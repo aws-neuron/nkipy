@@ -418,7 +418,7 @@ class TestReduceMeanDecompose:
         b.set_outputs({"r": b.reduce(x, axis=1, kind="mean")})
         inputs = {"x": np.random.randn(4, 8).astype(np.float32)}
         n = self._run_and_compare_decompose(b.graph, inputs)
-        assert n == 1
+        assert n == 2  # ReduceKeepdimsFalse + ReduceMean
         reduce_ops = [op for op in b.graph.ops if op.opcode == "reduce"]
         assert all(op.attrs["kind"] != "mean" for op in reduce_ops)
         assert any(op.attrs["kind"] == "sum" for op in reduce_ops)
@@ -444,7 +444,7 @@ class TestReduceMeanDecompose:
         b.set_outputs({"r": b.reduce(x, axis=(1, 2), kind="mean")})
         inputs = {"x": np.random.randn(2, 4, 8).astype(np.float32)}
         n = self._run_and_compare_decompose(b.graph, inputs)
-        assert n == 1
+        assert n == 2  # ReduceKeepdimsFalse + ReduceMean
         reduce_ops = [op for op in b.graph.ops if op.opcode == "reduce"]
         assert all(op.attrs["kind"] != "mean" for op in reduce_ops)
 
@@ -455,7 +455,7 @@ class TestReduceMeanDecompose:
         b.set_outputs({"r": b.reduce(x, axis=0, kind="mean")})
         inputs = {"x": np.random.randn(16, 4).astype(np.float32)}
         n = self._run_and_compare_decompose(b.graph, inputs)
-        assert n == 1
+        assert n == 2  # ReduceKeepdimsFalse + ReduceMean
 
     def test_mixed_div_and_reduce_mean(self):
         """Both div and reduce(kind="mean") get decomposed in a single pass."""

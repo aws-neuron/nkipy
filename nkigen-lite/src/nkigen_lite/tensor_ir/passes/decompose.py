@@ -78,6 +78,47 @@ class DivPattern(DecomposePattern):
         graph.replace_value(op.result, mul_op.result)
 
 
+class ReduceKeepdimsFalsePattern(DecomposePattern):
+    """reduce(x, keepdims=False) → reshape(reduce(x, keepdims=True), squeezed_shape)
+
+    The layout solver and direct lowering require keepdims=True so that the
+    reduce output retains the same rank/layout as its input. We decompose
+    keepdims=False into a keepdims=True reduce followed by a reshape that
+    drops the reduced dimensions.
+    """
+
+    def match(self, op):
+        if op.opcode != "reduce":
+            return None
+        if op.attrs.get("keepdims", False):
+            return None
+        x = op.inputs[0]
+        axes = op.attrs["axis"]
+        kind = op.attrs["kind"]
+        keepdims_shape = tuple(
+            1 if i in axes else s for i, s in enumerate(x.type.shape)
+        )
+        return {"x": x, "axes": axes, "kind": kind, "keepdims_shape": keepdims_shape}
+
+    def rewrite(self, op, data, graph):
+        from nkigen_lite.tensor_ir.ir import TensorType
+
+        keepdims_type = TensorType(data["keepdims_shape"], op.result.type.dtype)
+        reduce_op = Op(
+            "reduce", [data["x"]], [keepdims_type],
+            {"axis": data["axes"], "keepdims": True, "kind": data["kind"]},
+            counter=graph.counter,
+        )
+        graph.insert_before(op, reduce_op)
+        reshape_op = Op(
+            "reshape", [reduce_op.result], [op.result.type],
+            {"shape": op.result.type.shape},
+            counter=graph.counter,
+        )
+        graph.insert_before(op, reshape_op)
+        graph.replace_value(op.result, reshape_op.result)
+
+
 class ReduceMeanPattern(DecomposePattern):
     """reduce(x, kind="mean") → mul(reduce(x, kind="sum"), constant(1/N))"""
 
@@ -273,6 +314,9 @@ class PowerPattern(DecomposePattern):
 
 
 DECOMPOSE_PATTERNS: list[DecomposePattern] = [
+    # ReduceKeepdimsFalse must run before ReduceMean so keepdims=False reduces
+    # become keepdims=True+reshape before mean decomposition fires.
+    ReduceKeepdimsFalsePattern(),
     # FloorDivide/Mod must run before DivPattern since they emit 'div' nodes
     # that DivPattern will decompose in a subsequent iteration.
     FloorDividePattern(),

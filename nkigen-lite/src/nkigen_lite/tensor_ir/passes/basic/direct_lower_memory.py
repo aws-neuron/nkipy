@@ -450,10 +450,26 @@ def _emit_concat_input(
 
 def emit_reshape(nb: Builder, x_hbm, y_hbm, in_shape, out_shape, dtype) -> None:
     """Emit reshape tiling into an existing Builder."""
-    if in_shape[-1] == out_shape[-1]:
+    if len(out_shape) == 0 or len(in_shape) == 0:
+        _emit_reshape_scalar(nb, x_hbm, y_hbm, in_shape, out_shape, dtype)
+    elif in_shape[-1] == out_shape[-1]:
         _emit_reshape_same_f(nb, x_hbm, y_hbm, in_shape, out_shape, dtype)
     else:
         _emit_reshape_diff_f(nb, x_hbm, y_hbm, in_shape, out_shape, dtype)
+
+
+def _emit_reshape_scalar(nb, x_hbm, y_hbm, in_shape, out_shape, dtype):
+    """Handle reshape to/from scalar (rank-0) tensors.
+
+    HBM buffers may have been promoted from () to (1,) by the lowering,
+    so use the actual HBM tensor rank for slice construction.
+    """
+    src_rank = len(x_hbm.type.shape)
+    dst_rank = len(y_hbm.type.shape)
+    src_slices = [DimSlice(0, 1)] * src_rank
+    dst_slices = [DimSlice(0, 1)] * dst_rank
+    tile = nb.dma_copy(nb.alloc((1, 1), dtype, MemorySpace.SBUF), x_hbm, src_slices)
+    nb.dma_copy(y_hbm, tile, dst_slices)
 
 
 def _emit_reshape_same_f(nb, x_hbm, y_hbm, in_shape, out_shape, dtype):
