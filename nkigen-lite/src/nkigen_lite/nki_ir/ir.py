@@ -169,6 +169,17 @@ class NisaArithOp(str, Enum):
     MAXIMUM = "Maximum"
     MINIMUM = "Minimum"
     POW = "Pow"
+    # Comparison ops (produce uint8 predicate output)
+    IS_GT = "IsGT"
+    IS_GE = "IsGE"
+    IS_LT = "IsLT"
+    IS_LE = "IsLE"
+    IS_EQ = "IsEQ"
+    IS_NE = "IsNE"
+    # Logical ops (operate on uint8 predicates)
+    LOGICAL_XOR = "LogicalXor"
+    LOGICAL_AND = "LogicalAnd"
+    LOGICAL_OR = "LogicalOr"
 
 
 class NisaReduceOp(str, Enum):
@@ -1220,6 +1231,44 @@ class Builder:
                 f"operand shape {a.type.shape}"
             )
         return self._emit("tensor_tensor_bitvec", [dst, a, b], [dst.type], {"op": op}).result
+
+    def tensor_tensor_compare(self, dst: Value, a: Value, b: Value, op: NisaArithOp) -> Value:
+        """Vector engine tensor-tensor comparison: dst = a op b (predicate output).
+
+        Unlike tensor_tensor_arith, allows dtype mismatch: inputs can be float
+        while dst is uint8 (predicate). Uses the same nisa.tensor_tensor_arith
+        instruction with comparison ops (IsGT, IsGE, etc.).
+        """
+        if a.type.memory == MemorySpace.HBM or b.type.memory == MemorySpace.HBM:
+            raise ValueError("tensor_tensor_compare: operands must be on-chip")
+        if a.type.shape != b.type.shape:
+            raise ValueError(
+                f"tensor_tensor_compare: shapes must match, "
+                f"got {a.type.shape} vs {b.type.shape}"
+            )
+        if dst.type.shape != a.type.shape:
+            raise ValueError(
+                f"tensor_tensor_compare: dst shape {dst.type.shape} != "
+                f"operand shape {a.type.shape}"
+            )
+        return self._emit("tensor_tensor_arith", [dst, a, b], [dst.type], {"op": op}).result
+
+    def tensor_scalar_bitvec(
+        self, dst: Value, x: Value, operand0: Value, op0: NisaBitvecOp,
+    ) -> Value:
+        """Vector engine tensor-scalar bitwise operation: dst = x op0 operand0.
+
+        Scalar operand must have free_size=1 (broadcast along free dims).
+        Maps to nisa.tensor_scalar_bitvec.
+        """
+        if x.type.memory == MemorySpace.HBM:
+            raise ValueError("tensor_scalar_bitvec: operands must be on-chip")
+        if operand0.type.free_size != 1:
+            raise ValueError(
+                f"tensor_scalar_bitvec: operand0 must have free_size=1, "
+                f"got shape {operand0.type.shape}"
+            )
+        return self._emit("tensor_scalar_bitvec", [dst, x, operand0], [dst.type], {"op0": op0}).result
 
     def tensor_scalar_arith(
         self,

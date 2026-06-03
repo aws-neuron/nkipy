@@ -99,6 +99,15 @@ _ARITH_TO_KB = {
     NisaArithOp.MAXIMUM: nisa.arith_op.Max,
     NisaArithOp.MINIMUM: nisa.arith_op.Min,
     NisaArithOp.POW: nisa.arith_op.Pow,
+    NisaArithOp.IS_GT: nisa.arith_op.IsGT,
+    NisaArithOp.IS_GE: nisa.arith_op.IsGE,
+    NisaArithOp.IS_LT: nisa.arith_op.IsLT,
+    NisaArithOp.IS_LE: nisa.arith_op.IsLE,
+    NisaArithOp.IS_EQ: nisa.arith_op.IsEQ,
+    NisaArithOp.IS_NE: nisa.arith_op.IsNE,
+    NisaArithOp.LOGICAL_XOR: nisa.arith_op.LogicalXor,
+    NisaArithOp.LOGICAL_AND: nisa.arith_op.LogicalAnd,
+    NisaArithOp.LOGICAL_OR: nisa.arith_op.LogicalOr,
 }
 
 _REDUCE_TO_KB = {
@@ -342,6 +351,14 @@ def _emit_op(op: Op, tiles: dict[str, object]) -> None:
         nisa.tensor_tensor_bitvec(
             dst=dst, lhs=a, rhs=b, op=_BITVEC_TO_KB[op.attrs["op"]],
         )
+        tiles[op.result.name] = dst
+
+    elif op.opcode == "tensor_scalar_bitvec":
+        dst = _get(op.inputs[0])
+        x = _get(op.inputs[1])
+        operand0 = _get(op.inputs[2])
+        op0 = _BITVEC_TO_KB[op.attrs["op0"]]
+        nisa.tensor_scalar_bitvec(dst=dst, src=x, operand0=operand0, op0=op0)
         tiles[op.result.name] = dst
 
     elif op.opcode == "tensor_scalar_arith":

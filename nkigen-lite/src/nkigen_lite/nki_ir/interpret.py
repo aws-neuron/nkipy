@@ -51,6 +51,15 @@ _NISA_ARITH_NP = {
     NisaArithOp.MAXIMUM: np.maximum,
     NisaArithOp.MINIMUM: np.minimum,
     NisaArithOp.POW: np.power,
+    NisaArithOp.IS_GT: np.greater,
+    NisaArithOp.IS_GE: np.greater_equal,
+    NisaArithOp.IS_LT: np.less,
+    NisaArithOp.IS_LE: np.less_equal,
+    NisaArithOp.IS_EQ: np.equal,
+    NisaArithOp.IS_NE: np.not_equal,
+    NisaArithOp.LOGICAL_XOR: np.logical_xor,
+    NisaArithOp.LOGICAL_AND: np.logical_and,
+    NisaArithOp.LOGICAL_OR: np.logical_or,
 }
 
 _NISA_BITVEC_NP = {
@@ -250,6 +259,13 @@ def eval_nisa_op(op: Op, get: callable, env: dict[str, np.ndarray]) -> bool:
         if bitvec not in _NISA_BITVEC_NP:
             raise NotImplementedError(f"tensor_tensor_bitvec op {bitvec!r}")
         env[op.result.name] = _NISA_BITVEC_NP[bitvec](a, b)
+    elif op.opcode == "tensor_scalar_bitvec":
+        x = get(op.inputs[d])
+        operand0 = get(op.inputs[d + 1])
+        op0 = op.attrs["op0"]
+        if op0 not in _NISA_BITVEC_NP:
+            raise NotImplementedError(f"tensor_scalar_bitvec op0 {op0!r}")
+        env[op.result.name] = _NISA_BITVEC_NP[op0](x, operand0)
     elif op.opcode == "tensor_scalar_arith":
         x = get(op.inputs[d])
         operand0 = get(op.inputs[d + 1])

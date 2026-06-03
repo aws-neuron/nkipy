@@ -396,42 +396,55 @@ def emit_unary_op(nb: Builder, out_dtype: DType, src: Value, opcode: str) -> Val
 
 
 def _emit_floor(nb: Builder, out_dtype: DType, src: Value) -> Value:
-    """Emit floor(x) as a multi-instruction NISA sequence.
+    """Emit floor(x) using the NKI compiler's compare+select pattern.
 
-    NISA has no native floor instruction.  We implement it via integer
-    truncation with sign-based correction (same pattern as neuronx-cc):
+    Pattern (from nki.language.operators.floor):
+      1. casted      = tensor_copy(x → i32)    — truncate toward zero
+      2. casted_back = tensor_copy(casted → f)  — back to float
+      3. condition   = casted_back > x          — true when trunc overshot
+      4. cond_not    = condition XOR 1          — logical NOT
+      5. casted_m1   = casted - 1              — trunc minus one (int)
+      6. larger      = condition * casted_m1    — selected when overshot
+      7. smaller     = cond_not * casted        — selected otherwise
+      8. result      = larger + smaller         — final floor (cast to out_dtype)
 
-      1. trunc_i32 = tensor_copy(x)        — f32 → i32 truncates toward zero
-      2. trunc_f   = tensor_copy(trunc_i32) — i32 → f32 back to float
-      3. diff      = x - trunc_f            — fractional residual
-      4. correction = relu(-sign(diff))     — 1 when x < trunc (negative frac)
-      5. floor     = trunc_f - correction   — subtract 1 for negative fracs
-
-    This correctly handles negative values: floor(-2.3) → trunc=-2,
-    diff=-0.3, sign(diff)=-1, relu(-(-1))=1, result=-2-1=-3. ✓
+    Uses integer arithmetic for the conditional select to avoid float
+    precision issues in the correction step.
     """
     shape = src.type.shape
-    # trunc(x) = cast(cast(x, i32), f32)
-    trunc_i32 = nb.alloc(shape, DType.I32, MemorySpace.SBUF)
-    nb.tensor_copy(trunc_i32, src)
-    trunc_f = nb.alloc(shape, out_dtype, MemorySpace.SBUF)
-    nb.tensor_copy(trunc_f, trunc_i32)
-    # correction: if x < trunc(x) then floor = trunc - 1
-    # x < trunc means frac is negative (i.e. x is negative and not integer)
-    # diff = x - trunc
-    diff = nb.alloc(shape, out_dtype, MemorySpace.SBUF)
-    nb.tensor_tensor_arith(diff, src, trunc_f, nki_ir.NisaArithOp.SUBTRACT)
-    # sign_diff = sign(diff): -1 if x<trunc, 0 if x==trunc, 1 if x>trunc
-    sign_diff = nb.alloc(shape, out_dtype, MemorySpace.SBUF)
-    nb.activation(sign_diff, diff, nki_ir.NisaActivationOp.SIGN)
-    # neg_part = relu(-sign_diff): 1 when x<trunc, 0 otherwise
-    neg_sign = nb.alloc(shape, out_dtype, MemorySpace.SBUF)
     p = shape[0]
-    neg_one = nb.constant(-1.0, (p, 1), out_dtype, MemorySpace.SBUF)
-    nb.tensor_scalar_arith(neg_sign, sign_diff, neg_one, nki_ir.NisaArithOp.MULTIPLY)
-    correction = nb.alloc(shape, out_dtype, MemorySpace.SBUF)
-    nb.activation(correction, neg_sign, nki_ir.NisaActivationOp.RELU)
-    # floor = trunc - correction
+
+    # trunc(x) via int32 cast (rounds toward zero)
+    casted = nb.alloc(shape, DType.I32, MemorySpace.SBUF)
+    nb.tensor_copy(casted, src)
+
+    # cast back to float for comparison
+    casted_back = nb.alloc(shape, out_dtype, MemorySpace.SBUF)
+    nb.tensor_copy(casted_back, casted)
+
+    # condition = (casted_back > x): uint8 predicate, 1 when trunc overshot
+    condition = nb.alloc(shape, DType.U8, MemorySpace.SBUF)
+    nb.tensor_tensor_compare(condition, casted_back, src, nki_ir.NisaArithOp.IS_GT)
+
+    # cond_not = condition XOR 1 (logical NOT)
+    one_u8 = nb.constant(1.0, (p, 1), DType.U8, MemorySpace.SBUF)
+    cond_not = nb.alloc(shape, DType.U8, MemorySpace.SBUF)
+    nb.tensor_scalar_bitvec(cond_not, condition, one_u8, nki_ir.NisaBitvecOp.XOR)
+
+    # casted_m1 = casted - 1 (integer subtraction)
+    one_i32 = nb.constant(1.0, (p, 1), DType.I32, MemorySpace.SBUF)
+    casted_m1 = nb.alloc(shape, DType.I32, MemorySpace.SBUF)
+    nb.tensor_scalar_arith(casted_m1, casted, one_i32, nki_ir.NisaArithOp.SUBTRACT)
+
+    # larger = condition * casted_m1 (mixed-dtype: u8 × i32 → out_dtype)
+    larger = nb.alloc(shape, out_dtype, MemorySpace.SBUF)
+    nb.tensor_tensor_compare(larger, condition, casted_m1, nki_ir.NisaArithOp.MULTIPLY)
+
+    # smaller = cond_not * casted (mixed-dtype: u8 × i32 → out_dtype)
+    smaller = nb.alloc(shape, out_dtype, MemorySpace.SBUF)
+    nb.tensor_tensor_compare(smaller, cond_not, casted, nki_ir.NisaArithOp.MULTIPLY)
+
+    # result = larger + smaller
     result = nb.alloc(shape, out_dtype, MemorySpace.SBUF)
-    nb.tensor_tensor_arith(result, trunc_f, correction, nki_ir.NisaArithOp.SUBTRACT)
+    nb.tensor_tensor_arith(result, larger, smaller, nki_ir.NisaArithOp.ADD)
     return result
