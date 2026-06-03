@@ -372,6 +372,9 @@ def _compile_nisa_to_neff(
         debug_dir = os.path.join(dump_dir, "neff")
     else:
         debug_dir = tempfile.mkdtemp(prefix="e2e_compile_")
+    if os.path.isdir(debug_dir):
+        import shutil
+        shutil.rmtree(debug_dir)
     os.makedirs(debug_dir, exist_ok=True)
 
     opts = CompileOptions(
