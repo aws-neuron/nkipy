@@ -229,11 +229,7 @@ class TestFReducePartialF:
 class TestPReduceGpsimd:
     """P-dim reduction via cross_lane_reduce_arith."""
 
-    @pytest.mark.parametrize("kind", ["sum", "max",
-        pytest.param("min", marks=pytest.mark.xfail(
-            strict=True, raises=KeyError,
-            reason="emit_to_kb lacks cross_lane_reduce_arith MIN mapping")),
-    ])
+    @pytest.mark.parametrize("kind", ["sum", "max", "min"])
     def test_basic_kinds(self, kind):
         rng = np.random.default_rng(42)
 
@@ -316,8 +312,6 @@ class TestPReduceGpsimd:
             "x": rng.standard_normal((300, 100)).astype(np.float32),
         })
 
-    @pytest.mark.xfail(strict=True, raises=KeyError,
-                       reason="emit_to_kb lacks cross_lane_reduce_arith MIN mapping")
     def test_large_p_min(self):
         """P > 128: tiles and combines partial reductions (min)."""
         rng = np.random.default_rng(5)
@@ -520,12 +514,7 @@ class TestFReduceNonSuffix:
 class TestUnifiedReduce:
     """Tests for the unified lower_reduce entry point."""
 
-    @pytest.mark.parametrize("kind", ["sum", "max",
-        pytest.param("min", marks=pytest.mark.xfail(
-            strict=True, raises=KeyError,
-            reason="emit_to_kb lacks cross_lane_reduce_arith MIN mapping")),
-        "mean",
-    ])
+    @pytest.mark.parametrize("kind", ["sum", "max", "min", "mean"])
     def test_all_dims_rank2(self, kind):
         """Reduce all dims of a rank-2 tensor (mixed P/F)."""
         rng = np.random.default_rng(30)

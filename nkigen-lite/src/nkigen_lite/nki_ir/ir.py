@@ -716,6 +716,9 @@ class Builder:
         axes via the Vector Engine).
 
         dst must be pre-allocated with partition dim = 1.
+
+        MIN is decomposed to negate→MAX→negate since hardware only
+        supports Add and Max for cross-lane reduction.
         """
         if x.type.memory == MemorySpace.HBM:
             raise ValueError("cross_lane_reduce_arith: operand must be on-chip")
@@ -728,6 +731,23 @@ class Builder:
             raise ValueError(
                 f"cross_lane_reduce_arith: dst shape {dst.type.shape} != "
                 f"expected {expected_shape}"
+            )
+        if op == NisaReduceOp.MIN:
+            # min(x) = -max(-x)
+            p_size = x.type.shape[0]
+            neg_const = self.constant(-1.0, (p_size, 1), x.type.dtype, MemorySpace.SBUF)
+            neg_x = self.alloc(x.type.shape, x.type.dtype, MemorySpace.SBUF)
+            neg_x = self.tensor_scalar_arith(
+                neg_x, x, neg_const, NisaArithOp.MULTIPLY
+            )
+            max_neg = self._emit(
+                "cross_lane_reduce_arith", [dst, neg_x], [dst.type],
+                {"op": NisaReduceOp.MAX},
+            ).result
+            neg_const_out = self.constant(-1.0, (1, 1), dst.type.dtype, MemorySpace.SBUF)
+            neg_result = self.alloc(dst.type.shape, dst.type.dtype, MemorySpace.SBUF)
+            return self.tensor_scalar_arith(
+                neg_result, max_neg, neg_const_out, NisaArithOp.MULTIPLY
             )
         return self._emit(
             "cross_lane_reduce_arith", [dst, x], [dst.type], {"op": op},
