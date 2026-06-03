@@ -50,6 +50,15 @@ def _ensure_value(x, ref_value):
     if isinstance(x, NKIPyTensorRef):
         return x.backend_tensor.handle
     b = _builder()
+    if isinstance(x, np.ndarray):
+        if x.ndim == 0:
+            return b.constant(float(x.item()), ref_value.type.shape, ref_value.type.dtype)
+        flat = x.ravel()
+        if np.all(flat == flat[0]):
+            return b.constant(float(flat[0]), ref_value.type.shape, ref_value.type.dtype)
+        raise NotImplementedError(
+            f"Non-uniform numpy array constants not yet supported in nkigen-lite"
+        )
     shape = ref_value.type.shape
     dtype = ref_value.type.dtype
     return b.constant(float(x), shape, dtype)
@@ -304,11 +313,28 @@ def matmul(x, y, out=None, dtype=None):
         y_val = _ensure_value(y_val, x_val)
     if x_val.type.dtype != y_val.type.dtype:
         y_val = _cast_if_needed(y_val, x_val.type.dtype)
-    # Validate shapes — assert to match HLO backend error behavior
+    # 1D promotion following NumPy matmul semantics
+    squeeze_lhs = False
+    squeeze_rhs = False
+    if len(x_val.type.shape) == 1:
+        x_val = b.reshape(x_val, (1, x_val.type.shape[0]))
+        squeeze_lhs = True
+    if len(y_val.type.shape) == 1:
+        y_val = b.reshape(y_val, (y_val.type.shape[0], 1))
+        squeeze_rhs = True
     k1 = x_val.type.shape[-1]
-    k2 = y_val.type.shape[-2] if len(y_val.type.shape) >= 2 else y_val.type.shape[0]
-    assert k1 == k2, f"Incompatible shapes for matmul"
-    return _wrap(b.matmul(x_val, y_val))
+    k2 = y_val.type.shape[-2]
+    assert k1 == k2, f"Incompatible shapes for matmul: {x_val.type.shape} @ {y_val.type.shape}"
+    result = b.matmul(x_val, y_val)
+    if squeeze_lhs and squeeze_rhs:
+        result = b.reshape(result, ())
+    elif squeeze_lhs:
+        new_shape = result.type.shape[:-2] + result.type.shape[-1:]
+        result = b.reshape(result, new_shape)
+    elif squeeze_rhs:
+        new_shape = result.type.shape[:-1]
+        result = b.reshape(result, new_shape)
+    return _wrap(result)
 
 
 # ---------------------------------------------------------------------------
@@ -399,12 +425,16 @@ def reduce_var(x, axis=None, keepdims=False, **kwargs):
 def zeros(shape, dtype=np.float32):
     b = _builder()
     lite_dtype = np_dtype_to_lite(np.dtype(dtype))
+    if isinstance(shape, int):
+        shape = (shape,)
     return _wrap(b.zeros(tuple(shape), lite_dtype))
 
 
 def full(shape, fill_value, dtype=np.float32):
     b = _builder()
     lite_dtype = np_dtype_to_lite(np.dtype(dtype))
+    if isinstance(shape, int):
+        shape = (shape,)
     return _wrap(b.full(tuple(shape), float(fill_value), lite_dtype))
 
 
@@ -447,7 +477,10 @@ def transpose(x, axes=None):
 def reshape(x, newshape, order='C'):
     b = _builder()
     x_val = _unwrap(x)
-    newshape = list(newshape)
+    if isinstance(newshape, int):
+        newshape = [newshape]
+    else:
+        newshape = list(newshape)
     # Resolve -1 dimension
     if -1 in newshape:
         from math import prod
@@ -495,7 +528,16 @@ def astype(x, dtype):
 
 def concatenate(arrays, axis=0, out=None, dtype=None):
     b = _builder()
+    if len(arrays) == 0:
+        raise ValueError("Need at least one tensor to concatenate")
     values = [_unwrap(a) for a in arrays]
+    if len(values) == 1:
+        return arrays[0] if isinstance(arrays[0], NKIPyTensorRef) else _wrap(values[0])
+    rank = len(values[0].type.shape)
+    if axis < -rank or axis >= rank:
+        raise ValueError(
+            f"axis {axis} is out of bounds for array of dimension {rank}"
+        )
     return _wrap(b.concat(values, axis=axis))
 
 
@@ -505,6 +547,9 @@ def where(condition, x, y):
     x_val = _unwrap(x)
     y_val = _unwrap(y)
     from nkigen_lite.core import Value, DType
+    if not isinstance(c_val, Value):
+        ref = x_val if isinstance(x_val, Value) else y_val
+        c_val = _ensure_value(c_val, ref)
     if not isinstance(x_val, Value):
         x_val = _ensure_value(x_val, y_val)
     if not isinstance(y_val, Value):
@@ -567,6 +612,12 @@ def squeeze(x, axis=None):
         if isinstance(axis, int):
             axis = (axis,)
         axis = tuple(a % rank for a in axis)
+        for a in axis:
+            if shape[a] != 1:
+                raise ValueError(
+                    f"cannot select an axis to squeeze out which has size "
+                    f"!= 1 (got {shape[a]} for axis {a})"
+                )
         new_shape = tuple(d for i, d in enumerate(shape) if i not in axis)
     if new_shape == shape:
         return x if isinstance(x, NKIPyTensorRef) else _wrap(x_val)
@@ -590,9 +641,22 @@ def split(x, indices_or_sections, axis=0):
     b = _builder()
     x_val = _unwrap(x)
     shape = x_val.type.shape
+    rank = len(shape)
+    if axis < -rank or axis >= rank:
+        raise ValueError(
+            f"axis {axis} is out of bounds for array of dimension {rank}"
+        )
+    axis = axis % rank
     if isinstance(indices_or_sections, int):
         sections = indices_or_sections
+        if sections <= 0:
+            raise ValueError("number of sections must be larger than 0")
         size = shape[axis]
+        if size % sections != 0:
+            raise ValueError(
+                f"array split does not result in an equal division: "
+                f"shape {shape} axis {axis} sections {sections}"
+            )
         section_size = size // sections
         results = []
         for i in range(sections):
