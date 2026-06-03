@@ -312,9 +312,52 @@ def _lower_f_broadcast(
     return b.graph
 
 
+def _emit_broadcast_scalar(nb: Builder, x_hbm, y_hbm, out_shape, dtype) -> None:
+    """Broadcast a scalar (rank-0) HBM tensor to an arbitrary output shape."""
+    rank = len(out_shape)
+    # Load scalar as (1, 1) tile
+    src_slices = [DimSlice(0, 1)] * len(x_hbm.type.shape)
+    scalar_tile = nb.dma_copy(
+        nb.alloc((1, 1), dtype, MemorySpace.SBUF), x_hbm, src_slices
+    )
+
+    tile_p = min(out_shape[-2], PARTITION_MAX) if rank >= 2 else 1
+    tile_f = out_shape[-1] if rank >= 1 else 1
+    p_extent = out_shape[-2] if rank >= 2 else 1
+    batch_dims = list(out_shape[:-2]) if rank > 2 else []
+    n_batch = math.prod(batch_dims) if batch_dims else 1
+
+    for bf in range(n_batch):
+        batch_idx = []
+        remaining = bf
+        for d in reversed(batch_dims):
+            batch_idx.append(remaining % d)
+            remaining //= d
+        batch_idx = tuple(reversed(batch_idx))
+
+        for p_i in range(ceildiv(p_extent, tile_p)):
+            p_off = p_i * tile_p
+            p_size = min(tile_p, p_extent - p_off)
+
+            ones = nb.constant(1.0, (p_size, tile_f), dtype, MemorySpace.SBUF)
+            dst = nb.alloc((p_size, tile_f), dtype, MemorySpace.SBUF)
+            dst = nb.tensor_scalar_arith(dst, ones, scalar_tile, NisaArithOp.MULTIPLY)
+
+            dst_slices = [DimSlice(bi, 1) for bi in batch_idx]
+            if rank >= 2:
+                dst_slices.append(DimSlice(p_off, p_size))
+            dst_slices.append(DimSlice(0, tile_f))
+            nb.dma_copy(y_hbm, dst, dst_slices)
+
+
 def emit_broadcast_to(nb: Builder, x_hbm, y_hbm, in_shape, out_shape, dtype) -> None:
     """Emit broadcast_to tiling into an existing Builder."""
     from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import broadcast_partition
+
+    # Scalar input: load the single element and broadcast to all output tiles
+    if len(in_shape) == 0:
+        _emit_broadcast_scalar(nb, x_hbm, y_hbm, out_shape, dtype)
+        return
 
     rank = len(out_shape)
     offset = rank - len(in_shape)

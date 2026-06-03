@@ -338,9 +338,31 @@ def _emit_op(op: Op, tiles: dict[str, object]) -> None:
             kwargs["op1"] = _ARITH_TO_KB[op.attrs["op1"]]
         if op.attrs.get("reverse_operands"):
             kwargs["reverse_operands"] = nisa.tens_scalar_rev_ops.None_
-        nisa.tensor_scalar_arith(
-            dst=dst, src=x, operand0=operand0, op0=op0, **kwargs,
-        )
+        # tensor_scalar_arith requires f32; upcast if needed
+        needs_cast = (op.inputs[1].type.dtype != DType.F32)
+        if needs_cast:
+            x_f32 = nb.compiler.alloc(
+                op.inputs[1].type.shape, nb.float32, space=nb.sbuf)
+            nisa.tensor_copy(dst=x_f32, src=x)
+            op0_f32 = nb.compiler.alloc(
+                op.inputs[2].type.shape, nb.float32, space=nb.sbuf)
+            nisa.tensor_copy(dst=op0_f32, src=operand0)
+            if "operand1" in kwargs:
+                op1_orig = kwargs["operand1"]
+                op1_f32 = nb.compiler.alloc(
+                    op.inputs[3].type.shape, nb.float32, space=nb.sbuf)
+                nisa.tensor_copy(dst=op1_f32, src=op1_orig)
+                kwargs["operand1"] = op1_f32
+            dst_f32 = nb.compiler.alloc(
+                op.inputs[0].type.shape, nb.float32, space=nb.sbuf)
+            nisa.tensor_scalar_arith(
+                dst=dst_f32, src=x_f32, operand0=op0_f32, op0=op0, **kwargs,
+            )
+            nisa.tensor_copy(dst=dst, src=dst_f32)
+        else:
+            nisa.tensor_scalar_arith(
+                dst=dst, src=x, operand0=operand0, op0=op0, **kwargs,
+            )
         tiles[op.result.name] = dst
 
     elif op.opcode == "scalar_tensor_tensor_arith":
