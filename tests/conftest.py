@@ -80,3 +80,4 @@ def pytest_configure(config):
 
         # acquire one Neuron core to do the test
         os.environ["NEURON_RT_NUM_CORES"] = "1"
+        os.environ["NEURON_RT_VISIBLE_CORES"] = str(core_idx)
