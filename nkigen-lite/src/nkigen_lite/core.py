@@ -28,6 +28,7 @@ class DType(str, Enum):
     BF16 = "bf16"
     TF32 = "tf32"
     FP8_E4M3 = "fp8_e4m3"
+    FP8_E4M3_IEEE = "fp8_e4m3_ieee"
     FP8_E5M2 = "fp8_e5m2"
     FP8_E3M4 = "fp8_e3m4"
     I32 = "i32"
@@ -44,6 +45,7 @@ _DTYPE_TO_NP = {
     DType.BF16: ml_dtypes.bfloat16,
     DType.TF32: np.float32,
     DType.FP8_E4M3: ml_dtypes.float8_e4m3fn,
+    DType.FP8_E4M3_IEEE: ml_dtypes.float8_e4m3,
     DType.FP8_E5M2: ml_dtypes.float8_e5m2,
     DType.FP8_E3M4: ml_dtypes.float8_e3m4,
     DType.I32: np.int32,
@@ -61,6 +63,7 @@ _DTYPE_BYTES = {
     DType.BF16: 2,
     DType.TF32: 4,
     DType.FP8_E4M3: 1,
+    DType.FP8_E4M3_IEEE: 1,
     DType.FP8_E5M2: 1,
     DType.FP8_E3M4: 1,
     DType.I32: 4,

@@ -30,6 +30,7 @@ def _lite_dtype_to_kb(lite_dtype):
         DType.BF16: nb.bfloat16,
         DType.TF32: nb.tfloat32,
         DType.FP8_E4M3: nb.float8_e4m3fn,
+        DType.FP8_E4M3_IEEE: nb.float8_e4m3,
         DType.FP8_E5M2: nb.float8_e5m2,
         DType.FP8_E3M4: nb.float8_e3m4,
         DType.I32: nb.int32,
