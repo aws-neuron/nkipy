@@ -534,6 +534,84 @@ def test_nki_wrap_kernel_beta3():
 @pytest.mark.skipif(
     not BETA3_NKI_AVAILABLE, reason="Beta 3 NKI frontend (nki >= 0.4) not available"
 )
+def test_nki_mutable_tensor_beta3():
+    """Test in-place (mutable) tensor aliasing with beta 3 frontend."""
+
+    @nki_beta3.jit
+    def nki_inplace_add_kernel(a_input, b_input):
+        ix = nl_beta3.affine_range(128)
+        iy = nl_beta3.affine_range(512)
+        a_tile = nl_beta3.load(a_input[ix, iy])
+        b_tile = nl_beta3.load(b_input[ix, iy])
+        c_tile = nl_beta3.add(a_tile, b_tile)
+        nl_beta3.store(a_input[ix, iy], value=c_tile)
+        return a_input
+
+    a = np.random.rand(128, 512).astype(np.float32)
+    b = np.random.rand(128, 512).astype(np.float32)
+
+    nki_op = wrap_nki_kernel(
+        nki_inplace_add_kernel,
+        [a, b],
+        is_nki_beta_3_version=True,
+        platform_target="trn2",
+    )
+
+    def test_func(a_input, b_input):
+        a_input = nki_op(a_input, b_input)
+        return a_input
+
+    traced = NKIPyKernel.trace(test_func, backend="hlo")
+    traced.specialize(a, b)
+
+
+@pytest.mark.skipif(
+    not BETA3_NKI_AVAILABLE, reason="Beta 3 NKI frontend (nki >= 0.4) not available"
+)
+@pytest.mark.skipif(
+    not NEURON_AVAILABLE,
+    reason="Hardware required - Beta 3 frontend does not support CPU execution",
+)
+def test_nki_mutable_tensor_beta3_hardware():
+    """Test in-place (mutable) tensor on hardware with beta 3 frontend."""
+
+    @nki_beta3.jit
+    def nki_inplace_add_kernel(a_input, b_input):
+        ix = nl_beta3.affine_range(128)
+        iy = nl_beta3.affine_range(512)
+        a_tile = nl_beta3.load(a_input[ix, iy])
+        b_tile = nl_beta3.load(b_input[ix, iy])
+        c_tile = nl_beta3.add(a_tile, b_tile)
+        nl_beta3.store(a_input[ix, iy], value=c_tile)
+        return a_input
+
+    a = np.random.rand(128, 512).astype(np.float32)
+    b = np.random.rand(128, 512).astype(np.float32)
+    ref = a + b
+
+    from nkipy.runtime import DeviceKernel, DeviceTensor
+
+    test_func = NKIPyKernel.trace(
+        lambda a_input, b_input: nki_inplace_add_kernel(a_input, b_input),
+        backend="hlo",
+    )
+
+    device_kernel = DeviceKernel.compile_and_load(
+        test_func, a, b, use_cached_if_exists=False
+    )
+    t_a = DeviceTensor.from_numpy(a)
+    t_b = DeviceTensor.from_numpy(b)
+    device_kernel(
+        inputs={"a_input.must_alias_input": t_a, "b_input": t_b},
+        outputs={"a_input": t_a},
+    )
+
+    baremetal_assert_allclose(t_a.numpy(), ref)
+
+
+@pytest.mark.skipif(
+    not BETA3_NKI_AVAILABLE, reason="Beta 3 NKI frontend (nki >= 0.4) not available"
+)
 @pytest.mark.skipif(
     not NEURON_AVAILABLE,
     reason="Hardware required - Beta 3 frontend does not support CPU execution",
