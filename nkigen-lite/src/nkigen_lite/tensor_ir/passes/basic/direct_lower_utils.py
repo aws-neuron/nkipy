@@ -266,6 +266,15 @@ BITWISE_OPS: dict[str, nki_ir.NisaBitvecOp] = {
     "bitwise_xor": nki_ir.NisaBitvecOp.XOR,
 }
 
+COMPARE_OPS: dict[str, nki_ir.NisaArithOp] = {
+    "equal": nki_ir.NisaArithOp.IS_EQ,
+    "not_equal": nki_ir.NisaArithOp.IS_NE,
+    "greater": nki_ir.NisaArithOp.IS_GT,
+    "greater_equal": nki_ir.NisaArithOp.IS_GE,
+    "less": nki_ir.NisaArithOp.IS_LT,
+    "less_equal": nki_ir.NisaArithOp.IS_LE,
+}
+
 COMMUTATIVE_OPS = {
     nki_ir.NisaArithOp.ADD,
     nki_ir.NisaArithOp.MULTIPLY,
@@ -318,6 +327,8 @@ ELEMENTWISE_OPCODES = frozenset({
     "sigmoid", "silu", "reciprocal", "abs", "sign", "sin", "floor",
     "constant", "cast",
     "bitwise_and", "bitwise_or", "bitwise_xor",
+    "equal", "not_equal", "greater", "greater_equal", "less", "less_equal",
+    "where",
 })
 
 
@@ -328,6 +339,19 @@ ELEMENTWISE_OPCODES = frozenset({
 
 def emit_binary_op(nb: Builder, out_dtype: DType, a: Value, b: Value, opcode: str) -> Value:
     """Emit a binary elementwise op with broadcast alignment."""
+    if opcode in COMPARE_OPS:
+        cmp_op = COMPARE_OPS[opcode]
+        if a.type.shape != b.type.shape:
+            ap, af = a.type.shape
+            bp, bf = b.type.shape
+            out_shape = (max(ap, bp), max(af, bf))
+            if a.type.shape != out_shape:
+                a = broadcast_partition(nb, a, out_shape) if ap < out_shape[0] else a
+            if b.type.shape != out_shape:
+                b = broadcast_partition(nb, b, out_shape) if bp < out_shape[0] else b
+        # Comparison ops produce same dtype as input (1.0/0.0 float)
+        dst = nb.alloc(a.type.shape, a.type.dtype, MemorySpace.SBUF)
+        return nb.tensor_tensor_compare(dst, a, b, cmp_op)
     if opcode in BITWISE_OPS:
         bitvec_op = BITWISE_OPS[opcode]
         if a.type.shape != b.type.shape:

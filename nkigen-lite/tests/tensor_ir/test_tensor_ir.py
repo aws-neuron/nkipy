@@ -254,12 +254,12 @@ class TestBuilderComparison:
     @pytest.mark.parametrize("op_name", [
         "equal", "not_equal", "greater", "greater_equal", "less", "less_equal",
     ])
-    def test_comparison_returns_bool(self, op_name):
+    def test_comparison_returns_same_dtype(self, op_name):
         b = Builder()
         x = b.add_input("x", (4,), DType.F32)
         y = b.add_input("y", (4,), DType.F32)
         result = getattr(b, op_name)(x, y)
-        assert result.type.dtype == DType.BOOL
+        assert result.type.dtype == DType.F32
         assert result.type.shape == (4,)
 
     def test_comparison_not_broadcastable(self):
@@ -276,7 +276,7 @@ class TestBuilderComparison:
         col = b.add_input("col", (1, 4), DType.F32)
         r = b.greater(row, col)
         assert r.type.shape == (3, 4)
-        assert r.type.dtype == DType.BOOL
+        assert r.type.dtype == DType.F32
 
 
 class TestBuilderWhere:
@@ -305,13 +305,15 @@ class TestBuilderWhere:
         r = b.where(c, x, y)
         assert r.type.shape == (4, 3)
 
-    def test_where_non_bool_cond(self):
+    def test_where_float_cond(self):
+        """where accepts float condition (1.0/0.0) — matches NKI convention."""
         b = Builder()
         c = b.add_input("c", (4,), DType.F32)
         x = b.add_input("x", (4,), DType.F32)
         y = b.add_input("y", (4,), DType.F32)
-        with pytest.raises(ValueError, match="cond must be bool"):
-            b.where(c, x, y)
+        r = b.where(c, x, y)
+        assert r.type.shape == (4,)
+        assert r.type.dtype == DType.F32
 
 
 # ===========================

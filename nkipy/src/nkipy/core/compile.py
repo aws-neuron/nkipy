@@ -39,6 +39,7 @@ def _lite_dtype_to_kb(lite_dtype):
         DType.U32: nb.uint32,
         DType.U16: nb.uint16,
         DType.U8: nb.uint8,
+        DType.BOOL: nb.uint8,
     }
     return _map[lite_dtype]
 

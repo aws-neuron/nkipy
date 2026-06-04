@@ -63,6 +63,7 @@ _DTYPE_TO_KB = {
     DType.U32: nb.uint32,
     DType.U16: nb.uint16,
     DType.U8: nb.uint8,
+    DType.BOOL: nb.uint8,
 }
 
 _MEMSPACE_TO_KB = {

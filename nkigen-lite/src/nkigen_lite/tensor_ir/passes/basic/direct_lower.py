@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from math import prod
 
-from nkigen_lite.core import Graph, Value
+from nkigen_lite.core import DType, Graph, Value
 from nkigen_lite.nki_ir.ir import (
     Builder,
     DimSlice,
@@ -32,6 +32,7 @@ from nkigen_lite.tensor_ir.passes.layout_solver import Layout
 from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
     BINARY_OPS,
     BITWISE_OPS,
+    COMPARE_OPS,
     ELEMENTWISE_OPCODES,
     UNARY_OPS,
     ceildiv,
@@ -323,7 +324,7 @@ def _emit_ew_tile(
         out_name = op.results[0].name
         out_dtype = op.results[0].type.dtype
 
-        if op.opcode in BINARY_OPS or op.opcode in BITWISE_OPS:
+        if op.opcode in BINARY_OPS or op.opcode in BITWISE_OPS or op.opcode in COMPARE_OPS:
             lhs = tile_map[op.inputs[0].name]
             rhs = tile_map[op.inputs[1].name]
             tile_map[out_name] = emit_binary_op(nb, out_dtype, lhs, rhs, op.opcode)
@@ -335,6 +336,28 @@ def _emit_ew_tile(
             dst = nb.alloc(src.type.shape, out_dtype, MemorySpace.SBUF)
             nb.tensor_copy(dst, src)
             tile_map[out_name] = dst
+        elif op.opcode == "where":
+            cond = tile_map[op.inputs[0].name]
+            x_true = tile_map[op.inputs[1].name]
+            y_false = tile_map[op.inputs[2].name]
+            from nkigen_lite.nki_ir.ir import NisaArithOp
+            # NKI pattern: result = cond*x + (1-cond)*y
+            # cond is float (1.0/0.0), same dtype as x/y
+            shape = x_true.type.shape
+            # inv_cond = 1.0 - cond
+            ones = nb.constant(1.0, shape, out_dtype, MemorySpace.SBUF)
+            inv_cond = nb.alloc(shape, out_dtype, MemorySpace.SBUF)
+            nb.tensor_tensor_arith(inv_cond, ones, cond, NisaArithOp.SUBTRACT)
+            # mask_x = cond * x
+            mask_x = nb.alloc(shape, out_dtype, MemorySpace.SBUF)
+            nb.tensor_tensor_arith(mask_x, cond, x_true, NisaArithOp.MULTIPLY)
+            # mask_y = inv_cond * y
+            mask_y = nb.alloc(shape, out_dtype, MemorySpace.SBUF)
+            nb.tensor_tensor_arith(mask_y, inv_cond, y_false, NisaArithOp.MULTIPLY)
+            # result = mask_x + mask_y
+            result = nb.alloc(shape, out_dtype, MemorySpace.SBUF)
+            nb.tensor_tensor_arith(result, mask_x, mask_y, NisaArithOp.ADD)
+            tile_map[out_name] = result
         elif op.opcode == "constant":
             out_shape = op.results[0].type.shape
             const_layout = _canonical_layout(len(out_shape))

@@ -540,10 +540,12 @@ def where(condition, x, y):
         y_val = _ensure_value(y_val, x_val)
     if x_val.type.dtype != y_val.type.dtype:
         y_val = _cast_if_needed(y_val, x_val.type.dtype)
-    # Ensure condition is bool
-    if c_val.type.dtype != DType.BOOL:
+    # Ensure condition is float (1.0/0.0) matching x/y dtype
+    if c_val.type.dtype != x_val.type.dtype:
         zero = b.constant(0.0, c_val.type.shape, c_val.type.dtype)
         c_val = b.not_equal(c_val, zero)
+        if c_val.type.dtype != x_val.type.dtype:
+            c_val = b.cast(c_val, x_val.type.dtype)
     # Broadcast all to common shape
     out_shape = np.broadcast_shapes(c_val.type.shape, x_val.type.shape, y_val.type.shape)
     if c_val.type.shape != out_shape:

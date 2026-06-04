@@ -203,16 +203,20 @@ class NkiGenLiteIR:
         """Update output specs to reflect shape changes from lowering.
 
         The NKI lowering may promote scalars to (1,) since NKI doesn't support
-        rank-0 tensors. This syncs output specs from the NKI graph's outputs.
+        rank-0 tensors. Also normalizes BOOL → uint8 since NKI hardware
+        represents booleans as uint8.
         """
-        from nkigen_lite.core import to_np_dtype
+        from nkigen_lite.core import DType, to_np_dtype
         new_specs = []
         for name, old_shape, old_dtype in self._output_specs:
             # NKI graph output keys don't have "_out" suffix
             nki_key = name.replace("_out", "")
             if nki_key in nki_graph.outputs:
                 val = nki_graph.outputs[nki_key]
-                new_specs.append((name, val.type.shape, to_np_dtype(val.type.dtype)))
+                dtype = val.type.dtype
+                # Hardware represents BOOL as uint8
+                np_dtype = np.dtype(np.uint8) if dtype == DType.BOOL else to_np_dtype(dtype)
+                new_specs.append((name, val.type.shape, np_dtype))
             else:
                 new_specs.append((name, old_shape, old_dtype))
         self._output_specs = new_specs

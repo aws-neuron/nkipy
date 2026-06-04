@@ -142,7 +142,8 @@ class Builder:
             raise ValueError(
                 f"{opcode}: shapes {a.type.shape} and {b.type.shape} are not broadcastable"
             )
-        rt = TensorType(out_shape, DType.BOOL)
+        # Produce same dtype as input (1.0/0.0) — matches NKI convention
+        rt = TensorType(out_shape, a.type.dtype)
         return self._emit(opcode, [a, b], [rt]).result
 
     def equal(self, a: Value, b: Value) -> Value:
@@ -218,8 +219,6 @@ class Builder:
     # -- ternary --
 
     def where(self, cond: Value, a: Value, b: Value) -> Value:
-        if cond.type.dtype != DType.BOOL:
-            raise ValueError(f"where: cond must be bool, got {cond.type.dtype}")
         if a.type.dtype != b.type.dtype:
             raise ValueError(f"where: dtype mismatch {a.type.dtype} vs {b.type.dtype}")
         try:
