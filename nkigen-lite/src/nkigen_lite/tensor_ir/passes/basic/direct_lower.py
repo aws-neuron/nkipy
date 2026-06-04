@@ -416,6 +416,7 @@ def _emit_slice_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
         nb, hbm_map[inp_val.name], hbm_map[out_val.name],
         inp_val.type.shape, out_val.type.shape, op.attrs["starts"],
         inp_val.type.dtype,
+        strides=op.attrs.get("strides"),
     )
 
 

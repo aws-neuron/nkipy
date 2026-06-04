@@ -608,9 +608,18 @@ def _emit_reshape_diff_f(nb, x_hbm, y_hbm, in_shape, out_shape, dtype):
                     cur_col = 0
 
 
-def emit_slice(nb: Builder, x_hbm, y_hbm, in_shape, out_shape, starts, dtype) -> None:
+def emit_slice(nb: Builder, x_hbm, y_hbm, in_shape, out_shape, starts, dtype,
+               strides=None) -> None:
     """Emit slice tiling into an existing Builder."""
     rank = len(in_shape)
+    if strides is None:
+        strides = (1,) * rank
+
+    has_non_unit_stride = any(s != 1 for s in strides)
+    if has_non_unit_stride:
+        _emit_strided_slice(nb, x_hbm, y_hbm, in_shape, out_shape, starts, strides, dtype)
+        return
+
     tile_p = min(out_shape[-2], PARTITION_MAX) if rank >= 2 else 1
     tile_f = out_shape[-1] if rank >= 2 else out_shape[0]
     p_extent = out_shape[-2] if rank >= 2 else 1
@@ -639,6 +648,71 @@ def emit_slice(nb: Builder, x_hbm, y_hbm, in_shape, out_shape, starts, dtype) ->
 
             tile = nb.dma_copy(nb.alloc((p_size, tile_f), dtype, MemorySpace.SBUF), x_hbm, src_slices)
             nb.dma_copy(y_hbm, tile, dst_slices)
+
+
+def _emit_strided_slice(nb, x_hbm, y_hbm, in_shape, out_shape, starts, strides, dtype):
+    """Emit strided slice by copying one output row at a time.
+
+    For each output row, computes the source row index using the stride,
+    then copies the appropriate elements. F-dimension strides are handled
+    by copying individual elements.
+    """
+    rank = len(in_shape)
+    if rank == 1:
+        f_stride = strides[0]
+        for i in range(out_shape[0]):
+            src_idx = starts[0] + i * f_stride
+            src_slices = [DimSlice(src_idx, 1)]
+            dst_slices = [DimSlice(i, 1)]
+            tile = nb.dma_copy(nb.alloc((1, 1), dtype, MemorySpace.SBUF), x_hbm, src_slices)
+            nb.dma_copy(y_hbm, tile, dst_slices)
+        return
+
+    # For rank >= 2: iterate over batch dims and P-dim, handle F-dim stride
+    p_stride = strides[-2] if rank >= 2 else 1
+    f_stride = strides[-1]
+    out_p = out_shape[-2] if rank >= 2 else 1
+    out_f = out_shape[-1]
+    batch_dims = list(out_shape[:-2]) if rank > 2 else []
+    n_batch = prod(batch_dims) if batch_dims else 1
+    batch_strides = strides[:-2] if rank > 2 else ()
+
+    for bf in range(n_batch):
+        batch_idx = unravel(bf, batch_dims) if batch_dims else ()
+        for p_out in range(out_p):
+            src_p = starts[-2] + p_out * p_stride if rank >= 2 else 0
+
+            if f_stride == 1:
+                src_slices = []
+                for i, bi in enumerate(batch_idx):
+                    src_slices.append(DimSlice(starts[i] + bi * batch_strides[i], 1))
+                src_slices.append(DimSlice(src_p, 1))
+                src_slices.append(DimSlice(starts[-1], out_f))
+
+                dst_slices = [DimSlice(bi, 1) for bi in batch_idx]
+                dst_slices.append(DimSlice(p_out, 1))
+                dst_slices.append(DimSlice(0, out_f))
+
+                tile = nb.dma_copy(
+                    nb.alloc((1, out_f), dtype, MemorySpace.SBUF), x_hbm, src_slices)
+                nb.dma_copy(y_hbm, tile, dst_slices)
+            else:
+                for f_out in range(out_f):
+                    src_f = starts[-1] + f_out * f_stride
+
+                    src_slices = []
+                    for i, bi in enumerate(batch_idx):
+                        src_slices.append(DimSlice(starts[i] + bi * batch_strides[i], 1))
+                    src_slices.append(DimSlice(src_p, 1))
+                    src_slices.append(DimSlice(src_f, 1))
+
+                    dst_slices = [DimSlice(bi, 1) for bi in batch_idx]
+                    dst_slices.append(DimSlice(p_out, 1))
+                    dst_slices.append(DimSlice(f_out, 1))
+
+                    tile = nb.dma_copy(
+                        nb.alloc((1, 1), dtype, MemorySpace.SBUF), x_hbm, src_slices)
+                    nb.dma_copy(y_hbm, tile, dst_slices)
 
 
 def emit_concat(nb: Builder, input_hbms: list, y_hbm, input_shapes: list, axis: int, dtype) -> None:

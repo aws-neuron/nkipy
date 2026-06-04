@@ -692,6 +692,14 @@ def dynamic_update_slice(x, value, start_indices, update_shape):
     elif isinstance(value, (int, float)):
         lite_dtype = x_val.type.dtype
         value_val = b.full(tuple(update_shape), float(value), lite_dtype)
+    elif isinstance(value, np.ndarray):
+        flat = value.ravel()
+        if np.all(flat == flat[0]):
+            value_val = b.full(tuple(update_shape), float(flat[0]), x_val.type.dtype)
+        else:
+            raise NotImplementedError(
+                "Non-uniform numpy array in dynamic_update_slice not supported"
+            )
     else:
         value_val = value
 
