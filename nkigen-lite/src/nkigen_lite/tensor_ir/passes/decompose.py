@@ -313,6 +313,27 @@ class PowerPattern(DecomposePattern):
         graph.replace_value(op.result, exp_op.result)
 
 
+class CosPattern(DecomposePattern):
+    """cos(x) → sin(x + π/2)"""
+
+    def match(self, op):
+        if op.opcode != "cos":
+            return None
+        return {"x": op.inputs[0]}
+
+    def rewrite(self, op, data, graph):
+        import math
+        x = data["x"]
+        rt = op.result.type
+        half_pi = Op("constant", [], [rt], {"value": math.pi / 2}, counter=graph.counter)
+        graph.insert_before(op, half_pi)
+        shifted = Op("add", [x, half_pi.result], [rt], counter=graph.counter)
+        graph.insert_before(op, shifted)
+        sin_op = Op("sin", [shifted.result], [rt], counter=graph.counter)
+        graph.insert_before(op, sin_op)
+        graph.replace_value(op.result, sin_op.result)
+
+
 DECOMPOSE_PATTERNS: list[DecomposePattern] = [
     # ReduceKeepdimsFalse must run before ReduceMean so keepdims=False reduces
     # become keepdims=True+reshape before mean decomposition fires.
@@ -323,6 +344,7 @@ DECOMPOSE_PATTERNS: list[DecomposePattern] = [
     ModPattern(),
     PowerPattern(),
     CeilPattern(),
+    CosPattern(),
     DivPattern(),
     ReduceMeanPattern(),
 ]
