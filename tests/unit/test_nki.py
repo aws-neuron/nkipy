@@ -1,11 +1,16 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 # Tests for NKI kernel integration with NKIPy
-# Supports both legacy (neuronxcc.nki) and beta 2 (nki) frontends
+# Supports legacy (neuronxcc.nki), beta 2 (nki), and beta 3 (nki >= 0.4) frontends
 
 import numpy as np
 import pytest
-from nkipy.core.nki_op import BETA2_NKI_AVAILABLE, LEGACY_NKI_AVAILABLE, wrap_nki_kernel
+from nkipy.core.nki_op import (
+    BETA2_NKI_AVAILABLE,
+    BETA3_NKI_AVAILABLE,
+    LEGACY_NKI_AVAILABLE,
+    wrap_nki_kernel,
+)
 from nkipy.core.trace import NKIPyKernel
 from utils import (
     NEURON_AVAILABLE,
@@ -24,6 +29,11 @@ if BETA2_NKI_AVAILABLE:
     import nki as nki_beta2
     import nki.isa as nisa_beta2
     import nki.language as nl_beta2
+
+# Import beta 3 frontend
+if BETA3_NKI_AVAILABLE:
+    import nki as nki_beta3
+    import nki.language as nl_beta3
 
 
 @pytest.mark.skipif(
@@ -392,6 +402,169 @@ def test_nki_direct_jit_beta2_kwargs_operand_order():
 
     traced = NKIPyKernel.trace(test_func, backend="hlo")
     traced.specialize(a, b)
+
+
+@pytest.mark.skipif(
+    not BETA3_NKI_AVAILABLE, reason="Beta 3 NKI frontend (nki >= 0.4) not available"
+)
+def test_nki_direct_jit_beta3():
+    """Test direct @nki.jit kernel usage with Beta 3 frontend."""
+
+    @nki_beta3.jit
+    def nki_add_kernel(a_input, b_input):
+        ix = nl_beta3.affine_range(128)
+        iy = nl_beta3.affine_range(512)
+        a_tile = nl_beta3.load(a_input[ix, iy])
+        b_tile = nl_beta3.load(b_input[ix, iy])
+        c_tile = nl_beta3.add(a_tile, b_tile)
+        output = nl_beta3.ndarray(
+            a_input.shape, dtype=a_input.dtype, buffer=nl_beta3.shared_hbm
+        )
+        nl_beta3.store(output[ix, iy], value=c_tile)
+        return output
+
+    a = np.random.rand(128, 512).astype(np.float32)
+    b = np.random.rand(128, 512).astype(np.float32)
+
+    def test_func(a, b):
+        return nki_add_kernel(a, b)
+
+    traced = NKIPyKernel.trace(test_func, backend="hlo")
+    traced.specialize(a, b)
+
+
+@pytest.mark.skipif(
+    not BETA3_NKI_AVAILABLE, reason="Beta 3 NKI frontend (nki >= 0.4) not available"
+)
+def test_nki_direct_jit_beta3_called_twice_different_shapes():
+    """Calling the same @nki.jit beta3 kernel twice with different shapes."""
+
+    @nki_beta3.jit
+    def nki_add_kernel(a_input, b_input):
+        ix = nl_beta3.affine_range(128)
+        iy = nl_beta3.affine_range(512)
+        a_tile = nl_beta3.load(a_input[ix, iy])
+        b_tile = nl_beta3.load(b_input[ix, iy])
+        c_tile = nl_beta3.add(a_tile, b_tile)
+        output = nl_beta3.ndarray(
+            a_input.shape, dtype=a_input.dtype, buffer=nl_beta3.shared_hbm
+        )
+        nl_beta3.store(output[ix, iy], value=c_tile)
+        return output
+
+    a1 = np.random.rand(128, 512).astype(np.float32)
+    b1 = np.random.rand(128, 512).astype(np.float32)
+    a2 = np.random.rand(128, 256).astype(np.float32)
+    b2 = np.random.rand(128, 256).astype(np.float32)
+
+    def test_func(a1, b1, a2, b2):
+        c1 = nki_add_kernel(a1, b1)
+        c2 = nki_add_kernel(a2, b2)
+        return c1, c2
+
+    traced = NKIPyKernel.trace(test_func, backend="hlo")
+    traced.specialize(a1, b1, a2, b2)
+
+
+@pytest.mark.skipif(
+    not BETA3_NKI_AVAILABLE, reason="Beta 3 NKI frontend (nki >= 0.4) not available"
+)
+def test_nki_direct_jit_beta3_kwargs_operand_order():
+    """Tensor operands passed as kwargs must be collected in parameter order (beta 3)."""
+
+    @nki_beta3.jit
+    def nki_add_kernel(a_input, b_input):
+        ix = nl_beta3.affine_range(128)
+        iy = nl_beta3.affine_range(512)
+        a_tile = nl_beta3.load(a_input[ix, iy])
+        b_tile = nl_beta3.load(b_input[ix, iy])
+        c_tile = nl_beta3.add(a_tile, b_tile)
+        output = nl_beta3.ndarray(
+            a_input.shape, dtype=a_input.dtype, buffer=nl_beta3.shared_hbm
+        )
+        nl_beta3.store(output[ix, iy], value=c_tile)
+        return output
+
+    a = np.random.rand(128, 512).astype(np.float32)
+    b = np.random.rand(128, 512).astype(np.float32)
+
+    def test_func(a, b):
+        return nki_add_kernel(b_input=b, a_input=a)
+
+    traced = NKIPyKernel.trace(test_func, backend="hlo")
+    traced.specialize(a, b)
+
+
+@pytest.mark.skipif(
+    not BETA3_NKI_AVAILABLE, reason="Beta 3 NKI frontend (nki >= 0.4) not available"
+)
+def test_nki_wrap_kernel_beta3():
+    """Test wrap_nki_kernel with is_nki_beta_3_version=True."""
+
+    @nki_beta3.jit
+    def nki_add_kernel(a_input, b_input):
+        ix = nl_beta3.affine_range(128)
+        iy = nl_beta3.affine_range(512)
+        a_tile = nl_beta3.load(a_input[ix, iy])
+        b_tile = nl_beta3.load(b_input[ix, iy])
+        c_tile = nl_beta3.add(a_tile, b_tile)
+        output = nl_beta3.ndarray(
+            a_input.shape, dtype=a_input.dtype, buffer=nl_beta3.shared_hbm
+        )
+        nl_beta3.store(output[ix, iy], value=c_tile)
+        return output
+
+    a = np.random.rand(128, 512).astype(np.float32)
+    b = np.random.rand(128, 512).astype(np.float32)
+
+    nki_op = wrap_nki_kernel(
+        nki_add_kernel,
+        [a, b],
+        is_nki_beta_3_version=True,
+        platform_target="trn2",
+    )
+
+    def test_func(a, b):
+        return nki_op(a, b)
+
+    traced = NKIPyKernel.trace(test_func, backend="hlo")
+    traced.specialize(a, b)
+
+
+@pytest.mark.skipif(
+    not BETA3_NKI_AVAILABLE, reason="Beta 3 NKI frontend (nki >= 0.4) not available"
+)
+@pytest.mark.skipif(
+    not NEURON_AVAILABLE,
+    reason="Hardware required - Beta 3 frontend does not support CPU execution",
+)
+def test_nki_simple_beta3_hardware():
+    """Test beta 3 NKI kernel on hardware (hardware only)."""
+
+    @nki_beta3.jit
+    def nki_add_kernel(a_input, b_input):
+        ix = nl_beta3.affine_range(128)
+        iy = nl_beta3.affine_range(512)
+        a_tile = nl_beta3.load(a_input[ix, iy])
+        b_tile = nl_beta3.load(b_input[ix, iy])
+        c_tile = nl_beta3.add(a_tile, b_tile)
+        output = nl_beta3.ndarray(
+            a_input.shape, dtype=a_input.dtype, buffer=nl_beta3.shared_hbm
+        )
+        nl_beta3.store(output[ix, iy], value=c_tile)
+        return output
+
+    a = np.random.rand(128, 512).astype(np.float32)
+    b = np.random.rand(128, 512).astype(np.float32)
+    d = np.random.rand(128, 512).astype(np.float32)
+    ref = a + b + d
+
+    def test_func(a, b, d):
+        c = nki_add_kernel(a, b)
+        return np.add(c, d)
+
+    out_baremetal = on_device_test(test_func, "hlo", a, b, d)
+    baremetal_assert_allclose(ref, out_baremetal)
 
 
 if __name__ == "__main__":

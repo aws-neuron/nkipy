@@ -18,9 +18,10 @@ This module provides three ways to use NKI kernels in NKIPy:
    - Accepts both @nki.jit (HLO backend) and kernel_builder (nkigen backend)
    - Dispatches to the correct implementation based on the active backend
 
-Supports two NKI frontends:
+Supports three NKI frontends:
 - Legacy frontend (neuronxcc.nki): Default, supports CPU execution
-- Beta 2 frontend (nki): New frontend, hardware-only (no CPU execution support)
+- Beta 2 frontend (nki with GenericKernel): Hardware-only (no CPU execution support)
+- Beta 3 frontend (nki with Kernel): Hardware-only, new compilation API
 """
 
 import dataclasses
@@ -47,7 +48,7 @@ except ImportError:
     LegacyUnifiedKernel = None
     LEGACY_NKI_AVAILABLE = False
 
-# Beta 2 frontend (nki)
+# Beta 2 frontend (nki with GenericKernel)
 try:
     from nki.compile import GenericKernel as Beta2GenericKernel
     from nki.compiler.backends.neuron.FrameworkKernel import (
@@ -60,6 +61,19 @@ except ImportError:
     Beta2UnifiedKernel = None
     BETA2_NKI_AVAILABLE = False
 
+# Beta 3 frontend (nki with Kernel + compile_kernel_to_nir)
+try:
+    from nki.framework.kernel import Kernel as Beta3Kernel
+    from nki.framework.compiled import compile_kernel_to_nir as _beta3_compile_kernel_to_nir
+    from nki.compiler.ncc_driver import CompileOptions as Beta3CompileOptions
+
+    BETA3_NKI_AVAILABLE = True
+except ImportError:
+    Beta3Kernel = None
+    _beta3_compile_kernel_to_nir = None
+    Beta3CompileOptions = None
+    BETA3_NKI_AVAILABLE = False
+
 
 def _get_platform_target_default() -> str:
     """Get the default platform target from the system."""
@@ -70,6 +84,26 @@ def _get_platform_target_default() -> str:
     except Exception:
         # Fallback to trn1 if detection fails
         return "trn1"
+
+
+# Beta 3 BIR artifacts must persist until neuronx-cc compiles the HLO module.
+# Use a process-level temp directory that lives until the process exits.
+_beta3_base_artifacts_dir = None
+_beta3_artifacts_counter = 0
+
+
+def _get_beta3_artifacts_dir() -> str:
+    """Get a unique persistent directory for beta 3 BIR artifacts."""
+    import os
+    import tempfile
+
+    global _beta3_base_artifacts_dir, _beta3_artifacts_counter
+    if _beta3_base_artifacts_dir is None:
+        _beta3_base_artifacts_dir = tempfile.mkdtemp(prefix="nkipy_beta3_bir_")
+    _beta3_artifacts_counter += 1
+    subdir = os.path.join(_beta3_base_artifacts_dir, str(_beta3_artifacts_counter))
+    os.makedirs(subdir, exist_ok=True)
+    return subdir
 
 
 def _patch_nkipy_methods(kernel):
@@ -131,8 +165,89 @@ else:
 NKIOp = LegacyNKIOp if LEGACY_NKI_AVAILABLE else Beta2NKIOp
 
 
+def _emit_hlo_custom_call(
+    hlo_operands,
+    tensor_operands,
+    output_shapes,
+    output_dtypes,
+    backend_config,
+    has_collectives,
+    alias_map,
+    is_tuple_return,
+):
+    """Emit the HLO custom-call op shared by all NKI frontends.
+
+    Callers normalize their frontend-specific config into these arguments:
+
+        hlo_operands:    backend tensors passed to the custom-call (inputs +
+                         any frontend-managed constants).
+        tensor_operands: the NKIPyTensorRef inputs, in operand order, used to
+                         resolve output aliases back to their input tensor.
+        output_shapes/output_dtypes: per-output result types.
+        backend_config:  serialized kernel config blob.
+        has_collectives: whether the kernel uses collectives.
+        alias_map:       {input_operand_idx: output_idx} aliasing, indexed over
+                         ``tensor_operands``.
+        is_tuple_return: force a tuple result even for a single output.
+    """
+    ctx = get_hlo_context()
+
+    custom_call_attrs = {
+        "custom_call_target": "AwsNeuronCustomNativeKernel",
+        "backend_config": backend_config,
+    }
+
+    if has_collectives:
+        custom_call_attrs["has_collectives"] = True
+
+    alias_map = alias_map or {}
+    if alias_map:
+        custom_call_attrs["operand_output_aliases"] = alias_map
+    # Invert to output_idx -> input_operand_idx for result construction
+    output_alias_map = {out_idx: in_idx for in_idx, out_idx in alias_map.items()}
+
+    def _resolve(output_idx, result_tensor):
+        """Wrap a result tensor, mutating the aliased input in place if any."""
+        if output_idx in output_alias_map:
+            original = tensor_operands[output_alias_map[output_idx]]
+            original._is_mutated = True
+            original.backend_tensor = result_tensor
+            original._shape = result_tensor.shape
+            original._dtype = result_tensor.dtype
+            return original
+        return NKIPyTensorRef(result_tensor)
+
+    # Single output vs tuple output
+    if len(output_shapes) == 1 and not is_tuple_return:
+        result_tensor = ctx.build_op(
+            "custom-call",
+            hlo_operands,
+            output_shapes[0],
+            output_dtypes[0],
+            custom_call_attrs,
+        )
+        return _resolve(0, result_tensor)
+
+    custom_call_attrs["is_tuple"] = True
+    result_tensor = ctx.build_op(
+        "custom-call", hlo_operands, output_shapes, output_dtypes, custom_call_attrs
+    )
+
+    results = []
+    for i in range(len(output_shapes)):
+        element_tensor = ctx.build_op(
+            "get-tuple-element",
+            [result_tensor],
+            output_shapes[i],
+            output_dtypes[i],
+            {"tuple_index": i},
+        )
+        results.append(_resolve(i, element_tensor))
+    return tuple(results)
+
+
 def _build_hlo_custom_call(config, operands):
-    """Build HLO custom-call operation from a TraceResult config."""
+    """Build HLO custom-call operation from a TraceResult config (beta 1/2)."""
     if get_backend() != "hlo":
         raise NotImplementedError("Modes other than HLO are not implemented yet")
 
@@ -157,67 +272,48 @@ def _build_hlo_custom_call(config, operands):
     output_shapes = [shape for dtype, shape in config.return_types]
     output_dtypes = [dtype for dtype, shape in config.return_types]
 
-    custom_call_attrs = {
-        "custom_call_target": "AwsNeuronCustomNativeKernel",
-        "backend_config": config.dumped_config,
-    }
+    return _emit_hlo_custom_call(
+        hlo_operands=hlo_operands,
+        tensor_operands=tensor_operands,
+        output_shapes=output_shapes,
+        output_dtypes=output_dtypes,
+        backend_config=config.dumped_config,
+        has_collectives=config.has_collectives,
+        # NKI alias map: {input_operand_idx: output_idx}
+        alias_map=config.operand_output_aliases,
+        is_tuple_return=config.result_is_sequence,
+    )
 
-    if config.has_collectives:
-        custom_call_attrs["has_collectives"] = True
 
-    # NKI alias map: {input_operand_idx: output_idx}
-    alias_map = config.operand_output_aliases or {}
-    if alias_map:
-        custom_call_attrs["operand_output_aliases"] = alias_map
-    # Invert to output_idx -> input_operand_idx for result construction
-    output_alias_map = {out_idx: in_idx for in_idx, out_idx in alias_map.items()}
+def _build_hlo_custom_call_beta3(framework_config, is_tuple_return, operands):
+    """Build HLO custom-call operation from a beta 3 FrameworkConfig."""
+    if get_backend() != "hlo":
+        raise NotImplementedError("Modes other than HLO are not implemented yet")
 
-    # Single output vs tuple output
-    if len(output_shapes) == 1 and not config.result_is_sequence:
-        result_tensor = ctx.build_op(
-            "custom-call",
-            hlo_operands,
-            output_shapes[0],
-            output_dtypes[0],
-            custom_call_attrs,
-        )
-        if 0 in output_alias_map:
-            original = tensor_operands[output_alias_map[0]]
-            original._is_mutated = True
-            original.backend_tensor = result_tensor
-            original._shape = result_tensor.shape
-            original._dtype = result_tensor.dtype
-            return original
-        return NKIPyTensorRef(result_tensor)
-    else:
-        custom_call_attrs["is_tuple"] = True
-        result_tensor = ctx.build_op(
-            "custom-call", hlo_operands, output_shapes, output_dtypes, custom_call_attrs
-        )
+    # Collect tensor operands (preserving order) for alias resolution
+    tensor_operands = [op for op in operands if isinstance(op, NKIPyTensorRef)]
 
-        results = []
-        for i in range(len(output_shapes)):
-            element_tensor = ctx.build_op(
-                "get-tuple-element",
-                [result_tensor],
-                output_shapes[i],
-                output_dtypes[i],
-                {"tuple_index": i},
-            )
-            if i in output_alias_map:
-                original = tensor_operands[output_alias_map[i]]
-                original._is_mutated = True
-                original.backend_tensor = element_tensor
-                original._shape = element_tensor.shape
-                original._dtype = element_tensor.dtype
-                results.append(original)
-            else:
-                results.append(NKIPyTensorRef(element_tensor))
-        return tuple(results)
+    # Build HLO operands (beta 3 handles constants internally)
+    hlo_operands = [op.backend_tensor for op in tensor_operands]
+
+    output_shapes = [tuple(spec.shape) for spec in framework_config.output_specs]
+    output_dtypes = [np.dtype(spec.dtype) for spec in framework_config.output_specs]
+
+    return _emit_hlo_custom_call(
+        hlo_operands=hlo_operands,
+        tensor_operands=tensor_operands,
+        output_shapes=output_shapes,
+        output_dtypes=output_dtypes,
+        backend_config=framework_config.backend_config_b64,
+        has_collectives=framework_config.has_collectives,
+        # Beta 3 alias map: {input_idx: output_idx}
+        alias_map=framework_config.operand_output_aliases,
+        is_tuple_return=is_tuple_return,
+    )
 
 
 def _generate_nki_custom_call(kernel, *args, **kwargs):
-    """Generate HLO custom-call for an NKI kernel during NKIPy tracing."""
+    """Generate HLO custom-call for an NKI kernel during NKIPy tracing (beta 1/2)."""
     _patch_nkipy_methods(kernel)
 
     # Bind original args/kwargs to the kernel signature to get parameter-ordered
@@ -250,6 +346,59 @@ def _generate_nki_custom_call(kernel, *args, **kwargs):
     return _build_hlo_custom_call(config, operands)
 
 
+def _beta3_compile_and_get_config(kernel, numpy_inputs, platform_target=None, lnc=None):
+    """Compile a beta 3 kernel and return (framework_config, is_tuple_return).
+
+    The artifacts directory is managed by the caller via _get_beta3_artifacts_dir().
+    """
+    import os
+
+    if platform_target is None:
+        platform_target = _get_platform_target_default()
+    if lnc is None:
+        lnc = getattr(kernel, "lnc", 1) or 1
+
+    artifacts_dir = _get_beta3_artifacts_dir()
+    compile_opts = Beta3CompileOptions(
+        target=platform_target,
+        lnc=lnc,
+        artifacts_dir=artifacts_dir,
+        output_path=os.path.join(artifacts_dir, "kernel.neff"),
+    )
+    nir = _beta3_compile_kernel_to_nir(
+        kernel, inputs=numpy_inputs, compile_opts=compile_opts, enable_cache=False
+    )
+    return nir.build_config(), nir.is_tuple_return
+
+
+def _generate_nki_custom_call_beta3(kernel, *args, **kwargs):
+    """Generate HLO custom-call for a beta 3 NKI kernel during NKIPy tracing."""
+    func = getattr(kernel, "func", kernel)
+    sig = inspect.signature(func)
+    bound = sig.bind(*args, **kwargs)
+    bound.apply_defaults()
+
+    # Convert NKIPyTensorRef to empty numpy arrays for compilation
+    numpy_inputs = {
+        k: np.empty(v.shape, dtype=v.dtype) if isinstance(v, NKIPyTensorRef) else v
+        for k, v in bound.arguments.items()
+    }
+
+    framework_config, is_tuple_return = _beta3_compile_and_get_config(kernel, numpy_inputs)
+
+    # Collect tensor operands in parameter order
+    operands = [
+        v
+        for v in bound.arguments.values()
+        if isinstance(v, (NKIPyTensorRef, np.ndarray))
+    ]
+    if get_backend() == "cpu":
+        raise NotImplementedError("CPU execution is not supported for NKI custom ops")
+    return _build_hlo_custom_call_beta3(
+        framework_config, is_tuple_return, operands
+    )
+
+
 # Monkey-patch to intercept jit calls during NKIPy tracing
 if LEGACY_NKI_AVAILABLE:
     _original_legacy_generic_kernel_call = LegacyGenericKernel.__call__
@@ -277,6 +426,18 @@ if BETA2_NKI_AVAILABLE:
     Beta2GenericKernel.__call__ = _patched_beta2_generic_kernel_call
 
 
+if BETA3_NKI_AVAILABLE:
+    _original_beta3_kernel_call = Beta3Kernel.__call__
+
+    def _patched_beta3_kernel_call(self, *args, **kwargs):
+        """Patched __call__ that intercepts calls during NKIPy tracing."""
+        if get_backend() != "cpu":
+            return _generate_nki_custom_call_beta3(self, *args, **kwargs)
+        return _original_beta3_kernel_call(self, *args, **kwargs)
+
+    Beta3Kernel.__call__ = _patched_beta3_kernel_call
+
+
 class NKICustomOp:
     """HLO custom-call wrapper for a pre-traced NKI kernel.
 
@@ -292,31 +453,44 @@ class NKICustomOp:
         kernel_return: bool = True,
         compiler_args: str = "",
         is_nki_beta_2_version: bool = False,
+        is_nki_beta_3_version: bool = False,
         platform_target: Optional[str] = None,
     ):
         operands = list(operands)
+        self._is_beta3 = is_nki_beta_3_version
 
-        # Select the appropriate NKIOp class based on frontend
-        if is_nki_beta_2_version:
+        if platform_target is None:
+            platform_target = _get_platform_target_default()
+
+        if is_nki_beta_3_version:
+            if not BETA3_NKI_AVAILABLE:
+                raise ImportError(
+                    "Beta 3 NKI frontend (nki.framework.kernel.Kernel) is not "
+                    "available. Please install nki >= 0.4."
+                )
+            self._compile_beta3(kernel, operands, platform_target)
+        elif is_nki_beta_2_version:
             if not BETA2_NKI_AVAILABLE:
                 raise ImportError(
                     "Beta 2 NKI frontend (nki) is not available. Please install nki."
                 )
-            NKIOpClass = Beta2NKIOp
+            self._compile_beta2(
+                kernel, operands, grid, kernel_return, compiler_args, platform_target
+            )
         else:
             if not LEGACY_NKI_AVAILABLE:
                 raise ImportError(
                     "Legacy NKI frontend (neuronxcc.nki) is not available."
                     " Please install neuronxcc."
                 )
-            NKIOpClass = LegacyNKIOp
+            self._compile_legacy(
+                kernel, operands, grid, kernel_return, compiler_args, platform_target
+            )
 
-        # Determine platform target
-        if platform_target is None:
-            platform_target = _get_platform_target_default()
-
-        # Trace the kernel with the appropriate NKIOp class
-        traced_kernel = NKIOpClass.trace(
+    def _compile_legacy(
+        self, kernel, operands, grid, kernel_return, compiler_args, platform_target
+    ):
+        traced_kernel = LegacyNKIOp.trace(
             kernel,
             grid=grid,
             kernel_return=kernel_return,
@@ -324,14 +498,48 @@ class NKICustomOp:
             enable_cache=False,
             platform_target=platform_target,
         )
-
-        # Get TraceResult config
         self.config = traced_kernel.dump_config(*operands)
+
+    def _compile_beta2(
+        self, kernel, operands, grid, kernel_return, compiler_args, platform_target
+    ):
+        traced_kernel = Beta2NKIOp.trace(
+            kernel,
+            grid=grid,
+            kernel_return=kernel_return,
+            experimental_flags=compiler_args,
+            enable_cache=False,
+            platform_target=platform_target,
+        )
+        self.config = traced_kernel.dump_config(*operands)
+
+    def _compile_beta3(self, kernel, operands, platform_target):
+        # Build inputs dict from operands matching kernel parameter names
+        func = getattr(kernel, "func", kernel)
+        sig = inspect.signature(func)
+        params = list(sig.parameters.keys())
+
+        numpy_inputs = {}
+        op_idx = 0
+        for p in params:
+            if op_idx < len(operands):
+                numpy_inputs[p] = operands[op_idx]
+                op_idx += 1
+            else:
+                break
+
+        self._beta3_framework_config, self._beta3_is_tuple_return = (
+            _beta3_compile_and_get_config(kernel, numpy_inputs, platform_target)
+        )
 
     def __call__(self, *operands):
         if get_backend() == "cpu":
             raise NotImplementedError(
                 "CPU execution is not supported for NKI custom ops"
+            )
+        if self._is_beta3:
+            return _build_hlo_custom_call_beta3(
+                self._beta3_framework_config, self._beta3_is_tuple_return, operands
             )
         return _build_hlo_custom_call(self.config, operands)
 
@@ -341,6 +549,7 @@ def wrap_nki_kernel(
     operands: Iterable,
     grid: Optional[Tuple[int, ...]] = (),
     is_nki_beta_2_version: bool = False,
+    is_nki_beta_3_version: bool = False,
     platform_target: Optional[str] = None,
 ):
     """Wrap an NKI kernel for use in NKIPy's HLO tracing flow.
@@ -351,9 +560,10 @@ def wrap_nki_kernel(
         kernel: The NKI kernel function (or @nki.jit decorated kernel)
         operands: Example operands (numpy arrays) for tracing (shape and dtype)
         grid: SPMD grid configuration (ignored if kernel is already @nki.jit with grid)
-        is_nki_beta_2_version: If True, use the new Beta 2 NKI frontend (nki package).
-                               If False, use the legacy frontend (neuronxcc.nki).
-                               Note: Beta 2 frontend does not support CPU execution.
+        is_nki_beta_2_version: If True, use the Beta 2 NKI frontend (nki package
+                               with GenericKernel). Note: does not support CPU execution.
+        is_nki_beta_3_version: If True, use the Beta 3 NKI frontend (nki >= 0.4 with
+                               compile_kernel_to_nir). Note: does not support CPU execution.
         platform_target: Target platform (e.g., "trn1", "trn2"). If None, auto-detected.
 
     Returns:
@@ -364,6 +574,7 @@ def wrap_nki_kernel(
         operands,
         grid,
         is_nki_beta_2_version=is_nki_beta_2_version,
+        is_nki_beta_3_version=is_nki_beta_3_version,
         platform_target=platform_target,
     )
 
@@ -456,6 +667,8 @@ class NKICustomOpHandle:
                     "nki_custom_op has no nki_kernel for the HLO backend. "
                     "Provide an @nki.jit decorated kernel via nki_kernel=."
                 )
+            if BETA3_NKI_AVAILABLE and isinstance(self._nki_kernel, Beta3Kernel):
+                return _generate_nki_custom_call_beta3(self._nki_kernel, *args)
             return _generate_nki_custom_call(self._nki_kernel, *args)
 
         if backend == "nkigen":
