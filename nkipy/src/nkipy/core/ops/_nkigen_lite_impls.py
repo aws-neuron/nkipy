@@ -595,30 +595,58 @@ def where(condition, x, y):
     return _wrap(b.where(c_val, x_val, y_val))
 
 
-def take(a, indices, axis=0):
-    # Implement take as a series of slices gathered by index
-    # For static integer indices (numpy arrays), expand to slices
+def take(a, indices, axis=None):
+    """np.take with static (trace-time) integer indices.
+
+    Implemented as a slice-based gather: each requested index becomes a
+    width-1 slice along ``axis``; the slices are concatenated and reshaped
+    so the gathered axis is replaced by ``indices.shape``. This matches
+    numpy semantics:
+
+        out.shape == a.shape[:axis] + indices.shape + a.shape[axis + 1:]
+
+    A scalar index removes the axis entirely (``indices.shape == ()``).
+    """
     b = _builder()
     a_val = _unwrap(a)
-    # For now, implement as a slice-based gather
-    # This handles the common case of 1D index arrays
+
+    # Dynamic (traced) indices need a hardware gather, which isn't supported.
     if isinstance(indices, NKIPyTensorRef):
         raise NotImplementedError(
             "Dynamic tensor indexing is not yet supported in nkigen-lite. "
             "Use static numpy array indices instead."
         )
-    indices_arr = np.asarray(indices).flatten()
-    rank = len(a_val.type.shape)
-    results = []
-    for idx in indices_arr:
-        idx = int(idx)
-        starts = tuple(0 if i != axis else idx for i in range(rank))
-        stops = tuple(a_val.type.shape[i] if i != axis else idx + 1 for i in range(rank))
-        sliced = b.slice(a_val, starts, stops)
-        results.append(sliced)
-    if len(results) == 1:
-        return _wrap(results[0])
-    return _wrap(b.concat(results, axis=axis))
+
+    idx_arr = np.asarray(indices)
+
+    # axis=None flattens the input and gathers from the flat vector.
+    if axis is None:
+        total = int(np.prod(a_val.type.shape)) if a_val.type.shape else 1
+        a_val = b.reshape(a_val, (total,))
+        axis = 0
+
+    in_shape = a_val.type.shape
+    rank = len(in_shape)
+    axis = axis % rank
+    axis_dim = in_shape[axis]
+
+    # Gather each flat index as a width-1 slice along `axis`, then concat.
+    flat_idx = idx_arr.flatten()
+    slices = []
+    for raw in flat_idx:
+        i = int(raw) % axis_dim  # normalize negatives like numpy
+        starts = tuple(0 if d != axis else i for d in range(rank))
+        stops = tuple(in_shape[d] if d != axis else i + 1 for d in range(rank))
+        slices.append(b.slice(a_val, starts, stops))
+
+    gathered = slices[0] if len(slices) == 1 else b.concat(slices, axis=axis)
+
+    # gathered currently has `axis` size == len(flat_idx); reshape so that
+    # axis is replaced by indices.shape (dropped entirely for scalar index).
+    out_shape = in_shape[:axis] + tuple(idx_arr.shape) + in_shape[axis + 1:]
+    if gathered.type.shape != out_shape:
+        gathered = b.reshape(gathered, out_shape)
+    return _wrap(gathered)
 
 
 # ---------------------------------------------------------------------------
