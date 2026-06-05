@@ -363,7 +363,15 @@ When scaling up multiple engines simultaneously, the sender broadcasts weights t
 | **Broadcast transfer** | **2.8s** | 128 GB total, 367 Gbps aggregate |
 | **Total wake-up** | **~11s** | 8 engines on same instance |
 
-> **Note**: The 8.2s wake phase is inflated by resource contention — 8 engines on the same instance compete for NRT init and EFA MR registration. In production, receivers are distributed across separate instances where each engine wakes without contention (~1-2s). Expected production broadcast latency: **~5s** (wake ~2s + transfer ~3s).
+**Qwen3-235B-A22B (TP=32, 1 sender → 2 receivers on separate trn2 instances):**
+
+| Phase | Latency | Notes |
+|---|---|---|
+| Wake + MR register | 4.4s | No contention (separate instances) |
+| **Broadcast transfer** | **5.0s** | 448 GB × 2 receivers, 86% wire speed |
+| **Total wake-up** | **~9.5s** | 2 engines on separate instances |
+
+> **Note**: Same-instance results above (8.2s wake for LLaMA-3-8B × 8) are inflated by resource contention. With receivers on separate instances, wake drops from 8.2s to 4.4s. Transfer time is unchanged (network-bound).
 
 **Broadcast scaling (all models, trn2.48xlarge, all receivers on same instance):**
 
