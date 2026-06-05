@@ -142,6 +142,20 @@ def minimum(x, y, out=None, dtype=None):
     return _binary_op("minimum", x, y, out, dtype)
 
 
+def floor_divide(x, y, out=None, dtype=None):
+    # Route to the native floor_divide opcode so the decompose pass'
+    # divide-then-verify-and-correct lowering fires. The default composed
+    # impl (floor(divide(x, y))) is wrong at exact-integer quotients because
+    # the reciprocal-based divide undershoots.
+    return _binary_op("floor_divide", x, y, out, dtype)
+
+
+def remainder(x, y, out=None, dtype=None):
+    # Route to the native mod opcode (decomposed as a - b*floor_divide(a, b)
+    # using the corrected floor_divide).
+    return _binary_op("mod", x, y, out, dtype)
+
+
 # Comparison ops
 def _compare_op(method_name, x, y, out=None, dtype=None):
     b = _builder()

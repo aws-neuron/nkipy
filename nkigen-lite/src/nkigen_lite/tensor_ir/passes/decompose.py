@@ -228,13 +228,16 @@ class FloorDividePattern(DecomposePattern):
         graph.insert_before(op, abs_rem)
         abs_b = Op("abs", [b], [rt], counter=graph.counter)
         graph.insert_before(op, abs_b)
-        # diff = abs(rem) - abs(b): positive means floor was too low
-        overshoot = Op("sub", [abs_rem.result, abs_b.result], [rt], counter=graph.counter)
-        graph.insert_before(op, overshoot)
-        sign_over = Op("sign", [overshoot.result], [rt], counter=graph.counter)
-        graph.insert_before(op, sign_over)
-        # corr_up = max(0, sign_over): 1 when |rem| >= |b|
-        corr_up = Op("maximum", [sign_over.result, zero.result], [rt], counter=graph.counter)
+        # corr_up = (|rem| >= |b|) -> 1.0/0.0.
+        #
+        # Must be an INCLUSIVE compare: when the true quotient is an exact
+        # integer N, the reciprocal-based divide undershoots to N-eps so
+        # floor gives N-1, leaving rem == b exactly (i.e. |rem| == |b|). A
+        # genuine remainder is always strictly < |b|, so |rem| == |b| can
+        # only mean undershoot. The previous `max(0, sign(|rem|-|b|))` form
+        # returned 0 at that boundary (sign(0)==0) and missed the correction.
+        corr_up = Op("greater_equal", [abs_rem.result, abs_b.result], [rt],
+                     counter=graph.counter)
         graph.insert_before(op, corr_up)
 
         # Step 4: result = q - corr_down + corr_up

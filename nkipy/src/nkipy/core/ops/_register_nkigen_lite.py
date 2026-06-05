@@ -24,6 +24,7 @@ def register_all_nkigen_lite_impls():
     # --- Binary ops (primitives) ---
     from nkipy.core.ops.binary import (
         add, subtract, multiply, divide, power, maximum, minimum,
+        floor_divide, remainder,
         equal, not_equal, greater, greater_equal, less, less_equal,
         bitwise_and, bitwise_or, bitwise_xor,
     )
@@ -34,6 +35,8 @@ def register_all_nkigen_lite_impls():
     power.impl("nkigen-lite")(lite_impls.power)
     maximum.impl("nkigen-lite")(lite_impls.maximum)
     minimum.impl("nkigen-lite")(lite_impls.minimum)
+    floor_divide.impl("nkigen-lite")(lite_impls.floor_divide)
+    remainder.impl("nkigen-lite")(lite_impls.remainder)
     equal.impl("nkigen-lite")(lite_impls.equal)
     not_equal.impl("nkigen-lite")(lite_impls.not_equal)
     greater.impl("nkigen-lite")(lite_impls.greater)
