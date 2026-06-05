@@ -327,43 +327,19 @@ def all_reduce(data, replica_groups, reduce_op=np.add, **kwargs):
     return _wrap(b.all_reduce(x_val, replica_groups, _reduce_op_to_str(reduce_op)))
 
 
-def _move_dim_to_last(b, x_val, dim):
-    """Transpose so `dim` becomes the last axis; return (xt, inverse_perm).
-
-    The NKI collective KB API only operates on the last (free) axis, so
-    collectives along other axes are staged via transpose. The returned
-    inverse permutation restores the original axis order afterwards.
-    """
-    rank = len(x_val.type.shape)
-    dim = dim % rank
-    if dim == rank - 1:
-        return x_val, None
-    perm = [i for i in range(rank) if i != dim] + [dim]
-    inverse = [perm.index(i) for i in range(rank)]
-    return b.transpose(x_val, tuple(perm)), tuple(inverse)
-
-
 def all_gather(data, all_gather_dim, replica_groups, **kwargs):
     b = _builder()
     x_val = _unwrap(data)
-    rank = len(x_val.type.shape)
-    xt, inverse = _move_dim_to_last(b, x_val, all_gather_dim)
-    gathered = b.all_gather(xt, len(xt.type.shape) - 1, replica_groups)
-    if inverse is not None:
-        gathered = b.transpose(gathered, inverse)
-    return _wrap(gathered)
+    return _wrap(b.all_gather(x_val, all_gather_dim, replica_groups))
 
 
 def reduce_scatter(data, reduce_scatter_dim, replica_groups, reduce_op=np.add, **kwargs):
     b = _builder()
     x_val = _unwrap(data)
-    xt, inverse = _move_dim_to_last(b, x_val, reduce_scatter_dim)
-    scattered = b.reduce_scatter(
-        xt, len(xt.type.shape) - 1, replica_groups, _reduce_op_to_str(reduce_op)
+    return _wrap(
+        b.reduce_scatter(x_val, reduce_scatter_dim, replica_groups,
+                         _reduce_op_to_str(reduce_op))
     )
-    if inverse is not None:
-        scattered = b.transpose(scattered, inverse)
-    return _wrap(scattered)
 
 
 def all_to_all(data, split_dimension, concat_dimension, replica_groups, **kwargs):

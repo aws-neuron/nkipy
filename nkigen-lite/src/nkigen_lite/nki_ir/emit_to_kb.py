@@ -676,6 +676,21 @@ _COLLECTIVE_REDUCE_TO_KB = {
 }
 
 
+def _to_cc_dim(dim: int):
+    """Convert an integer collective dim to the KB CollectiveDimension enum.
+
+    The KB nisa collective APIs forward ``cc_dim`` to the native builder
+    un-converted, which raises ``std::bad_cast`` on a bare int — the enum
+    must be passed explicitly.
+    """
+    from nki.compiler._internal.dialects.nisa import CollectiveDimension
+
+    mapping = {0: CollectiveDimension.DIM_0, 1: CollectiveDimension.DIM_1}
+    if dim not in mapping:
+        raise NotImplementedError(f"unsupported collective dim {dim}")
+    return mapping[dim]
+
+
 def _emit_collective(op: Op, tiles: dict[str, object]) -> None:
     """Emit a collective op (HBM->HBM) as a KB nisa collective call.
 
@@ -701,18 +716,20 @@ def _emit_collective(op: Op, tiles: dict[str, object]) -> None:
     elif op.opcode == "all_gather":
         nisa.all_gather(
             dsts=dst, srcs=src,
-            replica_group=replica_group_attr, cc_dim=op.attrs["all_gather_dim"],
+            replica_group=replica_group_attr,
+            cc_dim=_to_cc_dim(op.attrs["all_gather_dim"]),
         )
     elif op.opcode == "reduce_scatter":
         nisa.reduce_scatter(
             dsts=dst, srcs=src,
             reduce_op=_reduce_op(), replica_group=replica_group_attr,
-            cc_dim=op.attrs["reduce_scatter_dim"],
+            cc_dim=_to_cc_dim(op.attrs["reduce_scatter_dim"]),
         )
     elif op.opcode == "all_to_all":
         nisa.all_to_all(
             dsts=dst, srcs=src,
-            replica_group=replica_group_attr, cc_dim=op.attrs["split_dimension"],
+            replica_group=replica_group_attr,
+            cc_dim=_to_cc_dim(op.attrs["split_dimension"]),
         )
 
 
