@@ -1885,20 +1885,9 @@ def test_reshape_infer_dim(trace_mode):
 
 @pytest.mark.parametrize(
     "dtype_name",
-    [
-        "bfloat16",
-        pytest.param(
-            "float8_e5m2",
-            marks=pytest.mark.xfail(reason="float8_e5m2 backend support missing"),
-        ),
-        "float8_e4m3",
-        pytest.param(
-            "float8_e4m3fn",
-            marks=pytest.mark.xfail(reason="float8_e4m3fn backend support missing"),
-        ),
-    ],
+    ["bfloat16", "float8_e5m2", "float8_e4m3", "float8_e4m3fn"],
 )
-def test_ml_dtypes_constant_encoding(trace_mode, dtype_name):
+def test_ml_dtypes_constant_encoding(request, trace_mode, dtype_name):
     """Test that ml_dtypes constants (bfloat16, float8) are correctly encoded in HLO.
 
     This is a regression test for a bug where ml_dtypes constants were incorrectly
@@ -1909,6 +1898,18 @@ def test_ml_dtypes_constant_encoding(trace_mode, dtype_name):
         import ml_dtypes
     except ImportError:
         pytest.skip("ml_dtypes not available")
+
+    # float8 support is uneven across backends; xfail the combinations that are
+    # known to lack it so they flip to XPASS once support lands.
+    unsupported = {
+        ("hlo", "float8_e5m2"),
+        ("hlo", "float8_e4m3fn"),
+        ("nkigen-lite", "float8_e4m3fn"),
+    }
+    if (trace_mode, dtype_name) in unsupported:
+        request.node.add_marker(
+            pytest.mark.xfail(reason=f"{dtype_name} not supported on {trace_mode} backend")
+        )
 
     # Get the dtype from ml_dtypes
     dtype = getattr(ml_dtypes, dtype_name)

@@ -297,6 +297,7 @@ UNARY_OPS: dict[str, nki_ir.NisaActivationOp | None] = {
     "abs": nki_ir.NisaActivationOp.ABS,
     "sign": nki_ir.NisaActivationOp.SIGN,
     "sin": nki_ir.NisaActivationOp.SIN,
+    "arctan": nki_ir.NisaActivationOp.ARCTAN,
     "floor": None,  # handled by _emit_floor special case
 }
 
@@ -324,7 +325,7 @@ COMBINE_INIT: dict[str, float] = {
 ELEMENTWISE_OPCODES = frozenset({
     "add", "sub", "mul", "maximum", "minimum",
     "neg", "exp", "log", "sqrt", "rsqrt", "tanh", "relu", "gelu",
-    "sigmoid", "silu", "reciprocal", "abs", "sign", "sin", "floor",
+    "sigmoid", "silu", "reciprocal", "abs", "sign", "sin", "arctan", "floor",
     "constant", "cast",
     "bitwise_and", "bitwise_or", "bitwise_xor",
     "equal", "not_equal", "greater", "greater_equal", "less", "less_equal",

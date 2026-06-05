@@ -314,6 +314,8 @@ def _lower_f_broadcast(
 
 def _emit_broadcast_scalar(nb: Builder, x_hbm, y_hbm, out_shape, dtype) -> None:
     """Broadcast a scalar (rank-0) HBM tensor to an arbitrary output shape."""
+    from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import broadcast_partition
+
     rank = len(out_shape)
     # Load scalar as (1, 1) tile
     src_slices = [DimSlice(0, 1)] * len(x_hbm.type.shape)
@@ -339,9 +341,15 @@ def _emit_broadcast_scalar(nb: Builder, x_hbm, y_hbm, out_shape, dtype) -> None:
             p_off = p_i * tile_p
             p_size = min(tile_p, p_extent - p_off)
 
+            # tensor_scalar_arith requires the scalar operand's partition dim to
+            # match dst; replicate the (1, 1) scalar to (p_size, 1) first.
+            if p_size > 1:
+                scalar_operand = broadcast_partition(nb, scalar_tile, (p_size, 1))
+            else:
+                scalar_operand = scalar_tile
             ones = nb.constant(1.0, (p_size, tile_f), dtype, MemorySpace.SBUF)
             dst = nb.alloc((p_size, tile_f), dtype, MemorySpace.SBUF)
-            dst = nb.tensor_scalar_arith(dst, ones, scalar_tile, NisaArithOp.MULTIPLY)
+            dst = nb.tensor_scalar_arith(dst, ones, scalar_operand, NisaArithOp.MULTIPLY)
 
             dst_slices = [DimSlice(bi, 1) for bi in batch_idx]
             if rank >= 2:

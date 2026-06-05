@@ -229,6 +229,10 @@ def cos(x, out=None, dtype=None):
     return _unary_op("cos", x, out, dtype)
 
 
+def arctan(x, out=None, dtype=None):
+    return _unary_op("arctan", x, out, dtype)
+
+
 def sign(x, out=None, dtype=None):
     return _unary_op("sign", x, out, dtype)
 
@@ -405,6 +409,40 @@ def full(shape, fill_value, dtype=np.float32):
     if isinstance(shape, int):
         shape = (shape,)
     return _wrap(b.full(tuple(shape), float(fill_value), lite_dtype))
+
+
+def constant(value, dtype=None):
+    # Passthrough for already-traced tensors, optionally casting dtype.
+    if isinstance(value, NKIPyTensorRef):
+        if dtype is not None and value.dtype != np.dtype(dtype):
+            return astype(value, dtype)
+        return value
+
+    # Resolve target dtype following numpy's scalar conventions.
+    if dtype is not None:
+        target_dtype = np.dtype(dtype)
+    elif hasattr(value, "dtype"):
+        target_dtype = np.dtype(value.dtype)
+    elif isinstance(value, bool):
+        target_dtype = np.dtype(np.bool_)
+    elif isinstance(value, int):
+        target_dtype = np.dtype(np.int32)
+    elif isinstance(value, float):
+        target_dtype = np.dtype(np.float32)
+    else:
+        target_dtype = np.dtype(np.asarray(value).dtype)
+
+    b = _builder()
+    lite_dtype = np_dtype_to_lite(target_dtype)
+    arr = np.asarray(value, dtype=target_dtype)
+    # The lite builder can only represent uniform-valued constants (fill).
+    flat = arr.ravel()
+    if flat.size > 0 and not np.all(flat == flat[0]):
+        raise NotImplementedError(
+            "Non-uniform array constants are not yet supported in nkigen-lite"
+        )
+    fill = float(flat[0]) if flat.size > 0 else 0.0
+    return _wrap(b.constant(fill, tuple(arr.shape), lite_dtype))
 
 
 def zeros_like(x, dtype=None):

@@ -26,6 +26,22 @@ sign = Op("sign")
 invert = Op("invert")
 bitwise_not = Op("bitwise_not")
 
+
+# Backends without a native bitwise-NOT (e.g. nkigen-lite) fall back to XOR
+# with all-ones (~0 == -1), matching the NKI compiler's implementation.
+@invert.composed_impl
+def _invert(x, out=None, dtype=None):
+    from nkipy.core.ops.binary import bitwise_xor
+
+    return bitwise_xor(x, -1)
+
+
+@bitwise_not.composed_impl
+def _bitwise_not(x, out=None, dtype=None):
+    from nkipy.core.ops.binary import bitwise_xor
+
+    return bitwise_xor(x, -1)
+
 # -----------------------------------------------------------------------------
 # Composed unary ops — built from other dispatched ops
 # -----------------------------------------------------------------------------

@@ -119,6 +119,9 @@ class Builder:
     def cos(self, x: Value) -> Value:
         return self._unary("cos", x)
 
+    def arctan(self, x: Value) -> Value:
+        return self._unary("arctan", x)
+
     def abs(self, x: Value) -> Value:
         return self._unary("abs", x)
 

@@ -41,6 +41,31 @@ logical_xor = Op("logical_xor")
 
 
 # -----------------------------------------------------------------------------
+# Composed logical operations
+#
+# Backends without a native logical_and (e.g. nkigen-lite) fall back to these.
+# Inputs are reduced to 0/1 truthiness, so the result matches numpy semantics
+# for arbitrary numeric inputs, not just boolean-like ones.
+# -----------------------------------------------------------------------------
+
+
+@logical_and.composed_impl
+def _logical_and(x, y, out=None, dtype=None):
+    return multiply(not_equal(x, 0), not_equal(y, 0))
+
+
+@logical_or.composed_impl
+def _logical_or(x, y, out=None, dtype=None):
+    # OR(a, b) = (a != 0) OR (b != 0); max of the two 0/1 predicates.
+    return maximum(not_equal(x, 0), not_equal(y, 0))
+
+
+@logical_xor.composed_impl
+def _logical_xor(x, y, out=None, dtype=None):
+    return not_equal(not_equal(x, 0), not_equal(y, 0))
+
+
+# -----------------------------------------------------------------------------
 # Composed binary operations
 # -----------------------------------------------------------------------------
 

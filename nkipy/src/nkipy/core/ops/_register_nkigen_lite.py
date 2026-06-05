@@ -46,7 +46,7 @@ def register_all_nkigen_lite_impls():
 
     # --- Unary ops (primitives) ---
     from nkipy.core.ops.unary import (
-        abs, exp, log, sqrt, sin, cos, tanh, ceil, floor, sign,
+        abs, exp, log, sqrt, sin, cos, arctan, tanh, ceil, floor, sign,
         negative, reciprocal, square, logical_not,
     )
     exp.impl("nkigen-lite")(lite_impls.exp)
@@ -55,6 +55,7 @@ def register_all_nkigen_lite_impls():
     tanh.impl("nkigen-lite")(lite_impls.tanh)
     sin.impl("nkigen-lite")(lite_impls.sin)
     cos.impl("nkigen-lite")(lite_impls.cos)
+    arctan.impl("nkigen-lite")(lite_impls.arctan)
     sign.impl("nkigen-lite")(lite_impls.sign)
     abs.impl("nkigen-lite")(lite_impls.abs_)
     ceil.impl("nkigen-lite")(lite_impls.ceil)
@@ -80,11 +81,12 @@ def register_all_nkigen_lite_impls():
 
     # --- Creation ops ---
     from nkipy.core.ops.creation import (
-        zeros as zeros_op, full as full_op,
+        zeros as zeros_op, full as full_op, constant as constant_op,
         zeros_like, ones_like, empty_like, full_like,
     )
     zeros_op.impl("nkigen-lite")(lite_impls.zeros)
     full_op.impl("nkigen-lite")(lite_impls.full)
+    constant_op.impl("nkigen-lite")(lite_impls.constant)
     zeros_like.impl("nkigen-lite")(lite_impls.zeros_like)
     ones_like.impl("nkigen-lite")(lite_impls.ones_like)
     empty_like.impl("nkigen-lite")(lite_impls.empty_like)
