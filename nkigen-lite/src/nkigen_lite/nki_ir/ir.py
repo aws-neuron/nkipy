@@ -474,6 +474,26 @@ class Builder:
             )
             return None
 
+    def collective(
+        self,
+        kind: str,
+        dst: Value,
+        src: Value,
+        attrs: dict[str, Any],
+    ) -> None:
+        """Emit a collective communication op (HBM -> HBM, side-effect).
+
+        ``kind`` is one of ``all_reduce``, ``all_gather``, ``reduce_scatter``,
+        ``all_to_all``. ``attrs`` carries the per-collective parameters
+        (replica_groups, reduce_op, dims) straight from the tensor_ir op.
+        """
+        if src.type.memory != MemorySpace.HBM or dst.type.memory != MemorySpace.HBM:
+            raise ValueError(
+                f"{kind}: collective operands must be HBM, got "
+                f"src={src.type.memory} dst={dst.type.memory}"
+            )
+        self._emit(kind, [dst, src], [], dict(attrs))
+
     def tensor_copy(self, dst: Value, src: Value) -> Value:
         """Copy between on-chip memories (e.g. PSUM -> SBUF).
 

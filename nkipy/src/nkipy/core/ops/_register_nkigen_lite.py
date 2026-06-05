@@ -118,3 +118,12 @@ def register_all_nkigen_lite_impls():
     take_op.impl("nkigen-lite")(lite_impls.take)
     static_slice.impl("nkigen-lite")(lite_impls.static_slice)
     dynamic_update_slice.impl("nkigen-lite")(lite_impls.dynamic_update_slice)
+
+    # --- Collective ops ---
+    from nkipy.core.ops.collectives import (
+        all_gather, all_reduce, reduce_scatter, all_to_all,
+    )
+    all_gather.impl("nkigen-lite")(lite_impls.all_gather)
+    all_reduce.impl("nkigen-lite")(lite_impls.all_reduce)
+    reduce_scatter.impl("nkigen-lite")(lite_impls.reduce_scatter)
+    all_to_all.impl("nkigen-lite")(lite_impls.all_to_all)

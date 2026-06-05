@@ -148,6 +148,8 @@ def lower_graph(graph: Graph, layouts: dict[str, Layout]) -> nki_ir.Graph:
             _emit_concat_op(nb, segment[0], hbm_map)
         elif segment[0].opcode == "broadcast_to":
             _emit_broadcast_op(nb, segment[0], layouts, hbm_map)
+        elif segment[0].opcode in COLLECTIVE_OPCODES:
+            _emit_collective_op(nb, segment[0], hbm_map)
         else:
             raise NotImplementedError(f"Op {segment[0].opcode!r} not supported")
 
@@ -412,6 +414,31 @@ def _emit_matmul_op(
         nb, hbm_map[a_val.name], hbm_map[b_val.name], hbm_map[c_val.name],
         a_val.type.shape, b_val.type.shape, a_val.type.dtype,
     )
+
+
+COLLECTIVE_OPCODES = frozenset(
+    {"all_reduce", "all_gather", "reduce_scatter", "all_to_all"}
+)
+
+
+def _emit_collective_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
+    """Lower a collective op to an nki_ir collective node.
+
+    The compiler forbids collectives from reading/writing kernel IO tensors
+    directly, so we stage through internal HBM scratch buffers:
+    IO/result HBM -> src scratch -> collective -> dst scratch -> result HBM.
+    """
+    inp_val = op.inputs[0]
+    out_val = op.results[0]
+    src_hbm = hbm_map[inp_val.name]
+    dst_hbm = hbm_map[out_val.name]
+
+    src_scratch = nb.alloc(src_hbm.type.shape, src_hbm.type.dtype, MemorySpace.HBM)
+    dst_scratch = nb.alloc(dst_hbm.type.shape, dst_hbm.type.dtype, MemorySpace.HBM)
+
+    _emit_hbm_copy(nb, src_hbm, src_scratch, inp_val.type.shape)
+    nb.collective(op.opcode, dst_scratch, src_scratch, op.attrs)
+    _emit_hbm_copy(nb, dst_scratch, dst_hbm, out_val.type.shape)
 
 
 def _emit_transpose_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:

@@ -416,6 +416,73 @@ class Builder:
         rt = TensorType(out_shape, a.type.dtype)
         return self._emit("matmul", [a, b], [rt]).result
 
+    # -- collective communication --
+
+    def all_reduce(self, x: Value, replica_groups, reduce_op: str = "add") -> Value:
+        """All-reduce across the replica group; output shape == input shape."""
+        rt = TensorType(x.type.shape, x.type.dtype)
+        return self._emit(
+            "all_reduce", [x], [rt],
+            {"replica_groups": replica_groups, "reduce_op": reduce_op},
+        ).result
+
+    def all_gather(self, x: Value, all_gather_dim: int, replica_groups) -> Value:
+        """All-gather; the gather dim grows by the replica-group size."""
+        world = len(replica_groups[0])
+        dim = all_gather_dim % x.type.rank
+        out_shape = tuple(
+            s * world if i == dim else s for i, s in enumerate(x.type.shape)
+        )
+        rt = TensorType(out_shape, x.type.dtype)
+        return self._emit(
+            "all_gather", [x], [rt],
+            {"all_gather_dim": dim, "replica_groups": replica_groups},
+        ).result
+
+    def reduce_scatter(
+        self, x: Value, reduce_scatter_dim: int, replica_groups, reduce_op: str = "add"
+    ) -> Value:
+        """Reduce-scatter; the scatter dim shrinks by the replica-group size."""
+        world = len(replica_groups[0])
+        dim = reduce_scatter_dim % x.type.rank
+        if x.type.shape[dim] % world != 0:
+            raise ValueError(
+                f"reduce_scatter: dim {dim} size {x.type.shape[dim]} not "
+                f"divisible by world size {world}"
+            )
+        out_shape = tuple(
+            s // world if i == dim else s for i, s in enumerate(x.type.shape)
+        )
+        rt = TensorType(out_shape, x.type.dtype)
+        return self._emit(
+            "reduce_scatter", [x], [rt],
+            {"reduce_scatter_dim": dim, "replica_groups": replica_groups,
+             "reduce_op": reduce_op},
+        ).result
+
+    def all_to_all(
+        self, x: Value, split_dimension: int, concat_dimension: int, replica_groups
+    ) -> Value:
+        """All-to-all; split dim shrinks and concat dim grows by world size."""
+        world = len(replica_groups[0])
+        rank = x.type.rank
+        split_dim = split_dimension % rank
+        concat_dim = concat_dimension % rank
+        if x.type.shape[split_dim] % world != 0:
+            raise ValueError(
+                f"all_to_all: split dim {split_dim} size "
+                f"{x.type.shape[split_dim]} not divisible by world size {world}"
+            )
+        out = list(x.type.shape)
+        out[split_dim] //= world
+        out[concat_dim] *= world
+        rt = TensorType(tuple(out), x.type.dtype)
+        return self._emit(
+            "all_to_all", [x], [rt],
+            {"split_dimension": split_dim, "concat_dimension": concat_dim,
+             "replica_groups": replica_groups},
+        ).result
+
     # -- type cast --
 
     def cast(self, x: Value, dtype: DType) -> Value:

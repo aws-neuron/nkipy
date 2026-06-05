@@ -660,8 +660,60 @@ def _emit_op(op: Op, tiles: dict[str, object]) -> None:
         nisa.select_reduce(dst=dst, predicate=pred, on_true=on_true, **kwargs)
         tiles[op.result.name] = dst
 
+    elif op.opcode in ("all_reduce", "all_gather", "reduce_scatter", "all_to_all"):
+        _emit_collective(op, tiles)
+
     else:
         raise NotImplementedError(f"Unhandled nki_ir opcode: {op.opcode!r}")
+
+
+# Map nkigen_lite collective reduce-op names to KB dma_compute_reduce_op.
+_COLLECTIVE_REDUCE_TO_KB = {
+    "add": "Add",
+    "max": "Max",
+    "min": "Min",
+    "multiply": "Multiply",
+}
+
+
+def _emit_collective(op: Op, tiles: dict[str, object]) -> None:
+    """Emit a collective op (HBM->HBM) as a KB nisa collective call.
+
+    inputs are [dst_hbm, src_hbm]; both are pre-allocated HBM TileViews.
+    The replica group comes through verbatim from the tensor_ir op.
+    """
+    from nki.compiler._internal.dialects import nisa as nisa_dialect
+
+    dst = tiles[op.inputs[0].name]
+    src = tiles[op.inputs[1].name]
+    replica_groups = [list(g) for g in op.attrs["replica_groups"]]
+    replica_group_attr = nisa_dialect.ExplicitReplicaGroupAttr.get(replica_groups)
+
+    def _reduce_op():
+        name = _COLLECTIVE_REDUCE_TO_KB[op.attrs.get("reduce_op", "add")]
+        return getattr(nisa.dma_compute_reduce_op, name)
+
+    if op.opcode == "all_reduce":
+        nisa.all_reduce(
+            dsts=dst, srcs=src,
+            reduce_op=_reduce_op(), replica_group=replica_group_attr,
+        )
+    elif op.opcode == "all_gather":
+        nisa.all_gather(
+            dsts=dst, srcs=src,
+            replica_group=replica_group_attr, cc_dim=op.attrs["all_gather_dim"],
+        )
+    elif op.opcode == "reduce_scatter":
+        nisa.reduce_scatter(
+            dsts=dst, srcs=src,
+            reduce_op=_reduce_op(), replica_group=replica_group_attr,
+            cc_dim=op.attrs["reduce_scatter_dim"],
+        )
+    elif op.opcode == "all_to_all":
+        nisa.all_to_all(
+            dsts=dst, srcs=src,
+            replica_group=replica_group_attr, cc_dim=op.attrs["split_dimension"],
+        )
 
 
 def _emit_tile_loop(op: Op, tiles: dict[str, object]) -> None:
