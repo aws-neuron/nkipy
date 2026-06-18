@@ -1,6 +1,10 @@
 #include "spike.h"
-#include <iostream>
 #include <Python.h>
+#include <cstring>
+#include <iostream>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <unistd.h>
 
 namespace spike {
 
@@ -15,6 +19,10 @@ Spike::Spike(int verbose_level)
         "Call close() on the existing instance or delete spike with all "
         "tensors/models first.");
   }
+
+  // Channel eventfds are created lazily on first use; -1 means unregistered.
+  channel_event_fds_.fill(-1);
+  scan_channel_queued_.fill(false);
 
   // RAII: Initialize NRT in constructor
   if (verbose_level_ > 0) {
@@ -36,27 +44,103 @@ uint32_t Spike::get_visible_neuron_core_count() {
 }
 
 int Spike::close() {
-  // Shut down nonblock threads if initialized
-  for (auto &q : exec_queues_) {
-    q.emplace(NonBlockCloseCmd{});
-  }
-  for (auto &q : tensor_queues_) {
-    q.emplace(NonBlockCloseCmd{});
-  }
-  for (auto &t : exec_threads_) {
-    if (t.joinable()) {
-      t.join();
+  for (auto &per_lnc : xu_queues_) {
+    for (auto &q : per_lnc) {
+      q.clear();
     }
   }
-  for (auto &t : tensor_threads_) {
-    if (t.joinable()) {
-      t.join();
+  tensor_write_batched_prepared_.clear();
+  tensor_read_batched_prepared_.clear();
+
+  // Tear down the epoll multiplexing state. Deregister each channel's eventfd
+  // from the runtime (negative fd deregisters) before closing it.
+  for (uint32_t lnc = 0; lnc < MAX_LNC; ++lnc) {
+    for (uint32_t xu = 0; xu < NRTA_XU_TYPE_NUM; ++xu) {
+      int &fd = channel_event_fds_[channel_index(lnc, xu)];
+      if (fd < 0) {
+        continue;
+      }
+      nrta_event_register_xu_completion(static_cast<int>(lnc),
+                                        static_cast<nrta_xu_t>(xu),
+                                        /*queue=*/0, /*fd=*/-1);
+      ::close(fd);
+      fd = -1;
     }
   }
+  if (epoll_fd_ >= 0) {
+    ::close(epoll_fd_);
+    epoll_fd_ = -1;
+  }
+  scan_channels_.clear();
+  scan_channel_queued_.fill(false);
 
   runtime_.reset();
   g_alive_spike_instance_exists = false;
   return 0;
+}
+
+void Spike::ensure_channel_registered(uint32_t lnc, nrta_xu_t xu) {
+  if (lnc >= MAX_LNC) {
+    throw SpikeError("LNC index exceeds MAX_LNC.");
+  }
+  if (xu >= NRTA_XU_TYPE_NUM) {
+    throw SpikeError("XU index out of range.");
+  }
+
+  if (epoll_fd_ < 0) {
+    epoll_fd_ = epoll_create1(EPOLL_CLOEXEC);
+    if (epoll_fd_ < 0) {
+      throw SpikeError(std::string("epoll_create1 failed: ") +
+                       std::strerror(errno));
+    }
+  }
+
+  int &fd = channel_event_fds_[channel_index(lnc, xu)];
+  if (fd >= 0) {
+    return; // Already registered.
+  }
+
+  fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+  if (fd < 0) {
+    throw SpikeError(std::string("eventfd failed: ") + std::strerror(errno));
+  }
+
+  // The data carries the channel index so epoll_wait tells us exactly which
+  // (lnc, xu) channel signaled.
+  struct epoll_event ev;
+  ev.events = EPOLLIN;
+  ev.data.u32 = channel_index(lnc, xu);
+  if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev) < 0) {
+    int err = errno;
+    ::close(fd);
+    fd = -1;
+    throw SpikeError(std::string("epoll_ctl ADD failed: ") +
+                     std::strerror(err));
+  }
+
+  // Hand the eventfd to the runtime; it signals it whenever this XU completes
+  // any sequence on queue 0.
+  NRT_STATUS status = nrta_event_register_xu_completion(
+      static_cast<int>(lnc), xu, /*queue=*/0, fd);
+  if (status != NRT_SUCCESS) {
+    epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+    ::close(fd);
+    fd = -1;
+    throw NrtError(status, "Failed to register XU completion event");
+  }
+}
+
+PendingOp &Spike::enqueue_pending(uint32_t lnc, nrta_xu_t xu, PendingOp op) {
+  // Channel registration happens before submission (in the calling
+  // tensor_*/execute_nonblock helpers), so we know an eventfd is in place for
+  // every completion. xu must be the same XU the channel was registered on so
+  // the queue index here matches the one try_poll derives from the epoll event.
+  if (lnc >= MAX_LNC || xu >= NRTA_XU_TYPE_NUM) {
+    throw SpikeError("Channel index out of range.");
+  }
+  std::deque<PendingOp> &q = xu_queues_[lnc][xu];
+  q.push_back(std::move(op));
+  return q.back();
 }
 
 NrtModel Spike::load_model(const std::string &neff_file, uint32_t core_id,
@@ -155,34 +239,37 @@ void Spike::execute(NrtModel &model,
   model.execute(input_set, output_set, ntff_name, save_trace);
 }
 
-void Spike::init_nonblock() {
-  // Initialize nonblocking thread pools: one execution thread and one tensor
-  // thread per physical NeuronCore. Uses total core count (not just visible)
-  // to avoid visible-to-physical ID mapping. Extra threads remain blocked
-  // with no overhead.
-
-  int num_nc = NrtRuntime::get_total_nc_count();
-  exec_queues_ = std::vector<LockedQueue<NonBlockExecOrCloseCmd, true>>(num_nc);
-  tensor_queues_ = std::vector<LockedQueue<NonBlockTensorCmd, true>>(num_nc);
-
-  for (int i = 0; i < num_nc; ++i) {
-    exec_threads_.emplace_back([this, i]() { loop_execute(i); });
-    tensor_threads_.emplace_back([this, i]() { loop_tensor(i); });
-  }
-}
+// Kept for backward compatibility with SpikeAsync. With the nrta_* backend we
+// don't need any thread pools; there's nothing to initialize.
+void Spike::init_nonblock() {}
 
 uint64_t Spike::tensor_write_nonblock(std::shared_ptr<NrtTensor> tensor,
                                        nb::bytes data_obj,
                                        size_t offset) {
-  uint64_t cmd_id = next_non_block_id_++;
-
   const void *data = data_obj.data();
   size_t size = data_obj.size();
-  uint32_t core_id = tensor->get_core_id();
 
-  NonBlockTensorWriteCmd cmd{cmd_id,        std::move(tensor), data,
-                             size,          std::move(data_obj), offset};
-  tensor_queues_[core_id].emplace(std::move(cmd));
+  uint64_t cmd_id = next_non_block_id_++;
+  uint32_t lnc = tensor->get_core_id();
+
+  PendingTensorWrite p;
+  p.ret = NRT_SUCCESS;
+  p.tensor = tensor;
+  p.data_obj = std::move(data_obj);
+
+  ensure_channel_registered(lnc, NRTA_XU_TENSOR_OP);
+  // Enqueue first so nrta_* can write completion status into the deque-resident
+  // op (its address must outlive this call); roll back if scheduling fails.
+  PendingOp &enq = enqueue_pending(
+      lnc, NRTA_XU_TENSOR_OP, PendingOp{cmd_id, /*wait_seq=*/0, std::move(p)});
+  PendingTensorWrite &q = std::get<PendingTensorWrite>(enq.op);
+  NRT_STATUS status = nrta_tensor_write(
+      tensor->get_ptr(), data, offset, size, static_cast<int>(lnc),
+      /*queue=*/0, &q.ret, &enq.wait_seq);
+  if (status != NRT_SUCCESS) {
+    xu_queues_[lnc][NRTA_XU_TENSOR_OP].pop_back();
+    throw NrtError(status, "Failed to schedule nonblocking tensor write");
+  }
 
   return cmd_id;
 }
@@ -190,15 +277,28 @@ uint64_t Spike::tensor_write_nonblock(std::shared_ptr<NrtTensor> tensor,
 uint64_t Spike::tensor_write_nonblock(std::shared_ptr<NrtTensor> tensor,
                                        nb::ndarray<> data_obj,
                                        size_t offset) {
-  uint64_t cmd_id = next_non_block_id_++;
-
   const void *data = data_obj.data();
   size_t size = data_obj.nbytes();
-  uint32_t core_id = tensor->get_core_id();
 
-  NonBlockTensorWriteCmd cmd{cmd_id,        std::move(tensor), data,
-                             size,          std::move(data_obj), offset};
-  tensor_queues_[core_id].emplace(std::move(cmd));
+  uint64_t cmd_id = next_non_block_id_++;
+  uint32_t lnc = tensor->get_core_id();
+
+  PendingTensorWrite p;
+  p.ret = NRT_SUCCESS;
+  p.tensor = tensor;
+  p.data_obj = std::move(data_obj);
+
+  ensure_channel_registered(lnc, NRTA_XU_TENSOR_OP);
+  PendingOp &enq = enqueue_pending(
+      lnc, NRTA_XU_TENSOR_OP, PendingOp{cmd_id, /*wait_seq=*/0, std::move(p)});
+  PendingTensorWrite &q = std::get<PendingTensorWrite>(enq.op);
+  NRT_STATUS status = nrta_tensor_write(
+      tensor->get_ptr(), data, offset, size, static_cast<int>(lnc),
+      /*queue=*/0, &q.ret, &enq.wait_seq);
+  if (status != NRT_SUCCESS) {
+    xu_queues_[lnc][NRTA_XU_TENSOR_OP].pop_back();
+    throw NrtError(status, "Failed to schedule nonblocking tensor write");
+  }
 
   return cmd_id;
 }
@@ -207,17 +307,24 @@ uint64_t Spike::tensor_write_nonblock(std::shared_ptr<NrtTensor> tensor,
                                        const void *data, size_t size,
                                        size_t offset) {
   uint64_t cmd_id = next_non_block_id_++;
+  uint32_t lnc = tensor->get_core_id();
 
-  uint32_t core_id = tensor->get_core_id();
+  PendingTensorWrite p;
+  p.ret = NRT_SUCCESS;
+  p.tensor = tensor;
+  // No data_obj: caller manages the raw buffer's lifetime.
 
-  NonBlockTensorWriteCmd cmd;
-  cmd.id = cmd_id;
-  cmd.tensor = std::move(tensor);
-  cmd.data = data;
-  cmd.size = size;
-  cmd.offset = offset;
-
-  tensor_queues_[core_id].emplace(std::move(cmd));
+  ensure_channel_registered(lnc, NRTA_XU_TENSOR_OP);
+  PendingOp &enq = enqueue_pending(
+      lnc, NRTA_XU_TENSOR_OP, PendingOp{cmd_id, /*wait_seq=*/0, std::move(p)});
+  PendingTensorWrite &q = std::get<PendingTensorWrite>(enq.op);
+  NRT_STATUS status = nrta_tensor_write(
+      tensor->get_ptr(), data, offset, size, static_cast<int>(lnc),
+      /*queue=*/0, &q.ret, &enq.wait_seq);
+  if (status != NRT_SUCCESS) {
+    xu_queues_[lnc][NRTA_XU_TENSOR_OP].pop_back();
+    throw NrtError(status, "Failed to schedule nonblocking tensor write");
+  }
 
   return cmd_id;
 }
@@ -227,15 +334,27 @@ uint64_t Spike::tensor_read_nonblock(std::shared_ptr<const NrtTensor> tensor,
   size = (size == 0) ? (tensor->get_size() - offset) : size;
 
   uint64_t cmd_id = next_non_block_id_++;
-
-  uint32_t core_id = tensor->get_core_id();
+  uint32_t lnc = tensor->get_core_id();
 
   nb::bytes dest(nullptr, size);
   void *data = PyBytes_AsString(dest.ptr());
 
-  NonBlockTensorReadCmd cmd{cmd_id,        std::move(tensor), offset,
-                            size,          data,              std::move(dest)};
-  tensor_queues_[core_id].emplace(std::move(cmd));
+  PendingTensorRead p;
+  p.ret = NRT_SUCCESS;
+  p.tensor = tensor;
+  p.data_obj = std::move(dest);
+
+  ensure_channel_registered(lnc, NRTA_XU_TENSOR_OP);
+  PendingOp &enq = enqueue_pending(
+      lnc, NRTA_XU_TENSOR_OP, PendingOp{cmd_id, /*wait_seq=*/0, std::move(p)});
+  PendingTensorRead &q = std::get<PendingTensorRead>(enq.op);
+  NRT_STATUS status = nrta_tensor_read(
+      data, tensor->get_ptr(), offset, size, static_cast<int>(lnc),
+      /*queue=*/0, &q.ret, &enq.wait_seq);
+  if (status != NRT_SUCCESS) {
+    xu_queues_[lnc][NRTA_XU_TENSOR_OP].pop_back();
+    throw NrtError(status, "Failed to schedule nonblocking tensor read");
+  }
 
   return cmd_id;
 }
@@ -250,14 +369,26 @@ uint64_t Spike::tensor_read_nonblock(std::shared_ptr<const NrtTensor> tensor,
   }
 
   uint64_t cmd_id = next_non_block_id_++;
-
-  uint32_t core_id = tensor->get_core_id();
+  uint32_t lnc = tensor->get_core_id();
 
   void *data = dest.data();
 
-  NonBlockTensorReadCmd cmd{cmd_id,        std::move(tensor), offset,
-                            size,          data,              std::move(dest)};
-  tensor_queues_[core_id].emplace(std::move(cmd));
+  PendingTensorRead p;
+  p.ret = NRT_SUCCESS;
+  p.tensor = tensor;
+  p.data_obj = std::move(dest);
+
+  ensure_channel_registered(lnc, NRTA_XU_TENSOR_OP);
+  PendingOp &enq = enqueue_pending(
+      lnc, NRTA_XU_TENSOR_OP, PendingOp{cmd_id, /*wait_seq=*/0, std::move(p)});
+  PendingTensorRead &q = std::get<PendingTensorRead>(enq.op);
+  NRT_STATUS status = nrta_tensor_read(
+      data, tensor->get_ptr(), offset, size, static_cast<int>(lnc),
+      /*queue=*/0, &q.ret, &enq.wait_seq);
+  if (status != NRT_SUCCESS) {
+    xu_queues_[lnc][NRTA_XU_TENSOR_OP].pop_back();
+    throw NrtError(status, "Failed to schedule nonblocking tensor read");
+  }
 
   return cmd_id;
 }
@@ -277,20 +408,15 @@ uint64_t Spike::tensor_write_nonblock_batched_prepare(
 
   uint64_t batch_id = next_batch_id_++;
 
-  std::vector<NonBlockTensorWriteCmd> cmds;
-  cmds.reserve(tensors.size());
+  std::vector<PreparedTensorWrite> prepared;
+  prepared.reserve(tensors.size());
 
   uint32_t core_id = tensors[0]->get_core_id();
 
   for (size_t i = 0; i < tensors.size(); ++i) {
     std::shared_ptr<NrtTensor> tensor = std::move(tensors[i]);
     nb::ndarray<> data_obj = std::move(data_objs[i]);
-    size_t offset;
-    if (offsets.has_value()) {
-      offset = offsets.value()[i];
-    } else {
-      offset = 0;
-    }
+    size_t offset = offsets.has_value() ? offsets.value()[i] : 0;
 
     const void *data = data_obj.data();
     size_t size = data_obj.nbytes();
@@ -299,36 +425,56 @@ uint64_t Spike::tensor_write_nonblock_batched_prepare(
       throw SpikeError("All tensors must be on the same NeuronCore.");
     }
 
-    NonBlockTensorWriteCmd cmd{batch_id, std::move(tensor),   data,
-                               size,     std::move(data_obj), offset};
-    cmds.push_back(std::move(cmd));
+    PreparedTensorWrite entry;
+    entry.tensor = std::move(tensor);
+    entry.data = data;
+    entry.size = size;
+    entry.offset = offset;
+    entry.data_obj = std::move(data_obj);
+    prepared.push_back(std::move(entry));
   }
 
-  std::scoped_lock lk(tensor_write_batched_cmds_mtx_);
-  tensor_write_batched_cmds_[batch_id] = std::move(cmds);
+  tensor_write_batched_prepared_[batch_id] = std::move(prepared);
 
   return batch_id;
 }
 
 uint64_t Spike::tensor_write_nonblock_batched_start(uint64_t batch_id) {
-  uint64_t cmd_id = next_non_block_id_++;
-
-  NonBlockTensorWriteBatchedCmd cmd;
-  cmd.id = cmd_id;
-  cmd.batch_id = batch_id;
-
-  std::shared_lock lk(tensor_write_batched_cmds_mtx_);
-
-  auto it = tensor_write_batched_cmds_.find(batch_id);
-  if (it == tensor_write_batched_cmds_.end()) {
-    lk.unlock();
+  auto it = tensor_write_batched_prepared_.find(batch_id);
+  if (it == tensor_write_batched_prepared_.end()) {
     throw SpikeError("The batch ID does not exist.");
   }
-  uint32_t core_id = it->second[0].tensor->get_core_id();
-  lk.unlock();
+  const std::vector<PreparedTensorWrite> &prepared = it->second;
 
-  tensor_queues_[core_id].emplace(std::move(cmd));
+  uint64_t cmd_id = next_non_block_id_++;
+  uint32_t lnc = prepared[0].tensor->get_core_id();
 
+  PendingTensorWriteBatched p;
+  p.batch_id = batch_id;
+  p.rets.assign(prepared.size(), NRT_SUCCESS);
+
+  ensure_channel_registered(lnc, NRTA_XU_TENSOR_OP);
+  // p.rets is a heap vector; the runtime keeps &p.rets[i] and fills it on
+  // completion. Moving p into the deque below preserves that buffer, so the
+  // pointers stay valid. All sub-requests hit the same (lnc, xu=TENSOR_OP,
+  // queue=0) back-to-back, so seq numbers are consecutive and we only wait on
+  // the last.
+  nrta_seq_t wait_seq = 0;
+  for (size_t i = 0; i < prepared.size(); ++i) {
+    const PreparedTensorWrite &e = prepared[i];
+    nrta_seq_t seq;
+    NRT_STATUS status = nrta_tensor_write(
+        e.tensor->get_ptr(), e.data, e.offset, e.size, static_cast<int>(lnc),
+        /*queue=*/0, &p.rets[i], &seq);
+    if (status != NRT_SUCCESS) {
+      throw NrtError(status,
+                     "Failed to schedule nonblocking batched tensor write");
+    }
+    wait_seq = seq;
+  }
+
+  enqueue_pending(lnc, NRTA_XU_TENSOR_OP,
+                  PendingOp{cmd_id, wait_seq, std::move(p)});
   return cmd_id;
 }
 
@@ -349,8 +495,8 @@ uint64_t Spike::tensor_read_nonblock_batched_prepare(
 
   uint64_t batch_id = next_batch_id_++;
 
-  std::vector<NonBlockTensorReadCmd> cmds;
-  cmds.reserve(tensors.size());
+  std::vector<PreparedTensorRead> prepared;
+  prepared.reserve(tensors.size());
 
   uint32_t core_id = tensors[0]->get_core_id();
 
@@ -359,8 +505,8 @@ uint64_t Spike::tensor_read_nonblock_batched_prepare(
     nb::ndarray<> dest = std::move(dests[i]);
 
     size_t offset = offsets.has_value() ? offsets.value()[i] : 0;
-    size_t size = sizes.has_value() ? sizes.value()[i] :
-                  (tensor->get_size() - offset);
+    size_t size = sizes.has_value() ? sizes.value()[i]
+                                    : (tensor->get_size() - offset);
 
     if (dest.nbytes() < size) {
       throw SpikeError("The read operation exceeds the destination bound.");
@@ -372,36 +518,54 @@ uint64_t Spike::tensor_read_nonblock_batched_prepare(
       throw SpikeError("All tensors must be on the same NeuronCore.");
     }
 
-    NonBlockTensorReadCmd cmd{batch_id, std::move(tensor), offset,
-                              size,     data,              std::move(dest)};
-    cmds.push_back(std::move(cmd));
+    PreparedTensorRead entry;
+    entry.tensor = std::move(tensor);
+    entry.offset = offset;
+    entry.size = size;
+    entry.data = data;
+    entry.data_obj = std::move(dest);
+    prepared.push_back(std::move(entry));
   }
 
-  std::scoped_lock lk(tensor_read_batched_cmds_mtx_);
-  tensor_read_batched_cmds_[batch_id] = std::move(cmds);
+  tensor_read_batched_prepared_[batch_id] = std::move(prepared);
 
   return batch_id;
 }
 
 uint64_t Spike::tensor_read_nonblock_batched_start(uint64_t batch_id) {
-  uint64_t cmd_id = next_non_block_id_++;
-
-  NonBlockTensorReadBatchedCmd cmd;
-  cmd.id = cmd_id;
-  cmd.batch_id = batch_id;
-
-  std::shared_lock lk(tensor_read_batched_cmds_mtx_);
-
-  auto it = tensor_read_batched_cmds_.find(batch_id);
-  if (it == tensor_read_batched_cmds_.end()) {
-    lk.unlock();
+  auto it = tensor_read_batched_prepared_.find(batch_id);
+  if (it == tensor_read_batched_prepared_.end()) {
     throw SpikeError("The batch ID does not exist.");
   }
-  uint32_t core_id = it->second[0].tensor->get_core_id();
-  lk.unlock();
+  const std::vector<PreparedTensorRead> &prepared = it->second;
 
-  tensor_queues_[core_id].emplace(std::move(cmd));
+  uint64_t cmd_id = next_non_block_id_++;
+  uint32_t lnc = prepared[0].tensor->get_core_id();
 
+  PendingTensorReadBatched p;
+  p.batch_id = batch_id;
+  p.rets.assign(prepared.size(), NRT_SUCCESS);
+
+  ensure_channel_registered(lnc, NRTA_XU_TENSOR_OP);
+  // p.rets is a heap vector; the runtime keeps &p.rets[i] and fills it on
+  // completion. Moving p into the deque below preserves that buffer, so the
+  // pointers stay valid. Seq numbers are consecutive; wait on the last.
+  nrta_seq_t wait_seq = 0;
+  for (size_t i = 0; i < prepared.size(); ++i) {
+    const PreparedTensorRead &e = prepared[i];
+    nrta_seq_t seq;
+    NRT_STATUS status = nrta_tensor_read(
+        e.data, e.tensor->get_ptr(), e.offset, e.size, static_cast<int>(lnc),
+        /*queue=*/0, &p.rets[i], &seq);
+    if (status != NRT_SUCCESS) {
+      throw NrtError(status,
+                     "Failed to schedule nonblocking batched tensor read");
+    }
+    wait_seq = seq;
+  }
+
+  enqueue_pending(lnc, NRTA_XU_TENSOR_OP,
+                  PendingOp{cmd_id, wait_seq, std::move(p)});
   return cmd_id;
 }
 
@@ -410,24 +574,167 @@ uint64_t Spike::execute_nonblock(
     std::shared_ptr<const NrtTensorSet> input_set,
     std::shared_ptr<NrtTensorSet> output_set,
     std::optional<std::string> ntff_name, bool save_trace) {
+  // nrta_execute_schedule has no profiling hook. The nrt_profile_start/stop
+  // pair in the sync path straddles a single synchronous nrt_execute, which
+  // can't be mapped safely onto an asynchronous schedule.
+  if (save_trace) {
+    throw SpikeError("save_trace is not supported with nonblocking execute.");
+  }
+  (void)ntff_name;
+
   uint64_t cmd_id = next_non_block_id_++;
+  uint32_t lnc = model->get_core_id();
 
-  uint32_t core_id = model->get_core_id();
+  PendingExecute p;
+  p.ret = NRT_SUCCESS;
+  p.model = model;
+  p.input_set = input_set;
+  p.output_set = output_set;
 
-  NonBlockExecCmd cmd{cmd_id,           std::move(model), std::move(input_set),
-                      std::move(output_set), ntff_name,        save_trace};
-  exec_queues_[core_id].emplace(std::move(cmd));
+  ensure_channel_registered(lnc, NRTA_XU_COMPUTE);
+  PendingOp &enq = enqueue_pending(
+      lnc, NRTA_XU_COMPUTE, PendingOp{cmd_id, /*wait_seq=*/0, std::move(p)});
+  PendingExecute &q = std::get<PendingExecute>(enq.op);
+  NRT_STATUS status =
+      nrta_execute_schedule(model->get_ptr(), input_set->get_ptr(),
+                            output_set->get_ptr(), /*queue=*/0, &q.ret,
+                            &enq.wait_seq);
+  if (status != NRT_SUCCESS) {
+    xu_queues_[lnc][NRTA_XU_COMPUTE].pop_back();
+    throw NrtError(status, "Failed to schedule nonblocking execute");
+  }
 
   return cmd_id;
 }
 
-std::optional<NonBlockResult> Spike::try_poll() {
-  std::optional<NonBlockInternalResult> internal_res = noti_queue_.try_pop();
-  if (internal_res.has_value()) {
-    return convert_internal_result(internal_res.value());
-  } else {
-    return std::nullopt;
+std::optional<std::variant<SpikeError, NrtError>>
+Spike::ret_to_err(NRT_STATUS ret) {
+  if (ret != NRT_SUCCESS) {
+    return NrtError(ret, "Nonblocking operation failed");
   }
+  return std::nullopt;
+}
+
+std::optional<std::variant<SpikeError, NrtError>>
+Spike::rets_to_err(const std::vector<NRT_STATUS> &rets) {
+  for (NRT_STATUS r : rets) {
+    if (r != NRT_SUCCESS) {
+      return NrtError(r, "Nonblocking operation failed");
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<NonBlockResult> Spike::try_poll() {
+  // The runtime signals each channel's eventfd whenever its XU completes a
+  // sequence. We ask epoll (non-blocking) which channels made progress and
+  // only scan those — rather than probing all MAX_LNC * NRTA_XU_TYPE_NUM
+  // channels every call. Registration is done before submission (see the
+  // tensor_*/execute_nonblock helpers), so every completion is guaranteed to
+  // signal epoll.
+  if (epoll_fd_ >= 0) {
+    struct epoll_event events[NUM_CHANNELS];
+    int n;
+    do {
+      n = epoll_wait(epoll_fd_, events, NUM_CHANNELS, /*timeout=*/0);
+    } while (n < 0 && errno == EINTR);
+    if (n < 0) {
+      throw SpikeError(std::string("epoll_wait failed: ") +
+                       std::strerror(errno));
+    }
+    for (int i = 0; i < n; ++i) {
+      uint32_t ch = events[i].data.u32;
+      // Drain the eventfd so it only fires again on a future completion
+      // (level-triggered). A single read resets the counter regardless of how
+      // many completions it accumulated; nrta_get_sequence reports the latest.
+      uint64_t counter;
+      int fd = channel_event_fds_[ch];
+      if (fd >= 0) {
+        ssize_t rc;
+        do {
+          rc = read(fd, &counter, sizeof(counter));
+        } while (rc < 0 && errno == EINTR);
+      }
+      // Enqueue for scanning, guarding against duplicates in O(1).
+      if (!scan_channel_queued_[ch]) {
+        scan_channel_queued_[ch] = true;
+        scan_channels_.push_back(ch);
+      }
+    }
+  }
+
+  // Each (lnc, xu) queue is FIFO in submission order, and within it nrta_seq_t
+  // values are monotonically increasing, so we only check the front op's
+  // wait_seq against nrta_get_sequence's latest-completed seq for that channel.
+  //
+  // scan_channels_ is a round-robin FIFO: we pop the front channel, and if it
+  // yields a completed op we re-queue it at the back before returning, so a
+  // continuously-busy channel can't starve the others. A channel that is empty
+  // or whose front is not yet complete is dropped (its eventfd will re-queue it
+  // on the next completion).
+  while (!scan_channels_.empty()) {
+    uint32_t ch = scan_channels_.front();
+    scan_channels_.pop_front();
+    scan_channel_queued_[ch] = false;
+
+    uint32_t lnc = ch / NRTA_XU_TYPE_NUM;
+    uint32_t xu_idx = ch % NRTA_XU_TYPE_NUM;
+    std::deque<PendingOp> &q = xu_queues_[lnc][xu_idx];
+
+    if (q.empty()) {
+      continue;
+    }
+    nrta_seq_t front_wait_seq = q.front().wait_seq;
+
+    nrta_xu_t xu = static_cast<nrta_xu_t>(xu_idx);
+    nrta_seq_t latest = 0;
+    NRT_STATUS s = nrta_get_sequence(lnc, xu, /*queue=*/0, &latest);
+    if (s != NRT_SUCCESS ||
+        NRTA_SEQ_GET_SEQ_NUM(front_wait_seq) > NRTA_SEQ_GET_SEQ_NUM(latest)) {
+      // Front not completed yet; stop scanning this channel until its eventfd
+      // signals the next completion.
+      continue;
+    }
+
+    PendingOp op = std::move(q.front());
+    q.pop_front();
+
+    // A single completion may have advanced the sequence past several queued
+    // ops, so re-queue this channel at the back: the next try_poll() re-checks
+    // its new front (and drops it if empty/not-ready) before trusting epoll.
+    if (!scan_channel_queued_[ch]) {
+      scan_channel_queued_[ch] = true;
+      scan_channels_.push_back(ch);
+    }
+
+    uint64_t id = op.id;
+    return std::visit(
+        [id](auto &p) -> NonBlockResult {
+          using T = std::decay_t<decltype(p)>;
+          if constexpr (std::is_same_v<T, PendingTensorWrite>) {
+            return NonBlockTensorWriteResult{id, ret_to_err(p.ret)};
+          } else if constexpr (std::is_same_v<T, PendingTensorRead>) {
+            return NonBlockTensorReadResult{id, std::move(p.data_obj),
+                                            ret_to_err(p.ret)};
+          } else if constexpr (std::is_same_v<T, PendingTensorWriteBatched>) {
+            return NonBlockTensorWriteResult{id, rets_to_err(p.rets)};
+          } else if constexpr (std::is_same_v<T, PendingTensorReadBatched>) {
+            // Lifetime anchors stay in tensor_read_batched_prepared_[batch_id]
+            // so the same prepared batch can be _start'd again. Callers read
+            // the data via the dests array they passed to _prepare, so the
+            // result's data field is left default-constructed.
+            return NonBlockTensorReadResult{
+                id, std::variant<nb::bytes, nb::ndarray<>>{},
+                rets_to_err(p.rets)};
+          } else {
+            static_assert(std::is_same_v<T, PendingExecute>);
+            return NonBlockExecResult{id, ret_to_err(p.ret)};
+          }
+        },
+        op.op);
+  }
+
+  return std::nullopt;
 }
 
 NrtModel Spike::wrap_model(nrt_model_t *ptr) {
@@ -455,159 +762,6 @@ NrtTensor Spike::wrap_tensor(nrt_tensor_t *ptr) {
 NrtTensorSet Spike::wrap_tensor_set(nrt_tensor_set_t *ptr) {
   return NrtTensorSet(ptr);
 }
-
-void Spike::loop_tensor(int core_id) {
-  while (true) {
-    NonBlockTensorCmd cmd_ = tensor_queues_[core_id].pop();
-
-    if (std::holds_alternative<NonBlockTensorReadCmd>(cmd_)) {
-      NonBlockTensorReadCmd &cmd = std::get<NonBlockTensorReadCmd>(cmd_);
-
-      NonBlockTensorReadInternalResult res;
-
-      try {
-        cmd.tensor->read(cmd.data, cmd.size, cmd.offset);
-        res.err = std::nullopt;
-      } catch (SpikeError &err) {
-        res.err = std::move(err);
-      } catch (NrtError &err) {
-        res.err = std::move(err);
-      }
-
-      res.id = cmd.id;
-      res.tensor = std::move(cmd.tensor);
-      res.data_obj = std::move(cmd.data_obj);
-
-      noti_queue_.emplace(std::move(res));
-    } else if (std::holds_alternative<NonBlockTensorWriteCmd>(cmd_)) {
-      NonBlockTensorWriteCmd &cmd = std::get<NonBlockTensorWriteCmd>(cmd_);
-
-      NonBlockTensorWriteInternalResult res;
-
-      try {
-        cmd.tensor->write(cmd.data, cmd.size, cmd.offset);
-        res.err = std::nullopt;
-      } catch (SpikeError &err) {
-        res.err = std::move(err);
-      } catch (NrtError &err) {
-        res.err = std::move(err);
-      }
-
-      res.id = cmd.id;
-      res.tensor = std::move(cmd.tensor);
-      res.data_obj = std::move(cmd.data_obj);
-
-      noti_queue_.emplace(std::move(res));
-    } else if (std::holds_alternative<NonBlockTensorWriteBatchedCmd>(cmd_)) {
-      NonBlockTensorWriteBatchedCmd &batched_cmd =
-          std::get<NonBlockTensorWriteBatchedCmd>(cmd_);
-
-      NonBlockTensorWriteInternalResult res;
-      res.id = batched_cmd.id;
-
-      std::shared_lock lk(tensor_write_batched_cmds_mtx_);
-
-      auto &cmds = tensor_write_batched_cmds_[batched_cmd.batch_id];
-
-      for (auto &cmd : cmds) {
-        try {
-          cmd.tensor->write(cmd.data, cmd.size, cmd.offset);
-          res.err = std::nullopt;
-        } catch (SpikeError &err) {
-          res.err = std::move(err);
-        } catch (NrtError &err) {
-          res.err = std::move(err);
-        }
-
-        if (res.err.has_value()) {
-          break;
-        }
-      }
-
-      noti_queue_.emplace(std::move(res));
-    } else if (std::holds_alternative<NonBlockTensorReadBatchedCmd>(cmd_)) {
-      NonBlockTensorReadBatchedCmd &batched_cmd =
-          std::get<NonBlockTensorReadBatchedCmd>(cmd_);
-
-      NonBlockTensorReadInternalResult res;
-      res.id = batched_cmd.id;
-
-      std::shared_lock lk(tensor_read_batched_cmds_mtx_);
-
-      auto &cmds = tensor_read_batched_cmds_[batched_cmd.batch_id];
-
-      for (auto &cmd : cmds) {
-        try {
-          cmd.tensor->read(cmd.data, cmd.size, cmd.offset);
-          res.err = std::nullopt;
-        } catch (SpikeError &err) {
-          res.err = std::move(err);
-        } catch (NrtError &err) {
-          res.err = std::move(err);
-        }
-
-        if (res.err.has_value()) {
-          break;
-        }
-      }
-
-      noti_queue_.emplace(std::move(res));
-    } else {
-      break;
-    }
-  }
-}
-
-void Spike::loop_execute(int core_id) {
-  while (true) {
-    NonBlockExecOrCloseCmd cmd_ = exec_queues_[core_id].pop();
-
-    if (std::holds_alternative<NonBlockExecCmd>(cmd_)) {
-      NonBlockExecCmd &cmd = std::get<NonBlockExecCmd>(cmd_);
-
-      NonBlockExecInternalResult res;
-
-      try {
-        cmd.model->execute(*cmd.input_set, *cmd.output_set, cmd.ntff_name,
-                           cmd.save_trace);
-        res.err = std::nullopt;
-      } catch (SpikeError &err) {
-        res.err = std::move(err);
-      } catch (NrtError &err) {
-        res.err = std::move(err);
-      }
-
-      res.id = cmd.id;
-      res.model = std::move(cmd.model);
-      res.input_set = std::move(cmd.input_set);
-      res.output_set = std::move(cmd.output_set);
-
-      noti_queue_.emplace(std::move(res));
-    } else {
-      break;
-    }
-  }
-}
-
-// Convert InternalResult to Result in GIL context.
-// Moves nanobind objects to Result, leaving shared_ptrs in InternalResult to be
-// destroyed here (with GIL held). This avoids calling Python object destructors
-// in worker threads, preventing GIL deadlocks and context switch overhead.
-NonBlockResult Spike::convert_internal_result(NonBlockInternalResult &internal_res_) {
-  if (std::holds_alternative<NonBlockTensorReadInternalResult>(internal_res_)) {
-    NonBlockTensorReadInternalResult &internal_res = std::get<NonBlockTensorReadInternalResult>(internal_res_);
-    NonBlockTensorReadResult res{internal_res.id, std::move(internal_res.data_obj), std::move(internal_res.err)};
-    return res;
-  } else if (std::holds_alternative<NonBlockTensorWriteInternalResult>(internal_res_)) {
-    NonBlockTensorWriteInternalResult &internal_res = std::get<NonBlockTensorWriteInternalResult>(internal_res_);
-    NonBlockTensorWriteResult res{internal_res.id, std::move(internal_res.err)};
-    return res;
-  } else {
-    NonBlockExecInternalResult &internal_res = std::get<NonBlockExecInternalResult>(internal_res_);
-    return NonBlockExecResult{internal_res.id, std::move(internal_res.err)};
-  }
-}
-
 
 std::string Spike::dtype_to_string(nrt_dtype_t dtype) {
   switch (dtype) {

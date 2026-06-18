@@ -6,18 +6,16 @@
 #include "tensor.h"
 #include "tensor_set.h"
 
+#include <nrt/nrt_async.h>
+
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 
-#include <atomic>
-#include <condition_variable>
+#include <array>
 #include <cstdint>
+#include <deque>
 #include <memory>
-#include <mutex>
 #include <optional>
-#include <queue>
-#include <shared_mutex>
-#include <thread>
 #include <unordered_map>
 #include <variant>
 #include <vector>
@@ -39,11 +37,18 @@ struct ModelTensorInfo {
   std::unordered_map<std::string, TensorMetadata> outputs;
 };
 
-// NonBlock command structures
-struct NonBlockCloseCmd {};
+// Prepared-batch records. These only hold the arguments to be used when
+// `_batched_start` is called; at start time we just submit one nrta_* request
+// per entry and group them under a single cmd_id.
+struct PreparedTensorWrite {
+  std::shared_ptr<NrtTensor> tensor;
+  const void *data;
+  size_t size;
+  size_t offset;
+  std::variant<nb::bytes, nb::ndarray<>> data_obj;
+};
 
-struct NonBlockTensorReadCmd {
-  uint64_t id;
+struct PreparedTensorRead {
   std::shared_ptr<const NrtTensor> tensor;
   size_t offset;
   size_t size;
@@ -51,114 +56,62 @@ struct NonBlockTensorReadCmd {
   std::variant<nb::bytes, nb::ndarray<>> data_obj;
 };
 
-struct NonBlockTensorWriteCmd {
-  uint64_t id;
+// Pending nonblocking operations. Each cmd_id we hand back to Python maps to
+// one PendingOp. The id and wait_seq are common to every kind of op, so they
+// live directly on PendingOp; the per-kind payload is the variant below. The
+// batched variants hold N sub-requests submitted back-to-back on the same
+// (lnc, xu, queue=0); their seq numbers are consecutive, so wait_seq stores
+// the last one and a completed wait_seq implies every prior sub-request is
+// complete too.
+
+// The nrta_* APIs store the op's completion status through the `ret` pointer
+// *after* submission, so `ret` must outlive the call. Callers therefore enqueue
+// the PendingOp first and pass a pointer into the deque-resident copy (see
+// enqueue_pending); std::deque never relocates existing elements on push_back,
+// so that address stays valid until the op is harvested.
+struct PendingTensorWrite {
+  NRT_STATUS ret;
   std::shared_ptr<NrtTensor> tensor;
-  const void *data;
-  size_t size;
+  // Anchors the Python-owned source buffer until the op completes. Empty for
+  // the raw-pointer overload (caller manages the buffer lifetime).
+  std::optional<std::variant<nb::bytes, nb::ndarray<>>> data_obj;
+};
+
+struct PendingTensorRead {
+  NRT_STATUS ret;
+  std::shared_ptr<const NrtTensor> tensor;
+  // The destination buffer; also returned to Python via
+  // NonBlockTensorReadResult.data.
   std::variant<nb::bytes, nb::ndarray<>> data_obj;
-  size_t offset;
 };
 
-struct NonBlockTensorWriteBatchedCmd {
-  uint64_t id;
+struct PendingTensorWriteBatched {
+  // Lifetime anchors live in tensor_write_batched_prepared_[batch_id], which
+  // persists until close() (or a future explicit-release API) so the same
+  // prepared batch can be _start'd many times.
   uint64_t batch_id;
+  std::vector<NRT_STATUS> rets;
 };
 
-struct NonBlockTensorReadBatchedCmd {
-  uint64_t id;
+struct PendingTensorReadBatched {
   uint64_t batch_id;
+  std::vector<NRT_STATUS> rets;
 };
 
-typedef std::variant<NonBlockTensorReadCmd, NonBlockTensorWriteCmd,
-                     NonBlockTensorWriteBatchedCmd,
-                     NonBlockTensorReadBatchedCmd, NonBlockCloseCmd>
-    NonBlockTensorCmd;
-
-struct NonBlockExecCmd {
-  uint64_t id;
+struct PendingExecute {
+  NRT_STATUS ret;
   std::shared_ptr<NrtModel> model;
   std::shared_ptr<const NrtTensorSet> input_set;
   std::shared_ptr<NrtTensorSet> output_set;
-  std::optional<std::string> ntff_name;
-  bool save_trace;
 };
 
-typedef std::variant<NonBlockExecCmd, NonBlockCloseCmd>
-    NonBlockExecOrCloseCmd;
-
-// Thread-safe queue template (blocking and non-blocking versions)
-template <typename T, bool is_blocking> class LockedQueue {
-public:
-  LockedQueue() {
-    if constexpr (!is_blocking) {
-      size_ = 0;
-    }
-  }
-
-  void push(const T &value) {
-    std::unique_lock lk(mtx_);
-    q_.push(value);
-    lk.unlock();
-    if constexpr (is_blocking) {
-      cv_.notify_one();
-    } else {
-      size_.fetch_add(1, std::memory_order_release);
-    }
-  }
-
-  void push(T &&value) {
-    std::unique_lock lk(mtx_);
-    q_.push(std::move(value));
-    lk.unlock();
-    if constexpr (is_blocking) {
-      cv_.notify_one();
-    } else {
-      size_.fetch_add(1, std::memory_order_release);
-    }
-  }
-
-  template <typename... Args> void emplace(Args &&...args) {
-    std::unique_lock lk(mtx_);
-    q_.emplace(std::forward<Args>(args)...);
-    lk.unlock();
-    if constexpr (is_blocking) {
-      cv_.notify_one();
-    } else {
-      size_.fetch_add(1, std::memory_order_release);
-    }
-  }
-
-  template <typename T_ = T> std::enable_if_t<is_blocking, T_> pop() {
-    std::unique_lock lk(mtx_);
-    cv_.wait(lk, [this]() { return !q_.empty(); });
-    T ret(std::move(q_.front()));
-    q_.pop();
-    lk.unlock();
-    return ret;
-  }
-
-  // This function is only safe with one consumer
-  template <typename T_ = T>
-  std::enable_if_t<!is_blocking, std::optional<T_>> try_pop() {
-    if (size_.load(std::memory_order_acquire) >= 1) {
-      size_.fetch_sub(1, std::memory_order_release);
-      std::lock_guard lk(mtx_);
-      T ret(std::move(q_.front()));
-      q_.pop();
-      return ret;
-    } else {
-      return std::nullopt;
-    }
-  }
-
-private:
-  struct Empty {};
-
-  std::queue<T> q_;
-  std::mutex mtx_;
-  std::conditional_t<is_blocking, std::condition_variable, Empty> cv_;
-  std::conditional_t<is_blocking, Empty, std::atomic_int64_t> size_;
+struct PendingOp {
+  uint64_t id;
+  nrta_seq_t wait_seq;
+  std::variant<PendingTensorWrite, PendingTensorRead,
+               PendingTensorWriteBatched, PendingTensorReadBatched,
+               PendingExecute>
+      op;
 };
 
 // NonBlock result structures (exposed to Python)
@@ -181,40 +134,6 @@ struct NonBlockExecResult {
 typedef std::variant<NonBlockTensorReadResult, NonBlockTensorWriteResult,
                      NonBlockExecResult>
     NonBlockResult;
-
-// NonBlock internal result structures (used in worker threads to avoid GIL)
-// These hold shared_ptrs to keep resources alive until convert_internal_result()
-// transfers nanobind objects to Result types. This two-phase pattern ensures
-// nanobind/Python object destructors run in GIL context, not in worker threads.
-struct NonBlockTensorReadInternalResult {
-  uint64_t id;
-  std::variant<nb::bytes, nb::ndarray<>> data_obj;
-  std::optional<std::variant<SpikeError, NrtError>> err;
-
-  std::shared_ptr<const NrtTensor> tensor;
-};
-
-struct NonBlockTensorWriteInternalResult {
-  uint64_t id;
-  std::optional<std::variant<SpikeError, NrtError>> err;
-
-  std::shared_ptr<NrtTensor> tensor;
-  std::variant<nb::bytes, nb::ndarray<>> data_obj;
-};
-
-struct NonBlockExecInternalResult {
-  uint64_t id;
-  std::optional<std::variant<SpikeError, NrtError>> err;
-
-  std::shared_ptr<const NrtModel> model;
-  std::shared_ptr<const NrtTensorSet> input_set;
-  std::shared_ptr<NrtTensorSet> output_set;
-};
-
-typedef std::variant<NonBlockTensorReadInternalResult,
-                     NonBlockTensorWriteInternalResult,
-                     NonBlockExecInternalResult>
-    NonBlockInternalResult;
 
 // Main Spike class - Python interface
 class Spike {
@@ -320,32 +239,74 @@ private:
   int verbose_level_;
   std::unique_ptr<NrtRuntime> runtime_;
 
-  // Nonblock support
+  // Nonblock state
   uint64_t next_non_block_id_ = 0;
   uint64_t next_batch_id_ = 0;
 
-  std::vector<std::thread> tensor_threads_;
-  std::vector<std::thread> exec_threads_;
-  std::vector<LockedQueue<NonBlockTensorCmd, true>> tensor_queues_;
-  std::vector<LockedQueue<NonBlockExecOrCloseCmd, true>> exec_queues_;
-  LockedQueue<NonBlockInternalResult, false> noti_queue_;
+  // One pending-op queue per (lnc, xu) channel. Each queue is FIFO by
+  // submission order, and within a queue nrta_seq_t values are monotonically
+  // increasing, so a channel only needs its front op's wait_seq checked
+  // against nrta_get_sequence's latest-completed seq for that channel.
+  static constexpr uint32_t MAX_LNC = 128;
+  static constexpr uint32_t NUM_CHANNELS = MAX_LNC * NRTA_XU_TYPE_NUM;
+  std::array<std::array<std::deque<PendingOp>, NRTA_XU_TYPE_NUM>, MAX_LNC>
+      xu_queues_;
 
-  std::unordered_map<uint64_t, std::vector<NonBlockTensorWriteCmd>>
-      tensor_write_batched_cmds_;
-  std::shared_mutex tensor_write_batched_cmds_mtx_;
+  // epoll-based completion multiplexing. Each (lnc, xu) channel that has ever
+  // had work gets one eventfd, registered with the runtime via
+  // nrta_event_register_xu_completion() and added to a single epoll instance.
+  // The runtime signals a channel's eventfd whenever that XU completes any
+  // sequence, so try_poll() can ask epoll which channels made progress instead
+  // of probing all MAX_LNC * NRTA_XU_TYPE_NUM channels every call.
+  int epoll_fd_ = -1;
+  // Per-channel eventfd, -1 until the channel is first registered.
+  std::array<int, NUM_CHANNELS> channel_event_fds_;
 
-  std::unordered_map<uint64_t, std::vector<NonBlockTensorReadCmd>>
-      tensor_read_batched_cmds_;
-  std::shared_mutex tensor_read_batched_cmds_mtx_;
+  // Channels whose front op may be ready to harvest. Populated by epoll_wait
+  // (each signaled eventfd) and by try_poll itself (a channel stays queued
+  // after a successful harvest, since one eventfd signal can cover several
+  // completed ops). Removed once the front is found not-yet-complete or the
+  // queue empties.
+  //
+  // A FIFO queue (rather than an ordered set) gives round-robin fairness: every
+  // try_poll() pops the front channel, and a channel that still has pollable
+  // work is pushed to the back, so a continuously-busy low-index channel can't
+  // starve the others. scan_channel_queued_ tracks membership in O(1) so a
+  // channel is never enqueued twice.
+  std::deque<uint32_t> scan_channels_;
+  std::array<bool, NUM_CHANNELS> scan_channel_queued_;
 
-  void loop_execute(int core_id);
-  void loop_tensor(int core_id);
+  static constexpr uint32_t channel_index(uint32_t lnc, uint32_t xu) {
+    return lnc * NRTA_XU_TYPE_NUM + xu;
+  }
+
+  // Lazily creates the epoll instance and the channel's eventfd, registering
+  // the latter with the runtime and the epoll set. Idempotent per channel.
+  void ensure_channel_registered(uint32_t lnc, nrta_xu_t xu);
+
+  // Prepared batches (data kept alive between _prepare and _start).
+  std::unordered_map<uint64_t, std::vector<PreparedTensorWrite>>
+      tensor_write_batched_prepared_;
+
+  std::unordered_map<uint64_t, std::vector<PreparedTensorRead>>
+      tensor_read_batched_prepared_;
+
+  // Appends op to the (lnc, xu) queue and returns a reference to the enqueued
+  // element. std::deque never relocates existing elements on push_back, so the
+  // returned reference (and pointers into its ret field) stay valid until the
+  // op is popped in try_poll. Scalar callers enqueue *before* submitting so the
+  // nrta_* call can write completion status straight into the queued op.
+  PendingOp &enqueue_pending(uint32_t lnc, nrta_xu_t xu, PendingOp op);
 
   // Helper methods
   NrtTensorSet create_tensor_set(
       const std::unordered_map<std::string, NrtTensor &> &tensor_map);
   std::string dtype_to_string(nrt_dtype_t dtype);
-  NonBlockResult convert_internal_result(NonBlockInternalResult &internal_res_);
+
+  static std::optional<std::variant<SpikeError, NrtError>>
+  ret_to_err(NRT_STATUS ret);
+  static std::optional<std::variant<SpikeError, NrtError>>
+  rets_to_err(const std::vector<NRT_STATUS> &rets);
 };
 
 } // namespace spike
