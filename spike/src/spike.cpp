@@ -239,10 +239,6 @@ void Spike::execute(NrtModel &model,
   model.execute(input_set, output_set, ntff_name, save_trace);
 }
 
-// Kept for backward compatibility with SpikeAsync. With the nrta_* backend we
-// don't need any thread pools; there's nothing to initialize.
-void Spike::init_nonblock() {}
-
 uint64_t Spike::tensor_write_nonblock(std::shared_ptr<NrtTensor> tensor,
                                        nb::bytes data_obj,
                                        size_t offset) {

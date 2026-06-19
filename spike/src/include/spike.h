@@ -184,8 +184,6 @@ public:
                bool save_trace = false);
 
   // Nonblocking operations
-  void init_nonblock();
-
   uint64_t tensor_write_nonblock(std::shared_ptr<NrtTensor> tensor,
                                   nb::bytes data_obj, size_t offset = 0);
   uint64_t tensor_write_nonblock(std::shared_ptr<NrtTensor> tensor,

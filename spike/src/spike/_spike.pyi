@@ -174,9 +174,6 @@ class Spike:
         Read data from tensor to Python buffer protocol object (bytearray, memoryview, etc.)
         """
 
-    def init_nonblock(self) -> None:
-        """Initialize for nonblocking operations"""
-
     @overload
     def tensor_read_nonblock(self, tensor: NrtTensor, offset: int = 0, size: int = 0) -> int:
         """Read data from tensor as bytes nonblockingly"""

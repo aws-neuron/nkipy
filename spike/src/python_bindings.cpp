@@ -235,9 +235,6 @@ NB_MODULE(_spike, m) {
           "memoryview, etc.)")
 
       // Nonblocking operations
-      .def("init_nonblock", &Spike::init_nonblock,
-           "Initialize for nonblocking operations")
-
       .def(
           "tensor_read_nonblock",
           [](Spike &self, std::shared_ptr<const NrtTensor> tensor,
