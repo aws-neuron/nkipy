@@ -173,7 +173,6 @@ The high-level API provides an asyncio-like interface with automatic dependency 
 from spike import SpikeAsync
 
 spike_async = SpikeAsync(verbose_level=1)
-# Nonblock mode is automatically initialized
 
 # Load models and allocate tensors
 model = spike_async.load_model("model.neff", core_id=0)
@@ -358,7 +357,6 @@ The low-level API provides direct access to non-blocking operations. You must ma
 from spike import Spike
 
 spike = Spike(verbose_level=1)
-spike.init_nonblock()  # Initialize thread pools for async operations
 ```
 
 ### Nonblocking Operations
@@ -381,6 +379,11 @@ input_set = spike.create_tensor_set({"input": input_tensor})
 output_set = spike.create_tensor_set({"output": output_tensor})
 exec_id = spike.execute_nonblock(model, input_set, output_set)
 ```
+
+> **Note:** `save_trace` is not supported for nonblocking execute. The
+> `nrta_execute_schedule` API has no profiling hook, so the synchronous
+> profiling path cannot be mapped onto an asynchronous schedule. Passing
+> `save_trace=True` raises an error.
 
 ### Polling for Results
 
@@ -457,18 +460,49 @@ while True:
 
 ## Architecture
 
-### Thread Pools
+The nonblock layer is built directly on the runtime's asynchronous `nrta_*`
+APIs. Operations are submitted to the hardware from the calling thread, and
+their completion is tracked with per-channel sequence numbers.
 
-When `init_nonblock()` is called, Spike creates two thread pools:
+### Direct Submission
 
-- **Tensor threads**: Handle tensor read/write operations (one per NeuronCore)
-- **Execution threads**: Handle model execution (one per NeuronCore)
+Each nonblocking call (`tensor_write_nonblock`, `tensor_read_nonblock`,
+`execute_nonblock`, and the batched variants) submits its request synchronously
+via the corresponding `nrta_*` API (`nrta_tensor_write`, `nrta_tensor_read`,
+`nrta_execute_schedule`). Submission returns immediately with an operation ID;
+the runtime carries out the work on the device and records completion status
+through a pointer the caller supplies.
 
-Operations are dispatched to the appropriate thread based on the NeuronCore ID of the tensor or model.
+### Per-Channel Sequence Queues
 
-### Result Queue
+Work is organized into `(lnc, xu)` channels — one per (NeuronCore, execution
+unit) pair, where the execution unit is either `NRTA_XU_TENSOR_OP` (tensor
+read/write) or `NRTA_XU_COMPUTE` (model execution). Each channel has a FIFO
+queue of pending operations.
 
-Completed operations are pushed to a lock-free notification queue. The `try_poll()` method (or the async event loop) checks this queue for results.
+Within a channel, the runtime assigns monotonically increasing sequence numbers
+to submitted requests. To check whether the operation at the front of a channel
+queue is done, `try_poll()` compares its `wait_seq` against the latest completed
+sequence reported by `nrta_get_sequence` for that channel. Because sequence
+numbers are monotonic and queues are FIFO, only the front operation of each
+channel needs checking.
+
+A batched operation submits its N sub-requests back-to-back on the same channel,
+so their sequence numbers are consecutive; the batch waits only on the last
+sequence number, which implies all prior sub-requests have completed too.
+
+### epoll-Based Completion Multiplexing
+
+To avoid probing every channel on each poll, each channel that has had work gets
+an `eventfd` registered with the runtime via
+`nrta_event_register_xu_completion()` and added to a single `epoll` instance.
+The runtime signals a channel's eventfd whenever that channel completes a
+sequence.
+
+`try_poll()` first calls `epoll_wait` (non-blocking) to learn which channels
+made progress, then scans only those channels' front operations. Channels are
+scanned in round-robin order so a continuously-busy channel cannot starve the
+others.
 
 ### Async Event Loop
 
@@ -478,9 +512,15 @@ The `SpikeAsyncEventLoop` integrates with the nonblock API:
 - The selector polls `try_poll()` periodically
 - When results arrive, corresponding futures are resolved
 
-### InternalResult → Result Pattern
+### Resource Lifetime
 
-To avoid GIL overheads, the worker threads use `InternalResult` structures that hold shared_ptrs to keep resources alive. When polled from the main thread (with GIL held), these are converted to `Result` structures. This ensures nanobind/Python object destructors run in GIL context, not in worker threads.
+Because the runtime writes completion status through a pointer after submission,
+each pending operation lives in a `std::deque` (which never relocates existing
+elements on `push_back`), keeping that pointer valid until the operation is
+harvested. The pending op also anchors any Python-owned source/destination
+buffers (and `shared_ptr`s to tensors/models) so they stay alive until
+completion. All submission and harvesting runs on the calling thread with the
+GIL held.
 
 ## Best Practices
 
@@ -490,13 +530,3 @@ To avoid GIL overheads, the worker threads use `InternalResult` structures that 
 4. **Use explicit dependencies for complex graphs**: When you have multiple parallel streams that need to synchronize in complex patterns
 5. **Batch operations when possible**: Batched operations reduce overhead for multiple small transfers
 6. **Don't mix sync and async**: Once you submit async or non-blocking operations, submitting sync operations may cause unexpected behaviors.
-
-## Migration from Old API
-
-If you're migrating from the old `NeuronPy` codebase:
-
-- `SpikeCore` → `Spike`
-- `spike_cpp` module → `_spike` module
-- `device_id` → `core_id` (parameter rename)
-- API is otherwise compatible at the low level
-- High-level `SpikeAsync` API is unchanged

@@ -124,7 +124,6 @@ class SpikeAsync:
 
     def __init__(self, verbose_level: int = 0) -> None:
         self.spike: Spike = Spike(verbose_level=verbose_level)
-        self.spike.init_nonblock()
 
         self._selector: SpikeAsyncSelector = SpikeAsyncSelector(self.spike)
         self._loop: SpikeAsyncEventLoop = SpikeAsyncEventLoop(self._selector)
