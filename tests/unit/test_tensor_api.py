@@ -1904,7 +1904,6 @@ def test_ml_dtypes_constant_encoding(request, trace_mode, dtype_name):
     unsupported = {
         ("hlo", "float8_e5m2"),
         ("hlo", "float8_e4m3fn"),
-        ("nkigen-lite", "float8_e4m3fn"),
     }
     if (trace_mode, dtype_name) in unsupported:
         request.node.add_marker(
