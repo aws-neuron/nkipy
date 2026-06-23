@@ -488,6 +488,12 @@ def eval_common_op(op: Op, get: callable, env: dict[str, np.ndarray]) -> bool:
             op.attrs["value"],
             dtype=to_np_dtype(op.result.type.dtype),
         )
+    elif op.opcode == "iota":
+        shape = op.result.type.shape
+        dim = op.attrs["dim"]
+        ramp = np.arange(shape[dim], dtype=to_np_dtype(op.result.type.dtype))
+        ramp = ramp.reshape([shape[dim] if i == dim else 1 for i in range(len(shape))])
+        env[op.result.name] = np.broadcast_to(ramp, shape).copy()
     elif op.opcode == "reduce":
         env[op.result.name] = NP_REDUCE[op.attrs["kind"]](
             get(op.inputs[0]), axis=op.attrs["axis"], keepdims=op.attrs["keepdims"],

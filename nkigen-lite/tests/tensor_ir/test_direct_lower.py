@@ -152,6 +152,34 @@ class TestBasicElementwise:
 
 
 # ---------------------------------------------------------------------------
+# Iota (index ramp)
+# ---------------------------------------------------------------------------
+
+
+class TestIota:
+    @pytest.mark.parametrize("shape,dim", [
+        ((8, 16), 0), ((8, 16), 1),
+        ((130, 5), 0),           # multi-tile partition
+        ((4, 128, 256), 0), ((4, 128, 256), 1), ((4, 128, 256), 2),
+    ])
+    def test_iota(self, shape, dim):
+        def build(b):
+            # F32 output to match the harness's float32 HBM buffers.
+            b.set_outputs({"y": b.iota(shape, dim=dim, dtype=DType.F32)})
+
+        _lower_and_check(build, {})
+
+    def test_iota_in_expression(self):
+        # iota feeding an elementwise op (row index + column index).
+        def build(b):
+            rows = b.iota((16, 16), dim=0, dtype=DType.F32)
+            cols = b.iota((16, 16), dim=1, dtype=DType.F32)
+            b.set_outputs({"y": b.add(rows, cols)})
+
+        _lower_and_check(build, {})
+
+
+# ---------------------------------------------------------------------------
 # Shape coverage
 # ---------------------------------------------------------------------------
 

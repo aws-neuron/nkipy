@@ -246,6 +246,22 @@ class Builder:
     def zeros(self, shape: tuple[int, ...], dtype: DType = DType.F32) -> Value:
         return self.constant(0.0, shape, dtype)
 
+    def iota(self, shape: tuple[int, ...], dim: int = 0, dtype: DType = DType.I32) -> Value:
+        """Index-ramp tensor: ``out[..., i, ...] == i`` along ``dim``.
+
+        The value at each position equals its index along ``dim`` (a 0-based
+        ramp), broadcast across all other axes — matching ``np.arange`` placed
+        on ``dim``.  Maps to ``nisa.iota`` during lowering.
+        """
+        rank = len(shape)
+        if rank == 0:
+            raise ValueError("iota: shape must have rank >= 1")
+        if dim < -rank or dim >= rank:
+            raise ValueError(f"iota: dim {dim} out of range for rank {rank}")
+        dim = dim % rank
+        rt = TensorType(tuple(shape), dtype)
+        return self._emit("iota", [], [rt], {"dim": dim}).result
+
     # -- reductions --
 
     def reduce(self, x: Value, axis: int | tuple[int, ...], kind: str = "sum", keepdims: bool = False) -> Value:

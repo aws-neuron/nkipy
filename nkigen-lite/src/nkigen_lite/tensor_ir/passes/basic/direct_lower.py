@@ -148,6 +148,8 @@ def lower_graph(graph: Graph, layouts: dict[str, Layout]) -> nki_ir.Graph:
             _emit_concat_op(nb, segment[0], hbm_map)
         elif segment[0].opcode == "broadcast_to":
             _emit_broadcast_op(nb, segment[0], layouts, hbm_map)
+        elif segment[0].opcode == "iota":
+            _emit_iota_op(nb, segment[0], hbm_map)
         elif segment[0].opcode in COLLECTIVE_OPCODES:
             _emit_collective_op(nb, segment[0], hbm_map)
         else:
@@ -491,3 +493,55 @@ def _emit_broadcast_op(nb: Builder, op, layouts: dict[str, Layout], hbm_map: dic
         nb, hbm_map[inp_val.name], hbm_map[out_val.name],
         inp_val.type.shape, out_val.type.shape, inp_val.type.dtype,
     )
+
+
+def _emit_iota_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
+    """Lower iota: an index ramp along ``dim``, broadcast over other axes.
+
+    Tiled with a canonical row-major layout (last dim = free, penultimate =
+    partition, earlier = batch).  ``nisa.iota`` produces, per SBUF tile,
+    ``offset + p * channel_multiplier + f * step``.  We pick those so the
+    value equals the global index along ``dim``:
+
+      - dim is the free axis:      step = 1,  channel_multiplier = 0, offset = f_off
+      - dim is the partition axis: step = 0,  channel_multiplier = 1, offset = p_off
+      - dim is a batch axis:       constant per tile = batch index on that axis
+    """
+    out_val = op.results[0]
+    dim = op.attrs["dim"]
+    dst_hbm = hbm_map[out_val.name]
+    dtype = out_val.type.dtype
+    shape = out_val.type.shape
+    rank = len(shape)
+
+    tile_p = min(shape[-2], PARTITION_MAX) if rank >= 2 else 1
+    tile_f = shape[-1] if rank >= 2 else shape[0]
+    p_extent = shape[-2] if rank >= 2 else 1
+    batch_dims = list(shape[:-2]) if rank > 2 else []
+    n_batch = prod(batch_dims) if batch_dims else 1
+
+    f_axis = rank - 1
+    p_axis = rank - 2  # only meaningful when rank >= 2
+
+    for bf in range(n_batch):
+        batch_idx = unravel(bf, batch_dims) if batch_dims else ()
+        for p_i in range(ceildiv(p_extent, tile_p)):
+            p_off = p_i * tile_p
+            p_size = min(tile_p, p_extent - p_off)
+
+            if dim == f_axis:
+                pattern, ch_mul, offset = [[1, tile_f]], 0, 0
+            elif rank >= 2 and dim == p_axis:
+                pattern, ch_mul, offset = [[0, tile_f]], 1, p_off
+            else:
+                # batch axis: every element in this tile shares the index
+                pattern, ch_mul, offset = [[0, tile_f]], 0, int(batch_idx[dim])
+
+            tile = nb.alloc((p_size, tile_f), dtype, MemorySpace.SBUF)
+            tile = nb.iota(tile, pattern=pattern, offset=offset, channel_multiplier=ch_mul)
+
+            dst_slices = [DimSlice(bi, 1) for bi in batch_idx]
+            if rank >= 2:
+                dst_slices.append(DimSlice(p_off, p_size))
+            dst_slices.append(DimSlice(0, tile_f))
+            nb.dma_copy(dst_hbm, tile, dst_slices)
