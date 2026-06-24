@@ -900,6 +900,179 @@ def split(x, indices_or_sections, axis=0):
     raise NotImplementedError("split with explicit indices not yet implemented")
 
 
+def _axis_slice(x_val, axis, start, stop):
+    """Slice [start:stop] along ``axis``, full extent on every other axis."""
+    rank = len(x_val.type.shape)
+    starts = tuple(start if d == axis else 0 for d in range(rank))
+    stops = tuple(
+        stop if d == axis else x_val.type.shape[d] for d in range(rank)
+    )
+    return _builder().slice(x_val, starts, stops)
+
+
+def flip(x, axis=None):
+    b = _builder()
+    x_val = _unwrap(x)
+    ndim = len(x_val.type.shape)
+    if axis is None:
+        axes = list(range(ndim))
+    elif isinstance(axis, int):
+        axes = [axis % ndim]
+    else:
+        axes = [a % ndim for a in axis]
+
+    result = x_val
+    for ax in axes:
+        n = result.type.shape[ax]
+        # Reverse by concatenating width-1 slices in descending index order.
+        parts = [_axis_slice(result, ax, i, i + 1) for i in range(n - 1, -1, -1)]
+        result = b.concat(parts, axis=ax) if len(parts) > 1 else parts[0]
+    return _wrap(result)
+
+
+def tile(x, reps):
+    b = _builder()
+    x_val = _unwrap(x)
+    if isinstance(reps, int):
+        reps = (reps,)
+    reps = tuple(int(r) for r in reps)
+
+    x_shape = x_val.type.shape
+    ndim = len(x_shape)
+    if len(reps) < ndim:
+        reps = (1,) * (ndim - len(reps)) + reps
+    elif len(reps) > ndim:
+        x_val = b.reshape(x_val, (1,) * (len(reps) - ndim) + tuple(x_shape))
+        x_shape = x_val.type.shape
+        ndim = len(x_shape)
+
+    # Repeat each axis by concatenating ``r`` copies of the running result.
+    result = x_val
+    for ax, r in enumerate(reps):
+        if r == 1:
+            continue
+        result = b.concat([result] * r, axis=ax)
+    if result is x_val:
+        # all reps == 1: return a fresh value (copy semantics)
+        return copy(x)
+    return _wrap(result)
+
+
+def roll(x, shift, axis=None):
+    b = _builder()
+    x_val = _unwrap(x)
+    x_shape = x_val.type.shape
+    ndim = len(x_shape)
+
+    if axis is None:
+        # Flatten, roll the single axis, restore shape.
+        total = int(np.prod(x_shape)) if x_shape else 1
+        flat = b.reshape(x_val, (total,))
+        rolled = _roll_axis(flat, shift, 0)
+        return _wrap(b.reshape(rolled, x_shape))
+
+    if isinstance(shift, (list, tuple)):
+        if not isinstance(axis, (list, tuple)):
+            raise ValueError("If shift is a tuple, axis must also be a tuple")
+        result = x_val
+        for s, a in zip(shift, axis):
+            result = _roll_axis(result, s, a % ndim)
+        return _wrap(result)
+
+    return _wrap(_roll_axis(x_val, shift, axis % ndim))
+
+
+def _roll_axis(x_val, shift, axis):
+    """Cyclic shift along ``axis`` via split + swapped concat."""
+    b = _builder()
+    n = x_val.type.shape[axis]
+    shift = shift % n
+    if shift == 0:
+        return x_val
+    split = n - shift
+    tail = _axis_slice(x_val, axis, split, n)   # wraps to the front
+    head = _axis_slice(x_val, axis, 0, split)
+    return b.concat([tail, head], axis=axis)
+
+
+def diff(a, n=1, axis=-1, prepend=None, append=None):
+    b = _builder()
+    a_val = _unwrap(a)
+    ndim = len(a_val.type.shape)
+    if prepend is not None or append is not None:
+        raise NotImplementedError(
+            "diff prepend/append not yet supported in nkigen-lite"
+        )
+    axis = axis % ndim
+    result = a_val
+    for _ in range(n):
+        size = result.type.shape[axis]
+        upper = _axis_slice(result, axis, 1, size)      # x[1:]
+        lower = _axis_slice(result, axis, 0, size - 1)  # x[:-1]
+        result = b.sub(upper, lower)
+    return _wrap(result)
+
+
+def pad(x, pad_width, mode="constant", constant_values=0, **kwargs):
+    b = _builder()
+    x_val = _unwrap(x)
+    shape = x_val.type.shape
+    ndim = len(shape)
+    dtype = x_val.type.dtype
+
+    # Normalize pad_width to a per-axis [(before, after), ...] list.
+    pad_arr = np.asarray(pad_width)
+    if pad_arr.ndim == 0:
+        pad_list = [(int(pad_arr), int(pad_arr))] * ndim
+    elif pad_arr.ndim == 1 and pad_arr.size == 2:
+        pad_list = [(int(pad_arr[0]), int(pad_arr[1]))] * ndim
+    elif pad_arr.ndim == 2:
+        if len(pad_arr) == 1:
+            pad_arr = np.broadcast_to(pad_arr, (ndim, 2))
+        pad_list = [(int(pad_arr[i, 0]), int(pad_arr[i, 1])) for i in range(ndim)]
+    else:
+        raise ValueError(f"unsupported pad_width: {pad_width!r}")
+
+    if mode == "constant":
+        result = x_val
+        for ax, (before, after) in enumerate(pad_list):
+            parts = []
+            if before > 0:
+                p_shape = tuple(
+                    before if d == ax else result.type.shape[d] for d in range(ndim)
+                )
+                parts.append(b.full(p_shape, float(constant_values), dtype))
+            parts.append(result)
+            if after > 0:
+                p_shape = tuple(
+                    after if d == ax else result.type.shape[d] for d in range(ndim)
+                )
+                parts.append(b.full(p_shape, float(constant_values), dtype))
+            if len(parts) > 1:
+                result = b.concat(parts, axis=ax)
+        return _wrap(result)
+
+    elif mode == "edge":
+        result = x_val
+        for ax, (before, after) in enumerate(pad_list):
+            parts = []
+            if before > 0:
+                edge = _axis_slice(result, ax, 0, 1)         # first slab
+                parts.extend([edge] * before)
+            parts.append(result)
+            if after > 0:
+                last = result.type.shape[ax]
+                edge = _axis_slice(result, ax, last - 1, last)  # last slab
+                parts.extend([edge] * after)
+            if len(parts) > 1:
+                result = b.concat(parts, axis=ax)
+        return _wrap(result)
+
+    raise NotImplementedError(
+        f"pad mode {mode!r} is not supported; only 'constant' and 'edge'"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Static slicing
 # ---------------------------------------------------------------------------
