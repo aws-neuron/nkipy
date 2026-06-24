@@ -337,6 +337,56 @@ class CosPattern(DecomposePattern):
         graph.replace_value(op.result, sin_op.result)
 
 
+class SinRangeReductionPattern(DecomposePattern):
+    """sin(x) → sin(x - 2π·round(x / 2π))
+
+    The hardware SIN activation is only accurate for arguments near
+    [-π, π]; outside that the polynomial approximation diverges wildly
+    (cos(x) for x≈500 returns ~2e7 instead of a value in [-1, 1]).  Reduce
+    the argument modulo 2π first.  round(y) = floor(y + 0.5).
+
+    The emitted inner ``sin`` carries ``range_reduced`` so the pattern does
+    not re-match it (which would loop forever).
+    """
+
+    TWO_PI = 6.283185307179586
+    INV_TWO_PI = 0.15915494309189535  # 1 / (2π)
+
+    def match(self, op):
+        if op.opcode != "sin" or op.attrs.get("range_reduced"):
+            return None
+        return {"x": op.inputs[0]}
+
+    def rewrite(self, op, data, graph):
+        x = data["x"]
+        rt = op.result.type
+
+        inv = Op("constant", [], [rt], {"value": self.INV_TWO_PI}, counter=graph.counter)
+        graph.insert_before(op, inv)
+        scaled = Op("mul", [x, inv.result], [rt], counter=graph.counter)
+        graph.insert_before(op, scaled)
+        # round-to-nearest: floor(y + 0.5)
+        half = Op("constant", [], [rt], {"value": 0.5}, counter=graph.counter)
+        graph.insert_before(op, half)
+        biased = Op("add", [scaled.result, half.result], [rt], counter=graph.counter)
+        graph.insert_before(op, biased)
+        k = Op("floor", [biased.result], [rt], counter=graph.counter)
+        graph.insert_before(op, k)
+        # x_reduced = x - k * 2π
+        two_pi = Op("constant", [], [rt], {"value": self.TWO_PI}, counter=graph.counter)
+        graph.insert_before(op, two_pi)
+        k2pi = Op("mul", [k.result, two_pi.result], [rt], counter=graph.counter)
+        graph.insert_before(op, k2pi)
+        x_red = Op("sub", [x, k2pi.result], [rt], counter=graph.counter)
+        graph.insert_before(op, x_red)
+
+        sin_op = Op(
+            "sin", [x_red.result], [rt], {"range_reduced": True}, counter=graph.counter
+        )
+        graph.insert_before(op, sin_op)
+        graph.replace_value(op.result, sin_op.result)
+
+
 DECOMPOSE_PATTERNS: list[DecomposePattern] = [
     # ReduceKeepdimsFalse must run before ReduceMean so keepdims=False reduces
     # become keepdims=True+reshape before mean decomposition fires.
@@ -348,6 +398,8 @@ DECOMPOSE_PATTERNS: list[DecomposePattern] = [
     PowerPattern(),
     CeilPattern(),
     CosPattern(),
+    # After CosPattern so cos→sin first, then both sins get range-reduced.
+    SinRangeReductionPattern(),
     DivPattern(),
     ReduceMeanPattern(),
 ]
