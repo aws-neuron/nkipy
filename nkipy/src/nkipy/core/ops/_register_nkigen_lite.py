@@ -146,3 +146,8 @@ def register_all_nkigen_lite_impls():
     all_reduce.impl("nkigen-lite")(lite_impls.all_reduce)
     reduce_scatter.impl("nkigen-lite")(lite_impls.reduce_scatter)
     all_to_all.impl("nkigen-lite")(lite_impls.all_to_all)
+
+    # --- Conv ops ---
+    from nkipy.core.ops.conv import conv2d, conv3d
+    conv2d.impl("nkigen-lite")(lite_impls.conv2d)
+    conv3d.impl("nkigen-lite")(lite_impls.conv3d)
