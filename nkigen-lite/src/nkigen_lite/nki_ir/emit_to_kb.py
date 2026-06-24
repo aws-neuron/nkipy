@@ -454,6 +454,18 @@ def _emit_op(op: Op, tiles: dict[str, object]) -> None:
         nisa.find_index8(dst=dst, src=src, vals=vals)
         tiles[op.result.name] = dst
 
+    elif op.opcode == "match_replace8":
+        dst = _get(op.inputs[0])
+        dst_idx = _get(op.inputs[1])
+        data = _get(op.inputs[2])
+        vals = _get(op.inputs[3])
+        nisa.max_index_and_match_replace(
+            dst=dst, src=data, vals=vals,
+            immediate=op.attrs["imm"], dst_idx=dst_idx,
+        )
+        tiles[op.results[0].name] = dst
+        tiles[op.results[1].name] = dst_idx
+
     elif op.opcode == "stream_shuffle":
         dst = _get(op.inputs[0])
         x = _get(op.inputs[1])

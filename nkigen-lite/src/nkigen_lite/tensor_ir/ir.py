@@ -401,28 +401,29 @@ class Builder:
         rt = TensorType(tuple(new_shape), ref.type.dtype)
         return self._emit("concat", list(inputs), [rt], {"axis": axis}).result
 
-    # -- top-8 selection (hardware max8 / find_index8) --
+    # -- top-k selection (hardware max8 / match_replace8 scan) --
 
-    def max8(self, x: Value) -> Value:
-        """8 largest values per row (last axis), descending. ``x`` is 2-D
-        ``(P, F)`` with 8 <= F <= 16384; result is ``(P, 8)``."""
+    def topk(self, x: Value, k: int) -> tuple[Value, Value]:
+        """Top-``k`` values and indices along the last axis of a 2-D ``(P, F)``
+        tile, descending.  Returns ``(values (P, k), indices (P, k) uint32)``.
+
+        Lowers to the canonical hardware scan: ceil(k/8) rounds of ``max8``
+        (next 8 largest) + ``match_replace8`` (record indices, mask taken
+        values with -inf).  ``F`` must be in [8, 16384].  Indices are uint32
+        because the DVE index instruction requires a uint16/uint32 AP.
+        """
         if x.type.rank != 2:
-            raise ValueError(f"max8: input must be 2-D, got rank {x.type.rank}")
-        if not (8 <= x.type.shape[1] <= 16384):
-            raise ValueError(
-                f"max8: free dim must be in [8, 16384], got {x.type.shape[1]}"
-            )
-        rt = TensorType((x.type.shape[0], 8), x.type.dtype)
-        return self._emit("max8", [x], [rt]).result
-
-    def find_index8(self, x: Value, vals: Value) -> Value:
-        """First-match index of each of the 8 ``vals`` within each row of
-        ``x``.  ``x`` is ``(P, F)``, ``vals`` is ``(P, 8)``; result ``(P, 8)``
-        int32."""
-        if x.type.rank != 2 or vals.type.rank != 2:
-            raise ValueError("find_index8: inputs must be 2-D")
-        rt = TensorType((x.type.shape[0], 8), DType.I32)
-        return self._emit("find_index8", [x, vals], [rt]).result
+            raise ValueError(f"topk: input must be 2-D, got rank {x.type.rank}")
+        P, F = x.type.shape
+        # max8 needs a free dim >= 8; the lowering pads with -inf when F < 8.
+        if F > 16384:
+            raise ValueError(f"topk: free dim must be <= 16384, got {F}")
+        if not (1 <= k <= F):
+            raise ValueError(f"topk: k must be in [1, {F}], got {k}")
+        val_t = TensorType((P, k), x.type.dtype)
+        idx_t = TensorType((P, k), DType.U32)
+        op = self._emit("topk", [x], [val_t, idx_t], {"k": k})
+        return op.results[0], op.results[1]
 
     # -- matmul --
 
@@ -632,20 +633,24 @@ def interpret(
             env[op.result.name] = np.concatenate(
                 [_get(v) for v in op.inputs], axis=op.attrs["axis"]
             )
-        elif op.opcode == "max8":
+        elif op.opcode == "topk":
             src = _get(op.inputs[0]).astype(np.float32)
-            out = np.sort(src, axis=1)[:, ::-1][:, :8]
-            env[op.result.name] = out.astype(to_np_dtype(op.result.type.dtype))
-        elif op.opcode == "find_index8":
-            src = _get(op.inputs[0]).astype(np.float32)
-            vals = _get(op.inputs[1]).astype(np.float32)
-            out = np.zeros((src.shape[0], 8), dtype=np.int64)
-            for p in range(src.shape[0]):
-                for i in range(min(8, vals.shape[1])):
-                    m = np.where(src[p] == vals[p, i])[0]
-                    if len(m) > 0:
-                        out[p, i] = m[0]
-            env[op.result.name] = out.astype(to_np_dtype(op.result.type.dtype))
+            k = op.attrs["k"]
+            P, F = src.shape
+            # Scanning semantics: repeated argmax of the first (lowest-index)
+            # occurrence, masking each taken position — matches the hardware
+            # max8 + match_replace8 loop and torch's stable tie-break.
+            work = src.copy()
+            vals = np.zeros((P, k), dtype=np.float32)
+            inds = np.zeros((P, k), dtype=np.int64)
+            for p in range(P):
+                for j in range(k):
+                    pos = int(np.argmax(work[p]))  # first max on ties
+                    vals[p, j] = work[p, pos]
+                    inds[p, j] = pos
+                    work[p, pos] = -np.inf
+            env[op.results[0].name] = vals.astype(to_np_dtype(op.results[0].type.dtype))
+            env[op.results[1].name] = inds.astype(to_np_dtype(op.results[1].type.dtype))
         elif op.opcode == "for_loop":
             body = op.attrs["body"]
             trip_count = op.attrs["trip_count"]

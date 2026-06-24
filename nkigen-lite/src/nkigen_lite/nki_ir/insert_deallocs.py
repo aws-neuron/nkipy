@@ -119,6 +119,17 @@ def _build_alias_map(graph: Graph, alloc_values: dict[str, Value]) -> dict[str, 
         if not op.inputs:
             continue
 
+        # match_replace8 has two dst buffers: result[0] occupies input[0]
+        # (masked data) and result[1] occupies input[1] (dst_idx).  The
+        # generic "all results alias input[0]" rule would mis-free the index
+        # buffer, so map each result to its own dst input.
+        if op.opcode == "match_replace8" and len(op.results) == 2:
+            for ri, di in ((0, 0), (1, 1)):
+                root = alias_to_alloc.get(op.inputs[di].name)
+                if root is not None:
+                    alias_to_alloc[op.results[ri].name] = root
+            continue
+
         dst_input = op.inputs[0]
         if not isinstance(dst_input.type, TileType):
             continue

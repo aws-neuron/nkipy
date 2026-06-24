@@ -553,6 +553,27 @@ def interpret(
                         out[p, i] = m[0]
             env[op.result.name] = out.astype(dtype).reshape(op.result.type.shape)
 
+        elif op.opcode == "match_replace8":
+            data = _get(op.inputs[2]).astype(np.float32).copy()
+            vals = _get(op.inputs[3])
+            P = data.shape[0]
+            dflat = data.reshape(P, -1)
+            vflat = np.asarray(vals).reshape(P, -1).astype(np.float32)
+            idx = np.zeros((P, 8), dtype=np.int64)
+            imm = op.attrs["imm"]
+            for p in range(P):
+                for i in range(min(8, vflat.shape[1])):
+                    m = np.where(dflat[p] == vflat[p, i])[0]
+                    if len(m) > 0:
+                        idx[p, i] = m[0]
+                        dflat[p, m[0]] = imm
+            masked_t = op.results[0].type
+            idx_t = op.results[1].type
+            env[op.results[0].name] = dflat.reshape(masked_t.shape).astype(
+                to_np_dtype(masked_t.dtype))
+            env[op.results[1].name] = idx.reshape(idx_t.shape).astype(
+                to_np_dtype(idx_t.dtype))
+
         elif op.opcode == "stream_shuffle":
             x = _get(op.inputs[1])
             mask = op.attrs["shuffle_mask"]

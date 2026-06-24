@@ -836,11 +836,36 @@ class Builder:
 
         Maps to ``nisa.find_index8``.  ``src`` is [par_dim, F], ``vals`` and
         ``dst`` are [par_dim, 8]; ``dst`` is integer.
+
+        NOTE: ``find_index8`` is gen2-only; on gen3+ targets it fails the
+        compiler's ISA check.  Use ``match_replace8`` (with ``dst_idx``)
+        instead for index recovery on current hardware.
         """
         for v in (dst, src, vals):
             if v.type.memory == MemorySpace.HBM:
                 raise ValueError("find_index8: operands must be on-chip")
         return self._emit("find_index8", [dst, src, vals], [dst.type]).result
+
+    def match_replace8(
+        self, dst: Value, dst_idx: Value, data: Value, vals: Value, imm: float,
+    ) -> tuple[Value, Value]:
+        """For each of the 8 ``vals``, find its first match in ``data``, record
+        the index in ``dst_idx``, and replace that position with ``imm``.
+
+        Maps to ``nisa.nc_match_replace8`` (gen3+).  Returns ``(masked_data,
+        indices)``.  ``data``/``dst`` are [par_dim, F]; ``vals``/``dst_idx``
+        are [par_dim, 8] (``dst_idx`` integer).  This is the workhorse of the
+        scanning top-k loop: it yields indices *and* masks taken values so the
+        next ``max8`` finds the following 8.
+        """
+        for v in (dst, dst_idx, data, vals):
+            if v.type.memory == MemorySpace.HBM:
+                raise ValueError("match_replace8: operands must be on-chip")
+        op = self._emit(
+            "match_replace8", [dst, dst_idx, data, vals],
+            [dst.type, dst_idx.type], {"imm": imm},
+        )
+        return op.results[0], op.results[1]
 
     def stream_shuffle(
         self,

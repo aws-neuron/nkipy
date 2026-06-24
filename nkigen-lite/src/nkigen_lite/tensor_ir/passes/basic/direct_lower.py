@@ -150,8 +150,8 @@ def lower_graph(graph: Graph, layouts: dict[str, Layout]) -> nki_ir.Graph:
             _emit_broadcast_op(nb, segment[0], layouts, hbm_map)
         elif segment[0].opcode == "iota":
             _emit_iota_op(nb, segment[0], hbm_map)
-        elif segment[0].opcode in ("max8", "find_index8"):
-            _emit_top8_op(nb, segment[0], hbm_map)
+        elif segment[0].opcode == "topk":
+            _emit_topk_op(nb, segment[0], hbm_map)
         elif segment[0].opcode in COLLECTIVE_OPCODES:
             _emit_collective_op(nb, segment[0], hbm_map)
         else:
@@ -549,34 +549,78 @@ def _emit_iota_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
             nb.dma_copy(dst_hbm, tile, dst_slices)
 
 
-def _emit_top8_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
-    """Lower max8 / find_index8: per-partition top-8 on a 2-D (P, F) tile.
+def _emit_topk_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
+    """Lower topk via the canonical hardware scan (max8 + match_replace8).
 
-    P is the partition dim (<= 128 for these ops' use), F the free dim.  Load
-    the source row-block into SBUF, run the hardware op, store the (P, 8)
-    result.  find_index8 also loads its (P, 8) ``vals`` operand.
+    The source (P, F) tile is loaded once into SBUF and kept resident; each
+    fold reads the next 8 largest (max8) and masks them to -inf in place
+    (match_replace8), which also yields their indices.  Each fold's results
+    are DMA-stored to the matching column slice of the (P, k) output buffers,
+    so no SBUF sub-tile writes are needed.  ceil(k/8) folds cover any k.
     """
-    out_val = op.results[0]
     src_val = op.inputs[0]
+    val_out, idx_out = op.results[0], op.results[1]
     P, F = src_val.type.shape
+    k = op.attrs["k"]
     src_hbm = hbm_map[src_val.name]
-    dst_hbm = hbm_map[out_val.name]
+    val_hbm = hbm_map[val_out.name]
+    idx_hbm = hbm_map[idx_out.name]
+    vdtype = val_out.type.dtype
+    idtype = idx_out.type.dtype
 
-    src_tile = nb.dma_copy(
-        nb.alloc((P, F), src_val.type.dtype, MemorySpace.SBUF),
-        src_hbm, (DimSlice(0, P), DimSlice(0, F)),
-    )
-    dst_tile = nb.alloc((P, 8), out_val.type.dtype, MemorySpace.SBUF)
-
-    if op.opcode == "max8":
-        result_tile = nb.max8(dst_tile, src_tile)
-    else:
-        vals_val = op.inputs[1]
-        vals_hbm = hbm_map[vals_val.name]
-        vals_tile = nb.dma_copy(
-            nb.alloc((P, 8), vals_val.type.dtype, MemorySpace.SBUF),
-            vals_hbm, (DimSlice(0, P), DimSlice(0, 8)),
+    # max8/match_replace8 need a free dim >= 8; pad with -inf when F < 8.
+    width = max(F, 8)
+    if width == F:
+        data = nb.dma_copy(
+            nb.alloc((P, width), vdtype, MemorySpace.SBUF),
+            src_hbm, (DimSlice(0, P), DimSlice(0, F)),
         )
-        result_tile = nb.find_index8(dst_tile, src_tile, vals_tile)
+    else:
+        padded = nb.memset(nb.alloc((P, width), vdtype, MemorySpace.SBUF), float("-inf"))
+        loaded = nb.dma_copy(
+            nb.alloc((P, F), vdtype, MemorySpace.SBUF),
+            src_hbm, (DimSlice(0, P), DimSlice(0, F)),
+        )
+        data = _overlay_columns(nb, padded, loaded, F)
 
-    nb.dma_copy(dst_hbm, result_tile, (DimSlice(0, P), DimSlice(0, 8)))
+    # Scanning loop: each fold grabs the next 8 largest (max8) and records
+    # their indices while masking them to -inf (match_replace8) so the next
+    # fold sees the following elements.  match_replace8 (not the gen2-only
+    # find_index8) supplies indices on current hardware.
+    n_fold = (k + 7) // 8
+    for fold in range(n_fold):
+        keep = min(8, k - fold * 8)
+        val8 = nb.max8(nb.alloc((P, 8), vdtype, MemorySpace.SBUF), data)
+        idx8 = nb.alloc((P, 8), idtype, MemorySpace.SBUF)
+        data, idx8 = nb.match_replace8(data, idx8, data, val8, float("-inf"))
+
+        col = DimSlice(fold * 8, keep)
+        v_store = val8 if keep == 8 else _first_cols(nb, val8, keep)
+        i_store = idx8 if keep == 8 else _first_cols(nb, idx8, keep)
+        nb.dma_copy(val_hbm, v_store, (DimSlice(0, P), col))
+        nb.dma_copy(idx_hbm, i_store, (DimSlice(0, P), col))
+
+
+def _first_cols(nb: Builder, tile: Value, keep: int) -> Value:
+    """Return a (P, keep) SBUF tile holding the first ``keep`` columns of an
+    8-wide tile, via an HBM scratch round-trip (nki_ir has no SBUF sub-view)."""
+    P = tile.type.shape[0]
+    scratch = nb.alloc((P, 8), tile.type.dtype, MemorySpace.HBM)
+    nb.dma_copy(scratch, tile, (DimSlice(0, P), DimSlice(0, 8)))
+    return nb.dma_copy(
+        nb.alloc((P, keep), tile.type.dtype, MemorySpace.SBUF),
+        scratch, (DimSlice(0, P), DimSlice(0, keep)),
+    )
+
+
+def _overlay_columns(nb: Builder, base: Value, cols: Value, n: int) -> Value:
+    """Write the first ``n`` columns of ``cols`` over ``base`` (P, W>=n) via an
+    HBM scratch round-trip, returning the merged SBUF tile."""
+    P, W = base.type.shape
+    scratch = nb.alloc((P, W), base.type.dtype, MemorySpace.HBM)
+    nb.dma_copy(scratch, base, (DimSlice(0, P), DimSlice(0, W)))
+    nb.dma_copy(scratch, cols, (DimSlice(0, P), DimSlice(0, n)))
+    return nb.dma_copy(
+        nb.alloc((P, W), base.type.dtype, MemorySpace.SBUF),
+        scratch, (DimSlice(0, P), DimSlice(0, W)),
+    )
