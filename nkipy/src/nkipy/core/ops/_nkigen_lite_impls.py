@@ -445,6 +445,64 @@ def reduce_var(x, axis=None, keepdims=False, **kwargs):
     return _wrap(b.reduce(sq, axis=axis, kind="mean", keepdims=keepdims))
 
 
+def _argreduce(kind, x, axis=None, keepdims=False):
+    """argmax/argmin via index masking.
+
+    Find the extreme value along ``axis``, mark every position equal to it
+    with its index (an iota ramp) and all others with a large sentinel, then
+    min-reduce the indices — yielding the *first* index that attains the
+    extreme, matching numpy.
+    """
+    b = _builder()
+    x_val = _unwrap(x)
+    orig_shape = x_val.type.shape
+    orig_axis = axis
+
+    if axis is None:
+        total = int(np.prod(orig_shape)) if orig_shape else 1
+        x_val = b.reshape(x_val, (total,))
+        axis = 0
+
+    ndim = len(x_val.type.shape)
+    axis = axis % ndim
+
+    # The whole computation runs in float32 (matching HLO). min/max reductions
+    # init with +/-inf, which cannot be memset into an integer tile, so an
+    # integer input (or index ramp) would fail to compile. Cast to int32 only
+    # at the very end.
+    f32 = np_dtype_to_lite(np.dtype(np.float32))
+    x_val = _cast_if_needed(x_val, f32)
+
+    # Extreme value along axis, broadcast back for the equality mask.
+    extreme = b.reduce(x_val, axis=(axis,), kind=kind, keepdims=True)
+    mask = b.equal(x_val, b.broadcast_to(extreme, x_val.type.shape))
+
+    idx = b.iota(x_val.type.shape, dim=axis, dtype=f32)
+    sentinel = float(x_val.type.shape[axis] + 1)
+    masked = where(_wrap(mask), _wrap(idx), sentinel)
+
+    result = b.reduce(_unwrap(masked), axis=(axis,), kind="min", keepdims=False)
+    result = b.cast(result, np_dtype_to_lite(np.dtype(np.int32)))
+
+    if keepdims:
+        if orig_axis is not None:
+            new_shape = list(orig_shape)
+            new_shape[orig_axis % len(orig_shape)] = 1
+        else:
+            new_shape = [1] * len(orig_shape)
+        result = b.reshape(result, tuple(new_shape))
+
+    return _wrap(result)
+
+
+def argmax(x, axis=None, out=None, keepdims=False):
+    return _argreduce("max", x, axis=axis, keepdims=keepdims)
+
+
+def argmin(x, axis=None, out=None, keepdims=False):
+    return _argreduce("min", x, axis=axis, keepdims=keepdims)
+
+
 # ---------------------------------------------------------------------------
 # Creation ops
 # ---------------------------------------------------------------------------
