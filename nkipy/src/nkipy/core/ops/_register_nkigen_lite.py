@@ -109,7 +109,7 @@ def register_all_nkigen_lite_impls():
     from nkipy.core.ops.transform import (
         transpose, reshape, expand_dims, concatenate,
         split, copy, broadcast_to, astype, squeeze, swapaxes, stack,
-        pad, diff, flip, tile, roll,
+        pad, diff, flip, tile, roll, repeat,
     )
     transpose.impl("nkigen-lite")(lite_impls.transpose)
     reshape.impl("nkigen-lite")(lite_impls.reshape)
@@ -127,6 +127,7 @@ def register_all_nkigen_lite_impls():
     flip.impl("nkigen-lite")(lite_impls.flip)
     tile.impl("nkigen-lite")(lite_impls.tile)
     roll.impl("nkigen-lite")(lite_impls.roll)
+    repeat.impl("nkigen-lite")(lite_impls.repeat)
 
     # --- Indexing ops ---
     from nkipy.core.ops.indexing import (

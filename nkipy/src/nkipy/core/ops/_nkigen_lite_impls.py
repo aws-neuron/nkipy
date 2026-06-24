@@ -1034,7 +1034,63 @@ def split(x, indices_or_sections, axis=0):
             strides = [1] * len(shape)
             results.append(static_slice(x, start, limit, strides, []))
         return tuple(results)
-    raise NotImplementedError("split with explicit indices not yet implemented")
+
+    # Explicit split indices: numpy semantics — boundaries at the given
+    # indices, producing len(indices)+1 sub-arrays (clamped to the axis size,
+    # and possibly empty if indices repeat or exceed the size).
+    boundaries = [int(i) for i in indices_or_sections]
+    axis_size = shape[axis]
+    edges = [0] + [min(max(i, 0), axis_size) for i in boundaries] + [axis_size]
+    results = []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        if hi <= lo:
+            # numpy yields an empty sub-array here, but the lite IR has no
+            # representation for a zero-size tensor (slice rejects it).
+            raise NotImplementedError(
+                "split producing an empty sub-array (repeated or out-of-range "
+                "index) is not supported in nkigen-lite"
+            )
+        start = [0] * len(shape)
+        start[axis] = lo
+        limit = list(shape)
+        limit[axis] = hi
+        strides = [1] * len(shape)
+        results.append(static_slice(x, start, limit, strides, []))
+    return tuple(results)
+
+
+def repeat(x, repeats, axis=None):
+    """np.repeat with a scalar integer ``repeats``.
+
+    Insert a size-1 axis after ``axis``, broadcast it to ``repeats``, then
+    reshape to fold it back in — so each element is duplicated in place.
+    """
+    b = _builder()
+    x_val = _unwrap(x)
+
+    if axis is None:
+        total = int(np.prod(x_val.type.shape)) if x_val.type.shape else 1
+        x_val = b.reshape(x_val, (total,))
+        axis = 0
+
+    ndim = len(x_val.type.shape)
+    axis = axis % ndim
+
+    if not isinstance(repeats, (int, np.integer)):
+        raise TypeError(
+            "Only compile-time integer repeats are supported in nkigen-lite, "
+            f"got {type(repeats).__name__}"
+        )
+    repeats = int(repeats)
+
+    shape = x_val.type.shape
+    expanded = b.expand_dims(x_val, axis + 1)            # (..., d, 1, ...)
+    bshape = list(expanded.type.shape)
+    bshape[axis + 1] = repeats
+    broadcast = b.broadcast_to(expanded, tuple(bshape))   # (..., d, r, ...)
+    new_shape = list(shape)
+    new_shape[axis] = shape[axis] * repeats
+    return _wrap(b.reshape(broadcast, tuple(new_shape)))
 
 
 def _axis_slice(x_val, axis, start, stop):
