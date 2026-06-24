@@ -564,11 +564,16 @@ def topk(x, k, axis=0, is_ascend=False, out=None, dtype=None):
     """Top-k values and indices along ``axis`` (descending; ascending if
     ``is_ascend``), matching torch.topk.
 
-    No sort primitive exists, so extract iteratively: k times, take the max
-    along the axis, record value + argmax index, then mask that single
-    position to -inf so the next iteration finds the following element.
-    Masking by index position (not value) gives the stable lowest-index
-    tie-break torch uses.
+    Values use the hardware ``max8`` primitive (8 largest per partition along
+    the free dim), so the topk axis is moved to the free dim and leading dims
+    flattened to the partition dim; the free dim is padded to >= 8 with -inf.
+    Limited to k <= 8 (one max8 call).
+
+    Indices are recovered per top value with an iota position ramp:
+    ``argmin(where(work == val, pos, BIG))`` gives the first (lowest-index)
+    occurrence — the stable tie-break torch uses.  (The hardware
+    ``find_index8`` fails the compiler's ISA check, so indices are computed
+    this way instead.)
     """
     b = _builder()
     x_val = _unwrap(x)
@@ -577,40 +582,64 @@ def topk(x, k, axis=0, is_ascend=False, out=None, dtype=None):
     n = x_val.type.shape[axis]
     if k > n:
         raise ValueError(f"topk: k={k} exceeds axis {axis} size {n}")
+    if k > 8:
+        raise NotImplementedError(
+            f"topk on nkigen-lite supports k <= 8 (hardware max8), got k={k}"
+        )
 
     f32 = np_dtype_to_lite(np.dtype(np.float32))
     work = _cast_if_needed(x_val, f32)
-    # Ascending = top-k of the negated input (negate the reported values back).
     if is_ascend:
         work = b.neg(work)
 
-    # Position ramp along the axis, for both argmax recovery and masking.
-    pos = b.iota(work.type.shape, dim=axis, dtype=f32)
-    neg_inf = b.constant(-3.0e38, work.type.shape, f32)
+    # Move topk axis to last, flatten leading dims to a single partition dim.
+    if axis != ndim - 1:
+        perm = [d for d in range(ndim) if d != axis] + [axis]
+        work = b.transpose(work, tuple(perm))
+    else:
+        perm = list(range(ndim))
+    lead_shape = work.type.shape[:-1]
+    P = int(np.prod(lead_shape)) if lead_shape else 1
+    F = work.type.shape[-1]
+    work2d = b.reshape(work, (P, F))
 
-    val_parts = []
-    idx_parts = []
-    for _ in range(k):
-        mx = b.reduce(work, axis=(axis,), kind="max", keepdims=True)        # (..,1,..)
-        is_max = b.equal(work, b.broadcast_to(mx, work.type.shape))         # 1.0 at maxima
-        # First (lowest-index) occurrence: among maxima pick the min position.
-        big = float(n + 1)
-        masked_pos = where(_wrap(is_max), _wrap(pos),
-                           _wrap(b.constant(big, work.type.shape, f32)))
-        argmx = b.reduce(_unwrap(masked_pos), axis=(axis,), kind="min", keepdims=True)
-        val_parts.append(mx)
-        idx_parts.append(argmx)
+    # max8 needs F >= 8; pad with -inf so padding never enters the top-k.
+    if F < 8:
+        pad = b.constant(-3.0e38, (P, 8 - F), f32)
+        padded = b.concat([work2d, pad], axis=1)
+    else:
+        padded = work2d
+    vals8 = b.max8(padded)                        # (P, 8) descending
+    vals_k = b.slice(vals8, (0, 0), (P, k))       # (P, k)
 
-        # Mask out exactly that one position (pos == argmx) for the next round.
-        chosen = b.equal(pos, b.broadcast_to(argmx, pos.type.shape))
-        work = _unwrap(where(_wrap(chosen), _wrap(neg_inf), _wrap(work)))
+    # Index recovery: position ramp over the (unpadded) free dim; for each of
+    # the k values, the lowest position whose value matches.
+    pos = b.iota((P, F), dim=1, dtype=f32)        # (P, F): col index
+    big = float(F + 1)
+    idx_cols = []
+    for j in range(k):
+        col = b.slice(vals_k, (0, j), (P, j + 1))           # (P, 1)
+        match = b.equal(work2d, b.broadcast_to(col, (P, F)))  # 1.0 where equal
+        masked = where(_wrap(match), _wrap(pos),
+                       _wrap(b.constant(big, (P, F), f32)))
+        idx_cols.append(b.reduce(_unwrap(masked), axis=(1,), kind="min", keepdims=True))
+    idx_k = idx_cols[0] if k == 1 else b.concat(idx_cols, axis=1)  # (P, k)
 
-    values = b.concat(val_parts, axis=axis) if k > 1 else val_parts[0]
-    indices = b.concat(idx_parts, axis=axis) if k > 1 else idx_parts[0]
+    # Reshape (P, k) back to transposed layout, then undo the transpose.
+    out_t_shape = tuple(lead_shape) + (k,)
+    vals_t = b.reshape(vals_k, out_t_shape)
+    idx_t = b.reshape(idx_k, out_t_shape)
+    if axis != ndim - 1:
+        inv = [0] * ndim
+        for new_pos, old in enumerate(perm):
+            inv[old] = new_pos
+        vals_t = b.transpose(vals_t, tuple(inv))
+        idx_t = b.transpose(idx_t, tuple(inv))
+
     if is_ascend:
-        values = b.neg(values)
-    indices = b.cast(indices, np_dtype_to_lite(np.dtype(np.uint32)))
-    return _wrap(values), _wrap(indices)
+        vals_t = b.neg(vals_t)
+    idx_out = b.cast(idx_t, np_dtype_to_lite(np.dtype(np.uint32)))
+    return _wrap(vals_t), _wrap(idx_out)
 
 
 # ---------------------------------------------------------------------------

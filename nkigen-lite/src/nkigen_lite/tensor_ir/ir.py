@@ -401,6 +401,29 @@ class Builder:
         rt = TensorType(tuple(new_shape), ref.type.dtype)
         return self._emit("concat", list(inputs), [rt], {"axis": axis}).result
 
+    # -- top-8 selection (hardware max8 / find_index8) --
+
+    def max8(self, x: Value) -> Value:
+        """8 largest values per row (last axis), descending. ``x`` is 2-D
+        ``(P, F)`` with 8 <= F <= 16384; result is ``(P, 8)``."""
+        if x.type.rank != 2:
+            raise ValueError(f"max8: input must be 2-D, got rank {x.type.rank}")
+        if not (8 <= x.type.shape[1] <= 16384):
+            raise ValueError(
+                f"max8: free dim must be in [8, 16384], got {x.type.shape[1]}"
+            )
+        rt = TensorType((x.type.shape[0], 8), x.type.dtype)
+        return self._emit("max8", [x], [rt]).result
+
+    def find_index8(self, x: Value, vals: Value) -> Value:
+        """First-match index of each of the 8 ``vals`` within each row of
+        ``x``.  ``x`` is ``(P, F)``, ``vals`` is ``(P, 8)``; result ``(P, 8)``
+        int32."""
+        if x.type.rank != 2 or vals.type.rank != 2:
+            raise ValueError("find_index8: inputs must be 2-D")
+        rt = TensorType((x.type.shape[0], 8), DType.I32)
+        return self._emit("find_index8", [x, vals], [rt]).result
+
     # -- matmul --
 
     def matmul(self, a: Value, b: Value) -> Value:
@@ -609,6 +632,20 @@ def interpret(
             env[op.result.name] = np.concatenate(
                 [_get(v) for v in op.inputs], axis=op.attrs["axis"]
             )
+        elif op.opcode == "max8":
+            src = _get(op.inputs[0]).astype(np.float32)
+            out = np.sort(src, axis=1)[:, ::-1][:, :8]
+            env[op.result.name] = out.astype(to_np_dtype(op.result.type.dtype))
+        elif op.opcode == "find_index8":
+            src = _get(op.inputs[0]).astype(np.float32)
+            vals = _get(op.inputs[1]).astype(np.float32)
+            out = np.zeros((src.shape[0], 8), dtype=np.int64)
+            for p in range(src.shape[0]):
+                for i in range(min(8, vals.shape[1])):
+                    m = np.where(src[p] == vals[p, i])[0]
+                    if len(m) > 0:
+                        out[p, i] = m[0]
+            env[op.result.name] = out.astype(to_np_dtype(op.result.type.dtype))
         elif op.opcode == "for_loop":
             body = op.attrs["body"]
             trip_count = op.attrs["trip_count"]

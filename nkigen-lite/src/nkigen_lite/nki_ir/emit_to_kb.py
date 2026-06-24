@@ -441,6 +441,19 @@ def _emit_op(op: Op, tiles: dict[str, object]) -> None:
         nisa.iota(dst=dst, pattern=pattern, offset=offset, channel_multiplier=ch_mul)
         tiles[op.result.name] = dst
 
+    elif op.opcode == "max8":
+        dst = _get(op.inputs[0])
+        src = _get(op.inputs[1])
+        nisa.max8(dst=dst, src=src)
+        tiles[op.result.name] = dst
+
+    elif op.opcode == "find_index8":
+        dst = _get(op.inputs[0])
+        src = _get(op.inputs[1])
+        vals = _get(op.inputs[2])
+        nisa.find_index8(dst=dst, src=src, vals=vals)
+        tiles[op.result.name] = dst
+
     elif op.opcode == "stream_shuffle":
         dst = _get(op.inputs[0])
         x = _get(op.inputs[1])

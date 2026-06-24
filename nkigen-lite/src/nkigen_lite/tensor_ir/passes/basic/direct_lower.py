@@ -150,6 +150,8 @@ def lower_graph(graph: Graph, layouts: dict[str, Layout]) -> nki_ir.Graph:
             _emit_broadcast_op(nb, segment[0], layouts, hbm_map)
         elif segment[0].opcode == "iota":
             _emit_iota_op(nb, segment[0], hbm_map)
+        elif segment[0].opcode in ("max8", "find_index8"):
+            _emit_top8_op(nb, segment[0], hbm_map)
         elif segment[0].opcode in COLLECTIVE_OPCODES:
             _emit_collective_op(nb, segment[0], hbm_map)
         else:
@@ -545,3 +547,36 @@ def _emit_iota_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
                 dst_slices.append(DimSlice(p_off, p_size))
             dst_slices.append(DimSlice(0, tile_f))
             nb.dma_copy(dst_hbm, tile, dst_slices)
+
+
+def _emit_top8_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
+    """Lower max8 / find_index8: per-partition top-8 on a 2-D (P, F) tile.
+
+    P is the partition dim (<= 128 for these ops' use), F the free dim.  Load
+    the source row-block into SBUF, run the hardware op, store the (P, 8)
+    result.  find_index8 also loads its (P, 8) ``vals`` operand.
+    """
+    out_val = op.results[0]
+    src_val = op.inputs[0]
+    P, F = src_val.type.shape
+    src_hbm = hbm_map[src_val.name]
+    dst_hbm = hbm_map[out_val.name]
+
+    src_tile = nb.dma_copy(
+        nb.alloc((P, F), src_val.type.dtype, MemorySpace.SBUF),
+        src_hbm, (DimSlice(0, P), DimSlice(0, F)),
+    )
+    dst_tile = nb.alloc((P, 8), out_val.type.dtype, MemorySpace.SBUF)
+
+    if op.opcode == "max8":
+        result_tile = nb.max8(dst_tile, src_tile)
+    else:
+        vals_val = op.inputs[1]
+        vals_hbm = hbm_map[vals_val.name]
+        vals_tile = nb.dma_copy(
+            nb.alloc((P, 8), vals_val.type.dtype, MemorySpace.SBUF),
+            vals_hbm, (DimSlice(0, P), DimSlice(0, 8)),
+        )
+        result_tile = nb.find_index8(dst_tile, src_tile, vals_tile)
+
+    nb.dma_copy(dst_hbm, result_tile, (DimSlice(0, P), DimSlice(0, 8)))

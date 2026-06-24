@@ -530,6 +530,29 @@ def interpret(
                         result[f] = val
             env[op.result.name] = result
 
+        elif op.opcode == "max8":
+            src = _get(op.inputs[1])
+            dtype = to_np_dtype(op.result.type.dtype)
+            P = src.shape[0]
+            flat = src.reshape(P, -1).astype(np.float32)
+            out = np.sort(flat, axis=1)[:, ::-1][:, :8]
+            env[op.result.name] = out.astype(dtype).reshape(op.result.type.shape)
+
+        elif op.opcode == "find_index8":
+            src = _get(op.inputs[1])
+            vals = _get(op.inputs[2])
+            dtype = to_np_dtype(op.result.type.dtype)
+            P = src.shape[0]
+            sflat = src.reshape(P, -1).astype(np.float32)
+            vflat = vals.reshape(P, -1).astype(np.float32)
+            out = np.zeros((P, 8), dtype=np.int64)
+            for p in range(P):
+                for i in range(min(8, vflat.shape[1])):
+                    m = np.where(sflat[p] == vflat[p, i])[0]
+                    if len(m) > 0:
+                        out[p, i] = m[0]
+            env[op.result.name] = out.astype(dtype).reshape(op.result.type.shape)
+
         elif op.opcode == "stream_shuffle":
             x = _get(op.inputs[1])
             mask = op.attrs["shuffle_mask"]

@@ -822,6 +822,26 @@ class Builder:
         }
         return self._emit("iota", [dst], [dst.type], attrs).result
 
+    def max8(self, dst: Value, src: Value) -> Value:
+        """8 largest values per partition, descending. Maps to ``nisa.max8``.
+
+        ``src`` is [par_dim, F] (8 <= F <= 16384); ``dst`` is [par_dim, 8].
+        """
+        if src.type.memory == MemorySpace.HBM or dst.type.memory == MemorySpace.HBM:
+            raise ValueError("max8: operands must be on-chip")
+        return self._emit("max8", [dst, src], [dst.type]).result
+
+    def find_index8(self, dst: Value, src: Value, vals: Value) -> Value:
+        """Indices of each of ``vals`` (first match) within ``src`` per partition.
+
+        Maps to ``nisa.find_index8``.  ``src`` is [par_dim, F], ``vals`` and
+        ``dst`` are [par_dim, 8]; ``dst`` is integer.
+        """
+        for v in (dst, src, vals):
+            if v.type.memory == MemorySpace.HBM:
+                raise ValueError("find_index8: operands must be on-chip")
+        return self._emit("find_index8", [dst, src, vals], [dst.type]).result
+
     def stream_shuffle(
         self,
         dst: Value,
