@@ -56,9 +56,9 @@ def _ensure_value(x, ref_value):
         flat = x.ravel()
         if np.all(flat == flat[0]):
             return b.constant(float(flat[0]), ref_value.type.shape, ref_value.type.dtype)
-        raise NotImplementedError(
-            f"Non-uniform numpy array constants not yet supported in nkigen-lite"
-        )
+        # Non-uniform array: materialize it via the general constant path
+        # (run-length fills + concat) rather than a single fill.
+        return _unwrap(constant(x))
     shape = ref_value.type.shape
     dtype = ref_value.type.dtype
     return b.constant(float(x), shape, dtype)
@@ -324,6 +324,63 @@ def matmul(x, y, out=None, dtype=None):
     return _wrap(result)
 
 
+def cumsum(x, axis=None, dtype=None):
+    """Cumulative sum via matmul with an upper-triangular ones matrix.
+
+    out = x_2d @ U, where U[i, j] = 1 if i <= j else 0 (so column j sums all
+    rows 0..j).  U is built with iota + compare rather than a non-uniform
+    constant, which keeps the flattened (axis=None) case tractable.
+    """
+    b = _builder()
+    x_val = _unwrap(x)
+    x_shape = x_val.type.shape
+    ndim = len(x_shape)
+
+    if axis is None:
+        total = int(np.prod(x_shape)) if x_shape else 1
+        x_val = b.reshape(x_val, (total,))
+        x_shape = (total,)
+        ndim = 1
+        axis = 0
+    elif axis < 0:
+        axis = ndim + axis
+
+    N = x_shape[axis]
+    work_dtype = x_val.type.dtype
+
+    # U[i, j] = 1.0 if i <= j else 0.0  (row index <= col index)
+    row = b.iota((N, N), dim=0, dtype=np_dtype_to_lite(np.dtype(np.int32)))
+    col = b.iota((N, N), dim=1, dtype=np_dtype_to_lite(np.dtype(np.int32)))
+    mask = b.less_equal(row, col)
+    ones = b.constant(1.0, (N, N), work_dtype)
+    zeros = b.constant(0.0, (N, N), work_dtype)
+    tri = _unwrap(where(_wrap(mask), _wrap(ones), _wrap(zeros)))
+
+    def _cumsum_last_axis(x2d_val):
+        return _unwrap(matmul(_wrap(x2d_val), _wrap(tri)))
+
+    if ndim == 1:
+        x_2d = b.reshape(x_val, (1, N))
+        result = b.reshape(_cumsum_last_axis(x_2d), (N,))
+    elif axis == ndim - 1:
+        batch = int(np.prod(x_shape[:-1]))
+        x_2d = b.reshape(x_val, (batch, N))
+        result = b.reshape(_cumsum_last_axis(x_2d), x_shape)
+    else:
+        perm = list(range(ndim))
+        perm[axis], perm[-1] = perm[-1], perm[axis]
+        x_t = b.transpose(x_val, tuple(perm))
+        x_t_shape = tuple(x_shape[p] for p in perm)
+        batch = int(np.prod(x_t_shape[:-1]))
+        x_2d = b.reshape(x_t, (batch, N))
+        result_t = b.reshape(_cumsum_last_axis(x_2d), x_t_shape)
+        result = b.transpose(result_t, tuple(perm))
+
+    if dtype is not None:
+        result = _cast_if_needed(result, np_dtype_to_lite(np.dtype(dtype)))
+    return _wrap(result)
+
+
 # ---------------------------------------------------------------------------
 # Collective communication ops
 # ---------------------------------------------------------------------------
@@ -547,14 +604,36 @@ def constant(value, dtype=None):
     b = _builder()
     lite_dtype = np_dtype_to_lite(target_dtype)
     arr = np.asarray(value, dtype=target_dtype)
-    # The lite builder can only represent uniform-valued constants (fill).
     flat = arr.ravel()
-    if flat.size > 0 and not np.all(flat == flat[0]):
+
+    # Uniform array (or scalar): a single fill.
+    if flat.size <= 1 or np.all(flat == flat[0]):
+        fill = float(flat[0]) if flat.size > 0 else 0.0
+        return _wrap(b.constant(fill, tuple(arr.shape), lite_dtype))
+
+    # Non-uniform: the builder only emits uniform fills, so materialize the
+    # data as a flat sequence of run-length fills, concatenate, and reshape.
+    # Cheap for structured/small arrays; worst case (all-distinct) is one fill
+    # per element, so cap to keep tracing bounded.
+    MAX_RUNS = 4096
+    # Run-length encode the flat array.
+    change = np.nonzero(np.diff(flat))[0] + 1
+    starts = np.concatenate(([0], change))
+    lengths = np.diff(np.concatenate((starts, [flat.size])))
+    if len(starts) > MAX_RUNS:
         raise NotImplementedError(
-            "Non-uniform array constants are not yet supported in nkigen-lite"
+            f"Non-uniform constant with {len(starts)} runs exceeds the "
+            f"nkigen-lite limit of {MAX_RUNS}; provide it as a kernel input"
         )
-    fill = float(flat[0]) if flat.size > 0 else 0.0
-    return _wrap(b.constant(fill, tuple(arr.shape), lite_dtype))
+
+    pieces = [
+        b.constant(float(flat[s]), (int(n),), lite_dtype)
+        for s, n in zip(starts, lengths)
+    ]
+    flat_val = pieces[0] if len(pieces) == 1 else b.concat(pieces, axis=0)
+    if arr.shape != (flat.size,):
+        flat_val = b.reshape(flat_val, tuple(arr.shape))
+    return _wrap(flat_val)
 
 
 def zeros_like(x, dtype=None):

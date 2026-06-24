@@ -74,7 +74,9 @@ def register_all_nkigen_lite_impls():
     trace.impl("nkigen-lite")(lite_impls.trace)
 
     # --- Reduction ops ---
-    from nkipy.core.ops.reduce import sum, prod, max, min, mean, std, var, argmax, argmin
+    from nkipy.core.ops.reduce import (
+        sum, prod, max, min, mean, std, var, argmax, argmin, cumsum,
+    )
     sum.impl("nkigen-lite")(lite_impls.reduce_sum)
     prod.impl("nkigen-lite")(lite_impls.reduce_prod)
     max.impl("nkigen-lite")(lite_impls.reduce_max)
@@ -84,6 +86,7 @@ def register_all_nkigen_lite_impls():
     var.impl("nkigen-lite")(lite_impls.reduce_var)
     argmax.impl("nkigen-lite")(lite_impls.argmax)
     argmin.impl("nkigen-lite")(lite_impls.argmin)
+    cumsum.impl("nkigen-lite")(lite_impls.cumsum)
 
     # --- Creation ops ---
     from nkipy.core.ops.creation import (
