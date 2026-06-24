@@ -69,8 +69,9 @@ def register_all_nkigen_lite_impls():
     logical_not.impl("nkigen-lite")(lite_impls.logical_not)
 
     # --- Linalg ops ---
-    from nkipy.core.ops.linalg import matmul
+    from nkipy.core.ops.linalg import matmul, trace
     matmul.impl("nkigen-lite")(lite_impls.matmul)
+    trace.impl("nkigen-lite")(lite_impls.trace)
 
     # --- Reduction ops ---
     from nkipy.core.ops.reduce import sum, prod, max, min, mean, std, var
@@ -86,6 +87,7 @@ def register_all_nkigen_lite_impls():
     from nkipy.core.ops.creation import (
         zeros as zeros_op, full as full_op, constant as constant_op,
         zeros_like, ones_like, empty_like, full_like,
+        tril, triu, diag,
     )
     zeros_op.impl("nkigen-lite")(lite_impls.zeros)
     full_op.impl("nkigen-lite")(lite_impls.full)
@@ -94,6 +96,9 @@ def register_all_nkigen_lite_impls():
     ones_like.impl("nkigen-lite")(lite_impls.ones_like)
     empty_like.impl("nkigen-lite")(lite_impls.empty_like)
     full_like.impl("nkigen-lite")(lite_impls.full_like)
+    tril.impl("nkigen-lite")(lite_impls.tril)
+    triu.impl("nkigen-lite")(lite_impls.triu)
+    diag.impl("nkigen-lite")(lite_impls.diag)
 
     # --- Transform ops ---
     from nkipy.core.ops.transform import (

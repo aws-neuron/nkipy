@@ -524,6 +524,130 @@ def full_like(x, fill_value, dtype=None):
 
 
 # ---------------------------------------------------------------------------
+# Triangular / diagonal ops (built from iota index masks)
+# ---------------------------------------------------------------------------
+
+def _i32():
+    from nkigen_lite.core import DType
+    return DType.I32
+
+
+def _iota(shape, dim):
+    """int32 index ramp along ``dim``, broadcast over the other axes."""
+    return _builder().iota(tuple(shape), dim=dim, dtype=_i32())
+
+
+def _shift(idx_val, k):
+    """idx_val - k as an int32 tensor (no-op when k == 0)."""
+    if k == 0:
+        return idx_val
+    b = _builder()
+    k_const = b.constant(float(k), idx_val.type.shape, _i32())
+    return b.sub(idx_val, k_const)
+
+
+def _triangular(x, k, keep_lower):
+    """Zero out the upper (tril) or lower (triu) triangle.
+
+    tril keeps row >= col - k; triu keeps row <= col - k.  The mask is built
+    from row/col iotas over the last two axes (broadcast over any batch dims).
+    """
+    b = _builder()
+    x_val = _unwrap(x)
+    shape = x_val.type.shape
+    ndim = len(shape)
+    if ndim < 2:
+        raise ValueError(f"input must be at least 2-D, got {ndim}-D")
+
+    row = _iota(shape, ndim - 2)
+    col = _shift(_iota(shape, ndim - 1), k)
+    mask = b.greater_equal(row, col) if keep_lower else b.less_equal(row, col)
+    return where(_wrap(mask), _wrap(x_val), 0.0)
+
+
+def tril(x, k=0):
+    return _triangular(x, k, keep_lower=True)
+
+
+def triu(x, k=0):
+    return _triangular(x, k, keep_lower=False)
+
+
+def diag(v, k=0):
+    b = _builder()
+    v_val = _unwrap(v)
+    shape = v_val.type.shape
+    ndim = len(shape)
+
+    if ndim == 1:
+        # Build an (N, N) matrix with v on the k-th diagonal.  Dynamic gather
+        # is unsupported on nkigen-lite, so instead extend v to length N (pad
+        # with zeros on the side away from the diagonal), broadcast it across
+        # columns, and keep only the diagonal entries (col == row + k).
+        n = shape[0]
+        N = n + abs(k)
+        if k > 0:
+            v_ext = b.concat([v_val, b.zeros((k,), v_val.type.dtype)], axis=0)
+        elif k < 0:
+            v_ext = b.concat([b.zeros((-k,), v_val.type.dtype), v_val], axis=0)
+        else:
+            v_ext = v_val
+
+        rows = b.broadcast_to(b.reshape(v_ext, (N, 1)), (N, N))
+        row_idx = _shift(_iota((N, N), 0), -k)  # row + k
+        col_idx = _iota((N, N), 1)
+        mask = b.equal(col_idx, row_idx)
+        return where(_wrap(mask), _wrap(rows), 0.0)
+
+    elif ndim == 2:
+        # Extract the k-th diagonal of a 2-D matrix.
+        rows, cols = shape
+        if k >= 0:
+            diag_len = min(rows, cols - k)
+        else:
+            diag_len = min(rows + k, cols)
+        if diag_len <= 0:
+            return _wrap(b.zeros((0,), v_val.type.dtype))
+
+        row_idx = _iota(shape, 0)
+        col_idx = _shift(_iota(shape, 1), k)
+        mask = b.equal(row_idx, col_idx)
+        masked = where(_wrap(mask), _wrap(v_val), 0.0)
+        # Each diagonal element survives in exactly one row (k>=0) or column
+        # (k<0); summing that axis collapses the mask to the diagonal vector.
+        summed = reduce_sum(masked, axis=1 if k >= 0 else 0)
+        s_val = _unwrap(summed)
+        if s_val.type.shape[0] != diag_len:
+            s_val = b.slice(s_val, (0,), (diag_len,))
+        return _wrap(s_val)
+
+    raise ValueError(f"Input must be 1-D or 2-D, got {ndim}-D")
+
+
+def trace(a, offset=0, axis1=0, axis2=1, dtype=None):
+    b = _builder()
+    a_val = _unwrap(a)
+    shape = a_val.type.shape
+    ndim = len(shape)
+    if axis1 < 0:
+        axis1 += ndim
+    if axis2 < 0:
+        axis2 += ndim
+
+    row = _iota(shape, axis1)
+    col = _shift(_iota(shape, axis2), offset)
+    mask = b.equal(row, col)
+    masked = where(_wrap(mask), _wrap(a_val), 0.0)
+
+    result = masked
+    for ax in sorted([axis1, axis2], reverse=True):
+        result = reduce_sum(result, axis=ax)
+    if dtype is not None:
+        result = astype(result, np.dtype(dtype))
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Transform ops
 # ---------------------------------------------------------------------------
 
