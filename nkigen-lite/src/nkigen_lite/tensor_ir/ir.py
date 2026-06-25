@@ -453,6 +453,66 @@ class Builder:
         rt = TensorType((data.type.shape[0], idx.type.shape[1]), data.type.dtype)
         return self._emit("gather_along_axis", [data, idx], [rt]).result
 
+    # -- scatter (runtime row index) --
+
+    def scatter_rows(self, base: Value, idx: Value, updates: Value) -> Value:
+        """Row scatter with a runtime index: write whole rows of ``updates``
+        into a copy of ``base`` at the row positions named by ``idx``.
+
+        ``out = base.copy(); out[idx[r], :] = updates[r, :]`` for 2-D ``base``
+        (N, W), ``updates`` (M, W) and ``idx`` (M, 1).  Result shape == ``base``
+        shape.  This is the row-granular scatter that ``scatter_along_axis`` and
+        ``put_along_axis`` normalize onto (via transpose / flat reshape).
+
+        Indices must be ``U32`` (the indirect-DMA index AP requires an unsigned
+        integer tile) and 2-D ``(M, 1)`` (1-D SBUF index tiles are rejected by
+        the hardware).  Maps to the indirect-DMA store (``dma_copy_indirect``)
+        during lowering.  Duplicate indices follow hardware last-write semantics.
+        """
+        if base.type.rank != 2:
+            raise ValueError(f"scatter_rows: base must be 2-D, got rank {base.type.rank}")
+        if updates.type.rank != 2:
+            raise ValueError(f"scatter_rows: updates must be 2-D, got rank {updates.type.rank}")
+        if idx.type.rank != 2 or idx.type.shape[1] != 1:
+            raise ValueError(f"scatter_rows: idx must be (M, 1), got {idx.type.shape}")
+        if base.type.shape[1] != updates.type.shape[1]:
+            raise ValueError(
+                f"scatter_rows: row width mismatch, base {base.type.shape[1]} "
+                f"vs updates {updates.type.shape[1]}"
+            )
+        if updates.type.shape[0] != idx.type.shape[0]:
+            raise ValueError(
+                f"scatter_rows: row count mismatch, updates {updates.type.shape[0]} "
+                f"vs idx {idx.type.shape[0]}"
+            )
+        if idx.type.dtype != DType.U32:
+            raise ValueError(f"scatter_rows: idx must be U32, got {idx.type.dtype}")
+        rt = TensorType(base.type.shape, base.type.dtype)
+        return self._emit("scatter_rows", [base, idx, updates], [rt]).result
+
+    def gather_rows(self, src: Value, idx: Value) -> Value:
+        """Row gather with a runtime index: read whole rows of ``src`` at the
+        row positions named by ``idx``.
+
+        ``out[r, :] = src[idx[r], :]`` for 2-D ``src`` (N, W) and ``idx``
+        (M, 1); result is (M, W) with ``src``'s dtype.  This is the row-granular
+        gather that row-major ``take``/``take_along_axis`` (axis 0 of a tall
+        table) normalize onto, avoiding the full-table transpose that a
+        free-axis ``gather`` would require.
+
+        Indices must be ``U32`` and 2-D ``(M, 1)`` (1-D SBUF index tiles are
+        rejected by the hardware).  Maps to the indirect-DMA load
+        (``dma_copy_indirect``) during lowering.
+        """
+        if src.type.rank != 2:
+            raise ValueError(f"gather_rows: src must be 2-D, got rank {src.type.rank}")
+        if idx.type.rank != 2 or idx.type.shape[1] != 1:
+            raise ValueError(f"gather_rows: idx must be (M, 1), got {idx.type.shape}")
+        if idx.type.dtype != DType.U32:
+            raise ValueError(f"gather_rows: idx must be U32, got {idx.type.dtype}")
+        rt = TensorType((idx.type.shape[0], src.type.shape[1]), src.type.dtype)
+        return self._emit("gather_rows", [src, idx], [rt]).result
+
     # -- matmul --
 
     def matmul(self, a: Value, b: Value) -> Value:
@@ -687,6 +747,21 @@ def interpret(
             for p in range(P):
                 out[p] = data[p][idx[p]]
             env[op.result.name] = out
+        elif op.opcode == "scatter_rows":
+            base = _get(op.inputs[0])
+            idx = _get(op.inputs[1]).astype(np.intp).reshape(-1)
+            updates = _get(op.inputs[2])
+            out = base.copy()
+            # Sequential assignment: last write wins on duplicate indices,
+            # matching the hardware indirect-DMA store.
+            for r in range(updates.shape[0]):
+                out[idx[r]] = updates[r]
+            env[op.result.name] = out.astype(to_np_dtype(op.result.type.dtype))
+        elif op.opcode == "gather_rows":
+            src = _get(op.inputs[0])
+            idx = _get(op.inputs[1]).astype(np.intp).reshape(-1)
+            out = src[idx]
+            env[op.result.name] = out.astype(to_np_dtype(op.result.type.dtype))
         elif op.opcode == "for_loop":
             body = op.attrs["body"]
             trip_count = op.attrs["trip_count"]

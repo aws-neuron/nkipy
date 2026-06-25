@@ -647,18 +647,28 @@ def interpret(
         elif op.opcode == "dma_copy_indirect":
             direction = op.attrs["direction"]
             if direction == "load":
+                # Row gather: out[r, :] = src[index[r], :].  The index addresses
+                # whole rows of the source tensor (matching the
+                # .ap(vector_offset=) load emit), one entry per output row.
                 src = _get(op.inputs[1])
-                index = _get(op.inputs[2]).astype(np.intp)
-                env[op.result.name] = np.take(src.reshape(-1), index).reshape(
-                    op.result.type.shape
-                )
+                index = _get(op.inputs[2]).astype(np.intp).reshape(-1)
+                out_shape = op.result.type.shape
+                src2d = src.reshape(src.shape[0], -1)
+                gathered = src2d[index]
+                env[op.result.name] = gathered.reshape(out_shape)
             else:
+                # Row scatter: dst[index[r], :] = src[r, :].  The index
+                # addresses whole rows of the destination tensor (matching the
+                # .ap(vector_offset=) store emit), one entry per src row.
                 src_tile = _get(op.inputs[0])
                 dst_name = op.inputs[1].name
-                index = _get(op.inputs[2]).astype(np.intp)
-                flat = env[dst_name].reshape(-1)
-                np.put(flat, index.reshape(-1), src_tile.reshape(-1))
-                env[dst_name] = flat.reshape(env[dst_name].shape)
+                index = _get(op.inputs[2]).astype(np.intp).reshape(-1)
+                dst_arr = env[dst_name]
+                src2d = src_tile.reshape(src_tile.shape[0], -1)
+                dst2d = dst_arr.reshape(dst_arr.shape[0], -1)
+                for r in range(src2d.shape[0]):
+                    dst2d[index[r]] = src2d[r]
+                env[dst_name] = dst2d.reshape(dst_arr.shape)
 
         elif op.opcode == "tensor_tensor_scan":
             data0 = _get(op.inputs[1])

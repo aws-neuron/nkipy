@@ -1007,6 +1007,18 @@ def _take_dynamic(b, a_val, idx_val, axis):
     F_data = in_shape[axis]
     M = int(np.prod(idx_shape)) if idx_shape else 1
 
+    # Row-gather fast path (axis 0): gather whole rows by index via the indirect
+    # DMA, without transposing the table onto the free axis.  This is essential
+    # for tall tables (e.g. embedding (128256, 2048)) where the transpose path
+    # would allocate a (P, 128256) SBUF tile and OOM.
+    if axis == 0 and rank >= 2:
+        W = int(np.prod(in_shape[1:]))
+        src2d = b.reshape(a_val, (in_shape[0], W))
+        idx_rows = _cast_if_needed(b.reshape(idx_val, (M, 1)), u32)
+        out2d = b.gather_rows(src2d, idx_rows)          # (M, W)
+        out_shape = tuple(idx_shape) + tuple(in_shape[1:])
+        return _wrap(b.reshape(out2d, out_shape))
+
     # Move the gather axis to the last position -> free dim.
     if axis != rank - 1:
         perm = tuple([d for d in range(rank) if d != axis] + [axis])
@@ -1179,6 +1191,174 @@ def take_along_axis(a, indices, axis):
             inv[old] = new_pos
         out = b.transpose(out, tuple(inv))
     return _wrap(out)
+
+
+def scatter_along_axis(arr, indices, values, axis=0):
+    """Scatter ``values`` into a copy of ``arr`` at row positions ``indices``
+    along ``axis`` (the dynamic-``__setitem__`` path, ``a[:, t, :] = b``).
+
+    ``indices`` is a 1-D vector of length M; ``values`` matches ``arr`` with the
+    ``axis`` dim replaced by M.  Semantics:
+    ``out = arr.copy(); out[..., indices[i], ...] = values[..., i, ...]``.
+
+    Normalized onto the 2-D row scatter primitive: move ``axis`` to the front
+    (row dim), flatten the trailing dims to a single row width, scatter whole
+    rows by index, then move the axis back.
+    """
+    b = _builder()
+    arr_val = _unwrap(arr)
+    upd_val = _unwrap(values)
+    ndim = len(arr_val.type.shape)
+    axis = axis % ndim
+    in_shape = arr_val.type.shape
+    N = in_shape[axis]
+    M = upd_val.type.shape[axis]
+
+    u32 = np_dtype_to_lite(np.dtype(np.uint32))
+    idx_val = _unwrap(indices) if isinstance(indices, NKIPyTensorRef) else _unwrap(constant(np.asarray(indices).astype(np.int32)))
+    idx_val = _cast_if_needed(b.reshape(idx_val, (M, 1)), u32)
+
+    # Move scatter axis to front, flatten trailing dims to the row width.
+    if axis != 0:
+        perm = tuple([axis] + [d for d in range(ndim) if d != axis])
+        arr_t = b.transpose(arr_val, perm)
+        upd_t = b.transpose(upd_val, perm)
+    else:
+        perm = tuple(range(ndim))
+        arr_t, upd_t = arr_val, upd_val
+    trail = arr_t.type.shape[1:]            # dims after the scatter axis
+    W = int(np.prod(trail)) if trail else 1
+    base2d = b.reshape(arr_t, (N, W))
+    upd2d = b.reshape(upd_t, (M, W))
+
+    out2d = b.scatter_rows(base2d, idx_val, upd2d)
+
+    out_t = b.reshape(out2d, (N,) + tuple(trail))
+    if axis != 0:
+        inv = [0] * ndim
+        for new_pos, old in enumerate(perm):
+            inv[old] = new_pos
+        out_t = b.transpose(out_t, tuple(inv))
+    return _wrap(out_t)
+
+
+def put_along_axis(arr, indices, values, axis):
+    """np.put_along_axis: per-element scatter along ``axis``.
+
+    ``out[..., indices[..., i], ...] = values[..., i, ...]`` — element-wise
+    (not whole-row) along the gather axis, with ``indices``/``values``
+    broadcasting against ``arr`` on the non-axis dims.  Lowered via the
+    flatten-via-strides trick (matching the HLO backend): linearize ``arr`` to
+    a flat ``(total, 1)`` buffer, compute each element's flat destination index
+    (``idx * stride[axis] + static_offset``), and scatter width-1 rows.
+    """
+    b = _builder()
+    arr_val = _unwrap(arr)
+    x_shape = arr_val.type.shape
+
+    # axis=None flattens the operand and scatters into the flat vector.
+    if axis is None:
+        eff_shape = (int(np.prod(x_shape)) if x_shape else 1,)
+        axis_eff = 0
+    else:
+        eff_shape = x_shape
+        axis_eff = axis % len(x_shape)
+
+    # Materialize the index operand and its (static) shape.
+    if isinstance(indices, NKIPyTensorRef):
+        idx_val = _unwrap(indices)
+    else:
+        idx_val = _unwrap(constant(np.asarray(indices).astype(np.int32)))
+    idx_shape = idx_val.type.shape
+    M = int(np.prod(idx_shape)) if idx_shape else 1
+
+    # Row-major strides over the effective (possibly flattened) shape.
+    ndim = len(eff_shape)
+    strides = [1] * ndim
+    for d in range(ndim - 2, -1, -1):
+        strides[d] = strides[d + 1] * eff_shape[d + 1]
+
+    # Static per-element offset from the non-axis coordinates (idx broadcasts to
+    # eff_shape on non-axis dims; the test indices already carry those dims).
+    offset_np = np.zeros(idx_shape, dtype=np.int32)
+    for d in range(min(ndim, len(idx_shape))):
+        if d == axis_eff:
+            continue
+        coord = np.arange(idx_shape[d], dtype=np.int32)
+        bcast = [1] * len(idx_shape)
+        bcast[d] = idx_shape[d]
+        offset_np = offset_np + coord.reshape(bcast) * strides[d]
+    offset_val = _unwrap(constant(offset_np))
+
+    i32 = np_dtype_to_lite(np.dtype(np.int32))
+    u32 = np_dtype_to_lite(np.dtype(np.uint32))
+    idx_i32 = _cast_if_needed(idx_val, i32)
+    stride_axis = b.full(idx_shape, float(strides[axis_eff]), i32) if idx_shape else b.full((1,), float(strides[axis_eff]), i32)
+    flat_idx = b.add(b.mul(idx_i32, stride_axis), offset_val)
+    flat_idx = _cast_if_needed(b.reshape(flat_idx, (M, 1)), u32)
+
+    # Materialize values (scalar -> fill, else broadcast to idx shape).
+    if isinstance(values, NKIPyTensorRef):
+        val_val = _unwrap(values)
+    elif np.isscalar(values) or (isinstance(values, np.ndarray) and values.ndim == 0):
+        val_val = b.full(idx_shape if idx_shape else (1,), float(values), arr_val.type.dtype)
+    else:
+        val_val = _unwrap(constant(np.asarray(values).astype(np.float32)))
+    if val_val.type.shape != idx_shape and idx_shape:
+        val_val = b.broadcast_to(val_val, idx_shape)
+    val_rows = b.reshape(val_val, (M, 1))
+
+    total = int(np.prod(eff_shape))
+    base_flat = b.reshape(arr_val, (total, 1))
+    out_flat = b.scatter_rows(base_flat, flat_idx, val_rows)
+    return _wrap(b.reshape(out_flat, x_shape))
+
+
+def scatter_strided(arr, value, scatter_indices_per_dim):
+    """Strided slice assignment ``a[::s0, ::s1, ...] = value``.
+
+    ``scatter_indices_per_dim`` is a list of *static* per-dim position lists
+    (known at trace time).  The written positions are their cartesian product;
+    the corresponding flat indices are a compile-time constant, so this reduces
+    to a width-1 row scatter into the flattened operand — no runtime index math.
+    """
+    import itertools
+
+    b = _builder()
+    arr_val = _unwrap(arr)
+    x_shape = arr_val.type.shape
+    ndim = len(x_shape)
+
+    # Row-major strides; flat index of every scattered (cartesian) position.
+    strides = [1] * ndim
+    for d in range(ndim - 2, -1, -1):
+        strides[d] = strides[d + 1] * x_shape[d + 1]
+    positions = list(itertools.product(*scatter_indices_per_dim))
+    flat_positions = np.array(
+        [sum(c * strides[d] for d, c in enumerate(pos)) for pos in positions],
+        dtype=np.int32,
+    )
+    M = len(flat_positions)
+    value_shape = tuple(len(p) for p in scatter_indices_per_dim)
+
+    u32 = np_dtype_to_lite(np.dtype(np.uint32))
+    idx_rows = _cast_if_needed(
+        b.reshape(_unwrap(constant(flat_positions)), (M, 1)), u32
+    )
+
+    # Materialize values (scalar fill or array) and flatten to width-1 rows.
+    if isinstance(value, NKIPyTensorRef):
+        val_val = _unwrap(value)
+    elif np.isscalar(value) or (isinstance(value, np.ndarray) and value.ndim == 0):
+        val_val = b.full(value_shape, float(value), arr_val.type.dtype)
+    else:
+        val_val = _unwrap(constant(np.asarray(value).astype(np.float32)))
+    val_rows = b.reshape(val_val, (M, 1))
+
+    total = int(np.prod(x_shape)) if x_shape else 1
+    base_flat = b.reshape(arr_val, (total, 1))
+    out_flat = b.scatter_rows(base_flat, idx_rows, val_rows)
+    return _wrap(b.reshape(out_flat, x_shape))
 
 
 # ---------------------------------------------------------------------------

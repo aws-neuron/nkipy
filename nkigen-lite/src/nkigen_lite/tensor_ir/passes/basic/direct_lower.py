@@ -154,6 +154,10 @@ def lower_graph(graph: Graph, layouts: dict[str, Layout]) -> nki_ir.Graph:
             _emit_topk_op(nb, segment[0], hbm_map)
         elif segment[0].opcode == "gather_along_axis":
             _emit_gather_along_axis_op(nb, segment[0], hbm_map)
+        elif segment[0].opcode == "scatter_rows":
+            _emit_scatter_rows_op(nb, segment[0], hbm_map)
+        elif segment[0].opcode == "gather_rows":
+            _emit_gather_rows_op(nb, segment[0], hbm_map)
         elif segment[0].opcode in COLLECTIVE_OPCODES:
             _emit_collective_op(nb, segment[0], hbm_map)
         else:
@@ -639,6 +643,81 @@ def _emit_gather_along_axis_op(nb: Builder, op, hbm_map: dict[str, Value]) -> No
             data_tile, idx_tile,
         )
         nb.dma_copy(out_hbm, out_tile, (DimSlice(p_off, p_size), DimSlice(0, F_idx)))
+
+
+def _emit_scatter_rows_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
+    """Lower scatter_rows: ``out = base.copy(); out[idx[r], :] = updates[r, :]``.
+
+    First copy ``base`` HBM -> result HBM (tiled by N rows, the unchanged
+    backdrop), then scatter the M update rows into the result via the indirect
+    DMA store (``dma_copy_indirect``), tiled by M update rows.  The index tile
+    is (m_size, 1) U32: 1-D SBUF index tiles are rejected by the hardware.
+    """
+    base_val, idx_val, upd_val = op.inputs[0], op.inputs[1], op.inputs[2]
+    out_val = op.results[0]
+    N, W = base_val.type.shape
+    M = upd_val.type.shape[0]
+    base_hbm = hbm_map[base_val.name]
+    idx_hbm = hbm_map[idx_val.name]
+    upd_hbm = hbm_map[upd_val.name]
+    out_hbm = hbm_map[out_val.name]
+    vdtype = out_val.type.dtype
+    idtype = idx_val.type.dtype
+
+    # Backdrop: copy base -> result, tiled over N rows.
+    for p_i in range(ceildiv(N, PARTITION_MAX)):
+        p_off = p_i * PARTITION_MAX
+        p_size = min(PARTITION_MAX, N - p_off)
+        tile = nb.dma_copy(
+            nb.alloc((p_size, W), vdtype, MemorySpace.SBUF),
+            base_hbm, (DimSlice(p_off, p_size), DimSlice(0, W)),
+        )
+        nb.dma_copy(out_hbm, tile, (DimSlice(p_off, p_size), DimSlice(0, W)))
+
+    # Scatter the M update rows, tiled over M.  dma_copy_indirect addresses
+    # whole rows of the result HBM tensor via the per-row index.
+    for m_i in range(ceildiv(M, PARTITION_MAX)):
+        m_off = m_i * PARTITION_MAX
+        m_size = min(PARTITION_MAX, M - m_off)
+        upd_tile = nb.dma_copy(
+            nb.alloc((m_size, W), vdtype, MemorySpace.SBUF),
+            upd_hbm, (DimSlice(m_off, m_size), DimSlice(0, W)),
+        )
+        idx_tile = nb.dma_copy(
+            nb.alloc((m_size, 1), idtype, MemorySpace.SBUF),
+            idx_hbm, (DimSlice(m_off, m_size), DimSlice(0, 1)),
+        )
+        nb.dma_copy_indirect(out_hbm, upd_tile, idx_tile)
+
+
+def _emit_gather_rows_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
+    """Lower gather_rows: ``out[r, :] = src[idx[r], :]`` via the indirect DMA
+    load (``dma_copy_indirect``), gathering whole rows from the (N, W) src HBM
+    tensor into the (M, W) result.  Tiled over M gathered rows.  The index tile
+    is (m_size, 1) U32.  Avoids materializing the full (N, W) table on chip, so
+    it scales to tall tables (e.g. embedding (128256, 2048))."""
+    src_val, idx_val = op.inputs[0], op.inputs[1]
+    out_val = op.results[0]
+    N, W = src_val.type.shape
+    M = out_val.type.shape[0]
+    src_hbm = hbm_map[src_val.name]
+    idx_hbm = hbm_map[idx_val.name]
+    out_hbm = hbm_map[out_val.name]
+    vdtype = out_val.type.dtype
+    idtype = idx_val.type.dtype
+
+    for m_i in range(ceildiv(M, PARTITION_MAX)):
+        m_off = m_i * PARTITION_MAX
+        m_size = min(PARTITION_MAX, M - m_off)
+        idx_tile = nb.dma_copy(
+            nb.alloc((m_size, 1), idtype, MemorySpace.SBUF),
+            idx_hbm, (DimSlice(m_off, m_size), DimSlice(0, 1)),
+        )
+        # Indirect load: gather m_size rows of src (selected by idx) into SBUF.
+        out_tile = nb.dma_copy_indirect(
+            nb.alloc((m_size, W), vdtype, MemorySpace.SBUF), src_hbm, idx_tile,
+        )
+        nb.dma_copy(out_hbm, out_tile, (DimSlice(m_off, m_size), DimSlice(0, W)))
 
 
 def _first_cols(nb: Builder, tile: Value, keep: int) -> Value:

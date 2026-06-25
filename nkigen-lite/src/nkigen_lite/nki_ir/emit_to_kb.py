@@ -601,13 +601,36 @@ def _emit_op(op: Op, tiles: dict[str, object]) -> None:
             dst = _get(op.inputs[0])
             src = _get(op.inputs[1])
             index = _get(op.inputs[2])
-            nisa.dma_copy_indirect(dst=dst, src=src, src_index=index)
+            # Indirect gather: address src rows via the index tile using the
+            # canonical .ap(vector_offset=) view, then a plain dma_copy.  The
+            # view shape matches dst (M gathered rows x free), and .ap derives
+            # the row stride / bound (N) from the full src tile.
+            free = 1
+            for d in src.shape[1:]:
+                free *= d
+            m_rows = dst.shape[0]
+            src_view = src.ap([[free, m_rows], [1, free]], vector_offset=index)
+            nisa.dma_copy(dst=dst, src=src_view)
             tiles[op.result.name] = dst
         else:
             src = _get(op.inputs[0])
             dst = _get(op.inputs[1])
             index = _get(op.inputs[2])
-            nisa.dma_copy_indirect(dst=dst, src=src, dst_index=index)
+            # Indirect scatter: address dst rows via the index tile using the
+            # canonical .ap(vector_offset=) view, then a plain dma_copy (which
+            # routes to dma_copy_indirect).  Passing dst/src as raw tiles to the
+            # low-level dma_copy_indirect mismatches element counts.
+            #
+            # The view shape must match src (M scattered rows x free), NOT the
+            # full dst (N rows): the index tile has one entry per scattered row
+            # and selects which physical dst row each lands on.  .ap derives the
+            # row stride and bound (N) from the full dst tile.
+            free = 1
+            for d in dst.shape[1:]:
+                free *= d
+            m_rows = src.shape[0]
+            dst_view = dst.ap([[free, m_rows], [1, free]], vector_offset=index)
+            nisa.dma_copy(dst=dst_view, src=src)
 
     elif op.opcode == "tensor_tensor_scan":
         dst = _get(op.inputs[0])
