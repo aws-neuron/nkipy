@@ -425,6 +425,34 @@ class Builder:
         op = self._emit("topk", [x], [val_t, idx_t], {"k": k})
         return op.results[0], op.results[1]
 
+    # -- gather (per-partition runtime index) --
+
+    def gather_along_axis(self, data: Value, idx: Value) -> Value:
+        """Per-partition runtime gather along the free axis of a 2-D tile.
+
+        ``out[p, i] == data[p, idx[p, i]]`` for 2-D ``data`` (P, F_data) and
+        ``idx`` (P, F_idx); the result is (P, F_idx) with ``data``'s dtype.
+        This is the 2-D kernel that ``np.take_along_axis`` (and dynamic
+        ``np.take``) normalize onto via transpose/reshape.
+
+        Indices must be ``U32`` — the hardware gather index AP requires an
+        unsigned integer tile (same constraint as ``topk``'s indices).  Maps
+        to ``nisa.gather`` during lowering.
+        """
+        if data.type.rank != 2:
+            raise ValueError(f"gather_along_axis: data must be 2-D, got rank {data.type.rank}")
+        if idx.type.rank != 2:
+            raise ValueError(f"gather_along_axis: idx must be 2-D, got rank {idx.type.rank}")
+        if data.type.shape[0] != idx.type.shape[0]:
+            raise ValueError(
+                f"gather_along_axis: partition dims must match, got "
+                f"{data.type.shape[0]} (data) vs {idx.type.shape[0]} (idx)"
+            )
+        if idx.type.dtype != DType.U32:
+            raise ValueError(f"gather_along_axis: idx must be U32, got {idx.type.dtype}")
+        rt = TensorType((data.type.shape[0], idx.type.shape[1]), data.type.dtype)
+        return self._emit("gather_along_axis", [data, idx], [rt]).result
+
     # -- matmul --
 
     def matmul(self, a: Value, b: Value) -> Value:
@@ -651,6 +679,14 @@ def interpret(
                     work[p, pos] = -np.inf
             env[op.results[0].name] = vals.astype(to_np_dtype(op.results[0].type.dtype))
             env[op.results[1].name] = inds.astype(to_np_dtype(op.results[1].type.dtype))
+        elif op.opcode == "gather_along_axis":
+            data = _get(op.inputs[0])
+            idx = _get(op.inputs[1]).astype(np.intp)
+            P = data.shape[0]
+            out = np.empty(op.result.type.shape, dtype=to_np_dtype(op.result.type.dtype))
+            for p in range(P):
+                out[p] = data[p][idx[p]]
+            env[op.result.name] = out
         elif op.opcode == "for_loop":
             body = op.attrs["body"]
             trip_count = op.attrs["trip_count"]

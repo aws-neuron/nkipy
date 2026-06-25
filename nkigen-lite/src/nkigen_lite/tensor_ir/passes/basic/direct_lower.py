@@ -152,6 +152,8 @@ def lower_graph(graph: Graph, layouts: dict[str, Layout]) -> nki_ir.Graph:
             _emit_iota_op(nb, segment[0], hbm_map)
         elif segment[0].opcode == "topk":
             _emit_topk_op(nb, segment[0], hbm_map)
+        elif segment[0].opcode == "gather_along_axis":
+            _emit_gather_along_axis_op(nb, segment[0], hbm_map)
         elif segment[0].opcode in COLLECTIVE_OPCODES:
             _emit_collective_op(nb, segment[0], hbm_map)
         else:
@@ -599,6 +601,44 @@ def _emit_topk_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
         i_store = idx8 if keep == 8 else _first_cols(nb, idx8, keep)
         nb.dma_copy(val_hbm, v_store, (DimSlice(0, P), col))
         nb.dma_copy(idx_hbm, i_store, (DimSlice(0, P), col))
+
+
+def _emit_gather_along_axis_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
+    """Lower gather_along_axis via the hardware per-partition gather.
+
+    ``out[p, i] = data[p, idx[p, i]]``.  Each partition chunk (up to
+    PARTITION_MAX rows) loads its data and index rows into SBUF, runs
+    ``nisa.gather``, and stores the gathered row back to HBM.  The free
+    dims of data and idx differ (F_data vs F_idx); the gather dst matches
+    the idx shape.
+    """
+    data_val, idx_val = op.inputs[0], op.inputs[1]
+    out_val = op.results[0]
+    P, F_data = data_val.type.shape
+    F_idx = idx_val.type.shape[1]
+    data_hbm = hbm_map[data_val.name]
+    idx_hbm = hbm_map[idx_val.name]
+    out_hbm = hbm_map[out_val.name]
+    vdtype = out_val.type.dtype
+    idtype = idx_val.type.dtype
+
+    for p_i in range(ceildiv(P, PARTITION_MAX)):
+        p_off = p_i * PARTITION_MAX
+        p_size = min(PARTITION_MAX, P - p_off)
+
+        data_tile = nb.dma_copy(
+            nb.alloc((p_size, F_data), vdtype, MemorySpace.SBUF),
+            data_hbm, (DimSlice(p_off, p_size), DimSlice(0, F_data)),
+        )
+        idx_tile = nb.dma_copy(
+            nb.alloc((p_size, F_idx), idtype, MemorySpace.SBUF),
+            idx_hbm, (DimSlice(p_off, p_size), DimSlice(0, F_idx)),
+        )
+        out_tile = nb.gather(
+            nb.alloc((p_size, F_idx), vdtype, MemorySpace.SBUF),
+            data_tile, idx_tile,
+        )
+        nb.dma_copy(out_hbm, out_tile, (DimSlice(p_off, p_size), DimSlice(0, F_idx)))
 
 
 def _first_cols(nb: Builder, tile: Value, keep: int) -> Value:

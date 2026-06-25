@@ -131,11 +131,12 @@ def register_all_nkigen_lite_impls():
 
     # --- Indexing ops ---
     from nkipy.core.ops.indexing import (
-        where as where_op, take as take_op,
+        where as where_op, take as take_op, take_along_axis,
         static_slice, dynamic_update_slice,
     )
     where_op.impl("nkigen-lite")(lite_impls.where)
     take_op.impl("nkigen-lite")(lite_impls.take)
+    take_along_axis.impl("nkigen-lite")(lite_impls.take_along_axis)
     static_slice.impl("nkigen-lite")(lite_impls.static_slice)
     dynamic_update_slice.impl("nkigen-lite")(lite_impls.dynamic_update_slice)
 

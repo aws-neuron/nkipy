@@ -1016,6 +1016,77 @@ def take(a, indices, axis=None):
     return _wrap(gathered)
 
 
+def take_along_axis(a, indices, axis):
+    """np.take_along_axis with runtime (traced) indices.
+
+    ``out[..., i, ...] = a[..., indices[..., i, ...], ...]`` along ``axis``.
+    Indices broadcast against ``a`` on all non-``axis`` dims (matching the
+    HLO backend).  The gather axis is moved to the free dim and leading dims
+    flattened to a single partition dim, so the work reduces to the 2-D
+    hardware ``gather_along_axis`` primitive; the result is reshaped and
+    transposed back.
+    """
+    b = _builder()
+    a_val = _unwrap(a)
+
+    # Materialize the index operand as a Value (static arrays -> constant).
+    if isinstance(indices, NKIPyTensorRef):
+        idx_val = _unwrap(indices)
+    elif isinstance(indices, np.ndarray):
+        idx_val = _unwrap(constant(indices.astype(np.int32)))
+    else:
+        idx_val = _unwrap(indices)
+
+    u32 = np_dtype_to_lite(np.dtype(np.uint32))
+
+    # axis=None flattens both operands to 1-D, then gathers along axis 0.
+    if axis is None:
+        total = int(np.prod(a_val.type.shape)) if a_val.type.shape else 1
+        a_val = b.reshape(a_val, (total,))
+        n = int(np.prod(idx_val.type.shape)) if idx_val.type.shape else 1
+        idx_val = b.reshape(idx_val, (n,))
+        axis = 0
+
+    in_shape = a_val.type.shape
+    ndim = len(in_shape)
+    axis = axis % ndim
+
+    # Broadcast indices to a's shape on every dim except the gather axis.
+    target_idx_shape = list(in_shape)
+    target_idx_shape[axis] = idx_val.type.shape[axis]
+    target_idx_shape = tuple(target_idx_shape)
+    if idx_val.type.shape != target_idx_shape:
+        idx_val = b.broadcast_to(idx_val, target_idx_shape)
+    idx_val = _cast_if_needed(idx_val, u32)
+
+    # Move the gather axis to the last position so it becomes the free dim.
+    if axis != ndim - 1:
+        perm = tuple([d for d in range(ndim) if d != axis] + [axis])
+        a_t = b.transpose(a_val, perm)
+        idx_t = b.transpose(idx_val, perm)
+    else:
+        perm = tuple(range(ndim))
+        a_t, idx_t = a_val, idx_val
+
+    lead = a_t.type.shape[:-1]            # shared non-axis dims of a and idx
+    P = int(np.prod(lead)) if lead else 1
+    F_data = a_t.type.shape[-1]
+    F_idx = idx_t.type.shape[-1]
+    a2d = b.reshape(a_t, (P, F_data))
+    idx2d = b.reshape(idx_t, (P, F_idx))
+
+    g = b.gather_along_axis(a2d, idx2d)   # (P, F_idx)
+
+    out_t_shape = tuple(lead) + (F_idx,)
+    out = b.reshape(g, out_t_shape)
+    if axis != ndim - 1:
+        inv = [0] * ndim
+        for new_pos, old in enumerate(perm):
+            inv[old] = new_pos
+        out = b.transpose(out, tuple(inv))
+    return _wrap(out)
+
+
 # ---------------------------------------------------------------------------
 # Squeeze / swapaxes / stack / split
 # ---------------------------------------------------------------------------
