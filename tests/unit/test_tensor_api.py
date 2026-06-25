@@ -1229,12 +1229,6 @@ def test_topk_ascending(trace_mode, shape, top_k, axis):
     ],
 )
 def test_conv2d(trace_mode, in_channels, out_channels, kernel_size, stride, padding):
-    if trace_mode == "nkigen-lite":
-        pytest.skip(
-            "conv2d lowering is very slow on nkigen-lite (~1-2 min/case); "
-            "passes correctly but disabled for suite speed until lowering is optimized"
-        )
-
     def kernel(input_tensor, weight):
         return tensor_apis.conv2d(input_tensor, weight, stride=stride, padding=padding)
 
@@ -1280,12 +1274,6 @@ def test_conv2d_scalar_params(
     trace_mode, in_channels, out_channels, kernel_size, stride, padding
 ):
     """Test conv2d with scalar stride and padding parameters"""
-    if trace_mode == "nkigen-lite":
-        pytest.skip(
-            "conv2d lowering is very slow on nkigen-lite (~1-2 min/case); "
-            "passes correctly but disabled for suite speed until lowering is optimized"
-        )
-
     def kernel(input_tensor, weight):
         return tensor_apis.conv2d(input_tensor, weight, stride=stride, padding=padding)
 
@@ -1331,12 +1319,6 @@ def test_conv2d_with_dilation(
     trace_mode, in_channels, out_channels, kernel_size, stride, padding, dilation
 ):
     """Test conv2d with dilation parameter"""
-    if trace_mode == "nkigen-lite":
-        pytest.skip(
-            "conv2d lowering is very slow on nkigen-lite (~1-2 min/case); "
-            "passes correctly but disabled for suite speed until lowering is optimized"
-        )
-
     def kernel(input_tensor, weight):
         return tensor_apis.conv2d(
             input_tensor, weight, stride=stride, padding=padding, dilation=dilation
@@ -1385,12 +1367,6 @@ def test_conv2d_with_bias(
     trace_mode, in_channels, out_channels, kernel_size, stride, padding
 ):
     """Test conv2d with bias parameter"""
-    if trace_mode == "nkigen-lite":
-        pytest.skip(
-            "conv2d lowering is very slow on nkigen-lite (~1-2 min/case); "
-            "passes correctly but disabled for suite speed until lowering is optimized"
-        )
-
     def kernel(input_tensor, weight, bias):
         return tensor_apis.conv2d(
             input_tensor, weight, bias=bias, stride=stride, padding=padding
@@ -1440,10 +1416,12 @@ def test_conv2d_with_bias(
     ],
 )
 def test_conv3d(trace_mode, in_channels, out_channels, kernel_size, stride, padding):
-    if trace_mode == "nkigen-lite":
+    if trace_mode == "nkigen-lite" and out_channels >= 512:
         pytest.skip(
-            "conv3d lowering is pathologically slow on nkigen-lite and hangs the "
-            "suite (large-channel cases never complete); skip until lowering is optimized"
+            "conv3d im2col weight-reshape blows up for many kernel positions "
+            "(e.g. the 1152-channel Qwen3-VL case): the (Co, *K, Ci)->(Co, K*Ci) "
+            "reshape lowers to millions of per-row DMAs. Pending reshape-lowering "
+            "optimization; smaller-channel conv3d cases now lower in seconds."
         )
 
     def kernel(input_tensor, weight):
@@ -1491,10 +1469,10 @@ def test_conv3d_with_dilation(
     trace_mode, in_channels, out_channels, kernel_size, stride, padding, dilation
 ):
     """Test conv3d with dilation parameter"""
-    if trace_mode == "nkigen-lite":
+    if trace_mode == "nkigen-lite" and out_channels >= 512:
         pytest.skip(
-            "conv3d lowering is pathologically slow on nkigen-lite and hangs the "
-            "suite (large-channel cases never complete); skip until lowering is optimized"
+            "conv3d im2col weight-reshape blows up for many kernel positions; "
+            "pending reshape-lowering optimization"
         )
 
     def kernel(input_tensor, weight):
@@ -1544,10 +1522,10 @@ def test_conv3d_with_bias(
     trace_mode, in_channels, out_channels, kernel_size, stride, padding
 ):
     """Test conv3d with bias parameter"""
-    if trace_mode == "nkigen-lite":
+    if trace_mode == "nkigen-lite" and out_channels >= 512:
         pytest.skip(
-            "conv3d lowering is pathologically slow on nkigen-lite and hangs the "
-            "suite (large-channel cases never complete); skip until lowering is optimized"
+            "conv3d im2col weight-reshape blows up for many kernel positions; "
+            "pending reshape-lowering optimization"
         )
 
     def kernel(input_tensor, weight, bias):

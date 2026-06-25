@@ -677,68 +677,59 @@ def emit_slice(nb: Builder, x_hbm, y_hbm, in_shape, out_shape, starts, dtype,
 
 
 def _emit_strided_slice(nb, x_hbm, y_hbm, in_shape, out_shape, starts, strides, dtype):
-    """Emit strided slice by copying one output row at a time.
+    """Emit a strided slice as tiled strided-DMA descriptors.
 
-    For each output row, computes the source row index using the stride,
-    then copies the appropriate elements. F-dimension strides are handled
-    by copying individual elements.
+    A strided slice reads every ``stride``-th element along each axis. The DMA
+    engine expresses this natively via per-dimension ``DimSlice`` strides, so
+    we tile the output like the contiguous slice path (P at ``min(out_p, 128)``,
+    F full) and emit a single strided load + contiguous store per tile. The
+    earlier implementation copied one element at a time when the free-dim
+    stride was non-unit, which produced ``O(num_elements)`` DMAs (e.g. ~9.4k
+    ops for a single strided conv im2col slice).
     """
     rank = len(in_shape)
+
+    # Rank 1: one strided 1D load into a (1, out_f) tile.
     if rank == 1:
-        f_stride = strides[0]
-        for i in range(out_shape[0]):
-            src_idx = starts[0] + i * f_stride
-            src_slices = [DimSlice(src_idx, 1)]
-            dst_slices = [DimSlice(i, 1)]
-            tile = nb.dma_copy(nb.alloc((1, 1), dtype, MemorySpace.SBUF), x_hbm, src_slices)
-            nb.dma_copy(y_hbm, tile, dst_slices)
+        out_f = out_shape[0]
+        src_slices = [DimSlice(starts[0], out_f, stride=strides[0])]
+        dst_slices = [DimSlice(0, out_f)]
+        tile = nb.dma_copy(
+            nb.alloc((1, out_f), dtype, MemorySpace.SBUF), x_hbm, src_slices)
+        nb.dma_copy(y_hbm, tile, dst_slices)
         return
 
-    # For rank >= 2: iterate over batch dims and P-dim, handle F-dim stride
-    p_stride = strides[-2] if rank >= 2 else 1
+    # Rank >= 2: tile the output P-dim; load each tile with strided source
+    # descriptors on the P and F axes (and constant batch indices).
+    p_stride = strides[-2]
     f_stride = strides[-1]
-    out_p = out_shape[-2] if rank >= 2 else 1
+    out_p = out_shape[-2]
     out_f = out_shape[-1]
+    tile_p = min(out_p, PARTITION_MAX)
     batch_dims = list(out_shape[:-2]) if rank > 2 else []
     n_batch = prod(batch_dims) if batch_dims else 1
     batch_strides = strides[:-2] if rank > 2 else ()
 
     for bf in range(n_batch):
         batch_idx = unravel(bf, batch_dims) if batch_dims else ()
-        for p_out in range(out_p):
-            src_p = starts[-2] + p_out * p_stride if rank >= 2 else 0
+        for p_i in range(ceildiv(out_p, tile_p)):
+            p_off = p_i * tile_p
+            p_size = min(tile_p, out_p - p_off)
 
-            if f_stride == 1:
-                src_slices = []
-                for i, bi in enumerate(batch_idx):
-                    src_slices.append(DimSlice(starts[i] + bi * batch_strides[i], 1))
-                src_slices.append(DimSlice(src_p, 1))
-                src_slices.append(DimSlice(starts[-1], out_f))
+            src_slices = []
+            for i, bi in enumerate(batch_idx):
+                src_slices.append(DimSlice(starts[i] + bi * batch_strides[i], 1))
+            src_slices.append(
+                DimSlice(starts[-2] + p_off * p_stride, p_size, stride=p_stride))
+            src_slices.append(DimSlice(starts[-1], out_f, stride=f_stride))
 
-                dst_slices = [DimSlice(bi, 1) for bi in batch_idx]
-                dst_slices.append(DimSlice(p_out, 1))
-                dst_slices.append(DimSlice(0, out_f))
+            dst_slices = [DimSlice(bi, 1) for bi in batch_idx]
+            dst_slices.append(DimSlice(p_off, p_size))
+            dst_slices.append(DimSlice(0, out_f))
 
-                tile = nb.dma_copy(
-                    nb.alloc((1, out_f), dtype, MemorySpace.SBUF), x_hbm, src_slices)
-                nb.dma_copy(y_hbm, tile, dst_slices)
-            else:
-                for f_out in range(out_f):
-                    src_f = starts[-1] + f_out * f_stride
-
-                    src_slices = []
-                    for i, bi in enumerate(batch_idx):
-                        src_slices.append(DimSlice(starts[i] + bi * batch_strides[i], 1))
-                    src_slices.append(DimSlice(src_p, 1))
-                    src_slices.append(DimSlice(src_f, 1))
-
-                    dst_slices = [DimSlice(bi, 1) for bi in batch_idx]
-                    dst_slices.append(DimSlice(p_out, 1))
-                    dst_slices.append(DimSlice(f_out, 1))
-
-                    tile = nb.dma_copy(
-                        nb.alloc((1, 1), dtype, MemorySpace.SBUF), x_hbm, src_slices)
-                    nb.dma_copy(y_hbm, tile, dst_slices)
+            tile = nb.dma_copy(
+                nb.alloc((p_size, out_f), dtype, MemorySpace.SBUF), x_hbm, src_slices)
+            nb.dma_copy(y_hbm, tile, dst_slices)
 
 
 def emit_concat(nb: Builder, input_hbms: list, y_hbm, input_shapes: list, axis: int, dtype) -> None:
