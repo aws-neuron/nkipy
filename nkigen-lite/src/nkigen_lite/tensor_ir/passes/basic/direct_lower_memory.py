@@ -61,12 +61,19 @@ def lower_reshape(
             f"reshape: element count mismatch {prod(in_shape)} vs {prod(out_shape)}"
         )
 
-    out_rank = len(out_shape)
-    in_rank = len(in_shape)
-
     # If the last dim matches, we can load multi-row tiles directly
     if in_shape[-1] == out_shape[-1]:
         return _lower_reshape_same_last_dim(in_shape, out_shape, dtype)
+
+    # If the shapes share a leading prefix-product P, the reshape only regroups
+    # each row's free dimension (in_f -> out_f) with the partition axis fixed.
+    # That is a zero-copy on-chip ``view`` (legal: SBUF views must keep the
+    # partition dim), so we can tile P and emit one load+view+store per tile —
+    # no scratch round-trip. Covers conv im2col reshapes like
+    # (Co,*K,Ci) -> (Co, K*Ci) which otherwise blew up via scratch.
+    p_common = _largest_common_prefix(in_shape, out_shape)
+    if p_common > 1:
+        return _lower_reshape_via_prefix(in_shape, out_shape, p_common, dtype)
 
     # General case: use an HBM scratch buffer. Load source rows into scratch
     # in flat order, then reload from scratch in output shape. Since both
@@ -75,20 +82,86 @@ def lower_reshape(
     return _lower_reshape_via_scratch(in_shape, out_shape, dtype)
 
 
+def _largest_common_prefix(in_shape: tuple[int, ...], out_shape: tuple[int, ...]) -> int:
+    """Largest leading prefix-product common to both shapes (excluding the last
+    dim of each, which becomes the per-row free dimension).
+
+    e.g. (1152,2,16,16,3) and (1152,1536) share prefix product 1152; the
+    remaining free dims are 2*16*16*3=1536 and 1536, which match by construction
+    (total element counts are equal).
+    """
+    def prefixes(shape):
+        out = {1}
+        p = 1
+        for s in shape[:-1]:
+            p *= s
+            out.add(p)
+        return out
+
+    common = prefixes(in_shape) & prefixes(out_shape)
+    return max(common)
+
+
+def _lower_reshape_via_prefix(
+    in_shape: tuple[int, ...],
+    out_shape: tuple[int, ...],
+    p_common: int,
+    dtype: DType,
+) -> Graph:
+    """Reshape that only regroups the free dimension, with partition fixed.
+
+    The shapes share a leading prefix-product ``p_common`` (= partition extent).
+    Each partition row holds ``in_free = total/p_common`` source elements that
+    become ``out_free = total/p_common`` output elements at the same flat
+    positions — a free-dim ``view``. Tile the partition at 128 and emit one
+    contiguous load + view + contiguous store per tile.
+    """
+    total = prod(in_shape)
+    in_free = total // p_common
+    out_free = total // p_common
+
+    b = Builder("reshape")
+    x_hbm = b.add_input("x", in_shape, dtype)
+    y_hbm = b.add_input("y", out_shape, dtype)
+
+    in_strides = row_major_strides(in_shape)
+    out_strides = row_major_strides(out_shape)
+
+    for r0 in range(0, p_common, PARTITION_MAX):
+        p = min(PARTITION_MAX, p_common - r0)
+        # Source rows [r0:r0+p] of width in_free are contiguous in flat order
+        # and (since the split is at a leading-dim boundary of in_shape) form a
+        # single source rectangle; likewise for the output.
+        src_chunks = flat_range_to_src_chunks(
+            r0 * in_free, p * in_free, in_shape, in_strides)
+        dst_chunks = flat_range_to_src_chunks(
+            r0 * out_free, p * out_free, out_shape, out_strides)
+        # p_common is a shared leading boundary, so each side is one rectangle.
+        (src_slices, _), = src_chunks
+        (dst_slices, _), = dst_chunks
+        tile = b.dma_copy(
+            b.alloc((p, in_free), dtype, MemorySpace.SBUF), x_hbm, src_slices)
+        tile = b.view(tile, (p, out_free))
+        b.dma_copy(y_hbm, tile, dst_slices)
+
+    b.set_outputs({"y": y_hbm})
+    return b.graph
+
+
 def _lower_reshape_via_scratch(
     in_shape: tuple[int, ...],
     out_shape: tuple[int, ...],
     dtype: DType,
 ) -> Graph:
-    """Reshape when inner dims differ, using a flat HBM scratch buffer.
+    """Reshape when inner dims differ and the shapes share no usable leading
+    prefix, using a flat HBM scratch buffer.
 
-    Strategy: copy the entire source into a 1D scratch buffer (preserving
-    flat order), then reload from scratch using output coordinates. Both
-    source and output are row-major views of the same flat data, so the
-    scratch buffer (shaped as (total_rows, max_F)) bridges between them.
-
-    We use a scratch with shape (N, F) where F = in_F, then reload with
-    output's coordinate mapping.
+    Strategy: copy the entire source into a scratch buffer (preserving flat
+    order), then reload from scratch using output coordinates. Both source and
+    output are row-major views of the same flat data, so the scratch buffer
+    bridges between them. This is the slow fallback (it can reassemble output
+    rows from fragments); the common-prefix and same-last-dim paths handle the
+    fast cases.
     """
     total = prod(in_shape)
     out_rank = len(out_shape)
@@ -100,7 +173,6 @@ def _lower_reshape_via_scratch(
     scratch_shape = (total_rows_in, in_f)
 
     # Output iteration
-    total_rows_out = total // out_f
     out_p_extent = out_shape[-2] if out_rank >= 2 else 1
     batch_dims = list(out_shape[:-2]) if out_rank > 2 else []
     n_batch = prod(batch_dims) if batch_dims else 1

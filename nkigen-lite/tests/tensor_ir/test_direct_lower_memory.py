@@ -63,14 +63,18 @@ def _check(nki_graph, inputs, expected, atol=1e-5):
 # ---------------------------------------------------------------------------
 
 
-def _reshape_inputs(in_shape, out_shape, x):
-    """Build inputs dict for reshape, including scratch if needed."""
-    from math import prod as _prod
+def _reshape_inputs(in_shape, out_shape, x, graph=None):
+    """Build inputs dict for reshape, including scratch if needed.
+
+    The scratch buffer's shape is an internal detail of the lowering (it uses
+    a ``gcd(in_f, out_f)``-wide buffer), so derive it from the graph's declared
+    inputs rather than recomputing it here.
+    """
     inputs = {"x": x, "y": np.zeros(out_shape, dtype=np.float32)}
-    if in_shape[-1] != out_shape[-1]:
-        total = _prod(in_shape)
-        in_f = in_shape[-1]
-        inputs["scratch"] = np.zeros((total // in_f, in_f), dtype=np.float32)
+    if graph is not None:
+        for v in graph.inputs:
+            if v.name == "scratch":
+                inputs["scratch"] = np.zeros(v.type.shape, dtype=np.float32)
     return inputs
 
 
@@ -81,7 +85,7 @@ class TestReshape:
         x = rng.standard_normal((4, 128, 64)).astype(np.float32)
         expected = x.reshape(512, 64)
         graph = lower_reshape((4, 128, 64), (512, 64))
-        _check(graph, _reshape_inputs((4, 128, 64), (512, 64), x), expected)
+        _check(graph, _reshape_inputs((4, 128, 64), (512, 64), x, graph), expected)
 
     def test_unflatten(self):
         """(512, 64) -> (4, 128, 64)"""
@@ -89,7 +93,7 @@ class TestReshape:
         x = rng.standard_normal((512, 64)).astype(np.float32)
         expected = x.reshape(4, 128, 64)
         graph = lower_reshape((512, 64), (4, 128, 64))
-        _check(graph, _reshape_inputs((512, 64), (4, 128, 64), x), expected)
+        _check(graph, _reshape_inputs((512, 64), (4, 128, 64), x, graph), expected)
 
     def test_merge_last_two(self):
         """(4, 8, 32) -> (4, 256)"""
@@ -97,7 +101,7 @@ class TestReshape:
         x = rng.standard_normal((4, 8, 32)).astype(np.float32)
         expected = x.reshape(4, 256)
         graph = lower_reshape((4, 8, 32), (4, 256))
-        _check(graph, _reshape_inputs((4, 8, 32), (4, 256), x), expected)
+        _check(graph, _reshape_inputs((4, 8, 32), (4, 256), x, graph), expected)
 
     def test_split_last(self):
         """(128, 256) -> (128, 4, 64)"""
@@ -105,7 +109,7 @@ class TestReshape:
         x = rng.standard_normal((128, 256)).astype(np.float32)
         expected = x.reshape(128, 4, 64)
         graph = lower_reshape((128, 256), (128, 4, 64))
-        _check(graph, _reshape_inputs((128, 256), (128, 4, 64), x), expected)
+        _check(graph, _reshape_inputs((128, 256), (128, 4, 64), x, graph), expected)
 
     def test_same_shape(self):
         """No-op reshape (128, 64) -> (128, 64)"""
@@ -113,7 +117,7 @@ class TestReshape:
         x = rng.standard_normal((128, 64)).astype(np.float32)
         expected = x.copy()
         graph = lower_reshape((128, 64), (128, 64))
-        _check(graph, _reshape_inputs((128, 64), (128, 64), x), expected)
+        _check(graph, _reshape_inputs((128, 64), (128, 64), x, graph), expected)
 
     def test_large_p(self):
         """P > 128: (300, 64) -> (300, 64) identity with P-tiling."""
@@ -121,7 +125,7 @@ class TestReshape:
         x = rng.standard_normal((300, 64)).astype(np.float32)
         expected = x.copy()
         graph = lower_reshape((300, 64), (300, 64))
-        _check(graph, _reshape_inputs((300, 64), (300, 64), x), expected)
+        _check(graph, _reshape_inputs((300, 64), (300, 64), x, graph), expected)
 
     def test_column_to_row(self):
         """(256, 1) -> (1, 256): column vector to row vector."""
@@ -129,7 +133,7 @@ class TestReshape:
         x = rng.standard_normal((256, 1)).astype(np.float32)
         expected = x.reshape(1, 256)
         graph = lower_reshape((256, 1), (1, 256))
-        _check(graph, _reshape_inputs((256, 1), (1, 256), x), expected)
+        _check(graph, _reshape_inputs((256, 1), (1, 256), x, graph), expected)
 
     def test_row_to_column(self):
         """(1, 256) -> (256, 1): row vector to column vector."""
@@ -137,7 +141,7 @@ class TestReshape:
         x = rng.standard_normal((1, 256)).astype(np.float32)
         expected = x.reshape(256, 1)
         graph = lower_reshape((1, 256), (256, 1))
-        _check(graph, _reshape_inputs((1, 256), (256, 1), x), expected)
+        _check(graph, _reshape_inputs((1, 256), (256, 1), x, graph), expected)
 
 
 # ---------------------------------------------------------------------------
