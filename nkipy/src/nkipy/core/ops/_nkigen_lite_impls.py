@@ -962,6 +962,102 @@ def where(condition, x, y):
     return _wrap(b.where(c_val, x_val, y_val))
 
 
+def _take_dynamic(b, a_val, idx_val, axis):
+    """np.take with runtime (traced) indices, via the hardware gather.
+
+    np.take applies the *same* index vector to every non-axis position and
+    replaces ``axis`` with ``indices.shape``:
+
+        out.shape == a.shape[:axis] + indices.shape + a.shape[axis+1:]
+
+    We move ``axis`` to the free dim and flatten the leading dims to a single
+    partition dim, giving a 2-D ``(P, F_data)`` tile.  The flattened index
+    vector (length M = prod(indices.shape)) is the same for every partition,
+    so we broadcast it to ``(P, M)`` and run ``gather_along_axis``.  The
+    ``(P, M)`` result is then reshaped/transposed back to the numpy layout.
+    """
+    from nkigen_lite.core import DType
+
+    PARTITION_MAX = 128  # NeuronCore SBUF partition count
+
+    # Only integer indices are gatherable.  A float/bool index is a boolean
+    # mask (nkigen-lite reports comparisons as f32, so the frontend's bool
+    # guard misses them), whose output length is data-dependent and cannot be
+    # lowered to a fixed-shape gather — reject it as unsupported.
+    _INT_INDEX = {DType.I32, DType.I16, DType.I8, DType.U32, DType.U16, DType.U8}
+    if idx_val.type.dtype not in _INT_INDEX:
+        raise NotImplementedError(
+            "Boolean / non-integer indexing is not supported in nkigen-lite. "
+            "Boolean masks produce variable-length outputs that cannot be "
+            "lowered to a fixed-shape gather."
+        )
+
+    u32 = np_dtype_to_lite(np.dtype(np.uint32))
+    idx_shape = idx_val.type.shape
+
+    # axis=None flattens the input and gathers from the flat vector.
+    if axis is None:
+        total = int(np.prod(a_val.type.shape)) if a_val.type.shape else 1
+        a_val = b.reshape(a_val, (total,))
+        axis = 0
+
+    in_shape = a_val.type.shape
+    rank = len(in_shape)
+    axis = axis % rank
+    F_data = in_shape[axis]
+    M = int(np.prod(idx_shape)) if idx_shape else 1
+
+    # Move the gather axis to the last position -> free dim.
+    if axis != rank - 1:
+        perm = tuple([d for d in range(rank) if d != axis] + [axis])
+        a_t = b.transpose(a_val, perm)
+    else:
+        perm = tuple(range(rank))
+        a_t = a_val
+    lead = a_t.type.shape[:-1]            # all non-axis dims of a
+    P = int(np.prod(lead)) if lead else 1
+    # Collapsing >1 leading dim into the partition axis requires a reshape
+    # whose partition extent the DMA tiler can split: P <= 128 or a multiple
+    # of 128.  Other extents hit a pre-existing reshape-lowering limit, so
+    # reject them here rather than emit an uncompilable kernel.
+    if len(lead) > 1 and P > PARTITION_MAX and P % PARTITION_MAX != 0:
+        raise NotImplementedError(
+            f"take: gathering with a flattened partition extent of {P} "
+            f"(must be <= {PARTITION_MAX} or a multiple of {PARTITION_MAX}) "
+            "is not yet supported by nkigen-lite reshape lowering."
+        )
+    a2d = b.reshape(a_t, (P, F_data))
+
+    # Same index vector for every partition: flatten to (M,), cast, broadcast.
+    idx_flat = b.reshape(idx_val, (M,)) if idx_shape != (M,) else idx_val
+    idx_flat = _cast_if_needed(idx_flat, u32)
+    idx2d = b.broadcast_to(b.reshape(idx_flat, (1, M)), (P, M))
+
+    g = b.gather_along_axis(a2d, idx2d)  # (P, M)
+
+    # g is laid out as (lead..., M); reshape M back to indices.shape, giving
+    # the transposed output (lead..., *indices.shape).  Then undo the move so
+    # the gathered block lands at `axis`: out = a.shape[:axis] + idx + rest.
+    g_t = b.reshape(g, tuple(lead) + tuple(idx_shape))
+    if axis != rank - 1:
+        # `lead` is a.shape with `axis` removed; the gathered block (rank of
+        # idx) currently sits at the end.  Build a permutation that inserts
+        # those trailing axes back at position `axis`.
+        n_idx = len(idx_shape)
+        n_lead = len(lead)
+        # current axes: [0..n_lead) = lead dims, [n_lead..n_lead+n_idx) = idx
+        cur = list(range(n_lead + n_idx))
+        idx_axes = cur[n_lead:]
+        lead_axes = cur[:n_lead]
+        new_order = lead_axes[:axis] + idx_axes + lead_axes[axis:]
+        # A scalar index (or other degenerate case) can leave the gathered
+        # block already in place; skip the no-op transpose, which would also
+        # trip the rank-1 transpose lowering.
+        if new_order != list(range(len(new_order))):
+            g_t = b.transpose(g_t, tuple(new_order))
+    return _wrap(g_t)
+
+
 def take(a, indices, axis=None):
     """np.take with static (trace-time) integer indices.
 
@@ -977,12 +1073,10 @@ def take(a, indices, axis=None):
     b = _builder()
     a_val = _unwrap(a)
 
-    # Dynamic (traced) indices need a hardware gather, which isn't supported.
+    # Dynamic (traced) indices: gather at runtime via the hardware gather
+    # primitive.  Static numpy indices keep the slice-based path below.
     if isinstance(indices, NKIPyTensorRef):
-        raise NotImplementedError(
-            "Dynamic tensor indexing is not yet supported in nkigen-lite. "
-            "Use static numpy array indices instead."
-        )
+        return _take_dynamic(b, a_val, _unwrap(indices), axis)
 
     idx_arr = np.asarray(indices)
 
