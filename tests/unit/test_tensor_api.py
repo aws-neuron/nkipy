@@ -1103,6 +1103,25 @@ def test_slice_assignment_indeterministic(trace_mode, shape, indices):
         trace_and_compile(kernel, trace_mode, np.copy(a), b, t)
 
 
+def test_slice_assignment_nonuniform_literal(trace_mode):
+    """Assign a non-uniform constant array into a static slice."""
+
+    update = np.arange(6, dtype=np.float32).reshape(2, 3)
+
+    def kernel(a):
+        a[1:3, 1:4] = update
+        return a
+
+    a = np.random.random_sample((4, 5)).astype(np.float32)
+    expected = kernel(np.copy(a))
+
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, np.copy(a))
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, np.copy(a))
+
+
 @pytest.mark.parametrize(
     "shape,idx_size",
     [
@@ -2741,6 +2760,43 @@ def test_pad_edge_asymmetric(trace_mode):
         return np.pad(a, ((2, 1), (0, 3)), mode="edge")
 
     shape = (16, 32)
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(np.float32)
+    expected = kernel(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+@pytest.mark.parametrize("mode", ["reflect", "symmetric", "wrap"])
+def test_pad_structural(trace_mode, mode):
+    """Test np.pad with reflect/symmetric/wrap modes (asymmetric per axis)."""
+    if trace_mode == "hlo":
+        pytest.skip("HLO pad supports only 'constant' and 'edge' modes")
+
+    def kernel(a):
+        return np.pad(a, ((2, 1), (1, 3)), mode=mode)
+
+    shape = (16, 32)
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(np.float32)
+    expected = kernel(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_diff_prepend_append(trace_mode):
+    """Test np.diff with prepend and append scalars."""
+    if trace_mode == "hlo":
+        pytest.skip("HLO diff ignores prepend/append")
+
+    def kernel(a):
+        return np.diff(a, prepend=0.0, append=1.0, axis=-1)
+
+    shape = (32, 64)
     in0 = np.random.uniform(0.0, 1.0, size=shape).astype(np.float32)
     expected = kernel(in0)
     if NEURON_AVAILABLE:

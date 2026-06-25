@@ -14,6 +14,7 @@ from nkipy.core.tensor import NKIPyTensorRef
 from nkipy.core.backend.nkigen_lite import (
     NkiGenLiteTensor,
     get_nkigen_lite_context,
+    lite_dtype_to_np,
     np_dtype_to_lite,
 )
 
@@ -1573,15 +1574,49 @@ def _roll_axis(x_val, shift, axis):
     return b.concat([tail, head], axis=axis)
 
 
+def _diff_pad_operand(b, value, ref_val, axis, ndim):
+    """Coerce a diff prepend/append value to a tensor concatenable along ``axis``.
+
+    Scalars become a width-1 slab; arrays are promoted to ``ref``'s rank (numpy
+    broadcasts a lower-rank value across the other axes) and cast to its dtype.
+    """
+    dtype = ref_val.type.dtype
+    if isinstance(value, NKIPyTensorRef):
+        v = _unwrap(value)
+    elif isinstance(value, (int, float, bool)):
+        slab_shape = tuple(
+            1 if d == axis else ref_val.type.shape[d] for d in range(ndim)
+        )
+        return b.full(slab_shape, float(value), dtype)
+    else:
+        arr = np.asarray(value)
+        v = _unwrap(constant(arr, dtype=lite_dtype_to_np(dtype)))
+    # Promote to ref rank by prepending size-1 axes, then broadcast the
+    # non-concat axes to match ref so the concat is well-formed.
+    while len(v.type.shape) < ndim:
+        v = b.expand_dims(v, 0)
+    target = tuple(
+        v.type.shape[axis] if d == axis else ref_val.type.shape[d]
+        for d in range(ndim)
+    )
+    if v.type.shape != target:
+        v = b.broadcast_to(v, target)
+    return _cast_if_needed(v, dtype)
+
+
 def diff(a, n=1, axis=-1, prepend=None, append=None):
     b = _builder()
     a_val = _unwrap(a)
     ndim = len(a_val.type.shape)
-    if prepend is not None or append is not None:
-        raise NotImplementedError(
-            "diff prepend/append not yet supported in nkigen-lite"
-        )
     axis = axis % ndim
+    if prepend is not None or append is not None:
+        parts = []
+        if prepend is not None:
+            parts.append(_diff_pad_operand(b, prepend, a_val, axis, ndim))
+        parts.append(a_val)
+        if append is not None:
+            parts.append(_diff_pad_operand(b, append, a_val, axis, ndim))
+        a_val = b.concat(parts, axis=axis) if len(parts) > 1 else parts[0]
     result = a_val
     for _ in range(n):
         size = result.type.shape[axis]
@@ -1646,8 +1681,42 @@ def pad(x, pad_width, mode="constant", constant_values=0, **kwargs):
                 result = b.concat(parts, axis=ax)
         return _wrap(result)
 
+    elif mode in ("reflect", "symmetric", "wrap"):
+        # Structural pads built from width-1 slabs in the right order. The
+        # source index pattern per axis (relative to the current extent n):
+        #   reflect    before -> [before..1],     after -> [n-2..n-1-after]
+        #   symmetric  before -> [before-1..0],    after -> [n-1..n-after]
+        #   wrap       before -> [n-before..n-1],  after -> [0..after-1]
+        result = x_val
+        for ax, (before, after) in enumerate(pad_list):
+            if before == 0 and after == 0:
+                continue
+            n = result.type.shape[ax]
+            if mode == "reflect" and n == 1:
+                # numpy reflects a single element as edge replication.
+                before_idx = [0] * before
+                after_idx = [0] * after
+            elif mode == "reflect":
+                before_idx = list(range(before, 0, -1))
+                after_idx = [n - 2 - i for i in range(after)]
+            elif mode == "symmetric":
+                before_idx = list(range(before - 1, -1, -1))
+                after_idx = [n - 1 - i for i in range(after)]
+            else:  # wrap
+                before_idx = [n - before + i for i in range(before)]
+                after_idx = list(range(after))
+
+            slabs = {i: _axis_slice(result, ax, i, i + 1) for i in range(n)}
+            parts = [slabs[i] for i in before_idx]
+            parts.append(result)
+            parts.extend(slabs[i] for i in after_idx)
+            if len(parts) > 1:
+                result = b.concat(parts, axis=ax)
+        return _wrap(result)
+
     raise NotImplementedError(
-        f"pad mode {mode!r} is not supported; only 'constant' and 'edge'"
+        f"pad mode {mode!r} is not supported; only 'constant', 'edge', "
+        "'reflect', 'symmetric', and 'wrap'"
     )
 
 
@@ -1691,11 +1760,13 @@ def dynamic_update_slice(x, value, start_indices, update_shape):
         value_val = b.full(tuple(update_shape), float(value), lite_dtype)
     elif isinstance(value, np.ndarray):
         flat = value.ravel()
-        if np.all(flat == flat[0]):
+        if flat.size and np.all(flat == flat[0]):
             value_val = b.full(tuple(update_shape), float(flat[0]), x_val.type.dtype)
         else:
-            raise NotImplementedError(
-                "Non-uniform numpy array in dynamic_update_slice not supported"
+            # Non-uniform data: materialize via the constant builder (which
+            # run-length-encodes it), then cast/reshape to the update shape.
+            value_val = _unwrap(
+                constant(value, dtype=lite_dtype_to_np(x_val.type.dtype))
             )
     else:
         value_val = value
