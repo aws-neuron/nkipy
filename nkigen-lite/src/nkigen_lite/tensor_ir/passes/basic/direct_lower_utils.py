@@ -94,6 +94,73 @@ def flat_range_to_src_slices(
     return slices
 
 
+def flat_range_to_src_chunks(
+    flat_offset: int,
+    n_elements: int,
+    shape: tuple[int, ...],
+    strides: tuple[int, ...],
+) -> list[tuple[list[DimSlice], int]]:
+    """Decompose a contiguous flat range into maximal rectangular sub-slices.
+
+    ``flat_range_to_src_slices`` expresses a contiguous range as a *single*
+    rectangle, which only works when the range starts at a leading-dim
+    boundary and stays within one. A range that crosses such a boundary (e.g.
+    collapsing ``(3, 100, 8)`` into ``(300, 8)`` and loading a 128-row tile)
+    cannot be a single rectangle, and the single-rectangle form silently
+    truncates at the first boundary.
+
+    This splits ``[flat_offset, flat_offset + n_elements)`` into a list of
+    ``(src_slices, covered)`` pairs, each a maximal rectangle, that together
+    cover the whole range. Returns a single chunk for the aligned fast path,
+    so callers pay no extra DMAs when the range already is a rectangle.
+    """
+    rank = len(shape)
+    chunks: list[tuple[list[DimSlice], int]] = []
+    pos = flat_offset
+    end = flat_offset + n_elements
+    while pos < end:
+        budget = end - pos
+        start_indices = []
+        remaining = pos
+        for s in strides:
+            start_indices.append(remaining // s)
+            remaining %= s
+
+        # Grow the largest rectangle from the innermost dim: absorb whole dims
+        # while they start at 0 and fit the budget. ``split_dim`` is the first
+        # dim (from the right) we can only partially traverse; -1 means the
+        # remaining range is itself one full-array rectangle.
+        inner = 1
+        split_dim = -1
+        for d in range(rank - 1, -1, -1):
+            if start_indices[d] == 0 and inner * shape[d] <= budget:
+                inner *= shape[d]
+            else:
+                split_dim = d
+                break
+
+        slices = []
+        if split_dim < 0:
+            for d in range(rank):
+                slices.append(DimSlice(0, shape[d]))
+            covered = inner
+        else:
+            avail = shape[split_dim] - start_indices[split_dim]
+            count = min(budget // inner, avail)
+            for d in range(rank):
+                if d < split_dim:
+                    slices.append(DimSlice(start_indices[d], 1))
+                elif d == split_dim:
+                    slices.append(DimSlice(start_indices[d], count))
+                else:
+                    slices.append(DimSlice(0, shape[d]))
+            covered = inner * count
+
+        chunks.append((slices, covered))
+        pos += covered
+    return chunks
+
+
 # ---------------------------------------------------------------------------
 # Tiling utilities
 # ---------------------------------------------------------------------------

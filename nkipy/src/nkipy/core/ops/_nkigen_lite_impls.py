@@ -978,8 +978,6 @@ def _take_dynamic(b, a_val, idx_val, axis):
     """
     from nkigen_lite.core import DType
 
-    PARTITION_MAX = 128  # NeuronCore SBUF partition count
-
     # Only integer indices are gatherable.  A float/bool index is a boolean
     # mask (nkigen-lite reports comparisons as f32, so the frontend's bool
     # guard misses them), whose output length is data-dependent and cannot be
@@ -1028,16 +1026,6 @@ def _take_dynamic(b, a_val, idx_val, axis):
         a_t = a_val
     lead = a_t.type.shape[:-1]            # all non-axis dims of a
     P = int(np.prod(lead)) if lead else 1
-    # Collapsing >1 leading dim into the partition axis requires a reshape
-    # whose partition extent the DMA tiler can split: P <= 128 or a multiple
-    # of 128.  Other extents hit a pre-existing reshape-lowering limit, so
-    # reject them here rather than emit an uncompilable kernel.
-    if len(lead) > 1 and P > PARTITION_MAX and P % PARTITION_MAX != 0:
-        raise NotImplementedError(
-            f"take: gathering with a flattened partition extent of {P} "
-            f"(must be <= {PARTITION_MAX} or a multiple of {PARTITION_MAX}) "
-            "is not yet supported by nkigen-lite reshape lowering."
-        )
     a2d = b.reshape(a_t, (P, F_data))
 
     # Same index vector for every partition: flatten to (M,), cast, broadcast.

@@ -30,7 +30,7 @@ from nkigen_lite.nki_ir.ir import (
 from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
     build_out_slices,
     ceildiv,
-    flat_range_to_src_slices,
+    flat_range_to_src_chunks,
     row_major_strides,
     unravel,
 )
@@ -243,14 +243,27 @@ def _lower_reshape_same_last_dim(
                 flat_offset += p_off * out_strides[-2]
 
             n_elements = p_size * tile_f
-            src_slices = flat_range_to_src_slices(flat_offset, n_elements, in_shape, in_strides)
-            dst_slices = build_out_slices(batch_idx, p_off, p_size, tile_f, out_rank)
-
-            tile = b.dma_copy(
-                b.alloc((p_size, tile_f), dtype, MemorySpace.SBUF),
-                x_hbm, src_slices,
+            # The tile's flat range may cross a source leading-dim boundary
+            # (e.g. collapsing (3, 100, 8) into (300, 8)), in which case it is
+            # not a single source rectangle. Split it into maximal rectangles;
+            # the aligned fast path yields exactly one chunk. Each chunk is a
+            # whole number of rows (last dim is unchanged), so it maps 1:1 to
+            # consecutive output rows.
+            chunks = flat_range_to_src_chunks(
+                flat_offset, n_elements, in_shape, in_strides
             )
-            b.dma_copy(y_hbm, tile, dst_slices)
+            row_cursor = 0
+            for src_slices, covered in chunks:
+                chunk_rows = covered // tile_f
+                tile = b.dma_copy(
+                    b.alloc((chunk_rows, tile_f), dtype, MemorySpace.SBUF),
+                    x_hbm, src_slices,
+                )
+                dst_slices = build_out_slices(
+                    batch_idx, p_off + row_cursor, chunk_rows, tile_f, out_rank
+                )
+                b.dma_copy(y_hbm, tile, dst_slices)
+                row_cursor += chunk_rows
 
     b.set_outputs({"y": y_hbm})
     return b.graph
@@ -493,16 +506,29 @@ def _emit_reshape_same_f(nb, x_hbm, y_hbm, in_shape, out_shape, dtype):
             if out_rank >= 2:
                 flat_offset += p_off * out_strides[-2]
 
-            src_slices = flat_range_to_src_slices(flat_offset, p_size * tile_f, in_shape, in_strides)
-            dst_slices = []
-            for bi in batch_idx:
-                dst_slices.append(DimSlice(bi, 1))
-            if out_rank >= 2:
-                dst_slices.append(DimSlice(p_off, p_size))
-            dst_slices.append(DimSlice(0, tile_f))
+            # The tile's flat range may cross a source leading-dim boundary, so
+            # split it into maximal rectangles (one chunk for the aligned fast
+            # path). Each chunk is a whole number of rows mapping 1:1 to
+            # consecutive output rows.
+            chunks = flat_range_to_src_chunks(
+                flat_offset, p_size * tile_f, in_shape, in_strides
+            )
+            row_cursor = 0
+            for src_slices, covered in chunks:
+                chunk_rows = covered // tile_f
+                dst_slices = []
+                for bi in batch_idx:
+                    dst_slices.append(DimSlice(bi, 1))
+                if out_rank >= 2:
+                    dst_slices.append(DimSlice(p_off + row_cursor, chunk_rows))
+                dst_slices.append(DimSlice(0, tile_f))
 
-            tile = nb.dma_copy(nb.alloc((p_size, tile_f), dtype, MemorySpace.SBUF), x_hbm, src_slices)
-            nb.dma_copy(y_hbm, tile, dst_slices)
+                tile = nb.dma_copy(
+                    nb.alloc((chunk_rows, tile_f), dtype, MemorySpace.SBUF),
+                    x_hbm, src_slices,
+                )
+                nb.dma_copy(y_hbm, tile, dst_slices)
+                row_cursor += chunk_rows
 
 
 def _emit_reshape_diff_f(nb, x_hbm, y_hbm, in_shape, out_shape, dtype):
