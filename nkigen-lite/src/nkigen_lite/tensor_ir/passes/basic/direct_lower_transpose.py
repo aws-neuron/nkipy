@@ -14,13 +14,16 @@ For any permutation perm, the output shape is [in_shape[perm[i]] for i in range(
 The key observation: on NeuronCore, only the last two dims are "on-chip" (P and F).
 Batch dim reordering is just DMA slice coordinate remapping (reading from different
 positions in HBM). The only operation that requires on-chip work is swapping P↔F.
+
+Optimization: adjacent dims that stay consecutive under the permutation are merged
+into a single axis before tiling (_collapse_perm). This dramatically reduces the
+number of batch iterations for cases like (Co, Ci, *K) -> (Co, *K, Ci) where the
+spatial dims K form a single contiguous run in the output.
 """
 
 from __future__ import annotations
 
 import math
-
-import numpy as np
 
 from nkigen_lite.core import DType, Graph
 from nkigen_lite.nki_ir.ir import (
@@ -28,11 +31,14 @@ from nkigen_lite.nki_ir.ir import (
     DimSlice,
     MemorySpace,
     PARTITION_MAX,
-    PSUM_FREE_MAX,
-    MATMUL_STATIONARY_FREE_MAX,
 )
 
-from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import ceildiv
+from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
+    ceildiv,
+    flat_range_to_src_chunks,
+    row_major_strides,
+    unravel,
+)
 
 
 def _needs_pf_swap(perm: tuple[int, ...]) -> bool:
@@ -43,6 +49,122 @@ def _needs_pf_swap(perm: tuple[int, ...]) -> bool:
     """
     rank = len(perm)
     return perm[rank - 2] > perm[rank - 1]
+
+
+def _collapse_perm(
+    in_shape: tuple[int, ...], perm: tuple[int, ...]
+) -> tuple[tuple[int, ...], tuple[int, ...], list[list[int]], list[list[int]]]:
+    """Merge runs of consecutive source dims that appear adjacent in perm.
+
+    Returns (collapsed_in_shape, collapsed_perm, groups, src_order) where:
+      - groups[k] = original source dim indices at collapsed output position k
+      - src_order[j] = group of original dims merged into collapsed source dim j
+      - collapsed_in[j] = product of original dim sizes for src_order[j]
+      - collapsed_perm maps collapsed output positions to collapsed source positions
+    """
+    groups: list[list[int]] = [[perm[0]]]
+    for j in range(1, len(perm)):
+        if perm[j] == perm[j - 1] + 1:
+            groups[-1].append(perm[j])
+        else:
+            groups.append([perm[j]])
+    src_order = sorted(groups, key=lambda g: g[0])
+    collapsed_in = tuple(math.prod(in_shape[a] for a in g) for g in src_order)
+    pos = {tuple(g): i for i, g in enumerate(src_order)}
+    collapsed_perm = tuple(pos[tuple(g)] for g in groups)
+    return collapsed_in, collapsed_perm, groups, src_order
+
+
+def _tile_iter(in_shape, perm, groups, c_out, c_rank, tile_p, tile_f):
+    """Yield (src_slices, dst_slices, p_covered, f_covered) for each sub-tile.
+
+    Handles axis-collapse: iterates over the collapsed output shape and expands
+    each tile's coordinates back to original-rank DimSlices using
+    flat_range_to_src_chunks for the P and F groups.
+    """
+    rank = len(in_shape)
+
+    c_batch_dims = list(c_out[:-2])
+    n_batch = math.prod(c_batch_dims) if c_batch_dims else 1
+    n_p_tiles = ceildiv(c_out[-2], tile_p)
+    n_f_tiles = ceildiv(c_out[-1], tile_f)
+
+    p_group = groups[c_rank - 2]
+    f_group = groups[c_rank - 1]
+    p_sub_shape = tuple(in_shape[d] for d in p_group)
+    f_sub_shape = tuple(in_shape[d] for d in f_group)
+    p_sub_strides = row_major_strides(p_sub_shape)
+    f_sub_strides = row_major_strides(f_sub_shape)
+
+    # Output dim ranges for each group (maps collapsed output pos -> original output dims)
+    out_dim_starts: list[int] = []
+    pos = 0
+    for g in groups:
+        out_dim_starts.append(pos)
+        pos += len(g)
+    p_out_start = out_dim_starts[c_rank - 2]
+    f_out_start = out_dim_starts[c_rank - 1]
+
+    for batch_flat in range(n_batch):
+        # Expand batch flat index to per-collapsed-batch-dim coords
+        batch_coords: tuple[int, ...] = ()
+        if c_batch_dims:
+            remaining = batch_flat
+            coords = []
+            for d in reversed(c_batch_dims):
+                coords.append(remaining % d)
+                remaining //= d
+            batch_coords = tuple(reversed(coords))
+
+        # Build batch portion of src and dst slices
+        batch_src: dict[int, DimSlice] = {}
+        batch_dst: dict[int, DimSlice] = {}
+        for k, coord in enumerate(batch_coords):
+            group = groups[k]
+            sub_shape = tuple(in_shape[d] for d in group)
+            indices = unravel(coord, list(sub_shape))
+            for i, d in enumerate(group):
+                batch_src[d] = DimSlice(indices[i], 1)
+            o_start = out_dim_starts[k]
+            for i in range(len(group)):
+                batch_dst[o_start + i] = DimSlice(indices[i], 1)
+
+        for p_i in range(n_p_tiles):
+            p_off = p_i * tile_p
+            p_size = min(tile_p, c_out[-2] - p_off)
+            p_chunks = flat_range_to_src_chunks(
+                p_off, p_size, p_sub_shape, p_sub_strides
+            )
+
+            for f_i in range(n_f_tiles):
+                f_off = f_i * tile_f
+                f_size = min(tile_f, c_out[-1] - f_off)
+                f_chunks = flat_range_to_src_chunks(
+                    f_off, f_size, f_sub_shape, f_sub_strides
+                )
+
+                for p_slices, p_covered in p_chunks:
+                    for f_slices, f_covered in f_chunks:
+                        src_slices = [None] * rank
+                        dst_slices = [None] * rank
+                        for d, ds in batch_src.items():
+                            src_slices[d] = ds
+                        for d, ds in batch_dst.items():
+                            dst_slices[d] = ds
+                        for i, d in enumerate(p_group):
+                            src_slices[d] = p_slices[i]
+                        for i, d in enumerate(f_group):
+                            src_slices[d] = f_slices[i]
+                        for i in range(len(p_group)):
+                            dst_slices[p_out_start + i] = p_slices[i]
+                        for i in range(len(f_group)):
+                            dst_slices[f_out_start + i] = f_slices[i]
+                        yield (
+                            tuple(src_slices),
+                            tuple(dst_slices),
+                            p_covered,
+                            f_covered,
+                        )
 
 
 def lower_transpose_dma(
@@ -69,79 +191,45 @@ def lower_transpose_dma(
     if sorted(perm) != list(range(rank)):
         raise ValueError(f"invalid permutation: {perm}")
 
+    c_in, c_perm, groups, src_order = _collapse_perm(in_shape, perm)
+    c_out = tuple(c_in[p] for p in c_perm)
+    c_rank = len(c_out)
     out_shape = tuple(in_shape[p] for p in perm)
-    swap_pf = _needs_pf_swap(perm)
-
-    # Both tiles capped at 128: after a P↔F swap the F-dim becomes the
-    # new partition dim, so it must also fit within PARTITION_MAX.
-    tile_p = min(out_shape[-2], PARTITION_MAX)
-    tile_f = min(out_shape[-1], PARTITION_MAX)
-    n_p_tiles = ceildiv(out_shape[-2], tile_p)
-    n_f_tiles = ceildiv(out_shape[-1], tile_f)
-
-    out_batch_dims = list(out_shape[:-2])
-    n_batch = math.prod(out_batch_dims) if out_batch_dims else 1
 
     b = Builder("transpose_dma")
     x_hbm = b.add_input("x", in_shape, dtype)
     y_hbm = b.add_input("y", out_shape, dtype)
 
-    def _batch_indices(flat_idx: int) -> tuple[int, ...]:
-        indices = []
-        remaining = flat_idx
-        for d in reversed(out_batch_dims):
-            indices.append(remaining % d)
-            remaining //= d
-        return tuple(reversed(indices))
+    if c_rank < 2:
+        # Identity permutation after collapse — fall back to uncollapsed.
+        groups = [[d] for d in perm]
+        c_out = out_shape
+        c_rank = rank
+        c_perm = perm
 
-    def _build_src_slices(batch_idx, p_off, p_size, f_off, f_size):
-        """Map output tile coordinates back to source HBM slices via perm."""
-        out_coords = {}
-        for i, bi in enumerate(batch_idx):
-            out_coords[i] = (bi, 1)
-        out_coords[rank - 2] = (p_off, p_size)
-        out_coords[rank - 1] = (f_off, f_size)
+    swap_pf = _needs_pf_swap(c_perm)
+    tile_p = min(c_out[-2], PARTITION_MAX)
+    tile_f = min(c_out[-1], PARTITION_MAX) if swap_pf else c_out[-1]
 
-        src_slices = [None] * rank
-        for out_dim in range(rank):
-            src_dim = perm[out_dim]
-            src_slices[src_dim] = DimSlice(*out_coords[out_dim])
-        return tuple(src_slices)
-
-    for batch_flat in range(n_batch):
-        batch_idx = _batch_indices(batch_flat) if out_batch_dims else ()
-        for p_i in range(n_p_tiles):
-            p_off = p_i * tile_p
-            p_size = min(tile_p, out_shape[-2] - p_off)
-            for f_i in range(n_f_tiles):
-                f_off = f_i * tile_f
-                f_size = min(tile_f, out_shape[-1] - f_off)
-
-                src_slices = _build_src_slices(batch_idx, p_off, p_size, f_off, f_size)
-                dst_slices = tuple(
-                    [DimSlice(bi, 1) for bi in batch_idx]
-                    + [DimSlice(p_off, p_size), DimSlice(f_off, f_size)]
-                )
-
-                if swap_pf:
-                    # Source loads as (f_size, p_size) due to reversed dim order,
-                    # then dma_transpose to (p_size, f_size) for the output.
-                    tile = b.dma_copy(
-                        b.alloc((f_size, p_size), dtype, MemorySpace.SBUF),
-                        x_hbm, src_slices,
-                    )
-                    transposed = b.transpose(tile, (1, 0))
-                    b.dealloc(tile)
-                    b.dma_copy(y_hbm, transposed, dst_slices)
-                    b.dealloc(transposed)
-                else:
-                    # No P↔F swap needed, just remap batch coordinates
-                    tile = b.dma_copy(
-                        b.alloc((p_size, f_size), dtype, MemorySpace.SBUF),
-                        x_hbm, src_slices,
-                    )
-                    b.dma_copy(y_hbm, tile, dst_slices)
-                    b.dealloc(tile)
+    for src_slices, dst_slices, p_cov, f_cov in _tile_iter(
+        in_shape, perm, groups, c_out, c_rank, tile_p, tile_f
+    ):
+        if swap_pf:
+            tile = b.dma_copy(
+                b.alloc((f_cov, p_cov), dtype, MemorySpace.SBUF),
+                x_hbm, src_slices,
+            )
+            transposed = b.transpose(tile, (1, 0))
+            b.dealloc(tile)
+            b.dma_copy(y_hbm, transposed, dst_slices)
+            b.dealloc(transposed)
+        else:
+            tile = b.dma_copy(
+                b.alloc((p_cov, f_cov), dtype, MemorySpace.SBUF),
+                x_hbm, src_slices,
+            )
+            b.dma_copy(y_hbm, tile, dst_slices)
+            b.dealloc(tile)
 
     b.set_outputs({"y": y_hbm})
     return b.graph
@@ -182,19 +270,20 @@ def lower_transpose_te(
     if sorted(perm) != list(range(rank)):
         raise ValueError(f"invalid permutation: {perm}")
 
+    c_in, c_perm, groups, src_order = _collapse_perm(in_shape, perm)
+    c_out = tuple(c_in[p] for p in c_perm)
+    c_rank = len(c_out)
     out_shape = tuple(in_shape[p] for p in perm)
-    swap_pf = _needs_pf_swap(perm)
 
-    # For TE: K=f_size <= 128 (partition), M=p_size <= 128 (stat free)
-    tile_p = min(out_shape[-2], PARTITION_MAX)
-    tile_f = min(out_shape[-1], PARTITION_MAX)
-    n_p_tiles = ceildiv(out_shape[-2], tile_p)
-    n_f_tiles = ceildiv(out_shape[-1], tile_f)
+    if c_rank < 2:
+        groups = [[d] for d in perm]
+        c_out = out_shape
+        c_rank = rank
+        c_perm = perm
 
-    out_batch_dims = list(out_shape[:-2])
-    n_batch = math.prod(out_batch_dims) if out_batch_dims else 1
-
-    # Identity matrix: size = tile_f (the K=N dimension for the matmul)
+    swap_pf = _needs_pf_swap(c_perm)
+    tile_p = min(c_out[-2], PARTITION_MAX)
+    tile_f = min(c_out[-1], PARTITION_MAX) if swap_pf else c_out[-1]
     eye_size = tile_f if swap_pf else 0
 
     bld = Builder("transpose_te")
@@ -205,76 +294,38 @@ def lower_transpose_te(
     else:
         y_hbm = bld.add_input("y", out_shape, dtype)
 
-    def _batch_indices(flat_idx: int) -> tuple[int, ...]:
-        indices = []
-        remaining = flat_idx
-        for d in reversed(out_batch_dims):
-            indices.append(remaining % d)
-            remaining //= d
-        return tuple(reversed(indices))
+    for src_slices, dst_slices, p_cov, f_cov in _tile_iter(
+        in_shape, perm, groups, c_out, c_rank, tile_p, tile_f
+    ):
+        if swap_pf:
+            stat = bld.dma_copy(
+                bld.alloc((f_cov, p_cov), dtype, MemorySpace.SBUF),
+                x_hbm, src_slices,
+            )
+            eye_tile = bld.dma_copy(
+                bld.alloc((f_cov, f_cov), dtype, MemorySpace.SBUF),
+                eye_hbm,
+                (DimSlice(0, f_cov), DimSlice(0, f_cov)),
+            )
 
-    def _build_src_slices(batch_idx, p_off, p_size, f_off, f_size):
-        out_coords = {}
-        for i, bi in enumerate(batch_idx):
-            out_coords[i] = (bi, 1)
-        out_coords[rank - 2] = (p_off, p_size)
-        out_coords[rank - 1] = (f_off, f_size)
+            psum = bld.alloc((p_cov, f_cov), DType.F32, MemorySpace.PSUM)
+            bld.matmul(psum, stat, eye_tile, accumulate=False)
+            bld.dealloc(stat)
+            bld.dealloc(eye_tile)
 
-        src_slices = [None] * rank
-        for out_dim in range(rank):
-            src_dim = perm[out_dim]
-            src_slices[src_dim] = DimSlice(*out_coords[out_dim])
-        return tuple(src_slices)
-
-    for batch_flat in range(n_batch):
-        batch_idx = _batch_indices(batch_flat) if out_batch_dims else ()
-        for p_i in range(n_p_tiles):
-            p_off = p_i * tile_p
-            p_size = min(tile_p, out_shape[-2] - p_off)
-
-            for f_i in range(n_f_tiles):
-                f_off = f_i * tile_f
-                f_size = min(tile_f, out_shape[-1] - f_off)
-
-                src_slices = _build_src_slices(batch_idx, p_off, p_size, f_off, f_size)
-                dst_slices = tuple(
-                    [DimSlice(bi, 1) for bi in batch_idx]
-                    + [DimSlice(p_off, p_size), DimSlice(f_off, f_size)]
-                )
-
-                if swap_pf:
-                    # Source loads as (f_size, p_size) — reversed dim order
-                    # Use as stationary: stat[K=f_size, M=p_size]
-                    # stat.T @ I[K=f_size, N=f_size] -> (p_size, f_size)
-                    stat = bld.dma_copy(
-                        bld.alloc((f_size, p_size), dtype, MemorySpace.SBUF),
-                        x_hbm, src_slices,
-                    )
-                    eye_tile = bld.dma_copy(
-                        bld.alloc((f_size, f_size), dtype, MemorySpace.SBUF),
-                        eye_hbm,
-                        (DimSlice(0, f_size), DimSlice(0, f_size)),
-                    )
-
-                    psum = bld.alloc((p_size, f_size), DType.F32, MemorySpace.PSUM)
-                    bld.matmul(psum, stat, eye_tile, accumulate=False)
-                    bld.dealloc(stat)
-                    bld.dealloc(eye_tile)
-
-                    out_sbuf = bld.tensor_copy(
-                        bld.alloc((p_size, f_size), DType.F32, MemorySpace.SBUF), psum
-                    )
-                    bld.dealloc(psum)
-                    bld.dma_copy(y_hbm, out_sbuf, dst_slices)
-                    bld.dealloc(out_sbuf)
-                else:
-                    # No swap, plain DMA copy with remapped slices
-                    tile = bld.dma_copy(
-                        bld.alloc((p_size, f_size), dtype, MemorySpace.SBUF),
-                        x_hbm, src_slices,
-                    )
-                    bld.dma_copy(y_hbm, tile, dst_slices)
-                    bld.dealloc(tile)
+            out_sbuf = bld.tensor_copy(
+                bld.alloc((p_cov, f_cov), DType.F32, MemorySpace.SBUF), psum
+            )
+            bld.dealloc(psum)
+            bld.dma_copy(y_hbm, out_sbuf, dst_slices)
+            bld.dealloc(out_sbuf)
+        else:
+            tile = bld.dma_copy(
+                bld.alloc((p_cov, f_cov), dtype, MemorySpace.SBUF),
+                x_hbm, src_slices,
+            )
+            bld.dma_copy(y_hbm, tile, dst_slices)
+            bld.dealloc(tile)
 
     bld.set_outputs({"y": y_hbm})
     return bld.graph
@@ -290,62 +341,34 @@ def emit_transpose(
 ) -> None:
     """Emit transpose tiling into an existing Builder (DMA strategy)."""
     rank = len(in_shape)
-    out_shape = tuple(in_shape[p] for p in perm)
-    swap_pf = _needs_pf_swap(perm)
 
-    tile_p = min(out_shape[-2], PARTITION_MAX)
-    tile_f = min(out_shape[-1], PARTITION_MAX)
-    n_p_tiles = ceildiv(out_shape[-2], tile_p)
-    n_f_tiles = ceildiv(out_shape[-1], tile_f)
+    c_in, c_perm, groups, src_order = _collapse_perm(in_shape, perm)
+    c_out = tuple(c_in[p] for p in c_perm)
+    c_rank = len(c_out)
 
-    out_batch_dims = list(out_shape[:-2])
-    n_batch = math.prod(out_batch_dims) if out_batch_dims else 1
+    if c_rank < 2:
+        groups = [[d] for d in perm]
+        c_out = tuple(in_shape[p] for p in perm)
+        c_rank = rank
+        c_perm = perm
 
-    def _batch_indices(flat_idx: int) -> tuple[int, ...]:
-        indices = []
-        remaining = flat_idx
-        for d in reversed(out_batch_dims):
-            indices.append(remaining % d)
-            remaining //= d
-        return tuple(reversed(indices))
+    swap_pf = _needs_pf_swap(c_perm)
+    tile_p = min(c_out[-2], PARTITION_MAX)
+    tile_f = min(c_out[-1], PARTITION_MAX) if swap_pf else c_out[-1]
 
-    def _build_src_slices(batch_idx, p_off, p_size, f_off, f_size):
-        out_coords = {}
-        for i, bi in enumerate(batch_idx):
-            out_coords[i] = (bi, 1)
-        out_coords[rank - 2] = (p_off, p_size)
-        out_coords[rank - 1] = (f_off, f_size)
-        src_slices = [None] * rank
-        for out_dim in range(rank):
-            src_dim = perm[out_dim]
-            src_slices[src_dim] = DimSlice(*out_coords[out_dim])
-        return tuple(src_slices)
-
-    for batch_flat in range(n_batch):
-        batch_idx = _batch_indices(batch_flat) if out_batch_dims else ()
-        for p_i in range(n_p_tiles):
-            p_off = p_i * tile_p
-            p_size = min(tile_p, out_shape[-2] - p_off)
-            for f_i in range(n_f_tiles):
-                f_off = f_i * tile_f
-                f_size = min(tile_f, out_shape[-1] - f_off)
-
-                src_slices = _build_src_slices(batch_idx, p_off, p_size, f_off, f_size)
-                dst_slices = tuple(
-                    [DimSlice(bi, 1) for bi in batch_idx]
-                    + [DimSlice(p_off, p_size), DimSlice(f_off, f_size)]
-                )
-
-                if swap_pf:
-                    tile = nb.dma_copy(
-                        nb.alloc((f_size, p_size), dtype, MemorySpace.SBUF),
-                        x_hbm, src_slices,
-                    )
-                    transposed = nb.transpose(tile, (1, 0))
-                    nb.dma_copy(y_hbm, transposed, dst_slices)
-                else:
-                    tile = nb.dma_copy(
-                        nb.alloc((p_size, f_size), dtype, MemorySpace.SBUF),
-                        x_hbm, src_slices,
-                    )
-                    nb.dma_copy(y_hbm, tile, dst_slices)
+    for src_slices, dst_slices, p_cov, f_cov in _tile_iter(
+        in_shape, perm, groups, c_out, c_rank, tile_p, tile_f
+    ):
+        if swap_pf:
+            tile = nb.dma_copy(
+                nb.alloc((f_cov, p_cov), dtype, MemorySpace.SBUF),
+                x_hbm, src_slices,
+            )
+            transposed = nb.transpose(tile, (1, 0))
+            nb.dma_copy(y_hbm, transposed, dst_slices)
+        else:
+            tile = nb.dma_copy(
+                nb.alloc((p_cov, f_cov), dtype, MemorySpace.SBUF),
+                x_hbm, src_slices,
+            )
+            nb.dma_copy(y_hbm, tile, dst_slices)

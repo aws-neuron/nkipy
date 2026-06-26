@@ -197,3 +197,40 @@ class TestTeArbitrary:
 
     def test_rank4_remainder(self):
         _check_te((2, 3, 100, 100), perm=(1, 0, 3, 2))
+
+
+class TestDmaCollapse:
+    """DMA transpose: axis-collapse optimization (merged contiguous dim runs)."""
+
+    def test_qwen_like(self):
+        """Multi-dim spatial merge: (Co, Ci, *K) -> (Co, *K, Ci)."""
+        _check_dma((4, 3, 2, 16, 16), perm=(0, 2, 3, 4, 1))
+
+    def test_boundary_straddle(self):
+        """Merged axis where PARTITION_MAX tile straddles original dim boundaries."""
+        _check_dma((4, 3, 5, 7), perm=(0, 2, 3, 1))
+
+    def test_all_reorder_with_merge(self):
+        """All dims reordered, adjacent pair merges."""
+        _check_dma((6, 8, 4), perm=(1, 2, 0))
+
+    def test_batch_merge_no_swap(self):
+        """Adjacent batch dims merge, no P↔F swap."""
+        _check_dma((3, 5, 64, 128), perm=(1, 0, 2, 3))
+
+    def test_large_spatial_merge(self):
+        """Large merged spatial exceeding PARTITION_MAX."""
+        _check_dma((4, 3, 4, 8, 16), perm=(0, 2, 3, 4, 1))
+
+
+class TestTeCollapse:
+    """Tensor engine: axis-collapse optimization."""
+
+    def test_qwen_like(self):
+        _check_te((4, 3, 2, 16, 16), perm=(0, 2, 3, 4, 1))
+
+    def test_boundary_straddle(self):
+        _check_te((4, 3, 5, 7), perm=(0, 2, 3, 1))
+
+    def test_all_reorder_with_merge(self):
+        _check_te((6, 8, 4), perm=(1, 2, 0))

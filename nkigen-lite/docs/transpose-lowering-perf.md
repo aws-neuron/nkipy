@@ -1,11 +1,12 @@
 # Transpose lowering performance for nkigen-lite
 
-Status: **OPEN / NOT YET FIXED.** This documents a known performance cliff in
-the transpose lowering (`tensor_ir/passes/basic/direct_lower_transpose.py`) and
-the two hardware constraints that make the clean fix non-trivial. It is the
-remaining bottleneck for the 1152-channel Qwen3-VL conv3d case, which stays
-skipped via the `out_channels >= 512` guard in
-`tests/unit/test_tensor_api.py::test_conv3d`.
+Status: **PARTIALLY FIXED (Idea 1 — axis collapse).** The `_collapse_perm`
+canonicalization merges adjacent in-order axis runs before tiling, reducing the
+Qwen3-VL case from ~258 k ops to ~32 k ops (8× improvement). The 1152-channel
+case remains skipped because the remaining ~32 k ops still make full lowering
+slow at that scale; full resolution requires Idea 2 (folding passthrough dims
+into the partition for a single wide transpose) which is blocked by the
+hardware constraint below.
 
 Companion to the reshape fix in commit `2f8f706` (the *other* Qwen conv3d
 bottleneck — the im2col weight reshape — which is now fast). Reshape and
@@ -131,17 +132,18 @@ ops** in the interpreter.
 
 ## Suggested approach for the fix
 
-1. Add `_collapse_perm` (Idea 1) as a canonicalization at the top of
+1. ✅ **DONE.** Add `_collapse_perm` (Idea 1) as a canonicalization at the top of
    `emit_transpose` / `lower_transpose_dma`. Low risk, immediate ~8x on Qwen
    even with the existing per-tile emitter.
-2. For the trailing P↔F swap, keep using the legal 2D `dma_transpose([1,0])`
-   (already what the per-tile path does) or the TE matmul path — do **not** rely
-   on `[0,2,1]`.
-3. Generate load/store slices at original rank via `flat_range_to_src_chunks`
-   so merged-axis tiles that straddle original-axis boundaries stay correct.
+2. ✅ **DONE.** For the trailing P↔F swap, keep using the legal 2D
+   `dma_transpose([1,0])` (already what the per-tile path does) or the TE matmul
+   path — do **not** rely on `[0,2,1]`.
+3. ✅ **DONE.** Generate load/store slices at original rank via
+   `flat_range_to_src_chunks` so merged-axis tiles that straddle original-axis
+   boundaries stay correct (via `_tile_iter` helper).
 4. Optionally fold leading passthrough dims into the partition to widen the
    partition axis (the big constant-factor win), but only once 1–3 are correct
-   and hardware-verified.
+   and hardware-verified. **Still blocked by the `[0,2,1]` hardware constraint.**
 
 ## Validation checklist
 
