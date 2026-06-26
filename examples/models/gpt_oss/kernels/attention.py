@@ -78,12 +78,15 @@ def attention_kernel(
         freqs_cos = freqs_cos[0:seq_len]
         freqs_sin = freqs_sin[0:seq_len]
     else:
-        # Promote comptime numpy arrays to runtime tensors so they can be indexed
-        # with the runtime tensor start_pos.
+        # Decode (seq_len==1) and speculative verify (seq_len==K+1) both write at a
+        # runtime offset. The absolute positions of the query tokens are
+        # start_pos + [0, 1, ..., seq_len-1]; promote comptime numpy arrays to
+        # runtime tensors so they can be gathered with that runtime index.
+        query_pos = start_pos + np.arange(seq_len, dtype=np.int32)
         freqs_cos = tensor_apis.constant(freqs_cos)
         freqs_sin = tensor_apis.constant(freqs_sin)
-        freqs_cos = freqs_cos[start_pos]
-        freqs_sin = freqs_sin[start_pos]
+        freqs_cos = freqs_cos[query_pos]
+        freqs_sin = freqs_sin[query_pos]
     xq, xk = apply_rotary_emb_kernel(xq, xk, freqs_cos, freqs_sin)
 
     # KV cache update
@@ -91,9 +94,10 @@ def attention_kernel(
         cache_k[:, :seq_len] = xk
         cache_v[:, :seq_len] = xv
     else:
-        assert seq_len == 1, "seq_len must be 1 for decode"
-        cache_k[:, start_pos] = xk
-        cache_v[:, start_pos] = xv
+        # Scatter the seq_len new K/V rows into the cache at their absolute
+        # positions (one row for decode, K+1 contiguous rows for verify).
+        cache_k[:, query_pos] = xk
+        cache_v[:, query_pos] = xv
 
     # GQA: repeat KV heads
     keys = repeat_kv_kernel(cache_k, n_rep)
@@ -123,8 +127,11 @@ def attention_kernel(
     if is_prefill:
         scores = scores + np.expand_dims(causal_mask[:seq_len, :k_seq_len], axis=[0, 1])
     else:
+        # Gather one mask row per query token. For verify (seq_len>1) this yields a
+        # block-causal mask: query at start_pos+i attends to keys <= start_pos+i
+        # (plus the sliding-window limit, already baked into causal_mask).
         scores = scores + np.expand_dims(
-            causal_mask[start_pos, :k_seq_len], axis=[0, 1]
+            causal_mask[query_pos, :k_seq_len], axis=[0, 1]
         )
 
     # Attention sinks: concatenate a per-head learned logit as an extra "key"

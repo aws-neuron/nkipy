@@ -36,9 +36,17 @@ class Config:
     max_seq_len: int = 4096
     dtype: np.dtype = DTYPE
     additional_compiler_args_nkipy: str = "--lnc 1"
+    # Decoder-layer indices whose outputs are tapped for EAGLE-3 speculative
+    # decoding. None disables capture (the default, non-speculative path).
+    aux_layers: tuple = None
 
     def is_sliding(self, layer_id: int) -> bool:
         return self.layer_types[layer_id] == "sliding_attention"
+
+    @staticmethod
+    def default_aux_layers(num_layers: int) -> tuple:
+        """EAGLE-3's standard low/mid/high decoder-layer taps (vLLM convention)."""
+        return (2, num_layers // 2, num_layers - 3)
 
 
 def get_config(model_name, context_len, max_new_tokens):

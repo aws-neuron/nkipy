@@ -209,15 +209,40 @@ class GptOssModel:
             },
         )
 
-    def generate(self, input_ids, double_buffering=True):
-        """Run inference and generate tokens."""
+    def run_prefill(self, input_ids, capture_aux=False):
+        """Run the context-encoding (prefill) layer stack.
+
+        Args:
+            input_ids: prompt token ids, shape (B, L).
+            capture_aux: when True, also return the residual-stream hidden states
+                produced by the EAGLE-3 tap layers (``config.aux_layers``), in
+                low->mid->high order. Each is a host torch tensor of shape
+                (B, L, hidden_size). Used to seed the speculative drafter.
+
+        Returns:
+            (hidden_states, aux) where hidden_states is the final-layer device
+            tensor and aux is a list of captured host tensors (empty unless
+            capture_aux and aux_layers are set).
+        """
         hidden_states = DeviceTensor.from_torch(
             self.tok_embedding[input_ids], "hidden_states"
         )
 
-        # Context encoding (prefill).
+        aux_layers = self.config.aux_layers if capture_aux else None
+        aux = []
         for i in range(self.config.num_layers):
+            # EAGLE-3 taps the *input* residual stream of each aux layer (i.e. the
+            # output of layer i-1), matching vLLM's `hidden_states + residual`
+            # captured before running layer i. Snapshot before _run_layer.
+            if aux_layers is not None and i in aux_layers:
+                aux.append(hidden_states.torch().clone())
             self._run_layer("cte", i, hidden_states, None)
+
+        return hidden_states, aux
+
+    def generate(self, input_ids, double_buffering=True):
+        """Run inference and generate tokens."""
+        hidden_states, _ = self.run_prefill(input_ids, capture_aux=False)
 
         if double_buffering:
             yield from self._generate_double_buffered(hidden_states)
