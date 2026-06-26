@@ -231,12 +231,9 @@ class GptOssModel:
         aux_layers = self.config.aux_layers if capture_aux else None
         aux = []
         for i in range(self.config.num_layers):
-            # EAGLE-3 taps the *input* residual stream of each aux layer (i.e. the
-            # output of layer i-1), matching vLLM's `hidden_states + residual`
-            # captured before running layer i. Snapshot before _run_layer.
+            self._run_layer("cte", i, hidden_states, None)
             if aux_layers is not None and i in aux_layers:
                 aux.append(hidden_states.torch().clone())
-            self._run_layer("cte", i, hidden_states, None)
 
         return hidden_states, aux
 

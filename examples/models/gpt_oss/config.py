@@ -48,6 +48,11 @@ class Config:
         """EAGLE-3's standard low/mid/high decoder-layer taps (vLLM convention)."""
         return (2, num_layers // 2, num_layers - 3)
 
+    @staticmethod
+    def peagle_aux_layers(num_layers: int) -> tuple:
+        """P-EAGLE's tap layers (0-indexed, captures before each layer)."""
+        return (0, num_layers // 2, num_layers - 1)
+
 
 def get_config(model_name, context_len, max_new_tokens):
     hf_config = AutoConfig.from_pretrained(model_name)

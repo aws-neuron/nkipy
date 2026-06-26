@@ -157,10 +157,6 @@ class SpeculativeGptOss(base.GptOssModel):
 
         aux = []
         for i in range(cfg.num_layers):
-            # Tap the input residual of each aux layer (output of layer i-1),
-            # matching run_prefill / vLLM's EAGLE-3 capture point.
-            if cfg.aux_layers is not None and i in cfg.aux_layers:
-                aux.append(h.torch().clone())
             lt = self.layer_tensors[i]
             kernel = self.kernel_verify_layer[cfg.is_sliding(i)]
             inputs = {key: lt[key] for key in base._LAYER_WEIGHT_KEYS}
@@ -176,6 +172,8 @@ class SpeculativeGptOss(base.GptOssModel):
                     "cache_v": lt["cache_v"],
                 },
             )
+            if cfg.aux_layers is not None and i in cfg.aux_layers:
+                aux.append(h.torch().clone())
 
         target_ids = DeviceTensor.from_numpy(
             np.empty((1, S), dtype=np.int32), "tgt_ids"
@@ -276,9 +274,9 @@ def main():
     seed_pos = DeviceTensor.from_numpy(np.array([cur_pos], dtype=np.int32), "seed_pos")
     seed_aux = []
     for i in range(config.num_layers):
+        target._run_layer("tkg", i, seed_h, seed_pos)
         if config.aux_layers is not None and i in config.aux_layers:
             seed_aux.append(seed_h.torch().clone())
-        target._run_layer("tkg", i, seed_h, seed_pos)
     last_aux3 = _stack_aux([a[:, 0:1, :] for a in seed_aux])
     cur_pos += 1
 
