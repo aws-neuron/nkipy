@@ -1967,34 +1967,42 @@ def _conv_nd(input, weight, bias, stride, padding, dilation, groups, n):
 
     # im2col: gather every kernel position's strided window as a
     # (N, Ci, out_pts) column block, then concat along the channel axis.
-    # Iterate kernel offsets in row-major order so the column order matches
-    # the weight's (Ci, *K) C-order flattening below.
-    cols = []
-    for flat_k in range(int(np.prod(ksize)) if ksize else 1):
-        koff = []
-        rem = flat_k
-        for d in reversed(ksize):
-            koff.append(rem % d)
-            rem //= d
-        koff = list(reversed(koff))
+    # Column ordering is (kernel-position outer, channel inner) to match the
+    # weight's (Co, *K, Ci) flattening.
+    prod_k = int(np.prod(ksize)) if ksize else 1
 
-        starts = [0, 0]
-        stops = [batch, in_ch]
-        strides = [1, 1]
-        for j in range(n):
-            s0 = koff[j] * dilation[j]
-            starts.append(s0)
-            stops.append(s0 + (out_spatial[j] - 1) * stride[j] + 1)
-            strides.append(stride[j])
-        window = b.slice(x, tuple(starts), tuple(stops), tuple(strides))
-        cols.append(b.reshape(window, (batch, in_ch, out_pts)))
+    if out_pts == 1 and all(d == 1 for d in dilation):
+        # Fast path: when there's exactly one output spatial point (stride >=
+        # kernel_size in all dims with no dilation), each kernel position just
+        # reads one spatial element. The entire column is the input rearranged
+        # from (N, Ci, *K) to (N, prod(K)*Ci, 1) — i.e., spatial dims move
+        # before channel: transpose(0, 2, ..., n+1, 1) then flatten.
+        col_perm = (0,) + tuple(range(2, 2 + n)) + (1,)
+        x_t = b.transpose(x, col_perm)  # (N, *K, Ci)
+        col = b.reshape(x_t, (batch, prod_k * in_ch, 1))
+    else:
+        # General im2col: iterate kernel offsets in row-major order.
+        cols = []
+        for flat_k in range(prod_k):
+            koff = []
+            rem = flat_k
+            for d in reversed(ksize):
+                koff.append(rem % d)
+                rem //= d
+            koff = list(reversed(koff))
 
-    # Column order is [k0_ci0..ci_{Ci-1}, k1_ci0..]; to match the weight's
-    # (Co, Ci, *K) -> (Co, Ci*prod(K)) flattening (C-order: ci outer, k inner)
-    # we transpose the weight to (Co, *K, Ci) before flattening, and likewise
-    # the column blocks are ordered by kernel position then channel — which is
-    # exactly (prod(K), Ci). Concatenate on channel axis to get that order.
-    col = cols[0] if len(cols) == 1 else b.concat(cols, axis=1)  # (N, Ci*prodK, P)
+            starts = [0, 0]
+            stops = [batch, in_ch]
+            strides_s = [1, 1]
+            for j in range(n):
+                s0 = koff[j] * dilation[j]
+                starts.append(s0)
+                stops.append(s0 + (out_spatial[j] - 1) * stride[j] + 1)
+                strides_s.append(stride[j])
+            window = b.slice(x, tuple(starts), tuple(stops), tuple(strides_s))
+            cols.append(b.reshape(window, (batch, in_ch, out_pts)))
+
+        col = cols[0] if len(cols) == 1 else b.concat(cols, axis=1)  # (N, Ci*prodK, P)
 
     # Weight: (Co, Ci, *K) -> (Co, *K, Ci) -> (Co, prod(K)*Ci) to match the
     # column ordering (kernel-position outer, channel inner).

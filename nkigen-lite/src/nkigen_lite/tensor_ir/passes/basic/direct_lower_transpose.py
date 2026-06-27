@@ -453,6 +453,32 @@ def emit_transpose(
     c_out = tuple(c_in[p] for p in c_perm)
     c_rank = len(c_out)
 
+    # Fast path: passthrough-partition (same logic as lower_transpose_dma)
+    if _can_use_passthrough_partition(c_in, c_perm, dtype):
+        out_shape = tuple(in_shape[p] for p in perm)
+        B, I, J = c_in
+        in_strides = row_major_strides(in_shape)
+        out_strides = row_major_strides(out_shape)
+        for p0 in range(0, B, PARTITION_MAX):
+            p_size = min(PARTITION_MAX, B - p0)
+            src_chunks = flat_range_to_src_chunks(
+                p0 * I * J, p_size * I * J, in_shape, in_strides)
+            (src_slices, _), = src_chunks
+            tile = nb.dma_copy(
+                nb.alloc((p_size, I * J), dtype, MemorySpace.SBUF),
+                x_hbm, src_slices,
+            )
+            src_view = nb.access_pattern(
+                tile, [[I * J, p_size], [1, J], [J, I]]
+            )
+            dst_tile = nb.alloc((p_size, J, I), dtype, MemorySpace.SBUF)
+            nb.tensor_copy(dst_tile, src_view)
+            dst_chunks = flat_range_to_src_chunks(
+                p0 * J * I, p_size * J * I, out_shape, out_strides)
+            (dst_slices, _), = dst_chunks
+            nb.dma_copy(y_hbm, dst_tile, dst_slices)
+        return
+
     if c_rank < 2:
         groups = [[d] for d in perm]
         c_out = tuple(in_shape[p] for p in perm)

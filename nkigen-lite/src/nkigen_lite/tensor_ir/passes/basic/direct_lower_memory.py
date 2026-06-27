@@ -61,9 +61,7 @@ def lower_reshape(
             f"reshape: element count mismatch {prod(in_shape)} vs {prod(out_shape)}"
         )
 
-    # If the last dim matches, we can load multi-row tiles directly
-    if in_shape[-1] == out_shape[-1]:
-        return _lower_reshape_same_last_dim(in_shape, out_shape, dtype)
+    total = prod(in_shape)
 
     # If the shapes share a leading prefix-product P, the reshape only regroups
     # each row's free dimension (in_f -> out_f) with the partition axis fixed.
@@ -71,9 +69,17 @@ def lower_reshape(
     # partition dim), so we can tile P and emit one load+view+store per tile —
     # no scratch round-trip. Covers conv im2col reshapes like
     # (Co,*K,Ci) -> (Co, K*Ci) which otherwise blew up via scratch.
+    # P == 1 is valid when the in_shape also has leading dim 1 (i.e., the
+    # prefix boundary is an actual row boundary in the source).
+    # Check prefix BEFORE same-last-dim to avoid degenerate cases like
+    # (1, 1152, 1) -> (1, 1152, 1, 1, 1) where last-dim == 1 causes O(N) ops.
     p_common = _largest_common_prefix(in_shape, out_shape)
-    if p_common > 1:
+    if p_common > 1 or (p_common == 1 and in_shape[0] == 1 and out_shape[0] == 1):
         return _lower_reshape_via_prefix(in_shape, out_shape, p_common, dtype)
+
+    # If the last dim matches, we can load multi-row tiles directly
+    if in_shape[-1] == out_shape[-1]:
+        return _lower_reshape_same_last_dim(in_shape, out_shape, dtype)
 
     # General case: use an HBM scratch buffer. Load source rows into scratch
     # in flat order, then reload from scratch in output shape. Since both
@@ -537,10 +543,41 @@ def emit_reshape(nb: Builder, x_hbm, y_hbm, in_shape, out_shape, dtype) -> None:
     """Emit reshape tiling into an existing Builder."""
     if len(out_shape) == 0 or len(in_shape) == 0:
         _emit_reshape_scalar(nb, x_hbm, y_hbm, in_shape, out_shape, dtype)
+        return
+
+    # Prefix path: when shapes share a leading prefix-product, emit one
+    # load + view + store per partition tile. Handles (Co,*K,Ci)->(Co,K*Ci),
+    # trailing-1 additions, and single-partition-row reshapes.
+    p_common = _largest_common_prefix(in_shape, out_shape)
+    if p_common > 1 or (p_common == 1 and in_shape[0] == 1 and out_shape[0] == 1):
+        _emit_reshape_via_prefix(nb, x_hbm, y_hbm, in_shape, out_shape, p_common, dtype)
     elif in_shape[-1] == out_shape[-1]:
         _emit_reshape_same_f(nb, x_hbm, y_hbm, in_shape, out_shape, dtype)
     else:
         _emit_reshape_diff_f(nb, x_hbm, y_hbm, in_shape, out_shape, dtype)
+
+
+def _emit_reshape_via_prefix(nb, x_hbm, y_hbm, in_shape, out_shape, p_common, dtype):
+    """Emit prefix-path reshape: partition fixed, free-dim regrouped via view."""
+    total = prod(in_shape)
+    in_free = total // p_common
+    out_free = total // p_common
+
+    in_strides = row_major_strides(in_shape)
+    out_strides = row_major_strides(out_shape)
+
+    for r0 in range(0, p_common, PARTITION_MAX):
+        p = min(PARTITION_MAX, p_common - r0)
+        src_chunks = flat_range_to_src_chunks(
+            r0 * in_free, p * in_free, in_shape, in_strides)
+        dst_chunks = flat_range_to_src_chunks(
+            r0 * out_free, p * out_free, out_shape, out_strides)
+        (src_slices, _), = src_chunks
+        (dst_slices, _), = dst_chunks
+        tile = nb.dma_copy(
+            nb.alloc((p, in_free), dtype, MemorySpace.SBUF), x_hbm, src_slices)
+        tile = nb.view(tile, (p, out_free))
+        nb.dma_copy(y_hbm, tile, dst_slices)
 
 
 def _emit_reshape_scalar(nb, x_hbm, y_hbm, in_shape, out_shape, dtype):
