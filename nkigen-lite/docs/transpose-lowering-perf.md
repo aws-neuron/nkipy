@@ -1,12 +1,12 @@
 # Transpose lowering performance for nkigen-lite
 
-Status: **PARTIALLY FIXED (Idea 1 — axis collapse).** The `_collapse_perm`
-canonicalization merges adjacent in-order axis runs before tiling, reducing the
-Qwen3-VL case from ~258 k ops to ~32 k ops (8× improvement). The 1152-channel
-case remains skipped because the remaining ~32 k ops still make full lowering
-slow at that scale; full resolution requires Idea 2 (folding passthrough dims
-into the partition for a single wide transpose) which is blocked by the
-hardware constraint below.
+Status: **FIXED.** The passthrough-partition path folds the leading batch dim
+into the partition and uses `access_pattern` + `tensor_copy` to transpose the
+trailing dims on-chip. The Qwen3-VL case now lowers to **72 ops** (down from
+~258 k before axis-collapse, ~32 k after, now 72). The conv3d test case remains
+skipped for a different reason: the im2col *strided slicing* (512 kernel
+positions) still generates ~2.5 M ops, which is a separate bottleneck unrelated
+to transpose.
 
 Companion to the reshape fix in commit `2f8f706` (the *other* Qwen conv3d
 bottleneck — the im2col weight reshape — which is now fast). Reshape and
@@ -141,9 +141,13 @@ ops** in the interpreter.
 3. ✅ **DONE.** Generate load/store slices at original rank via
    `flat_range_to_src_chunks` so merged-axis tiles that straddle original-axis
    boundaries stay correct (via `_tile_iter` helper).
-4. Optionally fold leading passthrough dims into the partition to widen the
-   partition axis (the big constant-factor win), but only once 1–3 are correct
-   and hardware-verified. **Still blocked by the `[0,2,1]` hardware constraint.**
+4. ✅ **DONE.** Fold leading passthrough dim into the partition using
+   `access_pattern` + `tensor_copy` (the `_lower_transpose_passthrough_partition`
+   path). Does NOT use `dma_transpose([0,2,1])` — instead loads the full
+   `(P, I*J)` tile and uses strided AP reads to shuffle elements on-chip, which
+   the hardware supports. The `[0,2,1]` constraint only applies to
+   `dma_transpose`; `tensor_copy` with APs has no such restriction. Verified on
+   Trainium hardware. Qwen case: 32 k → 72 ops.
 
 ## Validation checklist
 

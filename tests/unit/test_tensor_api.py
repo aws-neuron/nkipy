@@ -1418,10 +1418,10 @@ def test_conv2d_with_bias(
 def test_conv3d(trace_mode, in_channels, out_channels, kernel_size, stride, padding):
     if trace_mode == "nkigen-lite" and out_channels >= 512:
         pytest.skip(
-            "conv3d im2col weight-reshape blows up for many kernel positions "
-            "(e.g. the 1152-channel Qwen3-VL case): the (Co, *K, Ci)->(Co, K*Ci) "
-            "reshape lowers to millions of per-row DMAs. Pending reshape-lowering "
-            "optimization; smaller-channel conv3d cases now lower in seconds."
+            "conv3d im2col with many kernel positions (e.g. 1152-channel Qwen3-VL "
+            "with 512 positions) generates millions of strided-slice ops during "
+            "lowering (~5 min). Transpose and reshape are now fast (<100 ops); "
+            "the remaining bottleneck is per-position strided window extraction."
         )
 
     def kernel(input_tensor, weight):
@@ -1471,8 +1471,8 @@ def test_conv3d_with_dilation(
     """Test conv3d with dilation parameter"""
     if trace_mode == "nkigen-lite" and out_channels >= 512:
         pytest.skip(
-            "conv3d im2col weight-reshape blows up for many kernel positions; "
-            "pending reshape-lowering optimization"
+            "conv3d im2col with many kernel positions generates millions of "
+            "strided-slice ops during lowering (~5 min)"
         )
 
     def kernel(input_tensor, weight):
@@ -1524,8 +1524,8 @@ def test_conv3d_with_bias(
     """Test conv3d with bias parameter"""
     if trace_mode == "nkigen-lite" and out_channels >= 512:
         pytest.skip(
-            "conv3d im2col weight-reshape blows up for many kernel positions; "
-            "pending reshape-lowering optimization"
+            "conv3d im2col with many kernel positions generates millions of "
+            "strided-slice ops during lowering (~5 min)"
         )
 
     def kernel(input_tensor, weight, bias):
