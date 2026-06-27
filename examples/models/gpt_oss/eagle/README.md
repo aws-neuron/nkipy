@@ -135,29 +135,56 @@ attending past its own position.
 
 ## Known limitation: acceptance length
 
-The current acceptance length (~1.0–1.2) is below the paper's reported ~3.3.
-Root cause: **numerical coupling between drafter and target implementation**.
+The current CPU-side acceptance length is ~1.4 tokens/step (vs paper's ~3.7 for
+GPT-OSS 20B at K=5). The NTP (depth 0) position works correctly — draft[0]
+frequently matches the target's greedy. The MTP (depth 1+) positions
+underperform, producing generic tokens instead of context-specific ones.
 
-The P-EAGLE drafter was trained on hidden states from a specific target
-implementation (HF/vLLM on GPU). Our nkipy Neuron-compiled target produces the
-same greedy tokens as HF (validated losslessly), but its intermediate hidden
-states diverge at the ~4% relative level due to:
+### What's been verified
 
-- Different matmul accumulation order (TP sharding, Neuron XLA vs CUDA/CPU)
-- bf16 intermediate rounding across 21 MoE transformer layers
-- MoE router/dispatch numerical noise
+- Drafter NTP produces the correct next token when given HF hidden states ✅
+- Drafter KV cache is necessary and improves acceptance from 1.0 to 1.4 ✅
+- The EAGLE shifted-token convention (input_ids shifted +1 vs hidden states)
+  matches vLLM's implementation ✅
+- Hidden-state capture point (output of tap layers) matches what vLLM uses ✅
+- The midlayer concat `[norm(embed), norm(hidden)]` → 2H → attention → H output
+  with H-wide residual matches vLLM's `Eagle3DecoderLayer` ✅
 
-The drafter is extremely sensitive to these differences — it learns a nonlinear
-function of the exact intermediate representations it was trained on.
+### vLLM reference (parallel_drafting)
 
-### Path to full acceptance
+Studied from the installed vLLM at `private-vllm-neuron/.venv`. Key findings:
 
-To achieve the paper's reported acceptance length, the drafter must be
-**finetuned on hidden states from this exact nkipy/Neuron target**. The standard
-EAGLE-3 training recipe applies: run the target on Ultrachat data, capture the 3
-tap-layer hidden states, and train the drafter to predict the target's next token
-from those states. The codebase is ready for this — `run_prefill(capture_aux=True)`
-and the verify pass both expose the required hidden states.
+1. vLLM's parallel drafting produces ALL K tokens in **one forward pass**: the
+   expanded input contains [shifted context tokens | bonus (next_token) | K-1
+   ptd_token positions]. All go through the model together with PagedAttention.
 
-Alternatively, running the target via HF's exact computation graph (where the
-drafter was originally trained) would recover full acceptance.
+2. The `parallel_drafting_hidden_state_tensor` = `fc(mask_hidden)` (the fc-fused
+   mask_hidden at 2880 dim), placed at the MTP positions in the hidden_states
+   input to the model.
+
+3. The Triton kernel `copy_and_expand_eagle_inputs_kernel` handles the layout:
+   positions are sequential (start_pos + j), parallel-draft slots get
+   `ptd_token_id` for input_ids and `parallel_drafting_hidden_state_tensor` for
+   hidden_states.
+
+4. The model's `forward(input_ids, positions, hidden_states)` takes all three
+   as separate tensors of the same length. Only the midlayer (layer 0)
+   concatenates embeds with hidden to produce 2H; subsequent layers are standard.
+
+### Remaining gap to investigate
+
+The MTP positions have correct architecture but produce generic predictions. The
+most likely remaining issue is an off-by-one in how the drafter's RoPE positions
+map to the target's absolute positions during the KV-cached speculation loop.
+vLLM assigns positions sequentially from the start of the context, and the
+parallel-draft positions get positions immediately following the last valid token.
+Our `drafter_cpu.py` does the same via `torch.arange(cache_len, cache_len + K)`.
+
+### Path forward
+
+1. Run the drafter via vLLM on GPU with this exact checkpoint and capture the
+   actual acceptance length (confirms the checkpoint quality ceiling)
+2. If vLLM achieves ~3.7, the issue is in our inference loop (position/hidden
+   alignment during rollback+extend)
+3. If vLLM also gets ~1.4, the checkpoint may be under-trained for this prompt
+   distribution (the paper evaluates on HumanEval/MT-Bench/GSM-8K specifically)
