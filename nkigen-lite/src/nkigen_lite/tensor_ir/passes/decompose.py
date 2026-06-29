@@ -298,15 +298,54 @@ class PowerPattern(DecomposePattern):
 
     NISA POW only supports scalar exponents via tensor_scalar_arith.
     For general tensor-tensor power, decompose into exp/log.
+
+    Exception: when ``b`` is a constant non-negative integer exponent
+    (e.g. ``x**2`` in variance/RMSNorm), the exp/log form returns NaN for
+    negative bases (``log`` of a negative number). Decompose those into
+    repeated multiplication instead — exact and sign-correct.
     """
+
+    # Unroll constant integer exponents up to this power; larger ones fall
+    # back to exp/log (where a negative base is unusual anyway).
+    MAX_UNROLL = 8
 
     def match(self, op):
         if op.opcode != "power":
             return None
         return {"a": op.inputs[0], "b": op.inputs[1]}
 
+    def _const_int_exponent(self, b, graph):
+        """Return the integer value of ``b`` if it is a constant whole
+        number, else None."""
+        for o in graph.ops:
+            if any(r.name == b.name for r in o.results):
+                if o.opcode == "constant":
+                    val = o.attrs.get("value")
+                    if val is not None and float(val).is_integer():
+                        return int(val)
+                return None
+        return None
+
     def rewrite(self, op, data, graph):
         a, b = data["a"], data["b"]
+
+        n = self._const_int_exponent(b, graph)
+        if n is not None and 0 <= n <= self.MAX_UNROLL:
+            rt = op.result.type
+            if n == 0:
+                one = Op("constant", [], [rt], {"value": 1.0}, counter=graph.counter)
+                graph.insert_before(op, one)
+                graph.replace_value(op.result, one.result)
+                return
+            # n >= 1: chain of multiplications a * a * ... (n factors).
+            acc = a
+            for _ in range(n - 1):
+                mul_op = Op("mul", [acc, a], [rt], counter=graph.counter)
+                graph.insert_before(op, mul_op)
+                acc = mul_op.result
+            graph.replace_value(op.result, acc)
+            return
+
         log_op = Op("log", [a], [a.type], counter=graph.counter)
         graph.insert_before(op, log_op)
         mul_op = Op("mul", [b, log_op.result], [op.result.type], counter=graph.counter)
