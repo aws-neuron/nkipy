@@ -342,6 +342,12 @@ class Compiler:
         Dispatches to ``_compile_hlo``, ``_compile_nkigen``, or
         ``_compile_nkigen_lite`` based on the IR type.
         """
+        # _compile_hlo chdir()s into work_dir, so a relative work_dir (e.g. the
+        # "./build" passed by examples with save_artifacts=True) would make the
+        # hlo_module.pb path resolve relative to itself and double up. Resolve
+        # to absolute up front so every backend is robust to relative dirs.
+        work_dir = Path(work_dir).resolve()
+
         if isinstance(ir, HLOModule):
             return self._compile_hlo(
                 ir, work_dir, output_file, use_neuronx_cc_python_interface
