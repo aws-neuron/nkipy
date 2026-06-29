@@ -49,8 +49,7 @@ if _BASE not in sys.path:
     sys.path.insert(0, _BASE)
 
 from config import Config, get_config  # noqa: E402  (base config; _BASE wins)
-from eagle.config import get_eagle_config  # noqa: E402
-from eagle.drafter_model import DrafterModel  # noqa: E402
+from eagle.drafter_cpu import DrafterCPU  # noqa: E402
 from kernels.transformer_layer import transformer_layer  # noqa: E402  (base)
 from nkipy.runtime import DeviceKernel, DeviceTensor  # noqa: E402
 from safetensors.torch import load_file  # noqa: E402
@@ -199,7 +198,16 @@ def main():
     parser.add_argument("-n", "--max-new-tokens", type=int, default=128)
     parser.add_argument("-k", "--num-draft-tokens", type=int, default=7)
     parser.add_argument("prompt", nargs="?", default="The capital of France is")
+    parser.add_argument(
+        "--raw-prompt",
+        action="store_true",
+        help="Tokenize the prompt as raw text instead of applying the chat "
+        "template (chat formatting matches the drafter's training distribution "
+        "and yields higher acceptance).",
+    )
     parser.add_argument("--target-checkpoint", default="./tmp_gpt-oss-20b")
+    # Unused: the KV-cached DrafterCPU loads weights directly from --draft-model.
+    # Kept for backward compatibility with existing invocations.
     parser.add_argument("--draft-checkpoint", default="./tmp_p-eagle")
     parser.add_argument("--model", default="/home/ubuntu/models/gpt-oss-20b")
     parser.add_argument(
@@ -217,7 +225,17 @@ def main():
 
     K = args.num_draft_tokens
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    input_ids = tokenizer(args.prompt, return_tensors="np")["input_ids"]
+    # The drafter is trained on chat-formatted data; raw completion prompts are
+    # out-of-distribution and roughly halve acceptance length (≈2.0 vs ≈3.7 at
+    # K=7 on GPU). Apply the chat template unless --raw-prompt is set.
+    if args.raw_prompt or tokenizer.chat_template is None:
+        input_ids = tokenizer(args.prompt, return_tensors="np")["input_ids"]
+    else:
+        input_ids = tokenizer.apply_chat_template(
+            [{"role": "user", "content": args.prompt}],
+            add_generation_prompt=True,
+            return_tensors="np",
+        )
     prompt_len = input_ids.shape[1]
     eos_ids = _resolve_eos_ids(args.model, tokenizer)
 
@@ -231,23 +249,19 @@ def main():
     )
     target = SpeculativeGptOss(load_file(tgt_shard, device="cpu"), config, K)
 
-    # Drafter (replicated on every rank).
+    # Drafter (replicated on every rank). The drafter keeps its own KV cache over
+    # the full context and proposes K tokens in one parallel forward pass per step
+    # (validated against vLLM's eagle3 parallel-drafting path). It runs on CPU; it
+    # is tiny (4 layers, ~3.6 GB) and its correctness is independent of placement.
     print_log("Loading drafter weights")
-    ecfg = get_eagle_config(
-        args.draft_model,
-        target_hidden_size=config.hidden_size,
-        num_draft_tokens=K,
-        max_seq_len=config.max_seq_len,
-    )
-    draft_weights = load_file(
-        os.path.join(args.draft_checkpoint, "drafter.safetensors"), device="cpu"
-    )
-    drafter = DrafterModel(draft_weights, ecfg, base.BUILD_DIR)
+    drafter = DrafterCPU(args.draft_model, config.hidden_size, num_draft_tokens=K)
 
     # ── Prefill the target on the prompt ──
     dist.barrier()
     t0 = time.time()
     hidden, aux = target.run_prefill(input_ids, capture_aux=True)
+    # aux[k]: (1, prompt_len, H) for the k-th tap layer. Stack -> (1, prompt_len, 3H).
+    prompt_aux3 = _stack_aux(aux)
 
     # First token: greedy sample from the prefill hidden (reuse the base kernel).
     first_id_dev = DeviceTensor.from_numpy(np.array([[0]], dtype=np.uint32), "first_id")
@@ -262,23 +276,20 @@ def main():
     next_id = int(first_id_dev.torch().reshape(-1)[0])
 
     generated = [next_id]
-    cur_pos = prompt_len  # absolute position of `next_id`
 
-    # The prefill's aux gives hidden states at position (prompt_len - 1), but the
-    # drafter needs the hidden state at position `cur_pos` (after `next_id` has been
-    # processed through the target). Run a single-token decode on `next_id` to get
-    # the hidden state at `cur_pos`, capturing aux along the way.
-    seed_h = DeviceTensor.from_torch(
-        target.tok_embedding[torch.tensor([[next_id]])], "seed_h"
-    )
-    seed_pos = DeviceTensor.from_numpy(np.array([cur_pos], dtype=np.int32), "seed_pos")
-    seed_aux = []
-    for i in range(config.num_layers):
-        target._run_layer("tkg", i, seed_h, seed_pos)
-        if config.aux_layers is not None and i in config.aux_layers:
-            seed_aux.append(seed_h.torch().clone())
-    last_aux3 = _stack_aux([a[:, 0:1, :] for a in seed_aux])
-    cur_pos += 1
+    # ── Prefill the DRAFTER over the prompt (EAGLE shift) ──
+    # The drafter pairs embed(token_{p+1}) with target_hidden(token_p) at slot p.
+    # Prompt tokens t_0..t_{P-1} with prefill hiddens h_0..h_{P-1} fill drafter
+    # slots 0..P-2 as (embed(t_{p+1}), h_p). Tokens are the prompt shifted by +1.
+    P = prompt_len
+    shifted_tokens = torch.as_tensor(input_ids).reshape(-1)[1:P]  # t_1..t_{P-1}
+    drafter.prefill(shifted_tokens, prompt_aux3[:, : P - 1, :])
+
+    # The next committed slot is the first generated token `next_id` at abs pos
+    # P-1, paired with the prefill hidden at the last prompt position (h_{P-1}).
+    pending_tokens = [next_id]
+    pending_aux3 = prompt_aux3[:, P - 1 : P, :]  # (1, 1, 3H)
+    cur_pos = P  # absolute position of the token that `next_id` will predict
 
     ttft = time.time() - t0
     n_accepted_total = 0
@@ -291,8 +302,12 @@ def main():
 
     t_decode = time.time()
     while len(generated) < args.max_new_tokens:
-        # 1) Draft K tokens from the last accepted token + its tapped hiddens.
-        drafts = drafter.draft(last_aux3, generated[-1])
+        # 1) Draft K tokens. Commit the pending (newly accepted) tokens into the
+        #    drafter's KV cache; the NTP prediction comes from the last committed
+        #    slot and K-1 MTP (ptd) slots follow. base_pos is the absolute position
+        #    of the first pending token.
+        base_pos = cur_pos - len(pending_tokens)
+        drafts = drafter.draft(pending_tokens, pending_aux3, base_pos)
 
         # 2) Verify: feed [last_token, drafts...] at absolute cur_pos.
         cand = [generated[-1]] + drafts  # length K+1
@@ -314,11 +329,13 @@ def main():
 
         # Emit accepted tokens (truncate at max + stop on EOS).
         stop = False
+        n_emitted = 0
         for tok in accepted:
             if len(generated) >= args.max_new_tokens:
                 stop = True
                 break
             generated.append(tok)
+            n_emitted += 1
             if dist.get_rank() == 0:
                 print(tokenizer.decode([tok]), end="")
                 sys.stdout.flush()
@@ -328,14 +345,18 @@ def main():
         if stop:
             break
 
-        # 4) Advance. The accepted tokens occupy cur_pos .. cur_pos+n_accepted-1
-        # (already written to the KV cache by verify). The tapped hiddens for the
-        # last accepted token seed the next draft.
-        last_kept_index = n_accepted - 1  # index into the verify window
-        last_aux3 = _stack_aux(
-            [a[:, last_kept_index : last_kept_index + 1, :] for a in aux]
-        )
-        cur_pos += n_accepted
+        # 4) Advance. The accepted tokens become the drafter's committed slots for
+        #    the next step. The verify window ran candidates at absolute positions
+        #    cur_pos .. cur_pos+K, so its captured hidden at window index i is the
+        #    target hidden at position cur_pos+i. Accepted token j (= target_ids[j])
+        #    is the token predicted by window hidden j, i.e. it sits at sequence
+        #    position cur_pos+j+1, and the drafter pairs it (EAGLE shift) with the
+        #    target hidden at position cur_pos+j == verify window index j.
+        #    Verified against vLLM: commit token j pairs with verify_aux3[:, j].
+        verify_aux3 = _stack_aux(aux)  # (1, K+1, 3H)
+        pending_tokens = list(accepted[:n_emitted])
+        pending_aux3 = verify_aux3[:, :n_emitted, :]
+        cur_pos += n_emitted
 
     decode_time = time.time() - t_decode
     if dist.get_rank() == 0:

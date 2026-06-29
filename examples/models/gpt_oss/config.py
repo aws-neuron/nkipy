@@ -45,13 +45,17 @@ class Config:
 
     @staticmethod
     def default_aux_layers(num_layers: int) -> tuple:
-        """EAGLE-3's standard low/mid/high decoder-layer taps (vLLM convention)."""
-        return (2, num_layers // 2, num_layers - 3)
+        """EAGLE-3's low/mid/high taps as the *outputs* of these decoder layers.
 
-    @staticmethod
-    def peagle_aux_layers(num_layers: int) -> tuple:
-        """P-EAGLE's tap layers (0-indexed, captures before each layer)."""
-        return (0, num_layers // 2, num_layers - 1)
+        vLLM's EAGLE-3 default is ``(2, n//2, n-3)`` but it captures the residual
+        stream *entering* those layers (``_maybe_add_hidden_state`` runs with
+        ``layer_idx=i+1`` after layer ``i``). Our prefill loop captures *after*
+        running layer ``i``, so to tap the same values we shift down by one:
+        the input of layer ``L`` is the output of layer ``L-1``. Verified on GPU
+        against vLLM for gpt-oss-20b: the drafter's 3 fc chunks equal the outputs
+        of target layers (1, 11, 20) at cosine 1.0 (see eagle README).
+        """
+        return (2 - 1, num_layers // 2 - 1, num_layers - 3 - 1)
 
 
 def get_config(model_name, context_len, max_new_tokens):

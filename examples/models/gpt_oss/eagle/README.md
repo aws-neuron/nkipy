@@ -60,9 +60,11 @@ Decode tokens/sec: XX.XX
 
 ```
 1. Target prefill on prompt → first token + 3 tapped hidden states
-2. Seed: run first token through target decode → hidden states for drafter
+2. Drafter prefill on prompt (EAGLE shift) → drafter KV cache over positions 0..P-2
 3. Loop:
-   a. Drafter: K tokens in ONE parallel forward pass
+   a. Drafter: roll cache back to last accepted pos; run
+      [newly-accepted tokens | K-1 ptd slots] in ONE parallel forward pass,
+      attending to the FULL drafter KV cache → K draft tokens
    b. Target verify: run [last_accepted, draft_0, ..., draft_{K-1}] through
       target layers (seq_len = K+1) with block-causal mask
    c. Accept: longest prefix where draft[i] == target_argmax[i]
@@ -73,16 +75,18 @@ Decode tokens/sec: XX.XX
 ### P-EAGLE parallel drafting (K tokens in one pass)
 
 Unlike autoregressive EAGLE which runs K sequential drafter passes, P-EAGLE
-generates all K draft tokens simultaneously:
+generates all K draft tokens simultaneously. Per step, the slots appended to the
+drafter's KV cache (all attending to the full prior context) are:
 
-| Position | Embedding input | Hidden state input |
-|----------|----------------|-------------------|
-| 0 (NTP) | `embed(last_accepted_token)` | `fc(concat(aux_layer_2, aux_layer_12, aux_layer_21))` — real target hidden |
-| 1..K-1 (MTP) | `embed(ptd_token_id)` — placeholder | `fc(mask_hidden)` — learnable shared hidden |
+| Slot | Embedding input | Hidden state input |
+|------|----------------|-------------------|
+| committed (incl. NTP, depth 0) | `embed(newly-accepted token)` | `fc(concat(aux_layer_1, aux_layer_11, aux_layer_20))` — real target hidden |
+| K-1 MTP (depth 1..K-1) | `embed(ptd_token_id)` — placeholder | `fc(mask_hidden)` — learnable shared hidden |
 
-All K positions attend under a **cross-depth causal mask** (depth d sees depths
-≤ d) through the EAGLE-3 fusion midlayer + 3 plain Llama decoder layers. Each
-position's `lm_head` logit gives one draft token.
+The K draft logits come from the **last committed slot** (NTP) plus the K-1 ptd
+slots (MTP), each through the EAGLE-3 fusion midlayer + 3 plain Llama decoder
+layers. All positions attend causally (over absolute positions) to the full
+context KV cache — not just to each other.
 
 ### Architecture details
 
@@ -128,63 +132,75 @@ attending past its own position.
 
 | What | Result |
 |------|--------|
-| Drafter kernel math | ✅ All 7 draft tokens match independent PyTorch reference |
-| Speculation output | ✅ Lossless — output matches HF greedy baseline exactly |
-| Drafter with HF hidden states | ✅ Draft[0] matches target greedy perfectly |
-| Multi-token verify | ✅ Block-causal mask + KV scatter correct |
+| Drafter layer math (`DrafterCPU`) | ✅ cos 0.9999 vs vLLM on prefill (85/86 tokens) |
+| KV-cached decode steps | ✅ cos 0.9999, 100% draft-token match vs vLLM |
+| `draft()` public API | ✅ 7/7 draft tokens match vLLM on multiple decode steps |
+| Aux tap layers (1, 11, 20) | ✅ fc chunks equal target layer outputs at cos 1.0 |
+| Rollback / context-attention | ✅ guarded by `test_drafter_cpu.py` |
 
-## Known limitation: acceptance length
+## Acceptance length: root cause & fix
 
-The current CPU-side acceptance length is ~1.4 tokens/step (vs paper's ~3.7 for
-GPT-OSS 20B at K=5). The NTP (depth 0) position works correctly — draft[0]
-frequently matches the target's greedy. The MTP (depth 1+) positions
-underperform, producing generic tokens instead of context-specific ones.
+Earlier acceptance was ~1.4 tokens/step (vs the model card's 3.30–3.80 at K=7).
+This was root-caused on GPU by running the **identical checkpoint** through vLLM's
+`eagle3` parallel-drafting path and capturing its exact drafter I/O, then
+reproducing it with a standalone PyTorch reference (cosine **0.9999**, 100%
+draft-token match). Three issues were found and fixed:
 
-### What's been verified
+1. **Context-blind drafting (dominant).** `speculate.py` drove `DrafterModel`
+   (`kernels/drafter.py`), which runs only the K draft positions under a (K,K)
+   cross-depth mask with **no prefill and no KV cache** — the MTP slots never saw
+   the prompt, so they produced generic tokens. The drafter must keep a KV cache
+   over the whole context and have every new position attend to it (plain causal
+   over absolute positions). `speculate.py` now uses the KV-cached `DrafterCPU`:
+   it prefills the drafter on the prompt and, each step, rolls the cache back to
+   the last accepted position and runs `[newly-accepted tokens | K-1 ptd slots]`.
 
-- Drafter NTP produces the correct next token when given HF hidden states ✅
-- Drafter KV cache is necessary and improves acceptance from 1.0 to 1.4 ✅
-- The EAGLE shifted-token convention (input_ids shifted +1 vs hidden states)
-  matches vLLM's implementation ✅
-- Hidden-state capture point (output of tap layers) matches what vLLM uses ✅
-- The midlayer concat `[norm(embed), norm(hidden)]` → 2H → attention → H output
-  with H-wide residual matches vLLM's `Eagle3DecoderLayer` ✅
+2. **`rollback()` truncated the wrong axis.** The cache tensors are
+   `(B, n_kv, seq, head_dim)`; `rollback()` sliced dim 1 (`n_kv`) instead of dim 2
+   (`seq`), so rejected speculative KV entries were never discarded and corrupted
+   every later step. Fixed to slice the sequence axis. Guarded by
+   `test_drafter_cpu.py::test_rollback_restores_clean_cache`.
+
+3. **Aux tap off-by-one.** vLLM's EAGLE-3 default `(2, n//2, n-3)` captures the
+   residual stream *entering* those layers (`layer_idx=i+1` after layer `i`), i.e.
+   the **outputs of layers (1, 11, 20)** for the 24-layer target. Our prefill loop
+   captures *after* layer `i`, so `default_aux_layers` now returns `(1, 11, 20)`.
+   Verified on GPU: the drafter's 3 fc chunks equal target layer outputs (1,11,20)
+   at cosine 1.0.
+
+**Prompt formatting matters too.** The drafter is trained on chat data; raw
+completion prompts are out-of-distribution and roughly halve acceptance (GPU,
+identical checkpoint, K=7: **3.65** chat vs **1.99** raw). `speculate.py` now
+applies the chat template by default (`--raw-prompt` to opt out).
+
+### Validated algorithm (matches vLLM)
+
+1. Target taps the residual stream (`x+residual`) at the **outputs of layers
+   (1, 11, 20)**; concat the 3 → `fc` → H.
+2. **EAGLE shift:** drafter slot `p` pairs `embed(token@p+1)` with
+   `target_hidden@p`.
+3. **Drafter prefill** over the prompt builds a KV cache (positions 0..P-2), plain
+   causal.
+4. **Each draft step:** roll the cache back to the last accepted position; append
+   `[newly-accepted tokens (real target hidden) | K-1 ptd slots (fc(mask_hidden),
+   ptd_token_id embedding)]` at consecutive absolute positions, attending to the
+   full cache; the K draft logits are the last committed slot (NTP) + the K-1 ptd
+   slots (MTP).
 
 ### vLLM reference (parallel_drafting)
 
-Studied from the installed vLLM at `private-vllm-neuron/.venv`. Key findings:
+vLLM produces all K tokens in **one forward pass**: the expanded input is
+`[shifted context tokens | bonus (next_token) | K-1 ptd_token positions]`, all run
+together. `parallel_drafting_hidden_state_tensor = fc(mask_hidden)` fills the MTP
+positions; the `copy_and_expand_eagle_inputs_kernel` lays out sequential positions
+(`start_pos + j`) and tags parallel-draft slots with `ptd_token_id`. Only the
+midlayer concatenates embeds with hidden to 2H; later layers are standard.
 
-1. vLLM's parallel drafting produces ALL K tokens in **one forward pass**: the
-   expanded input contains [shifted context tokens | bonus (next_token) | K-1
-   ptd_token positions]. All go through the model together with PagedAttention.
+### Status / remaining work
 
-2. The `parallel_drafting_hidden_state_tensor` = `fc(mask_hidden)` (the fc-fused
-   mask_hidden at 2880 dim), placed at the MTP positions in the hidden_states
-   input to the model.
-
-3. The Triton kernel `copy_and_expand_eagle_inputs_kernel` handles the layout:
-   positions are sequential (start_pos + j), parallel-draft slots get
-   `ptd_token_id` for input_ids and `parallel_drafting_hidden_state_tensor` for
-   hidden_states.
-
-4. The model's `forward(input_ids, positions, hidden_states)` takes all three
-   as separate tensors of the same length. Only the midlayer (layer 0)
-   concatenates embeds with hidden to produce 2H; subsequent layers are standard.
-
-### Remaining gap to investigate
-
-The MTP positions have correct architecture but produce generic predictions. The
-most likely remaining issue is an off-by-one in how the drafter's RoPE positions
-map to the target's absolute positions during the KV-cached speculation loop.
-vLLM assigns positions sequentially from the start of the context, and the
-parallel-draft positions get positions immediately following the last valid token.
-Our `drafter_cpu.py` does the same via `torch.arange(cache_len, cache_len + K)`.
-
-### Path forward
-
-1. Run the drafter via vLLM on GPU with this exact checkpoint and capture the
-   actual acceptance length (confirms the checkpoint quality ceiling)
-2. If vLLM achieves ~3.7, the issue is in our inference loop (position/hidden
-   alignment during rollback+extend)
-3. If vLLM also gets ~1.4, the checkpoint may be under-trained for this prompt
-   distribution (the paper evaluates on HumanEval/MT-Bench/GSM-8K specifically)
+The CPU drafter path (`DrafterCPU`) and the `speculate.py` loop bookkeeping are
+GPU-validated against vLLM. Not yet re-validated on Trainium hardware: the NKI
+target's `verify`/prefill numerics and end-to-end acceptance. The on-device
+`kernels/drafter.py` still lacks a KV cache and is currently unused by
+`speculate.py`; porting the validated KV-cached path to the device kernel is the
+remaining performance work.

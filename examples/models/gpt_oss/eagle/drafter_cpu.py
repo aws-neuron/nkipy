@@ -48,11 +48,14 @@ class DrafterCPU:
         self.cache_len = 0
 
     def rollback(self, new_len):
-        """Truncate KV caches to new_len (discard rejected speculative entries)."""
+        """Truncate KV caches to new_len (discard rejected speculative entries).
+
+        Cache tensors are (B, n_kv, seq, head_dim); the sequence axis is dim 2.
+        """
         for i in range(self.n_layers):
             if self.kv_caches[i] is not None:
                 k, v = self.kv_caches[i]
-                self.kv_caches[i] = (k[:, :new_len], v[:, :new_len])
+                self.kv_caches[i] = (k[:, :, :new_len], v[:, :, :new_len])
         self.cache_len = new_len
 
     # ── Building blocks ──────────────────────────────────────────────────────
@@ -193,66 +196,79 @@ class DrafterCPU:
         self.cache_len = S
 
     @torch.no_grad()
-    def draft(self, target_aux3, last_token_id, accepted_tokens=None, accepted_aux=None):
-        """Generate K draft tokens attending to the full cached context.
+    def draft(self, commit_token_ids, commit_aux3, base_pos):
+        """Generate K draft tokens for one speculation step (parallel drafting).
+
+        Validated against vLLM's eagle3 parallel-drafting path on GPU (the new
+        positions attend to the FULL drafter KV cache via causal attention over
+        absolute positions; cosine 0.9999, 100% draft-token match).
+
+        Layout of the new positions appended to the cache (all attend to the
+        full prior context):
+
+            [ commit_0 ... commit_{C-1} | ptd_0 ... ptd_{K-2} ]
+              ^ newly committed tokens     ^ K-1 MTP mask slots
+              (real target hidden)         (fc(mask_hidden), ptd_token_id embed)
+
+        The K draft predictions are the lm_head argmax at the **last committed
+        slot** (NTP, depth 0) followed by the K-1 ptd slots (MTP, depths 1..K-1).
+
+        EAGLE shift: ``commit_token_ids[i]`` is the token that *follows* the
+        target hidden state ``commit_aux3[i]`` in the sequence (the drafter pairs
+        ``embed(token_{p+1})`` with ``target_hidden(token_p)``).
 
         Args:
-            target_aux3: (1, 1, 3*target_H) target hidden at the last accepted pos.
-            last_token_id: int, the last accepted token.
-            accepted_tokens: list[int], newly accepted tokens to add to cache first.
-            accepted_aux: (1, n_accepted, 3*target_H) their target hidden states.
+            commit_token_ids: list[int], the newly committed tokens (shifted; see
+                above). Must be non-empty — its last entry is the NTP slot.
+            commit_aux3: (1, C, 3*target_H) target tap-layer hiddens for the
+                committed positions.
+            base_pos: absolute position of ``commit_token_ids[0]``.
 
         Returns:
-            list[int] of K draft token ids.
+            list[int] of K draft token ids (target vocab).
         """
-        H = self.H
-        new_positions = []
+        H, K = self.H, self.K
+        C = len(commit_token_ids)
+        assert C >= 1, "draft() needs at least the NTP (last committed) token"
 
-        # Step 1: Extend cache with newly accepted tokens (if any).
-        if accepted_tokens is not None and len(accepted_tokens) > 0:
-            A = len(accepted_tokens)
-            acc_emb = self.w["embed_tokens.weight"][torch.tensor(accepted_tokens)].unsqueeze(0)
-            acc_hidden = self._fc_fuse(accepted_aux)
-            acc_2h = torch.cat([acc_emb, acc_hidden], dim=-1)
-            acc_pos = torch.arange(self.cache_len, self.cache_len + A)
-            self._run_layers(acc_2h, acc_pos)
-            self.cache_len += A
+        # Roll back any speculative (ptd) slots left in the cache from the
+        # previous step, so the committed tokens land at their true positions.
+        if self.cache_len != base_pos:
+            self.rollback(base_pos)
 
-        # Step 2: Build K positions (1 NTP + K-1 MTP).
-        ntp_emb = self.w["embed_tokens.weight"][last_token_id].view(1, 1, H)
-        ntp_hidden = self._fc_fuse(target_aux3)  # (1, 1, H)
+        # Committed slots: real embeddings + fc-fused real target hiddens.
+        commit_emb = self.w["embed_tokens.weight"][
+            torch.tensor(commit_token_ids)
+        ].view(1, C, H)
+        commit_hidden = self._fc_fuse(commit_aux3)  # (1, C, H)
 
-        K = self.K
+        # MTP slots: ptd-token embedding + fc(mask_hidden), shared across depths.
         if K > 1:
             ptd_emb = self.w["embed_tokens.weight"][self.ptd_token_id].view(1, 1, H)
-            mtp_embs = ptd_emb.expand(1, K - 1, H)
-            mask_hidden = self._fc_fuse(
-                self.w["mask_hidden"].view(1, 1, -1)
-            ).expand(1, K - 1, H)
-            embs = torch.cat([ntp_emb, mtp_embs], dim=1)
-            hiddens = torch.cat([ntp_hidden, mask_hidden], dim=1)
+            mtp_emb = ptd_emb.expand(1, K - 1, H)
+            mtp_hidden = self._fc_fuse(self.w["mask_hidden"].view(1, 1, -1)).expand(
+                1, K - 1, H
+            )
+            embs = torch.cat([commit_emb, mtp_emb], dim=1)
+            hiddens = torch.cat([commit_hidden, mtp_hidden], dim=1)
         else:
-            embs = ntp_emb
-            hiddens = ntp_hidden
+            embs, hiddens = commit_emb, commit_hidden
 
-        x_2h = torch.cat([embs, hiddens], dim=-1)  # (1, K, 2H)
-        draft_positions = torch.arange(self.cache_len, self.cache_len + K)
+        x_2h = torch.cat([embs, hiddens], dim=-1)  # (1, C+K-1, 2H)
+        n_new = C + K - 1
+        positions = torch.arange(base_pos, base_pos + n_new)
 
-        # Run through layers (this extends the KV cache with K new entries).
-        x = self._run_layers(x_2h, draft_positions)
+        x = self._run_layers(x_2h, positions)
+        # Keep the committed slots in the cache; the ptd slots are speculative and
+        # will be rolled back at the start of the next draft() call.
+        self.cache_len = base_pos + n_new
 
-        # DON'T advance cache_len here — these are speculative positions.
-        # They'll be rolled back if rejected. But we DO keep them in the cache
-        # temporarily for the KV consistency.
-        self.cache_len += K
-
-        # Logits → draft tokens.
+        # The K draft logits live at the last committed slot (NTP) + the K-1 ptd
+        # slots (MTP). Indices into the n_new-wide window: [C-1, C, ..., C+K-2].
         x = self._rms(x, self.w["norm.weight"])
-        logits = (x @ self.w["lm_head.weight"].T).float()  # (1, K, vocab)
-        draft_ids = logits[0].argmax(dim=-1).tolist()
+        logits = (x[0, C - 1 :] @ self.w["lm_head.weight"].T).float()  # (K, vocab)
+        draft_local = logits.argmax(dim=-1)
 
-        # Map draft vocab → target vocab (identity for this checkpoint).
+        # Map draft vocab -> target vocab (identity when d2t is all-zero).
         d2t = self.w["d2t"].long()
-        draft_ids = [(d + int(d2t[d])) for d in draft_ids]
-
-        return draft_ids
+        return (draft_local + d2t[draft_local]).tolist()
