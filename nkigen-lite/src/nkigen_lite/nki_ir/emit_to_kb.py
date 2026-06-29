@@ -597,6 +597,12 @@ def _emit_op(op: Op, tiles: dict[str, object]) -> None:
 
     elif op.opcode == "dma_copy_indirect":
         direction = op.attrs["direction"]
+        # Optional column window: process only free_offset:free_offset+free of
+        # each HBM row.  row_width is the HBM tensor's true row stride (the
+        # partition stride the indirect DMA needs), while the on-chip tile holds
+        # just the windowed columns.  Lets a very wide row be tiled across DMAs.
+        row_width = op.attrs.get("row_width")
+        free_offset = op.attrs.get("free_offset", 0)
         if direction == "load":
             dst = _get(op.inputs[0])
             src = _get(op.inputs[1])
@@ -606,10 +612,13 @@ def _emit_op(op: Op, tiles: dict[str, object]) -> None:
             # view shape matches dst (M gathered rows x free), and .ap derives
             # the row stride / bound (N) from the full src tile.
             free = 1
-            for d in src.shape[1:]:
+            for d in dst.shape[1:]:
                 free *= d
+            stride = row_width if row_width is not None else free
             m_rows = dst.shape[0]
-            src_view = src.ap([[free, m_rows], [1, free]], vector_offset=index)
+            src_view = src.ap(
+                [[stride, m_rows], [1, free]], offset=free_offset, vector_offset=index
+            )
             nisa.dma_copy(dst=dst, src=src_view)
             tiles[op.result.name] = dst
         else:
@@ -626,10 +635,13 @@ def _emit_op(op: Op, tiles: dict[str, object]) -> None:
             # and selects which physical dst row each lands on.  .ap derives the
             # row stride and bound (N) from the full dst tile.
             free = 1
-            for d in dst.shape[1:]:
+            for d in src.shape[1:]:
                 free *= d
+            stride = row_width if row_width is not None else free
             m_rows = src.shape[0]
-            dst_view = dst.ap([[free, m_rows], [1, free]], vector_offset=index)
+            dst_view = dst.ap(
+                [[stride, m_rows], [1, free]], offset=free_offset, vector_offset=index
+            )
             nisa.dma_copy(dst=dst_view, src=src)
 
     elif op.opcode == "tensor_tensor_scan":

@@ -911,25 +911,39 @@ class Builder:
         dst: Value,
         src: Value,
         index: Value,
+        row_width: int | None = None,
+        free_offset: int = 0,
     ) -> Value | None:
         """Indirect DMA copy with vector offset.  Maps to ``nisa.dma_copy_indirect``.
 
         *index* is an SBUF tile of integer offsets used to gather/scatter.
         Direction inferred from memory spaces like ``dma_copy``.
+
+        By default each gathered/scattered row spans the full HBM row (the
+        on-chip tile's free size). To process a *column window* of a wide row —
+        so a huge row can be tiled across several DMAs and never materialised in
+        one oversized SBUF tile — pass ``row_width`` (the HBM tensor's true row
+        stride) and ``free_offset`` (the starting column). The on-chip tile then
+        holds only ``free_offset:free_offset+free`` of each row.
         """
         src_hbm = src.type.memory == MemorySpace.HBM
         dst_hbm = dst.type.memory == MemorySpace.HBM
         if src_hbm == dst_hbm:
             raise ValueError("dma_copy_indirect: exactly one of src/dst must be HBM")
+        attrs: dict[str, Any] = {}
+        if row_width is not None:
+            attrs["row_width"] = int(row_width)
+        if free_offset:
+            attrs["free_offset"] = int(free_offset)
         if src_hbm:
+            attrs["direction"] = "load"
             return self._emit(
-                "dma_copy_indirect", [dst, src, index], [dst.type],
-                {"direction": "load"},
+                "dma_copy_indirect", [dst, src, index], [dst.type], attrs,
             ).result
         else:
+            attrs["direction"] = "store"
             self._emit(
-                "dma_copy_indirect", [src, dst, index], [],
-                {"direction": "store"},
+                "dma_copy_indirect", [src, dst, index], [], attrs,
             )
             return None
 

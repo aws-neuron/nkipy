@@ -668,7 +668,7 @@ def constant(value, dtype=None):
     # data as a flat sequence of run-length fills, concatenate, and reshape.
     # Cheap for structured/small arrays; worst case (all-distinct) is one fill
     # per element, so cap to keep tracing bounded.
-    MAX_RUNS = 4096
+    MAX_RUNS = 16384
     # Run-length encode the flat array.
     change = np.nonzero(np.diff(flat))[0] + 1
     starts = np.concatenate(([0], change))

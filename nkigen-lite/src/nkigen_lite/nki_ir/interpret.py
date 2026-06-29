@@ -646,18 +646,21 @@ def interpret(
 
         elif op.opcode == "dma_copy_indirect":
             direction = op.attrs["direction"]
+            # Optional column window into each row (see Builder.dma_copy_indirect).
+            free_offset = op.attrs.get("free_offset", 0)
             if direction == "load":
-                # Row gather: out[r, :] = src[index[r], :].  The index addresses
-                # whole rows of the source tensor (matching the
+                # Row gather: out[r, :] = src[index[r], off:off+w].  The index
+                # addresses whole rows of the source tensor (matching the
                 # .ap(vector_offset=) load emit), one entry per output row.
                 src = _get(op.inputs[1])
                 index = _get(op.inputs[2]).astype(np.intp).reshape(-1)
                 out_shape = op.result.type.shape
+                w = int(np.prod(out_shape[1:])) if len(out_shape) > 1 else 1
                 src2d = src.reshape(src.shape[0], -1)
-                gathered = src2d[index]
+                gathered = src2d[index][:, free_offset:free_offset + w]
                 env[op.result.name] = gathered.reshape(out_shape)
             else:
-                # Row scatter: dst[index[r], :] = src[r, :].  The index
+                # Row scatter: dst[index[r], off:off+w] = src[r, :].  The index
                 # addresses whole rows of the destination tensor (matching the
                 # .ap(vector_offset=) store emit), one entry per src row.
                 src_tile = _get(op.inputs[0])
@@ -665,9 +668,10 @@ def interpret(
                 index = _get(op.inputs[2]).astype(np.intp).reshape(-1)
                 dst_arr = env[dst_name]
                 src2d = src_tile.reshape(src_tile.shape[0], -1)
+                w = src2d.shape[1]
                 dst2d = dst_arr.reshape(dst_arr.shape[0], -1)
                 for r in range(src2d.shape[0]):
-                    dst2d[index[r]] = src2d[r]
+                    dst2d[index[r], free_offset:free_offset + w] = src2d[r]
                 env[dst_name] = dst2d.reshape(dst_arr.shape)
 
         elif op.opcode == "tensor_tensor_scan":

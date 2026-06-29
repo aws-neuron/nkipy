@@ -671,30 +671,44 @@ def _emit_scatter_rows_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
     vdtype = out_val.type.dtype
     idtype = idx_val.type.dtype
 
-    # Backdrop: copy base -> result, tiled over N rows.
+    # Tile the row width so wide rows never need a (P, W) SBUF tile.
+    w_tile = min(W, max_free_elems(vdtype))
+
+    # Backdrop: copy base -> result, tiled over N rows and W columns.
     for p_i in range(ceildiv(N, PARTITION_MAX)):
         p_off = p_i * PARTITION_MAX
         p_size = min(PARTITION_MAX, N - p_off)
-        tile = nb.dma_copy(
-            nb.alloc((p_size, W), vdtype, MemorySpace.SBUF),
-            base_hbm, (DimSlice(p_off, p_size), DimSlice(0, W)),
-        )
-        nb.dma_copy(out_hbm, tile, (DimSlice(p_off, p_size), DimSlice(0, W)))
+        for w_i in range(ceildiv(W, w_tile)):
+            w_off = w_i * w_tile
+            w_size = min(w_tile, W - w_off)
+            tile = nb.dma_copy(
+                nb.alloc((p_size, w_size), vdtype, MemorySpace.SBUF),
+                base_hbm, (DimSlice(p_off, p_size), DimSlice(w_off, w_size)),
+            )
+            nb.dma_copy(
+                out_hbm, tile, (DimSlice(p_off, p_size), DimSlice(w_off, w_size))
+            )
 
-    # Scatter the M update rows, tiled over M.  dma_copy_indirect addresses
-    # whole rows of the result HBM tensor via the per-row index.
+    # Scatter the M update rows, tiled over M and W.  dma_copy_indirect
+    # addresses whole rows of the result HBM tensor via the per-row index;
+    # row_width keeps the full row stride while a column window is written.
     for m_i in range(ceildiv(M, PARTITION_MAX)):
         m_off = m_i * PARTITION_MAX
         m_size = min(PARTITION_MAX, M - m_off)
-        upd_tile = nb.dma_copy(
-            nb.alloc((m_size, W), vdtype, MemorySpace.SBUF),
-            upd_hbm, (DimSlice(m_off, m_size), DimSlice(0, W)),
-        )
         idx_tile = nb.dma_copy(
             nb.alloc((m_size, 1), idtype, MemorySpace.SBUF),
             idx_hbm, (DimSlice(m_off, m_size), DimSlice(0, 1)),
         )
-        nb.dma_copy_indirect(out_hbm, upd_tile, idx_tile)
+        for w_i in range(ceildiv(W, w_tile)):
+            w_off = w_i * w_tile
+            w_size = min(w_tile, W - w_off)
+            upd_tile = nb.dma_copy(
+                nb.alloc((m_size, w_size), vdtype, MemorySpace.SBUF),
+                upd_hbm, (DimSlice(m_off, m_size), DimSlice(w_off, w_size)),
+            )
+            nb.dma_copy_indirect(
+                out_hbm, upd_tile, idx_tile, row_width=W, free_offset=w_off,
+            )
 
 
 def _emit_gather_rows_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
@@ -713,6 +727,11 @@ def _emit_gather_rows_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
     vdtype = out_val.type.dtype
     idtype = idx_val.type.dtype
 
+    # Tile the row width: a single (m_size, W) tile would overflow SBUF for
+    # wide rows (e.g. an MoE expert's flattened weight, W=786432). Gather a
+    # column window [w_off, w_off+w_size) per DMA, addressing the full row
+    # stride W via row_width so the index still selects whole source rows.
+    w_tile = min(W, max_free_elems(vdtype))
     for m_i in range(ceildiv(M, PARTITION_MAX)):
         m_off = m_i * PARTITION_MAX
         m_size = min(PARTITION_MAX, M - m_off)
@@ -720,11 +739,17 @@ def _emit_gather_rows_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
             nb.alloc((m_size, 1), idtype, MemorySpace.SBUF),
             idx_hbm, (DimSlice(m_off, m_size), DimSlice(0, 1)),
         )
-        # Indirect load: gather m_size rows of src (selected by idx) into SBUF.
-        out_tile = nb.dma_copy_indirect(
-            nb.alloc((m_size, W), vdtype, MemorySpace.SBUF), src_hbm, idx_tile,
-        )
-        nb.dma_copy(out_hbm, out_tile, (DimSlice(m_off, m_size), DimSlice(0, W)))
+        for w_i in range(ceildiv(W, w_tile)):
+            w_off = w_i * w_tile
+            w_size = min(w_tile, W - w_off)
+            # Indirect load: gather a column window of m_size rows of src.
+            out_tile = nb.dma_copy_indirect(
+                nb.alloc((m_size, w_size), vdtype, MemorySpace.SBUF),
+                src_hbm, idx_tile, row_width=W, free_offset=w_off,
+            )
+            nb.dma_copy(
+                out_hbm, out_tile, (DimSlice(m_off, m_size), DimSlice(w_off, w_size))
+            )
 
 
 def _first_cols(nb: Builder, tile: Value, keep: int) -> Value:
