@@ -9,12 +9,13 @@ from __future__ import annotations
 
 from math import prod
 
-from nkigen_lite.core import DType, Value
+from nkigen_lite.core import DType, Value, _DTYPE_BYTES
 from nkigen_lite.nki_ir.ir import (
     Builder,
     DimSlice,
     MemorySpace,
     PARTITION_MAX,
+    SBUF_PER_PARTITION_BYTES,
 )
 from nkigen_lite.nki_ir import ir as nki_ir
 from nkigen_lite.tensor_ir.passes.layout_solver import Layout
@@ -27,6 +28,20 @@ from nkigen_lite.tensor_ir.passes.layout_solver import Layout
 
 def ceildiv(a: int, b: int) -> int:
     return (a + b - 1) // b
+
+
+def max_free_elems(dtype: DType) -> int:
+    """Largest free-dim extent (per partition row) for one data-movement tile.
+
+    Data-movement tiles span the full partition (up to 128 rows), so the
+    free dim is what determines per-partition byte usage. Several such tiles
+    can be live at once (load + store, double-buffering, plus the segment's
+    working set), and the compiler's allocator must fit them all in one
+    partition's SBUF. Budget a conservative fraction of capacity so a handful
+    of concurrent tiles stay well under the limit. Returns at least 1.
+    """
+    elem_bytes = _DTYPE_BYTES[dtype]
+    return max(1, (SBUF_PER_PARTITION_BYTES // 4) // elem_bytes)
 
 
 # ---------------------------------------------------------------------------

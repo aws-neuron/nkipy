@@ -40,6 +40,7 @@ from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
     emit_binary_op,
     emit_unary_op,
     hbm_slices,
+    max_free_elems,
     on_chip_shape,
     unravel,
 )
@@ -185,27 +186,33 @@ def _emit_hbm_copy(nb: Builder, src: Value, dst: Value, shape: tuple[int, ...]):
         nb.dma_copy(dst, tile, dst_slices)
         return
     tile_p = min(shape[-2], PARTITION_MAX) if len(shape) >= 2 else 1
-    tile_f = shape[-1] if len(shape) >= 2 else shape[0]
+    f_extent = shape[-1] if len(shape) >= 2 else shape[0]
     p_extent = shape[-2] if len(shape) >= 2 else 1
     batch_dims = list(shape[:-2]) if len(shape) > 2 else []
     n_batch = prod(batch_dims) if batch_dims else 1
+    # Cap the free extent so a (tile_p, tile_f) tile fits one SBUF partition;
+    # a vocab-wide row (e.g. [1, 128256]) otherwise blows the per-partition cap.
+    tile_f = min(f_extent, max_free_elems(src.type.dtype))
 
     for batch_flat in range(n_batch):
         batch_idx = unravel(batch_flat, batch_dims) if batch_dims else ()
         for p_i in range(ceildiv(p_extent, tile_p)):
             p_off = p_i * tile_p
             p_size = min(tile_p, p_extent - p_off)
-            slices = []
-            for bi in batch_idx:
-                slices.append(DimSlice(bi, 1))
-            if len(shape) >= 2:
-                slices.append(DimSlice(p_off, p_size))
-            slices.append(DimSlice(0, tile_f))
-            tile = nb.dma_copy(
-                nb.alloc((p_size, tile_f), src.type.dtype, MemorySpace.SBUF),
-                src, slices,
-            )
-            nb.dma_copy(dst, tile, slices)
+            for f_i in range(ceildiv(f_extent, tile_f)):
+                f_off = f_i * tile_f
+                f_size = min(tile_f, f_extent - f_off)
+                slices = []
+                for bi in batch_idx:
+                    slices.append(DimSlice(bi, 1))
+                if len(shape) >= 2:
+                    slices.append(DimSlice(p_off, p_size))
+                slices.append(DimSlice(f_off, f_size))
+                tile = nb.dma_copy(
+                    nb.alloc((p_size, f_size), src.type.dtype, MemorySpace.SBUF),
+                    src, slices,
+                )
+                nb.dma_copy(dst, tile, slices)
 
 
 def _split_on_layout_conflict(

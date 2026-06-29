@@ -31,6 +31,7 @@ from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
     build_out_slices,
     ceildiv,
     flat_range_to_src_chunks,
+    max_free_elems,
     row_major_strides,
     unravel,
 )
@@ -108,6 +109,41 @@ def _largest_common_prefix(in_shape: tuple[int, ...], out_shape: tuple[int, ...]
     return max(common)
 
 
+def _prefix_row_segments(r0, p, free, in_shape, in_strides, out_shape, out_strides):
+    """Split partition rows [r0, r0+p) into segments that are a single
+    rectangle on *both* the source and destination.
+
+    A 128-row tile only forms one source/destination rectangle when its row
+    boundaries coincide with a leading-dim boundary of *each* shape. When
+    ``p_common`` is not itself such a boundary (e.g. reshaping (10,30,20) ->
+    (300,20): tiles cut at rows 128/256, mid-way through the 30-row source
+    blocks), the tile spans several rectangles. We find the row-boundary cut
+    points each side induces, merge them, and yield ``(rows, src_slices,
+    dst_slices)`` per segment — each a single rectangle on both sides.
+    """
+    def cut_rows(chunks):
+        # Cumulative covered rows at each chunk boundary (relative to r0).
+        cuts, acc = [], 0
+        for _slices, covered in chunks:
+            acc += covered // free
+            cuts.append(acc)
+        return cuts
+
+    src_chunks = flat_range_to_src_chunks(r0 * free, p * free, in_shape, in_strides)
+    dst_chunks = flat_range_to_src_chunks(r0 * free, p * free, out_shape, out_strides)
+    bounds = sorted(set(cut_rows(src_chunks) + cut_rows(dst_chunks)))
+
+    lo = 0
+    for hi in bounds:
+        rows = hi - lo
+        (src_slices, _), = flat_range_to_src_chunks(
+            (r0 + lo) * free, rows * free, in_shape, in_strides)
+        (dst_slices, _), = flat_range_to_src_chunks(
+            (r0 + lo) * free, rows * free, out_shape, out_strides)
+        yield rows, src_slices, dst_slices
+        lo = hi
+
+
 def _lower_reshape_via_prefix(
     in_shape: tuple[int, ...],
     out_shape: tuple[int, ...],
@@ -135,20 +171,15 @@ def _lower_reshape_via_prefix(
 
     for r0 in range(0, p_common, PARTITION_MAX):
         p = min(PARTITION_MAX, p_common - r0)
-        # Source rows [r0:r0+p] of width in_free are contiguous in flat order
-        # and (since the split is at a leading-dim boundary of in_shape) form a
-        # single source rectangle; likewise for the output.
-        src_chunks = flat_range_to_src_chunks(
-            r0 * in_free, p * in_free, in_shape, in_strides)
-        dst_chunks = flat_range_to_src_chunks(
-            r0 * out_free, p * out_free, out_shape, out_strides)
-        # p_common is a shared leading boundary, so each side is one rectangle.
-        (src_slices, _), = src_chunks
-        (dst_slices, _), = dst_chunks
-        tile = b.dma_copy(
-            b.alloc((p, in_free), dtype, MemorySpace.SBUF), x_hbm, src_slices)
-        tile = b.view(tile, (p, out_free))
-        b.dma_copy(y_hbm, tile, dst_slices)
+        # A p-row tile is a single source/destination rectangle only when its
+        # boundaries align with a leading-dim boundary of each shape. When they
+        # do not, split into segments that are one rectangle on both sides.
+        for rows, src_slices, dst_slices in _prefix_row_segments(
+            r0, p, in_free, in_shape, in_strides, out_shape, out_strides):
+            tile = b.dma_copy(
+                b.alloc((rows, in_free), dtype, MemorySpace.SBUF), x_hbm, src_slices)
+            tile = b.view(tile, (rows, out_free))
+            b.dma_copy(y_hbm, tile, dst_slices)
 
     b.set_outputs({"y": y_hbm})
     return b.graph
@@ -545,16 +576,63 @@ def emit_reshape(nb: Builder, x_hbm, y_hbm, in_shape, out_shape, dtype) -> None:
         _emit_reshape_scalar(nb, x_hbm, y_hbm, in_shape, out_shape, dtype)
         return
 
+    # When a path's natural tile would be wider than one SBUF partition can
+    # hold (e.g. a vocab-sized [1, 128256] row), fall back to a bounded flat
+    # copy — always correct since a reshape preserves row-major flat order.
+    cap = max_free_elems(dtype)
+
     # Prefix path: when shapes share a leading prefix-product, emit one
     # load + view + store per partition tile. Handles (Co,*K,Ci)->(Co,K*Ci),
     # trailing-1 additions, and single-partition-row reshapes.
     p_common = _largest_common_prefix(in_shape, out_shape)
     if p_common > 1 or (p_common == 1 and in_shape[0] == 1 and out_shape[0] == 1):
-        _emit_reshape_via_prefix(nb, x_hbm, y_hbm, in_shape, out_shape, p_common, dtype)
+        if prod(in_shape) // p_common > cap:
+            _emit_reshape_flat_copy(nb, x_hbm, y_hbm, in_shape, out_shape, dtype)
+        else:
+            _emit_reshape_via_prefix(nb, x_hbm, y_hbm, in_shape, out_shape, p_common, dtype)
     elif in_shape[-1] == out_shape[-1]:
-        _emit_reshape_same_f(nb, x_hbm, y_hbm, in_shape, out_shape, dtype)
+        if in_shape[-1] > cap:
+            _emit_reshape_flat_copy(nb, x_hbm, y_hbm, in_shape, out_shape, dtype)
+        else:
+            _emit_reshape_same_f(nb, x_hbm, y_hbm, in_shape, out_shape, dtype)
     else:
-        _emit_reshape_diff_f(nb, x_hbm, y_hbm, in_shape, out_shape, dtype)
+        if in_shape[-1] > cap or out_shape[-1] > cap:
+            _emit_reshape_flat_copy(nb, x_hbm, y_hbm, in_shape, out_shape, dtype)
+        else:
+            _emit_reshape_diff_f(nb, x_hbm, y_hbm, in_shape, out_shape, dtype)
+
+
+def _emit_reshape_flat_copy(nb, x_hbm, y_hbm, in_shape, out_shape, dtype):
+    """Reshape via a bounded flat copy, used when a row is too wide for SBUF.
+
+    A reshape preserves row-major flat order, so element ``i`` of the source
+    maps to element ``i`` of the output. We walk the flat range in chunks no
+    wider than one SBUF partition can hold, and split each chunk into segments
+    that are a single rectangle on *both* the source and destination (a chunk
+    may straddle a leading-dim boundary of either shape). Each segment is one
+    (1, seg) load + store — no on-chip reshape needed since flat positions
+    already coincide.
+    """
+    total = prod(in_shape)
+    cap = max_free_elems(dtype)
+    in_strides = row_major_strides(in_shape)
+    out_strides = row_major_strides(out_shape)
+
+    pos = 0
+    while pos < total:
+        budget = min(cap, total - pos)
+        # First chunk's `covered` is the largest single rectangle starting at
+        # `pos` within `budget` elements, on each side independently. Taking
+        # the smaller makes the segment one rectangle on *both* sides.
+        src_first = flat_range_to_src_chunks(pos, budget, in_shape, in_strides)[0]
+        dst_first = flat_range_to_src_chunks(pos, budget, out_shape, out_strides)[0]
+        seg = min(src_first[1], dst_first[1])
+        (src_slices, _), = flat_range_to_src_chunks(pos, seg, in_shape, in_strides)
+        (dst_slices, _), = flat_range_to_src_chunks(pos, seg, out_shape, out_strides)
+        tile = nb.dma_copy(
+            nb.alloc((1, seg), dtype, MemorySpace.SBUF), x_hbm, src_slices)
+        nb.dma_copy(y_hbm, tile, dst_slices)
+        pos += seg
 
 
 def _emit_reshape_via_prefix(nb, x_hbm, y_hbm, in_shape, out_shape, p_common, dtype):
@@ -568,16 +646,15 @@ def _emit_reshape_via_prefix(nb, x_hbm, y_hbm, in_shape, out_shape, p_common, dt
 
     for r0 in range(0, p_common, PARTITION_MAX):
         p = min(PARTITION_MAX, p_common - r0)
-        src_chunks = flat_range_to_src_chunks(
-            r0 * in_free, p * in_free, in_shape, in_strides)
-        dst_chunks = flat_range_to_src_chunks(
-            r0 * out_free, p * out_free, out_shape, out_strides)
-        (src_slices, _), = src_chunks
-        (dst_slices, _), = dst_chunks
-        tile = nb.dma_copy(
-            nb.alloc((p, in_free), dtype, MemorySpace.SBUF), x_hbm, src_slices)
-        tile = nb.view(tile, (p, out_free))
-        nb.dma_copy(y_hbm, tile, dst_slices)
+        # A tile of p rows may straddle leading-dim boundaries of either shape,
+        # in which case it is not a single rectangle. Split it into segments
+        # that are one rectangle on both sides and emit a load+view+store each.
+        for rows, src_slices, dst_slices in _prefix_row_segments(
+            r0, p, in_free, in_shape, in_strides, out_shape, out_strides):
+            tile = nb.dma_copy(
+                nb.alloc((rows, in_free), dtype, MemorySpace.SBUF), x_hbm, src_slices)
+            tile = nb.view(tile, (rows, out_free))
+            nb.dma_copy(y_hbm, tile, dst_slices)
 
 
 def _emit_reshape_scalar(nb, x_hbm, y_hbm, in_shape, out_shape, dtype):
