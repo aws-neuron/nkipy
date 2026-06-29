@@ -17,8 +17,18 @@ from nkipy.runtime import DeviceKernel, DeviceTensor
 
 logger = get_logger()
 
-BACKEND = "hlo"
-OUTPUT_PREFIX = "output"
+BACKEND = "nkigen-lite"
+
+
+def _bind_output(kernel, tensor):
+    """Bind a single-output kernel's result to ``tensor``.
+
+    The NEFF output tensor name differs by backend (HLO emits ``output0``,
+    nkigen-lite emits ``<key>_out``), so look it up from the compiled kernel
+    instead of hardcoding it. All kernels here have exactly one output.
+    """
+    (out_name,) = kernel.output_tensors_info.keys()
+    return {out_name: tensor}
 
 
 class Qwen3EmbeddingModel:
@@ -50,10 +60,13 @@ class Qwen3EmbeddingModel:
         self.lnc = lnc
         self.use_fused_layer = use_fused_layer
 
-        # Build compiler args with LNC setting
-        self.additional_compiler_args = (
-            f" --lnc {lnc}  --enable-mixed-precision-accumulation"
-        )
+        # Build compiler args with LNC setting.
+        # --enable-mixed-precision-accumulation is an HLO-path flag; the
+        # nkigen-lite path forwards compiler args straight to neuronx-cc, which
+        # rejects it (NCC_EARG002), so only pass it for the HLO backend.
+        self.additional_compiler_args = f" --lnc {lnc}"
+        if BACKEND == "hlo":
+            self.additional_compiler_args += "  --enable-mixed-precision-accumulation"
 
         # Extract and prepare global weights
         self.tok_embedding_device = DeviceTensor.from_torch(
@@ -366,7 +379,7 @@ class Qwen3EmbeddingModel:
                 "tok_embedding": self.tok_embedding_device,
                 "token_ids": input_ids_device,
             },
-            outputs={f"{OUTPUT_PREFIX}0": hidden_states},
+            outputs=_bind_output(self.token_embedding_kernel, hidden_states),
         )
 
         # Transformer layers
@@ -395,7 +408,7 @@ class Qwen3EmbeddingModel:
                         "gate_up_bias": self.gate_up_bias_device,
                         "down_bias": self.down_bias_device,
                     },
-                    outputs={f"{OUTPUT_PREFIX}0": layer_output},
+                    outputs=_bind_output(self.shared_layer_kernel, layer_output),
                 )
                 # Swap tensors for next iteration
                 hidden_states, layer_output = layer_output, hidden_states
@@ -422,7 +435,7 @@ class Qwen3EmbeddingModel:
                         "cos": self.cos,
                         "sin": self.sin,
                     },
-                    outputs={f"{OUTPUT_PREFIX}0": attn_output},
+                    outputs=_bind_output(self.attention_kernel, attn_output),
                 )
 
                 # 2. Post-attention RMSNorm
@@ -431,7 +444,7 @@ class Qwen3EmbeddingModel:
                         "x": attn_output,
                         "weight": layer_weight["post_attention_layernorm_weight"],
                     },
-                    outputs={f"{OUTPUT_PREFIX}0": normed_output},
+                    outputs=_bind_output(self.rmsnorm_kernel, normed_output),
                 )
 
                 # 3. FFN
@@ -443,7 +456,7 @@ class Qwen3EmbeddingModel:
                         "gate_up_bias": self.gate_up_bias_device,
                         "down_bias": self.down_bias_device,
                     },
-                    outputs={f"{OUTPUT_PREFIX}0": ffn_output},
+                    outputs=_bind_output(self.ffn_kernel, ffn_output),
                 )
 
                 # 4. Add residual (FFN output + attention output)
@@ -460,7 +473,7 @@ class Qwen3EmbeddingModel:
 
         self.final_norm_kernel(
             inputs={"x": hidden_states, "weight": self.norm_weight_device},
-            outputs={f"{OUTPUT_PREFIX}0": normed_hidden_states},
+            outputs=_bind_output(self.final_norm_kernel, normed_hidden_states),
         )
 
         final_hidden_states = normed_hidden_states.numpy()

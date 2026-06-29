@@ -9,13 +9,30 @@ import torch.distributed as dist
 from config import Config, get_config
 from kernels.sampling import greedy_sampling, greedy_sampling_with_embedding
 from kernels.transformer_layer import transformer_layer
+from nkipy.core.trace import NKIPyKernel
 from nkipy.runtime import DeviceKernel, DeviceTensor
 from safetensors.torch import load_file
 from transformers import AutoTokenizer
 from utils import print_log
 
 BUILD_DIR = "./build"
-USE_NKI_RMSNORM = True
+# Compilation backend: "hlo" (default) or "nkigen-lite".
+# NOTE: nkigen-lite does not yet compile the fused MoE transformer layer (it
+# overflows SBUF during lowering); use "hlo" for the full model.
+BACKEND = "hlo"
+
+
+def _traced(fn):
+    """Wrap a kernel fn for the selected backend (no-op for the default HLO)."""
+    if BACKEND == "hlo":
+        return fn
+    return NKIPyKernel.trace(fn, backend=BACKEND)
+
+
+# The NKI rmsnorm path is only a demo of embedding a raw NKI kernel; it requires
+# a matching NKI compiler version. Use the pure-NKIPy rmsnorm so the example runs
+# on the default (HLO) backend.
+USE_NKI_RMSNORM = False
 
 
 class Qwen3Model:
@@ -165,7 +182,7 @@ class Qwen3Model:
             np.empty(shape=(1), dtype=np.int32), "start_pos"
         )
         self.kernel_cte = DeviceKernel.compile_and_load(
-            transformer_layer,
+            _traced(transformer_layer),
             name="cte_layer",
             x=x_context,
             start_pos=None,
@@ -186,7 +203,7 @@ class Qwen3Model:
         )
 
         self.kernel_tkg_greedy_sampling = DeviceKernel.compile_and_load(
-            greedy_sampling,
+            _traced(greedy_sampling),
             name="tkg_greedy_sampling",
             h=x_token,
             norm_weight=self.norm_weight,
@@ -197,7 +214,7 @@ class Qwen3Model:
             additional_compiler_args=self.config.additional_compiler_args_nkipy,
         )
         self.kernel_cte_greedy_sampling = DeviceKernel.compile_and_load(
-            greedy_sampling,
+            _traced(greedy_sampling),
             name="cte_greedy_sampling",
             h=x_context,
             norm_weight=self.norm_weight,
@@ -209,7 +226,7 @@ class Qwen3Model:
         )
 
         self.kernel_tkg = DeviceKernel.compile_and_load(
-            transformer_layer,
+            _traced(transformer_layer),
             name="tkg_layer",
             x=x_token,
             start_pos=start_pos,
@@ -231,7 +248,7 @@ class Qwen3Model:
 
         # Fused greedy sampling + embedding lookup kernels (for double-buffered decode)
         self.kernel_tkg_greedy_sampling_embed = DeviceKernel.compile_and_load(
-            greedy_sampling_with_embedding,
+            _traced(greedy_sampling_with_embedding),
             name="tkg_greedy_sampling_embed",
             h=x_token,
             norm_weight=self.norm_weight,
@@ -243,7 +260,7 @@ class Qwen3Model:
             additional_compiler_args=self.config.additional_compiler_args_nkipy,
         )
         self.kernel_cte_greedy_sampling_embed = DeviceKernel.compile_and_load(
-            greedy_sampling_with_embedding,
+            _traced(greedy_sampling_with_embedding),
             name="cte_greedy_sampling_embed",
             h=x_context,
             norm_weight=self.norm_weight,
