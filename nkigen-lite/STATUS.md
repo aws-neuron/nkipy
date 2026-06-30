@@ -11,8 +11,8 @@ is **performance**, not correctness.
 
 | Model | Compiles | Runs e2e | Numerically correct | Notes |
 |-------|:--------:|:--------:|:-------------------:|-------|
-| **Qwen3-30B-A3B** (generative, MoE, TP=4) | yes | yes | yes — matches HLO | ~0.23 tok/s vs HLO ~44 — perf gap |
-| **Qwen3-Embedding-0.6B** (single-core) | yes | yes | yes — min cosine 0.9997 vs HF | default backend; ~118x slower than HLO (see Performance) |
+| **Qwen3-30B-A3B** (generative, MoE, TP=4) | yes | yes | yes — matches HLO | 0.38 tok/s vs HLO 38.1 (~100x); MoE loop still dominates |
+| **Qwen3-Embedding-0.6B** (single-core) | yes | yes | yes — min cosine 0.9997 vs HF | default backend; ~20x slower than HLO after lowering fixes (see Performance) |
 
 ## What works
 

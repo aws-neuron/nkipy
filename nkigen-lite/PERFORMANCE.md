@@ -31,6 +31,33 @@ QWEN3_BACKEND=nkigen-lite uv run python example_retrieval.py --benchmark
 
 Runs are very stable (std < 0.2 ms), so deltas below noise are meaningful.
 
+### Secondary benchmark — Qwen3-30B-A3B (generative, MoE, TP=4)
+
+`examples/models/qwen3/evaluate.py --benchmark`, TP=4 on trn2, checkpoint
+`/home/ubuntu/models/Qwen3-30B-A3B-TP4`, `-n 64`, 1 warmup + 3 runs, clean
+`build/` per backend. Both backends produce correct text ("...Paris. The
+capital of the United Kingdom is London...").
+
+```bash
+cd examples/models/qwen3 && rm -rf build/
+QWEN3_BACKEND=<hlo|nkigen-lite> uv run torchrun --nproc-per-node 4 \
+    evaluate.py --benchmark -n 64 \
+    --checkpoint /home/ubuntu/models/Qwen3-30B-A3B-TP4 \
+    --model Qwen/Qwen3-30B-A3B --benchmark-warmup 1 --benchmark-runs 3
+```
+
+| Backend | TTFT | Decode p50 | Throughput | vs HLO |
+|---------|-----:|-----------:|-----------:|-------:|
+| HLO (reference) | 62.4 ms | 25.9 ms | 38.1 tok/s | 1.0x |
+| nkigen-lite — original baseline | — | — | ~0.23 tok/s | ~165x |
+| nkigen-lite — current | 7296 ms | 2614 ms | 0.38 tok/s | ~100x |
+
+The lowering fixes carry over (~0.23 → 0.38 tok/s, ~1.65x), but the 30B gap is
+still ~100x because its dominant cost is the **fully-unrolled 64-expert MoE
+loop**, which the embedding model doesn't have and which these
+collapse-onto-partition fixes don't touch. That loop is the main 30B lever and
+is not yet addressed.
+
 ---
 
 ## Root cause (why the gap exists)
