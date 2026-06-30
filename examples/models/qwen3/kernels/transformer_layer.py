@@ -30,12 +30,19 @@ def transformer_layer(
     gate_up_weight,
     down_weight,
     configs: Config,
+    freqs_cos_cache=None,
+    freqs_sin_cache=None,
+    causal_mask_cache=None,
 ):
     """
     Single transformer layer for both context encoding (prefill) and token generation (decode).
 
     When start_pos is None: prefill mode (process full context)
     When start_pos is provided: decode mode (process single token)
+
+    In decode mode, freqs_cos_cache/freqs_sin_cache supply the RoPE cos/sin
+    tables as runtime kernel inputs (indexed by start_pos), avoiding a large
+    comptime constant promotion that overflows the nkigen-lite constant limit.
     """
     # Apply input RMSNorm
     norm_x = rmsnorm_kernel(x, input_weight, configs.norm_eps)
@@ -54,6 +61,9 @@ def transformer_layer(
         cache_v,
         start_pos=start_pos,
         o_weight=o_weight,
+        freqs_cos_cache=freqs_cos_cache,
+        freqs_sin_cache=freqs_sin_cache,
+        causal_mask_cache=causal_mask_cache,
     )
 
     # Residual connection after attention

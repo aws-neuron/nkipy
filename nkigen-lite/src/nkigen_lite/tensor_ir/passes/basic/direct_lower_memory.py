@@ -1,0 +1,1004 @@
+"""Direct lowering of memory/shape ops (reshape, slice, concat) to NKI IR.
+
+These are pure data-movement ops with no compute. Each is lowered to tiled
+DMA copies between HBM source and destination with appropriate indexing.
+
+  - reshape: reinterprets the HBM buffer layout. When the total element count
+    is preserved, this is a tiled copy with different source/destination
+    indexing derived from the shape change.
+
+  - slice: extracts a contiguous sub-tensor from the source at given
+    start/stop/stride offsets. Lowered as DMA loads from offset positions.
+
+  - concat: assembles multiple source tensors along a given axis into one
+    output tensor. Lowered as DMA copies from each source into the
+    appropriate offset of the destination.
+"""
+
+from __future__ import annotations
+
+from math import prod
+
+from nkigen_lite.core import DType, Graph
+from nkigen_lite.nki_ir.ir import (
+    Builder,
+    DimSlice,
+    MemorySpace,
+    PARTITION_MAX,
+)
+
+from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
+    build_out_slices,
+    ceildiv,
+    flat_range_to_src_chunks,
+    max_free_elems,
+    row_major_strides,
+    unravel,
+)
+
+
+# ---------------------------------------------------------------------------
+# Reshape
+# ---------------------------------------------------------------------------
+
+
+def lower_reshape(
+    in_shape: tuple[int, ...],
+    out_shape: tuple[int, ...],
+    dtype: DType = DType.F32,
+) -> Graph:
+    """Lower reshape as tiled DMA copies with linearized index remapping.
+
+    Both shapes must have the same total element count. Since both are
+    row-major in HBM, we iterate per output row (the F-dim), compute the
+    flat offset of that row, and express it as a source coordinate for DMA.
+
+    Tiling: output P-dim tiled at min(out[-2], 128). Each row of the output
+    tile maps to a contiguous range in the source (of length out[-1]),
+    which we express as source coordinates per row.
+    """
+    if prod(in_shape) != prod(out_shape):
+        raise ValueError(
+            f"reshape: element count mismatch {prod(in_shape)} vs {prod(out_shape)}"
+        )
+
+    total = prod(in_shape)
+
+    # If the shapes share a leading prefix-product P, the reshape only regroups
+    # each row's free dimension (in_f -> out_f) with the partition axis fixed.
+    # That is a zero-copy on-chip ``view`` (legal: SBUF views must keep the
+    # partition dim), so we can tile P and emit one load+view+store per tile —
+    # no scratch round-trip. Covers conv im2col reshapes like
+    # (Co,*K,Ci) -> (Co, K*Ci) which otherwise blew up via scratch.
+    # P == 1 is valid when the in_shape also has leading dim 1 (i.e., the
+    # prefix boundary is an actual row boundary in the source).
+    # Check prefix BEFORE same-last-dim to avoid degenerate cases like
+    # (1, 1152, 1) -> (1, 1152, 1, 1, 1) where last-dim == 1 causes O(N) ops.
+    p_common = _largest_common_prefix(in_shape, out_shape)
+    if p_common > 1 or (p_common == 1 and in_shape[0] == 1 and out_shape[0] == 1):
+        return _lower_reshape_via_prefix(in_shape, out_shape, p_common, dtype)
+
+    # If the last dim matches, we can load multi-row tiles directly
+    if in_shape[-1] == out_shape[-1]:
+        return _lower_reshape_same_last_dim(in_shape, out_shape, dtype)
+
+    # General case: use an HBM scratch buffer. Load source rows into scratch
+    # in flat order, then reload from scratch in output shape. Since both
+    # shapes describe the same flat data in row-major order, the scratch
+    # buffer (treated as flat) bridges the two interpretations.
+    return _lower_reshape_via_scratch(in_shape, out_shape, dtype)
+
+
+def _largest_common_prefix(in_shape: tuple[int, ...], out_shape: tuple[int, ...]) -> int:
+    """Largest leading prefix-product common to both shapes (excluding the last
+    dim of each, which becomes the per-row free dimension).
+
+    e.g. (1152,2,16,16,3) and (1152,1536) share prefix product 1152; the
+    remaining free dims are 2*16*16*3=1536 and 1536, which match by construction
+    (total element counts are equal).
+    """
+    def prefixes(shape):
+        out = {1}
+        p = 1
+        for s in shape[:-1]:
+            p *= s
+            out.add(p)
+        return out
+
+    common = prefixes(in_shape) & prefixes(out_shape)
+    return max(common)
+
+
+def _prefix_row_segments(r0, p, free, in_shape, in_strides, out_shape, out_strides):
+    """Split partition rows [r0, r0+p) into segments that are a single
+    rectangle on *both* the source and destination.
+
+    A 128-row tile only forms one source/destination rectangle when its row
+    boundaries coincide with a leading-dim boundary of *each* shape. When
+    ``p_common`` is not itself such a boundary (e.g. reshaping (10,30,20) ->
+    (300,20): tiles cut at rows 128/256, mid-way through the 30-row source
+    blocks), the tile spans several rectangles. We find the row-boundary cut
+    points each side induces, merge them, and yield ``(rows, src_slices,
+    dst_slices)`` per segment — each a single rectangle on both sides.
+    """
+    def cut_rows(chunks):
+        # Cumulative covered rows at each chunk boundary (relative to r0).
+        cuts, acc = [], 0
+        for _slices, covered in chunks:
+            acc += covered // free
+            cuts.append(acc)
+        return cuts
+
+    src_chunks = flat_range_to_src_chunks(r0 * free, p * free, in_shape, in_strides)
+    dst_chunks = flat_range_to_src_chunks(r0 * free, p * free, out_shape, out_strides)
+    bounds = sorted(set(cut_rows(src_chunks) + cut_rows(dst_chunks)))
+
+    lo = 0
+    for hi in bounds:
+        rows = hi - lo
+        (src_slices, _), = flat_range_to_src_chunks(
+            (r0 + lo) * free, rows * free, in_shape, in_strides)
+        (dst_slices, _), = flat_range_to_src_chunks(
+            (r0 + lo) * free, rows * free, out_shape, out_strides)
+        yield rows, src_slices, dst_slices
+        lo = hi
+
+
+def _lower_reshape_via_prefix(
+    in_shape: tuple[int, ...],
+    out_shape: tuple[int, ...],
+    p_common: int,
+    dtype: DType,
+) -> Graph:
+    """Reshape that only regroups the free dimension, with partition fixed.
+
+    The shapes share a leading prefix-product ``p_common`` (= partition extent).
+    Each partition row holds ``in_free = total/p_common`` source elements that
+    become ``out_free = total/p_common`` output elements at the same flat
+    positions — a free-dim ``view``. Tile the partition at 128 and emit one
+    contiguous load + view + contiguous store per tile.
+    """
+    total = prod(in_shape)
+    in_free = total // p_common
+    out_free = total // p_common
+
+    b = Builder("reshape")
+    x_hbm = b.add_input("x", in_shape, dtype)
+    y_hbm = b.add_input("y", out_shape, dtype)
+
+    in_strides = row_major_strides(in_shape)
+    out_strides = row_major_strides(out_shape)
+
+    for r0 in range(0, p_common, PARTITION_MAX):
+        p = min(PARTITION_MAX, p_common - r0)
+        # A p-row tile is a single source/destination rectangle only when its
+        # boundaries align with a leading-dim boundary of each shape. When they
+        # do not, split into segments that are one rectangle on both sides.
+        for rows, src_slices, dst_slices in _prefix_row_segments(
+            r0, p, in_free, in_shape, in_strides, out_shape, out_strides):
+            tile = b.dma_copy(
+                b.alloc((rows, in_free), dtype, MemorySpace.SBUF), x_hbm, src_slices)
+            tile = b.view(tile, (rows, out_free))
+            b.dma_copy(y_hbm, tile, dst_slices)
+
+    b.set_outputs({"y": y_hbm})
+    return b.graph
+
+
+def _lower_reshape_via_scratch(
+    in_shape: tuple[int, ...],
+    out_shape: tuple[int, ...],
+    dtype: DType,
+) -> Graph:
+    """Reshape when inner dims differ and the shapes share no usable leading
+    prefix, using a flat HBM scratch buffer.
+
+    Strategy: copy the entire source into a scratch buffer (preserving flat
+    order), then reload from scratch using output coordinates. Both source and
+    output are row-major views of the same flat data, so the scratch buffer
+    bridges between them. This is the slow fallback (it can reassemble output
+    rows from fragments); the common-prefix and same-last-dim paths handle the
+    fast cases.
+    """
+    total = prod(in_shape)
+    out_rank = len(out_shape)
+    in_f = in_shape[-1]
+    out_f = out_shape[-1]
+
+    # Scratch: 2D with the source's row width, flattened leading dims
+    total_rows_in = total // in_f
+    scratch_shape = (total_rows_in, in_f)
+
+    # Output iteration
+    out_p_extent = out_shape[-2] if out_rank >= 2 else 1
+    batch_dims = list(out_shape[:-2]) if out_rank > 2 else []
+    n_batch = prod(batch_dims) if batch_dims else 1
+
+    b = Builder("reshape")
+    x_hbm = b.add_input("x", in_shape, dtype)
+    y_hbm = b.add_input("y", out_shape, dtype)
+    scratch_hbm = b.add_input("scratch", scratch_shape, dtype)
+
+    # Phase 1: copy source into scratch (same row width, just flatten leading dims)
+    in_p_extent = in_shape[-2] if len(in_shape) >= 2 else 1
+    in_batch_dims = list(in_shape[:-2]) if len(in_shape) > 2 else []
+    in_n_batch = prod(in_batch_dims) if in_batch_dims else 1
+    tile_p_in = min(in_p_extent, PARTITION_MAX)
+    n_p_tiles_in = ceildiv(in_p_extent, tile_p_in)
+
+    row_offset = 0
+    for batch_flat in range(in_n_batch):
+        batch_idx = unravel(batch_flat, in_batch_dims) if in_batch_dims else ()
+        for p_i in range(n_p_tiles_in):
+            p_off = p_i * tile_p_in
+            p_size = min(tile_p_in, in_p_extent - p_off)
+
+            src_slices = []
+            for bi in batch_idx:
+                src_slices.append(DimSlice(bi, 1))
+            if len(in_shape) >= 2:
+                src_slices.append(DimSlice(p_off, p_size))
+            src_slices.append(DimSlice(0, in_f))
+
+            scratch_slices = [DimSlice(row_offset, p_size), DimSlice(0, in_f)]
+
+            tile = b.dma_copy(
+                b.alloc((p_size, in_f), dtype, MemorySpace.SBUF),
+                x_hbm, src_slices,
+            )
+            b.dma_copy(scratch_hbm, tile, scratch_slices)
+            row_offset += p_size
+
+    # Phase 2: reload from scratch using output coordinates.
+    # Each output row of out_f elements maps to a contiguous range in scratch.
+    # If out_f <= in_f and aligned, one load suffices. If out_f > in_f, the
+    # output row spans multiple scratch rows — copy each chunk separately.
+    out_strides = row_major_strides(out_shape)
+    for batch_flat in range(n_batch):
+        batch_idx = unravel(batch_flat, batch_dims) if batch_dims else ()
+        for p_i in range(out_p_extent):
+            flat_offset = 0
+            for i, bi in enumerate(batch_idx):
+                flat_offset += bi * out_strides[i]
+            if out_rank >= 2:
+                flat_offset += p_i * out_strides[-2]
+
+            row_flat = flat_offset
+            scratch_row = row_flat // in_f
+            scratch_col = row_flat % in_f
+
+            if scratch_col == 0 and out_f <= in_f:
+                scratch_slices = [DimSlice(scratch_row, 1), DimSlice(0, out_f)]
+                tile = b.dma_copy(
+                    b.alloc((1, out_f), dtype, MemorySpace.SBUF),
+                    scratch_hbm, scratch_slices,
+                )
+                dst_slices = build_out_slices(batch_idx, p_i, 1, out_f, out_rank)
+                b.dma_copy(y_hbm, tile, dst_slices)
+            elif scratch_col + out_f <= in_f:
+                scratch_slices = [DimSlice(scratch_row, 1), DimSlice(scratch_col, out_f)]
+                tile = b.dma_copy(
+                    b.alloc((1, out_f), dtype, MemorySpace.SBUF),
+                    scratch_hbm, scratch_slices,
+                )
+                dst_slices = build_out_slices(batch_idx, p_i, 1, out_f, out_rank)
+                b.dma_copy(y_hbm, tile, dst_slices)
+            else:
+                # Output row spans multiple scratch rows — copy chunk by chunk
+                remaining = out_f
+                out_col = 0
+                cur_row = scratch_row
+                cur_col = scratch_col
+                while remaining > 0:
+                    chunk = min(remaining, in_f - cur_col)
+                    scratch_slices = [DimSlice(cur_row, 1), DimSlice(cur_col, chunk)]
+                    tile = b.dma_copy(
+                        b.alloc((1, chunk), dtype, MemorySpace.SBUF),
+                        scratch_hbm, scratch_slices,
+                    )
+                    dst_slices = []
+                    for bi in batch_idx:
+                        dst_slices.append(DimSlice(bi, 1))
+                    if out_rank >= 2:
+                        dst_slices.append(DimSlice(p_i, 1))
+                    dst_slices.append(DimSlice(out_col, chunk))
+                    b.dma_copy(y_hbm, tile, dst_slices)
+                    remaining -= chunk
+                    out_col += chunk
+                    cur_row += 1
+                    cur_col = 0
+
+    b.set_outputs({"y": y_hbm})
+    return b.graph
+
+
+def _lower_reshape_same_last_dim(
+    in_shape: tuple[int, ...],
+    out_shape: tuple[int, ...],
+    dtype: DType,
+) -> Graph:
+    """Optimized reshape when the last dim is unchanged (common case).
+
+    When in_shape[-1] == out_shape[-1], each output row maps directly to a
+    source row (just at a different multi-dimensional index). We can load
+    multi-row tiles since consecutive output rows are also consecutive in
+    the source.
+    """
+    out_rank = len(out_shape)
+    tile_f = out_shape[-1]
+    p_extent = out_shape[-2] if out_rank >= 2 else 1
+    tile_p = min(p_extent, PARTITION_MAX)
+    n_p_tiles = ceildiv(p_extent, tile_p)
+    batch_dims = list(out_shape[:-2]) if out_rank > 2 else []
+    n_batch = prod(batch_dims) if batch_dims else 1
+
+    out_strides = row_major_strides(out_shape)
+    in_strides = row_major_strides(in_shape)
+
+    b = Builder("reshape")
+    x_hbm = b.add_input("x", in_shape, dtype)
+    y_hbm = b.add_input("y", out_shape, dtype)
+
+    for batch_flat in range(n_batch):
+        batch_idx = unravel(batch_flat, batch_dims) if batch_dims else ()
+        for p_i in range(n_p_tiles):
+            p_off = p_i * tile_p
+            p_size = min(tile_p, p_extent - p_off)
+
+            flat_offset = 0
+            for i, bi in enumerate(batch_idx):
+                flat_offset += bi * out_strides[i]
+            if out_rank >= 2:
+                flat_offset += p_off * out_strides[-2]
+
+            n_elements = p_size * tile_f
+            # The tile's flat range may cross a source leading-dim boundary
+            # (e.g. collapsing (3, 100, 8) into (300, 8)), in which case it is
+            # not a single source rectangle. Split it into maximal rectangles;
+            # the aligned fast path yields exactly one chunk. Each chunk is a
+            # whole number of rows (last dim is unchanged), so it maps 1:1 to
+            # consecutive output rows.
+            chunks = flat_range_to_src_chunks(
+                flat_offset, n_elements, in_shape, in_strides
+            )
+            row_cursor = 0
+            for src_slices, covered in chunks:
+                chunk_rows = covered // tile_f
+                tile = b.dma_copy(
+                    b.alloc((chunk_rows, tile_f), dtype, MemorySpace.SBUF),
+                    x_hbm, src_slices,
+                )
+                dst_slices = build_out_slices(
+                    batch_idx, p_off + row_cursor, chunk_rows, tile_f, out_rank
+                )
+                b.dma_copy(y_hbm, tile, dst_slices)
+                row_cursor += chunk_rows
+
+    b.set_outputs({"y": y_hbm})
+    return b.graph
+
+
+# ---------------------------------------------------------------------------
+# Slice
+# ---------------------------------------------------------------------------
+
+
+def lower_slice(
+    in_shape: tuple[int, ...],
+    starts: tuple[int, ...],
+    stops: tuple[int, ...],
+    strides: tuple[int, ...] | None = None,
+    dtype: DType = DType.F32,
+) -> Graph:
+    """Lower slice (sub-tensor extraction) as tiled DMA copies from offsets.
+
+    Extracts elements from in_shape[starts[i]:stops[i]:strides[i]] per dim.
+    Only stride=1 is supported (contiguous slices).
+
+    Tiling: output is tiled with P=min(out[-2], 128), F=out[-1] (full).
+    """
+    rank = len(in_shape)
+    if len(starts) != rank or len(stops) != rank:
+        raise ValueError("starts/stops must match input rank")
+    if strides is None:
+        strides = (1,) * rank
+    if any(s != 1 for s in strides):
+        raise NotImplementedError("only stride=1 is supported")
+
+    out_shape = tuple(stop - start for start, stop in zip(starts, stops))
+    for i, s in enumerate(out_shape):
+        if s <= 0:
+            raise ValueError(f"empty slice on axis {i}")
+
+    out_rank = len(out_shape)
+    tile_p = min(out_shape[-2], PARTITION_MAX) if out_rank >= 2 else 1
+    tile_f = out_shape[-1] if out_rank >= 2 else out_shape[0]
+    n_p_tiles = ceildiv(out_shape[-2], tile_p) if out_rank >= 2 else 1
+
+    batch_dims = list(out_shape[:-2]) if out_rank > 2 else []
+    n_batch = prod(batch_dims) if batch_dims else 1
+
+    b = Builder("slice")
+    x_hbm = b.add_input("x", in_shape, dtype)
+    y_hbm = b.add_input("y", out_shape, dtype)
+
+    for batch_flat in range(n_batch):
+        batch_idx = unravel(batch_flat, batch_dims) if batch_dims else ()
+        for p_i in range(n_p_tiles):
+            p_off = p_i * tile_p
+            p_size = min(tile_p, out_shape[-2] - p_off) if out_rank >= 2 else tile_p
+
+            # Source slices: offset by starts + current tile position
+            src_slices = []
+            for i in range(rank):
+                if out_rank > 2 and i < rank - 2:
+                    src_slices.append(DimSlice(starts[i] + batch_idx[i], 1))
+                elif i == rank - 2:
+                    src_slices.append(DimSlice(starts[i] + p_off, p_size))
+                else:  # i == rank - 1
+                    src_slices.append(DimSlice(starts[i], tile_f))
+
+            # Destination slices
+            dst_slices = build_out_slices(batch_idx, p_off, p_size, tile_f, out_rank)
+
+            tile = b.dma_copy(
+                b.alloc((p_size, tile_f), dtype, MemorySpace.SBUF),
+                x_hbm, src_slices,
+            )
+            b.dma_copy(y_hbm, tile, dst_slices)
+
+    b.set_outputs({"y": y_hbm})
+    return b.graph
+
+
+# ---------------------------------------------------------------------------
+# Concat
+# ---------------------------------------------------------------------------
+
+
+def lower_concat(
+    input_shapes: list[tuple[int, ...]],
+    axis: int,
+    dtype: DType = DType.F32,
+) -> Graph:
+    """Lower concat (tensor assembly along an axis) as tiled DMA copies.
+
+    Each input tensor is copied into the output at the appropriate offset
+    along the concat axis. All inputs must have the same shape except on
+    the concat axis.
+
+    Tiling: each input is tiled with P=min(shape[-2], 128), F=shape[-1].
+    """
+    if len(input_shapes) < 2:
+        raise ValueError("concat needs at least 2 inputs")
+
+    rank = len(input_shapes[0])
+    for s in input_shapes:
+        if len(s) != rank:
+            raise ValueError("all inputs must have the same rank")
+    if axis < 0:
+        axis += rank
+
+    # Validate non-concat dims match
+    for i in range(rank):
+        if i == axis:
+            continue
+        ref = input_shapes[0][i]
+        for s in input_shapes[1:]:
+            if s[i] != ref:
+                raise ValueError(
+                    f"shape mismatch on non-concat axis {i}: {ref} vs {s[i]}"
+                )
+
+    # Compute output shape
+    out_shape = list(input_shapes[0])
+    out_shape[axis] = sum(s[axis] for s in input_shapes)
+    out_shape = tuple(out_shape)
+
+    b = Builder("concat")
+    x_hbms = [b.add_input(f"x{i}", s, dtype) for i, s in enumerate(input_shapes)]
+    y_hbm = b.add_input("y", out_shape, dtype)
+
+    # Copy each input into the output at increasing offsets along concat axis
+    concat_offset = 0
+    for inp_idx, inp_shape in enumerate(input_shapes):
+        _emit_concat_input(b, x_hbms[inp_idx], y_hbm, inp_shape, out_shape,
+                           axis, concat_offset, dtype)
+        concat_offset += inp_shape[axis]
+
+    b.set_outputs({"y": y_hbm})
+    return b.graph
+
+
+def _emit_concat_input(
+    b: Builder,
+    x_hbm,
+    y_hbm,
+    inp_shape: tuple[int, ...],
+    out_shape: tuple[int, ...],
+    axis: int,
+    concat_offset: int,
+    dtype: DType,
+) -> None:
+    """Emit tiled DMA copies for one concat input into the output."""
+    rank = len(inp_shape)
+    tile_p = min(inp_shape[-2], PARTITION_MAX) if rank >= 2 else 1
+    tile_f = inp_shape[-1] if rank >= 2 else inp_shape[0]
+    n_p_tiles = ceildiv(inp_shape[-2], tile_p) if rank >= 2 else 1
+
+    batch_dims = list(inp_shape[:-2]) if rank > 2 else []
+    n_batch = prod(batch_dims) if batch_dims else 1
+
+    for batch_flat in range(n_batch):
+        batch_idx = unravel(batch_flat, batch_dims) if batch_dims else ()
+        for p_i in range(n_p_tiles):
+            p_off = p_i * tile_p
+            p_size = min(tile_p, inp_shape[-2] - p_off) if rank >= 2 else tile_p
+
+            # Source slices (from the input tensor)
+            src_slices = []
+            for i in range(rank):
+                if rank > 2 and i < rank - 2:
+                    src_slices.append(DimSlice(batch_idx[i], 1))
+                elif i == rank - 2:
+                    src_slices.append(DimSlice(p_off, p_size))
+                else:
+                    src_slices.append(DimSlice(0, tile_f))
+
+            # Destination slices (into the output tensor, shifted by concat_offset)
+            dst_slices = []
+            for i in range(rank):
+                if rank > 2 and i < rank - 2:
+                    offset = batch_idx[i] + (concat_offset if i == axis else 0)
+                    dst_slices.append(DimSlice(offset, 1))
+                elif i == rank - 2:
+                    offset = p_off + (concat_offset if i == axis else 0)
+                    dst_slices.append(DimSlice(offset, p_size))
+                else:  # i == rank - 1
+                    offset = concat_offset if i == axis else 0
+                    dst_slices.append(DimSlice(offset, tile_f))
+
+            tile = b.dma_copy(
+                b.alloc((p_size, tile_f), dtype, MemorySpace.SBUF),
+                x_hbm, src_slices,
+            )
+            b.dma_copy(y_hbm, tile, dst_slices)
+
+
+# ---------------------------------------------------------------------------
+# Emit functions for use by the orchestrator
+# ---------------------------------------------------------------------------
+
+
+def emit_reshape(nb: Builder, x_hbm, y_hbm, in_shape, out_shape, dtype) -> None:
+    """Emit reshape tiling into an existing Builder."""
+    if len(out_shape) == 0 or len(in_shape) == 0:
+        _emit_reshape_scalar(nb, x_hbm, y_hbm, in_shape, out_shape, dtype)
+        return
+
+    # When a path's natural tile would be wider than one SBUF partition can
+    # hold (e.g. a vocab-sized [1, 128256] row), fall back to a bounded flat
+    # copy — always correct since a reshape preserves row-major flat order.
+    cap = max_free_elems(dtype)
+
+    # Prefix path: when shapes share a leading prefix-product, emit one
+    # load + view + store per partition tile. Handles (Co,*K,Ci)->(Co,K*Ci),
+    # trailing-1 additions, and single-partition-row reshapes.
+    p_common = _largest_common_prefix(in_shape, out_shape)
+    if p_common > 1 or (p_common == 1 and in_shape[0] == 1 and out_shape[0] == 1):
+        if prod(in_shape) // p_common > cap:
+            _emit_reshape_flat_copy(nb, x_hbm, y_hbm, in_shape, out_shape, dtype)
+        else:
+            _emit_reshape_via_prefix(nb, x_hbm, y_hbm, in_shape, out_shape, p_common, dtype)
+    elif in_shape[-1] == out_shape[-1]:
+        if in_shape[-1] > cap:
+            _emit_reshape_flat_copy(nb, x_hbm, y_hbm, in_shape, out_shape, dtype)
+        else:
+            _emit_reshape_same_f(nb, x_hbm, y_hbm, in_shape, out_shape, dtype)
+    else:
+        if in_shape[-1] > cap or out_shape[-1] > cap:
+            _emit_reshape_flat_copy(nb, x_hbm, y_hbm, in_shape, out_shape, dtype)
+        else:
+            _emit_reshape_diff_f(nb, x_hbm, y_hbm, in_shape, out_shape, dtype)
+
+
+def _emit_reshape_flat_copy(nb, x_hbm, y_hbm, in_shape, out_shape, dtype):
+    """Reshape via a bounded flat copy, used when a row is too wide for SBUF.
+
+    A reshape preserves row-major flat order, so element ``i`` of the source
+    maps to element ``i`` of the output. We walk the flat range in chunks no
+    wider than one SBUF partition can hold, and split each chunk into segments
+    that are a single rectangle on *both* the source and destination (a chunk
+    may straddle a leading-dim boundary of either shape). Each segment is one
+    (1, seg) load + store — no on-chip reshape needed since flat positions
+    already coincide.
+    """
+    total = prod(in_shape)
+    cap = max_free_elems(dtype)
+    in_strides = row_major_strides(in_shape)
+    out_strides = row_major_strides(out_shape)
+
+    pos = 0
+    while pos < total:
+        budget = min(cap, total - pos)
+        # First chunk's `covered` is the largest single rectangle starting at
+        # `pos` within `budget` elements, on each side independently. Taking
+        # the smaller makes the segment one rectangle on *both* sides.
+        src_first = flat_range_to_src_chunks(pos, budget, in_shape, in_strides)[0]
+        dst_first = flat_range_to_src_chunks(pos, budget, out_shape, out_strides)[0]
+        seg = min(src_first[1], dst_first[1])
+        (src_slices, _), = flat_range_to_src_chunks(pos, seg, in_shape, in_strides)
+        (dst_slices, _), = flat_range_to_src_chunks(pos, seg, out_shape, out_strides)
+        tile = nb.dma_copy(
+            nb.alloc((1, seg), dtype, MemorySpace.SBUF), x_hbm, src_slices)
+        nb.dma_copy(y_hbm, tile, dst_slices)
+        pos += seg
+
+
+def _emit_reshape_via_prefix(nb, x_hbm, y_hbm, in_shape, out_shape, p_common, dtype):
+    """Emit prefix-path reshape: partition fixed, free-dim regrouped via view."""
+    total = prod(in_shape)
+    in_free = total // p_common
+    out_free = total // p_common
+
+    in_strides = row_major_strides(in_shape)
+    out_strides = row_major_strides(out_shape)
+
+    for r0 in range(0, p_common, PARTITION_MAX):
+        p = min(PARTITION_MAX, p_common - r0)
+        # A tile of p rows may straddle leading-dim boundaries of either shape,
+        # in which case it is not a single rectangle. Split it into segments
+        # that are one rectangle on both sides and emit a load+view+store each.
+        for rows, src_slices, dst_slices in _prefix_row_segments(
+            r0, p, in_free, in_shape, in_strides, out_shape, out_strides):
+            tile = nb.dma_copy(
+                nb.alloc((rows, in_free), dtype, MemorySpace.SBUF), x_hbm, src_slices)
+            tile = nb.view(tile, (rows, out_free))
+            nb.dma_copy(y_hbm, tile, dst_slices)
+
+
+def _emit_reshape_scalar(nb, x_hbm, y_hbm, in_shape, out_shape, dtype):
+    """Handle reshape to/from scalar (rank-0) tensors.
+
+    HBM buffers may have been promoted from () to (1,) by the lowering,
+    so use the actual HBM tensor rank for slice construction.
+    """
+    src_rank = len(x_hbm.type.shape)
+    dst_rank = len(y_hbm.type.shape)
+    src_slices = [DimSlice(0, 1)] * src_rank
+    dst_slices = [DimSlice(0, 1)] * dst_rank
+    tile = nb.dma_copy(nb.alloc((1, 1), dtype, MemorySpace.SBUF), x_hbm, src_slices)
+    nb.dma_copy(y_hbm, tile, dst_slices)
+
+
+def _emit_reshape_same_f(nb, x_hbm, y_hbm, in_shape, out_shape, dtype):
+    out_rank = len(out_shape)
+    tile_f = out_shape[-1]
+    p_extent = out_shape[-2] if out_rank >= 2 else 1
+    tile_p = min(p_extent, PARTITION_MAX)
+    batch_dims = list(out_shape[:-2]) if out_rank > 2 else []
+    n_batch = prod(batch_dims) if batch_dims else 1
+
+    out_strides = row_major_strides(out_shape)
+    in_strides = row_major_strides(in_shape)
+
+    for bf in range(n_batch):
+        batch_idx = unravel(bf, batch_dims) if batch_dims else ()
+        for p_i in range(ceildiv(p_extent, tile_p)):
+            p_off = p_i * tile_p
+            p_size = min(tile_p, p_extent - p_off)
+
+            flat_offset = sum(bi * out_strides[i] for i, bi in enumerate(batch_idx))
+            if out_rank >= 2:
+                flat_offset += p_off * out_strides[-2]
+
+            # The tile's flat range may cross a source leading-dim boundary, so
+            # split it into maximal rectangles (one chunk for the aligned fast
+            # path). Each chunk is a whole number of rows mapping 1:1 to
+            # consecutive output rows.
+            chunks = flat_range_to_src_chunks(
+                flat_offset, p_size * tile_f, in_shape, in_strides
+            )
+            row_cursor = 0
+            for src_slices, covered in chunks:
+                chunk_rows = covered // tile_f
+                dst_slices = []
+                for bi in batch_idx:
+                    dst_slices.append(DimSlice(bi, 1))
+                if out_rank >= 2:
+                    dst_slices.append(DimSlice(p_off + row_cursor, chunk_rows))
+                dst_slices.append(DimSlice(0, tile_f))
+
+                tile = nb.dma_copy(
+                    nb.alloc((chunk_rows, tile_f), dtype, MemorySpace.SBUF),
+                    x_hbm, src_slices,
+                )
+                nb.dma_copy(y_hbm, tile, dst_slices)
+                row_cursor += chunk_rows
+
+
+def _emit_reshape_diff_f(nb, x_hbm, y_hbm, in_shape, out_shape, dtype):
+    """Reshape with different last dim via scratch buffer."""
+    total = prod(in_shape)
+    out_f = out_shape[-1]
+    out_rank = len(out_shape)
+
+    # For 1D inputs or inputs whose last dim exceeds SBUF capacity,
+    # re-interpret the source as 2D with a bounded row width.
+    MAX_F_BYTES = 128 * 1024  # conservative SBUF tile limit
+    ELEM_BYTES = 4  # f32
+    max_f = MAX_F_BYTES // ELEM_BYTES
+
+    in_f = in_shape[-1]
+    if len(in_shape) == 1 and in_f > max_f:
+        # Re-interpret as 2D: (total/max_f, max_f) — pick a row width
+        # that divides the total evenly and is <= max_f
+        row_width = out_f if out_f <= max_f else max_f
+        while total % row_width != 0:
+            row_width -= 1
+        effective_in_shape = (total // row_width, row_width)
+    else:
+        effective_in_shape = in_shape
+        row_width = in_f
+
+    scratch_shape = (total // row_width, row_width)
+    scratch_hbm = nb.alloc(scratch_shape, dtype, MemorySpace.HBM)
+
+    # Phase 1: copy source into scratch
+    eff_f = effective_in_shape[-1]
+    eff_p = effective_in_shape[-2] if len(effective_in_shape) >= 2 else 1
+    eff_batch_dims = list(effective_in_shape[:-2]) if len(effective_in_shape) > 2 else []
+    eff_n_batch = prod(eff_batch_dims) if eff_batch_dims else 1
+    tile_p_in = min(eff_p, PARTITION_MAX)
+    row_offset = 0
+    for bf in range(eff_n_batch):
+        batch_idx = unravel(bf, eff_batch_dims) if eff_batch_dims else ()
+        for p_i in range(ceildiv(eff_p, tile_p_in)):
+            p_off = p_i * tile_p_in
+            p_size = min(tile_p_in, eff_p - p_off)
+            # Source slices use the original shape
+            src_slices = [DimSlice(bi, 1) for bi in batch_idx]
+            if len(in_shape) == 1:
+                # 1D source: use flat offset into the single dim
+                flat_off = row_offset * eff_f
+                src_slices = [DimSlice(flat_off, p_size * eff_f)]
+            else:
+                if len(in_shape) >= 2:
+                    src_slices.append(DimSlice(p_off, p_size))
+                src_slices.append(DimSlice(0, eff_f))
+            tile = nb.dma_copy(nb.alloc((p_size, eff_f), dtype, MemorySpace.SBUF), x_hbm, src_slices)
+            nb.dma_copy(scratch_hbm, tile, [DimSlice(row_offset, p_size), DimSlice(0, eff_f)])
+            row_offset += p_size
+
+    # Phase 2: reload from scratch per output row.
+    # scratch_shape = (total // row_width, row_width)
+    scratch_f = row_width
+    out_p = out_shape[-2] if out_rank >= 2 else 1
+    out_batch_dims = list(out_shape[:-2]) if out_rank > 2 else []
+    out_n_batch = prod(out_batch_dims) if out_batch_dims else 1
+    out_strides = row_major_strides(out_shape)
+
+    for bf in range(out_n_batch):
+        batch_idx = unravel(bf, out_batch_dims) if out_batch_dims else ()
+        for p_i in range(out_p):
+            flat_offset = sum(bi * out_strides[i] for i, bi in enumerate(batch_idx))
+            if out_rank >= 2:
+                flat_offset += p_i * out_strides[-2]
+
+            scratch_row = flat_offset // scratch_f
+            scratch_col = flat_offset % scratch_f
+
+            dst_slices = [DimSlice(bi, 1) for bi in batch_idx]
+            if out_rank >= 2:
+                dst_slices.append(DimSlice(p_i, 1))
+            dst_slices.append(DimSlice(0, out_f))
+
+            if scratch_col == 0 and out_f <= scratch_f:
+                s_sl = [DimSlice(scratch_row, 1), DimSlice(0, out_f)]
+                tile = nb.dma_copy(nb.alloc((1, out_f), dtype, MemorySpace.SBUF), scratch_hbm, s_sl)
+                nb.dma_copy(y_hbm, tile, dst_slices)
+            elif scratch_col + out_f <= scratch_f:
+                s_sl = [DimSlice(scratch_row, 1), DimSlice(scratch_col, out_f)]
+                tile = nb.dma_copy(nb.alloc((1, out_f), dtype, MemorySpace.SBUF), scratch_hbm, s_sl)
+                nb.dma_copy(y_hbm, tile, dst_slices)
+            else:
+                remaining = out_f
+                out_col = 0
+                cur_row, cur_col = scratch_row, scratch_col
+                while remaining > 0:
+                    chunk = min(remaining, scratch_f - cur_col)
+                    s_sl = [DimSlice(cur_row, 1), DimSlice(cur_col, chunk)]
+                    tile = nb.dma_copy(nb.alloc((1, chunk), dtype, MemorySpace.SBUF), scratch_hbm, s_sl)
+                    d_sl = [DimSlice(bi, 1) for bi in batch_idx]
+                    if out_rank >= 2:
+                        d_sl.append(DimSlice(p_i, 1))
+                    d_sl.append(DimSlice(out_col, chunk))
+                    nb.dma_copy(y_hbm, tile, d_sl)
+                    remaining -= chunk
+                    out_col += chunk
+                    cur_row += 1
+                    cur_col = 0
+
+
+def _collapse_to_2d(nb: Builder, hbm, shape, lead, last):
+    """Reinterpret a row-major HBM buffer of *shape* as 2D ``(lead, last)``.
+
+    ``lead * last`` must equal ``prod(shape)``. A reshape preserves row-major
+    flat order and HBM buffers are contiguous, so this is a zero-copy view (no
+    data movement). Returns the original buffer untouched when it already has
+    the target 2D shape.
+    """
+    if tuple(hbm.type.shape) == (lead, last):
+        return hbm
+    return nb.view(hbm, (lead, last))
+
+
+def _emit_2d_window_copy(
+    nb: Builder, src_2d, dst_2d, src_f_off: int, dst_f_off: int, f_width: int,
+    dtype,
+) -> None:
+    """Copy a full-height column window ``[f_off, f_off+f_width)`` from a 2D HBM
+    source to a 2D HBM destination, tiling the partition at 128 and the free
+    dim at the per-partition SBUF budget. One load + store per (P, F) tile.
+
+    Used by the collapsed slice/concat fast paths: both reduce to "copy a
+    contiguous last-axis window across all the (collapsed) leading rows".
+    """
+    P = src_2d.type.shape[0]
+    cap = max_free_elems(dtype)
+    for p_i in range(ceildiv(P, PARTITION_MAX)):
+        p_off = p_i * PARTITION_MAX
+        p_size = min(PARTITION_MAX, P - p_off)
+        for f_i in range(ceildiv(f_width, cap)):
+            fo = f_i * cap
+            fw = min(cap, f_width - fo)
+            tile = nb.dma_copy(
+                nb.alloc((p_size, fw), dtype, MemorySpace.SBUF),
+                src_2d, (DimSlice(p_off, p_size), DimSlice(src_f_off + fo, fw)),
+            )
+            nb.dma_copy(
+                dst_2d, tile, (DimSlice(p_off, p_size), DimSlice(dst_f_off + fo, fw))
+            )
+
+
+def emit_slice(nb: Builder, x_hbm, y_hbm, in_shape, out_shape, starts, dtype,
+               strides=None) -> None:
+    """Emit slice tiling into an existing Builder."""
+    rank = len(in_shape)
+    if strides is None:
+        strides = (1,) * rank
+
+    has_non_unit_stride = any(s != 1 for s in strides)
+    if has_non_unit_stride:
+        _emit_strided_slice(nb, x_hbm, y_hbm, in_shape, out_shape, starts, strides, dtype)
+        return
+
+    # Fast path: a rank>=3 slice that touches only the last axis (all leading
+    # dims kept in full) collapses to a 2D last-axis window. The leading dims
+    # fold onto the partition via a zero-copy view, so a single 2D tiled loop
+    # packs all 128 lanes instead of unrolling prod(out[:-2]) one-row copies.
+    if (rank >= 3
+            and all(starts[i] == 0 and out_shape[i] == in_shape[i] for i in range(rank - 1))):
+        lead = prod(in_shape[:-1])
+        src_2d = _collapse_to_2d(nb, x_hbm, in_shape, lead, in_shape[-1])
+        dst_2d = _collapse_to_2d(nb, y_hbm, out_shape, lead, out_shape[-1])
+        _emit_2d_window_copy(
+            nb, src_2d, dst_2d, starts[-1], 0, out_shape[-1], dtype)
+        return
+
+    tile_p = min(out_shape[-2], PARTITION_MAX) if rank >= 2 else 1
+    tile_f = out_shape[-1] if rank >= 2 else out_shape[0]
+    p_extent = out_shape[-2] if rank >= 2 else 1
+    batch_dims = list(out_shape[:-2]) if rank > 2 else []
+    n_batch = prod(batch_dims) if batch_dims else 1
+
+    for bf in range(n_batch):
+        batch_idx = unravel(bf, batch_dims) if batch_dims else ()
+        for p_i in range(ceildiv(p_extent, tile_p)):
+            p_off = p_i * tile_p
+            p_size = min(tile_p, p_extent - p_off)
+
+            src_slices = []
+            for i in range(rank):
+                if rank > 2 and i < rank - 2:
+                    src_slices.append(DimSlice(starts[i] + batch_idx[i], 1))
+                elif i == rank - 2:
+                    src_slices.append(DimSlice(starts[i] + p_off, p_size))
+                else:
+                    src_slices.append(DimSlice(starts[i], tile_f))
+
+            dst_slices = [DimSlice(bi, 1) for bi in batch_idx]
+            if rank >= 2:
+                dst_slices.append(DimSlice(p_off, p_size))
+            dst_slices.append(DimSlice(0, tile_f))
+
+            tile = nb.dma_copy(nb.alloc((p_size, tile_f), dtype, MemorySpace.SBUF), x_hbm, src_slices)
+            nb.dma_copy(y_hbm, tile, dst_slices)
+
+
+def _emit_strided_slice(nb, x_hbm, y_hbm, in_shape, out_shape, starts, strides, dtype):
+    """Emit a strided slice as tiled strided-DMA descriptors.
+
+    A strided slice reads every ``stride``-th element along each axis. The DMA
+    engine expresses this natively via per-dimension ``DimSlice`` strides, so
+    we tile the output like the contiguous slice path (P at ``min(out_p, 128)``,
+    F full) and emit a single strided load + contiguous store per tile. The
+    earlier implementation copied one element at a time when the free-dim
+    stride was non-unit, which produced ``O(num_elements)`` DMAs (e.g. ~9.4k
+    ops for a single strided conv im2col slice).
+    """
+    rank = len(in_shape)
+
+    # Rank 1: one strided 1D load into a (1, out_f) tile.
+    if rank == 1:
+        out_f = out_shape[0]
+        src_slices = [DimSlice(starts[0], out_f, stride=strides[0])]
+        dst_slices = [DimSlice(0, out_f)]
+        tile = nb.dma_copy(
+            nb.alloc((1, out_f), dtype, MemorySpace.SBUF), x_hbm, src_slices)
+        nb.dma_copy(y_hbm, tile, dst_slices)
+        return
+
+    # Rank >= 2: tile the output P-dim; load each tile with strided source
+    # descriptors on the P and F axes (and constant batch indices).
+    p_stride = strides[-2]
+    f_stride = strides[-1]
+    out_p = out_shape[-2]
+    out_f = out_shape[-1]
+    tile_p = min(out_p, PARTITION_MAX)
+    batch_dims = list(out_shape[:-2]) if rank > 2 else []
+    n_batch = prod(batch_dims) if batch_dims else 1
+    batch_strides = strides[:-2] if rank > 2 else ()
+
+    for bf in range(n_batch):
+        batch_idx = unravel(bf, batch_dims) if batch_dims else ()
+        for p_i in range(ceildiv(out_p, tile_p)):
+            p_off = p_i * tile_p
+            p_size = min(tile_p, out_p - p_off)
+
+            src_slices = []
+            for i, bi in enumerate(batch_idx):
+                src_slices.append(DimSlice(starts[i] + bi * batch_strides[i], 1))
+            src_slices.append(
+                DimSlice(starts[-2] + p_off * p_stride, p_size, stride=p_stride))
+            src_slices.append(DimSlice(starts[-1], out_f, stride=f_stride))
+
+            dst_slices = [DimSlice(bi, 1) for bi in batch_idx]
+            dst_slices.append(DimSlice(p_off, p_size))
+            dst_slices.append(DimSlice(0, out_f))
+
+            tile = nb.dma_copy(
+                nb.alloc((p_size, out_f), dtype, MemorySpace.SBUF), x_hbm, src_slices)
+            nb.dma_copy(y_hbm, tile, dst_slices)
+
+
+def emit_concat(nb: Builder, input_hbms: list, y_hbm, input_shapes: list, axis: int, dtype) -> None:
+    """Emit concat tiling into an existing Builder."""
+    rank = len(input_shapes[0])
+    if axis < 0:
+        axis += rank
+    out_shape = list(input_shapes[0])
+    out_shape[axis] = sum(s[axis] for s in input_shapes)
+    out_shape = tuple(out_shape)
+
+    # Fast path: a rank>=3 concat on the last axis (all non-axis dims match by
+    # definition) collapses to a 2D last-axis assembly. Each input becomes a
+    # column window of the 2D output; leading dims fold onto the partition via
+    # zero-copy views, so each input is one 2D tiled loop over all 128 lanes
+    # instead of unrolling prod(shape[:-2]) one-row copies.
+    if rank >= 3 and axis == rank - 1:
+        lead = prod(out_shape[:-1])
+        dst_2d = _collapse_to_2d(nb, y_hbm, out_shape, lead, out_shape[-1])
+        dst_f_off = 0
+        for inp_idx, inp_shape in enumerate(input_shapes):
+            w = inp_shape[-1]
+            src_2d = _collapse_to_2d(nb, input_hbms[inp_idx], inp_shape, lead, w)
+            _emit_2d_window_copy(nb, src_2d, dst_2d, 0, dst_f_off, w, dtype)
+            dst_f_off += w
+        return
+
+    concat_offset = 0
+    for inp_idx, inp_shape in enumerate(input_shapes):
+        _emit_concat_input(nb, input_hbms[inp_idx], y_hbm, inp_shape, out_shape,
+                           axis, concat_offset, dtype)
+        concat_offset += inp_shape[axis]

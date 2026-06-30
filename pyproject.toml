@@ -5,10 +5,10 @@ name = "nkipy-workspace"
 version = "0.1.0"
 description = "NKIPy Monorepo - A lightweight Pythonic kernel environment for AWS Neuron"
 requires-python = ">=3.10"
-dependencies = ["nkipy"]
+dependencies = ["nkipy", "nkigen-lite"]
 
 [tool.uv.workspace]
-members = ["nkipy", "spike"]
+members = ["nkipy", "spike", "nkigen-lite"]
 
 [[tool.uv.index]]
 name = "neuron"
@@ -18,6 +18,7 @@ explicit = true
 [tool.uv.sources]
 spike = { workspace = true }
 nkipy = { workspace = true }
+nkigen-lite = { workspace = true }
 
 [dependency-groups]
 dev = ["spike"]

@@ -7,15 +7,81 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from config import Config, get_config
+from kernels.rope import compute_cos_sin_cache
 from kernels.sampling import greedy_sampling, greedy_sampling_with_embedding
 from kernels.transformer_layer import transformer_layer
+from nkipy.core.trace import NKIPyKernel
 from nkipy.runtime import DeviceKernel, DeviceTensor
 from safetensors.torch import load_file
 from transformers import AutoTokenizer
 from utils import print_log
 
 BUILD_DIR = "./build"
-USE_NKI_RMSNORM = True
+# Compilation backend: "hlo" (default) or "nkigen-lite".
+# The fused MoE transformer layer compiles and runs on nkigen-lite (the former
+# SBUF overflow during lowering is fixed); "hlo" remains the default reference.
+# Override with the QWEN3_BACKEND environment variable.
+BACKEND = os.environ.get("QWEN3_BACKEND", "hlo")
+
+
+def _traced(fn):
+    """Wrap a kernel fn for the selected backend (no-op for the default HLO)."""
+    if BACKEND == "hlo":
+        return fn
+    return NKIPyKernel.trace(fn, backend=BACKEND)
+
+
+def _alias_key(name):
+    """Input key for a mutated/aliased parameter.
+
+    The HLO (neuronx-cc) path renames in-place-mutated params to
+    ``<name>.must_alias_input`` in the compiled neff; the nkigen-lite path keeps
+    the original name.  Pick the key the active backend's neff actually exposes.
+    """
+    return f"{name}.must_alias_input" if BACKEND == "hlo" else name
+
+
+# Primary (single) output key in the compiled neff: HLO emits "output0", the
+# nkigen-lite path emits "output_out".
+_OUTPUT0 = "output0" if BACKEND == "hlo" else "output_out"
+
+
+def _map_outputs(kernel, named):
+    """Resolve the outputs dict to the keys the compiled neff actually exposes.
+
+    HLO and nkigen-lite name outputs differently (HLO: ``output0`` plus
+    aliased-param names like ``cache_k``; nkigen-lite: positional
+    ``output_<i>_out``).  The HLO path already matches, so pass it through.
+    For nkigen-lite, remap the same tensors (in their insertion order, which is
+    [primary, then aliases]) onto the kernel's own ordered output keys.
+    """
+    if BACKEND == "hlo":
+        return named
+    keys = list(kernel.output_tensors_info.keys())
+    tensors = list(named.values())
+    if len(keys) != len(tensors):
+        raise ValueError(
+            f"{kernel.name}: kernel exposes {len(keys)} outputs {keys}, "
+            f"caller supplied {len(tensors)}"
+        )
+    # nkigen-lite names outputs ``output_<i>_out`` where i is the position in the
+    # traced return list ([user_return, *mutated_aliases]) — the same order as
+    # ``named``.  The runtime's key iteration order isn't guaranteed, so order by
+    # that trailing index rather than by dict iteration.
+    import re
+
+    def _idx(k):
+        m = re.search(r"output_?(\d+)_out", k)
+        return int(m.group(1)) if m else 0
+
+    ordered_keys = sorted(keys, key=_idx)
+    return dict(zip(ordered_keys, tensors))
+
+
+# The NKI rmsnorm path is only a demo of embedding a raw NKI kernel; it requires
+# a matching NKI compiler version. Use the pure-NKIPy rmsnorm so the example runs
+# on the default (HLO) backend.
+USE_NKI_RMSNORM = False
 
 
 class Qwen3Model:
@@ -134,6 +200,32 @@ class Qwen3Model:
             self.tok_embedding, "tok_embedding"
         )
 
+        # RoPE cos/sin caches as runtime tensors for decode.  Decode indexes the
+        # cache by the runtime start_pos, so the whole table must be a device
+        # tensor; passing it as a kernel input avoids promoting a large comptime
+        # constant (which overflows the nkigen-lite constant limit).
+        freqs_cos, freqs_sin = compute_cos_sin_cache(
+            self.config.head_dim, self.config.max_seq_len, base=1000000,
+            dtype=self.config.dtype,
+        )
+        self.freqs_cos_device = DeviceTensor.from_numpy(
+            np.ascontiguousarray(freqs_cos), "freqs_cos_cache"
+        )
+        self.freqs_sin_device = DeviceTensor.from_numpy(
+            np.ascontiguousarray(freqs_sin), "freqs_sin_cache"
+        )
+
+        # Causal mask as a runtime tensor for decode (indexed by start_pos), for
+        # the same reason as the RoPE caches: a comptime full mask overflows the
+        # nkigen-lite constant limit.  bf16 to match the attention score dtype.
+        causal_mask = np.triu(
+            np.ones((self.config.max_seq_len, self.config.max_seq_len)) * -100000,
+            k=1,
+        ).astype(self.config.dtype)
+        self.causal_mask_device = DeviceTensor.from_numpy(
+            np.ascontiguousarray(causal_mask), "causal_mask_cache"
+        )
+
         print_log(f"--> Finished Preparing Tensors in {time.time() - t:.2f}s")
 
     def _prepare_kernels(self):
@@ -165,7 +257,7 @@ class Qwen3Model:
             np.empty(shape=(1), dtype=np.int32), "start_pos"
         )
         self.kernel_cte = DeviceKernel.compile_and_load(
-            transformer_layer,
+            _traced(transformer_layer),
             name="cte_layer",
             x=x_context,
             start_pos=None,
@@ -186,7 +278,7 @@ class Qwen3Model:
         )
 
         self.kernel_tkg_greedy_sampling = DeviceKernel.compile_and_load(
-            greedy_sampling,
+            _traced(greedy_sampling),
             name="tkg_greedy_sampling",
             h=x_token,
             norm_weight=self.norm_weight,
@@ -197,7 +289,7 @@ class Qwen3Model:
             additional_compiler_args=self.config.additional_compiler_args_nkipy,
         )
         self.kernel_cte_greedy_sampling = DeviceKernel.compile_and_load(
-            greedy_sampling,
+            _traced(greedy_sampling),
             name="cte_greedy_sampling",
             h=x_context,
             norm_weight=self.norm_weight,
@@ -209,7 +301,7 @@ class Qwen3Model:
         )
 
         self.kernel_tkg = DeviceKernel.compile_and_load(
-            transformer_layer,
+            _traced(transformer_layer),
             name="tkg_layer",
             x=x_token,
             start_pos=start_pos,
@@ -225,13 +317,16 @@ class Qwen3Model:
             gate_up_weight=self.layer_tensors[0]["gate_up_weight"],
             down_weight=self.layer_tensors[0]["down_weight"],
             configs=self.config,
+            freqs_cos_cache=self.freqs_cos_device,
+            freqs_sin_cache=self.freqs_sin_device,
+            causal_mask_cache=self.causal_mask_device,
             build_dir=BUILD_DIR,
             additional_compiler_args=self.config.additional_compiler_args_nkipy,
         )
 
         # Fused greedy sampling + embedding lookup kernels (for double-buffered decode)
         self.kernel_tkg_greedy_sampling_embed = DeviceKernel.compile_and_load(
-            greedy_sampling_with_embedding,
+            _traced(greedy_sampling_with_embedding),
             name="tkg_greedy_sampling_embed",
             h=x_token,
             norm_weight=self.norm_weight,
@@ -243,7 +338,7 @@ class Qwen3Model:
             additional_compiler_args=self.config.additional_compiler_args_nkipy,
         )
         self.kernel_cte_greedy_sampling_embed = DeviceKernel.compile_and_load(
-            greedy_sampling_with_embedding,
+            _traced(greedy_sampling_with_embedding),
             name="cte_greedy_sampling_embed",
             h=x_context,
             norm_weight=self.norm_weight,
@@ -286,8 +381,8 @@ class Qwen3Model:
                     "input_weight": self.layer_tensors[i]["input_weight"],
                     "q_norm_weight": self.layer_tensors[i]["q_norm_weight"],
                     "k_norm_weight": self.layer_tensors[i]["k_norm_weight"],
-                    "cache_k.must_alias_input": self.layer_tensors[i]["cache_k"],
-                    "cache_v.must_alias_input": self.layer_tensors[i]["cache_v"],
+                    _alias_key("cache_k"): self.layer_tensors[i]["cache_k"],
+                    _alias_key("cache_v"): self.layer_tensors[i]["cache_v"],
                     "post_attention_weight": self.layer_tensors[i][
                         "post_attention_weight"
                     ],
@@ -295,11 +390,14 @@ class Qwen3Model:
                     "gate_up_weight": self.layer_tensors[i]["gate_up_weight"],
                     "down_weight": self.layer_tensors[i]["down_weight"],
                 },
-                outputs={
-                    "output0": hidden_states,
-                    "cache_k": self.layer_tensors[i]["cache_k"],
-                    "cache_v": self.layer_tensors[i]["cache_v"],
-                },
+                outputs=_map_outputs(
+                    self.kernel_cte,
+                    {
+                        _OUTPUT0: hidden_states,
+                        "cache_k": self.layer_tensors[i]["cache_k"],
+                        "cache_v": self.layer_tensors[i]["cache_v"],
+                    },
+                ),
             )
 
         if double_buffering:
@@ -319,20 +417,26 @@ class Qwen3Model:
                     "input_weight": self.layer_tensors[i]["input_weight"],
                     "q_norm_weight": self.layer_tensors[i]["q_norm_weight"],
                     "k_norm_weight": self.layer_tensors[i]["k_norm_weight"],
-                    "cache_k.must_alias_input": self.layer_tensors[i]["cache_k"],
-                    "cache_v.must_alias_input": self.layer_tensors[i]["cache_v"],
+                    _alias_key("cache_k"): self.layer_tensors[i]["cache_k"],
+                    _alias_key("cache_v"): self.layer_tensors[i]["cache_v"],
                     "post_attention_weight": self.layer_tensors[i][
                         "post_attention_weight"
                     ],
                     "router_weight": self.layer_tensors[i]["router_weight"],
                     "gate_up_weight": self.layer_tensors[i]["gate_up_weight"],
                     "down_weight": self.layer_tensors[i]["down_weight"],
+                    "freqs_cos_cache": self.freqs_cos_device,
+                    "freqs_sin_cache": self.freqs_sin_device,
+                    "causal_mask_cache": self.causal_mask_device,
                 },
-                outputs={
-                    "output0": hidden_states,
-                    "cache_k": self.layer_tensors[i]["cache_k"],
-                    "cache_v": self.layer_tensors[i]["cache_v"],
-                },
+                outputs=_map_outputs(
+                    self.kernel_tkg,
+                    {
+                        _OUTPUT0: hidden_states,
+                        "cache_k": self.layer_tensors[i]["cache_k"],
+                        "cache_v": self.layer_tensors[i]["cache_v"],
+                    },
+                ),
             )
 
     # ── Double-buffered decode (fused sampling + on-device embedding) ──────
@@ -362,10 +466,13 @@ class Qwen3Model:
                 "lm_head_weight": self.lm_head_weight,
                 "tok_embedding": self.tok_embedding_device,
             },
-            outputs={
-                "output0": next_id_bufs[cur_buf],
-                "output1": decode_hidden,
-            },
+            outputs=_map_outputs(
+                self.kernel_cte_greedy_sampling_embed,
+                {
+                    _OUTPUT0: next_id_bufs[cur_buf],
+                    "output1": decode_hidden,
+                },
+            ),
         )
 
         # Token generation with double buffering
@@ -383,10 +490,13 @@ class Qwen3Model:
                     "lm_head_weight": self.lm_head_weight,
                     "tok_embedding": self.tok_embedding_device,
                 },
-                outputs={
-                    "output0": next_id_bufs[cur_buf],
-                    "output1": decode_hidden,
-                },
+                outputs=_map_outputs(
+                    self.kernel_tkg_greedy_sampling_embed,
+                    {
+                        _OUTPUT0: next_id_bufs[cur_buf],
+                        "output1": decode_hidden,
+                    },
+                ),
             )
 
             # D2H the *previous* buffer while this iteration's kernels are in flight
@@ -413,7 +523,7 @@ class Qwen3Model:
                 "norm_weight": self.norm_weight,
                 "lm_head_weight": self.lm_head_weight,
             },
-            outputs={"output0": next_id},
+            outputs=_map_outputs(self.kernel_cte_greedy_sampling, {_OUTPUT0: next_id}),
         )
         next_id_torch = next_id.torch().reshape(B, 1).to(dtype=torch.int)
         yield next_id_torch
@@ -440,7 +550,7 @@ class Qwen3Model:
                     "norm_weight": self.norm_weight,
                     "lm_head_weight": self.lm_head_weight,
                 },
-                outputs={"output0": next_id},
+                outputs=_map_outputs(self.kernel_tkg_greedy_sampling, {_OUTPUT0: next_id}),
             )
 
             next_id_torch = next_id.torch().reshape(B, 1).to(dtype=torch.int)

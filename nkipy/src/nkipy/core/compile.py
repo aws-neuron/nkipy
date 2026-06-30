@@ -19,6 +19,30 @@ from neuronxcc.driver.CommandDriver import main as neuronx_cc_main
 from nkipy.core.backend.hlo import HLOModule
 from nkipy.core.trace import NKIPyKernel
 
+
+def _lite_dtype_to_kb(lite_dtype):
+    """Convert a nkigen_lite DType to a kernel_builder dtype."""
+    import nki.compiler.kernel_builder as nb
+    from nkigen_lite.core import DType
+    _map = {
+        DType.F32: nb.float32,
+        DType.F16: nb.float16,
+        DType.BF16: nb.bfloat16,
+        DType.TF32: nb.tfloat32,
+        DType.FP8_E4M3: nb.float8_e4m3fn,
+        DType.FP8_E4M3_IEEE: nb.float8_e4m3,
+        DType.FP8_E5M2: nb.float8_e5m2,
+        DType.FP8_E3M4: nb.float8_e3m4,
+        DType.I32: nb.int32,
+        DType.I16: nb.int16,
+        DType.I8: nb.int8,
+        DType.U32: nb.uint32,
+        DType.U16: nb.uint16,
+        DType.U8: nb.uint8,
+        DType.BOOL: nb.uint8,
+    }
+    return _map[lite_dtype]
+
 trace = NKIPyKernel.trace
 
 # Build directory for compiled kernels
@@ -224,6 +248,88 @@ class Compiler:
             )
         return output_path
 
+    def _compile_nkigen_lite(self, ir, work_dir: Path, output_file: str) -> Path:
+        """Compile a NkiGenLiteIR module to NEFF via nkigen_lite lowering + kernel_builder."""
+        from nkigen_lite.tensor_ir.passes import lower_to_nki
+        from nkigen_lite.nki_ir.emit_to_kb import build_kb_kernel
+        from nkigen_lite.core import to_np_dtype
+        import nki.compiler.kernel_builder as nb
+        from nki.compiler.kernel_builder import Tensor
+
+        target_str = self._resolve_target().value
+
+        # Lower tensor_ir → nki_ir (canonicalize/decompose mutate ir._graph)
+        nki_graph = lower_to_nki(ir._graph)
+
+        # Update output specs to reflect shape changes from lowering
+        # (e.g. scalar () → (1,) for NKI compatibility)
+        ir._sync_output_specs_from_nki_graph(nki_graph)
+
+        # Build kernel function from nki_ir
+        kernel_fn = build_kb_kernel(nki_graph)
+
+        # Prepare input/output specs for kernel_builder
+        input_specs = {}
+        for v in nki_graph.inputs:
+            kb_dtype = _lite_dtype_to_kb(v.type.dtype)
+            input_specs[v.name] = Tensor(v.type.shape, kb_dtype, nb.hbm)
+
+        output_specs = {}
+        for name, v in nki_graph.outputs.items():
+            kb_dtype = _lite_dtype_to_kb(v.type.dtype)
+            output_specs[name] = Tensor(v.type.shape, kb_dtype, nb.hbm)
+
+        # Build the kernel module
+        module = nb.build_kernel(
+            kernel_fn,
+            input_specs=input_specs,
+            output_specs=output_specs,
+            target=target_str,
+        )
+
+        # Compile to NEFF
+        cc_args = tuple(shlex.split(self.config.additional_args)) if self.config.additional_args else ()
+        neff_path = work_dir / output_file
+
+        from nki.compiler.kernel_builder import CompileOptions
+        compile_opts = CompileOptions(
+            target=target_str,
+            output_path=str(neff_path),
+            artifacts_dir=str(work_dir),
+            neuronx_cc_args=cc_args,
+        )
+
+        # compile_kernel expects numpy input/output arrays for shape/dtype info.
+        # The nki_ir graph includes output buffers as graph inputs (suffixed _out).
+        # We split them into inputs (user params) and outputs (result buffers).
+        import numpy as _np
+
+        # Identify which graph inputs are output buffers (they end with _out
+        # and correspond to a graph output name)
+        output_names = set(nki_graph.outputs.keys())
+        np_inputs = {}
+        np_outputs = {}
+        for v in nki_graph.inputs:
+            # Output buffers are named "<output_name>_out"
+            candidate_out_name = v.name[:-4] if v.name.endswith("_out") else None
+            if candidate_out_name and candidate_out_name in output_names:
+                np_outputs[v.name] = _np.empty(v.type.shape, dtype=to_np_dtype(v.type.dtype))
+            else:
+                np_inputs[v.name] = _np.empty(v.type.shape, dtype=to_np_dtype(v.type.dtype))
+
+        nb.compile_kernel(
+            kernel_fn,
+            inputs=np_inputs,
+            outputs=np_outputs,
+            compile_opts=compile_opts,
+        )
+
+        if not neff_path.exists():
+            raise self._compilation_error(
+                f"NkiGen-Lite compilation failed: {output_file} not generated."
+            )
+        return neff_path
+
     def compile(
         self,
         ir,
@@ -233,9 +339,15 @@ class Compiler:
     ) -> Path:
         """Compile an IR module to a NEFF file.
 
-        Dispatches to ``_compile_hlo`` or ``_compile_nkigen`` based on
-        the IR type.
+        Dispatches to ``_compile_hlo``, ``_compile_nkigen``, or
+        ``_compile_nkigen_lite`` based on the IR type.
         """
+        # _compile_hlo chdir()s into work_dir, so a relative work_dir (e.g. the
+        # "./build" passed by examples with save_artifacts=True) would make the
+        # hlo_module.pb path resolve relative to itself and double up. Resolve
+        # to absolute up front so every backend is robust to relative dirs.
+        work_dir = Path(work_dir).resolve()
+
         if isinstance(ir, HLOModule):
             return self._compile_hlo(
                 ir, work_dir, output_file, use_neuronx_cc_python_interface
@@ -246,9 +358,14 @@ class Compiler:
         if isinstance(ir, NkiGenIR):
             return self._compile_nkigen(ir, work_dir, output_file)
 
+        from nkipy.core.backend.nkigen_lite import NkiGenLiteIR
+
+        if isinstance(ir, NkiGenLiteIR):
+            return self._compile_nkigen_lite(ir, work_dir, output_file)
+
         raise RuntimeError(
             f"Unknown IR type: {type(ir).__name__}. "
-            "Expected HLOModule or NkiGenIR."
+            "Expected HLOModule, NkiGenIR, or NkiGenLiteIR."
         )
 
     def compile_in_directory(

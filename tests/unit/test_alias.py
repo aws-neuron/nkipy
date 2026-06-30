@@ -53,35 +53,11 @@ def test_single_alias(trace_mode):
     result = nkipy_kernel_single_alias(A.copy(), B)
     cpu_assert_allclose(result, expected)
 
-    # Test hardware if available
     if NEURON_AVAILABLE:
-        from nkipy.runtime import DeviceKernel, DeviceTensor
+        from utils import on_device_test
 
-        # Compile kernel with appropriate backend
-        if trace_mode == "hlo":
-            traced_kernel = NKIPyKernel.trace(nkipy_kernel_single_alias, backend="hlo")
-        else:
-            raise ValueError(f"Invalid trace_mode: {trace_mode}")
-
-        kernel = DeviceKernel.compile_and_load(
-            traced_kernel,
-            A,
-            B,
-            name=f"test_single_alias_{trace_mode}",
-            use_cached_if_exists=False,
-        )
-
-        device_A = DeviceTensor.from_numpy(A)
-        device_B = DeviceTensor.from_numpy(B)
-        output = device_A
-
-        # Use the .must_alias_input suffix for the mutable input parameter
-        kernel(
-            inputs={"a_input.must_alias_input": device_A, "b_input": device_B},
-            outputs={"a_input": output},
-        )
-
-        baremetal_assert_allclose(output.numpy(), expected)
+        out_device = on_device_test(nkipy_kernel_single_alias, trace_mode, A.copy(), B)
+        baremetal_assert_allclose(out_device, expected)
     else:
         trace_and_compile(nkipy_kernel_single_alias, trace_mode, A.copy(), B)
 
@@ -105,40 +81,13 @@ def test_multi_alias(trace_mode):
 
     # Test hardware if available
     if NEURON_AVAILABLE:
-        from nkipy.runtime import DeviceKernel, DeviceTensor
+        from utils import on_device_test
 
-        # Compile kernel with appropriate backend
-        if trace_mode == "hlo":
-            traced_kernel = NKIPyKernel.trace(nkipy_kernel_multi_alias, backend="hlo")
-        else:
-            raise ValueError(f"Invalid trace_mode: {trace_mode}")
-
-        kernel = DeviceKernel.compile_and_load(
-            traced_kernel,
-            A,
-            B,
-            C,
-            name=f"test_multi_alias_{trace_mode}",
-            use_cached_if_exists=False,
+        out_A, out_C = on_device_test(
+            nkipy_kernel_multi_alias, trace_mode, A.copy(), B, C.copy()
         )
-
-        device_A = DeviceTensor.from_numpy(A)
-        device_B = DeviceTensor.from_numpy(B)
-        device_C = DeviceTensor.from_numpy(C)
-        output0 = device_A
-        output1 = device_C
-
-        kernel(
-            inputs={
-                "a_input.must_alias_input": device_A,
-                "b_input": device_B,
-                "c_input.must_alias_input": device_C,
-            },
-            outputs={"a_input": output0, "c_input": output1},
-        )
-
-        baremetal_assert_allclose(output0.numpy(), expected_A)
-        baremetal_assert_allclose(output1.numpy(), expected_C)
+        baremetal_assert_allclose(out_A, expected_A)
+        baremetal_assert_allclose(out_C, expected_C)
     else:
         trace_and_compile(nkipy_kernel_multi_alias, trace_mode, A.copy(), B, C.copy())
 

@@ -1103,6 +1103,25 @@ def test_slice_assignment_indeterministic(trace_mode, shape, indices):
         trace_and_compile(kernel, trace_mode, np.copy(a), b, t)
 
 
+def test_slice_assignment_nonuniform_literal(trace_mode):
+    """Assign a non-uniform constant array into a static slice."""
+
+    update = np.arange(6, dtype=np.float32).reshape(2, 3)
+
+    def kernel(a):
+        a[1:3, 1:4] = update
+        return a
+
+    a = np.random.random_sample((4, 5)).astype(np.float32)
+    expected = kernel(np.copy(a))
+
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, np.copy(a))
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, np.copy(a))
+
+
 @pytest.mark.parametrize(
     "shape,idx_size",
     [
@@ -1255,7 +1274,6 @@ def test_conv2d_scalar_params(
     trace_mode, in_channels, out_channels, kernel_size, stride, padding
 ):
     """Test conv2d with scalar stride and padding parameters"""
-
     def kernel(input_tensor, weight):
         return tensor_apis.conv2d(input_tensor, weight, stride=stride, padding=padding)
 
@@ -1301,7 +1319,6 @@ def test_conv2d_with_dilation(
     trace_mode, in_channels, out_channels, kernel_size, stride, padding, dilation
 ):
     """Test conv2d with dilation parameter"""
-
     def kernel(input_tensor, weight):
         return tensor_apis.conv2d(
             input_tensor, weight, stride=stride, padding=padding, dilation=dilation
@@ -1350,7 +1367,6 @@ def test_conv2d_with_bias(
     trace_mode, in_channels, out_channels, kernel_size, stride, padding
 ):
     """Test conv2d with bias parameter"""
-
     def kernel(input_tensor, weight, bias):
         return tensor_apis.conv2d(
             input_tensor, weight, bias=bias, stride=stride, padding=padding
@@ -1400,6 +1416,7 @@ def test_conv2d_with_bias(
     ],
 )
 def test_conv3d(trace_mode, in_channels, out_channels, kernel_size, stride, padding):
+
     def kernel(input_tensor, weight):
         return tensor_apis.conv3d(input_tensor, weight, stride=stride, padding=padding)
 
@@ -1885,20 +1902,9 @@ def test_reshape_infer_dim(trace_mode):
 
 @pytest.mark.parametrize(
     "dtype_name",
-    [
-        "bfloat16",
-        pytest.param(
-            "float8_e5m2",
-            marks=pytest.mark.xfail(reason="float8_e5m2 backend support missing"),
-        ),
-        "float8_e4m3",
-        pytest.param(
-            "float8_e4m3fn",
-            marks=pytest.mark.xfail(reason="float8_e4m3fn backend support missing"),
-        ),
-    ],
+    ["bfloat16", "float8_e5m2", "float8_e4m3", "float8_e4m3fn"],
 )
-def test_ml_dtypes_constant_encoding(trace_mode, dtype_name):
+def test_ml_dtypes_constant_encoding(request, trace_mode, dtype_name):
     """Test that ml_dtypes constants (bfloat16, float8) are correctly encoded in HLO.
 
     This is a regression test for a bug where ml_dtypes constants were incorrectly
@@ -1909,6 +1915,17 @@ def test_ml_dtypes_constant_encoding(trace_mode, dtype_name):
         import ml_dtypes
     except ImportError:
         pytest.skip("ml_dtypes not available")
+
+    # float8 support is uneven across backends; xfail the combinations that are
+    # known to lack it so they flip to XPASS once support lands.
+    unsupported = {
+        ("hlo", "float8_e5m2"),
+        ("hlo", "float8_e4m3fn"),
+    }
+    if (trace_mode, dtype_name) in unsupported:
+        request.node.add_marker(
+            pytest.mark.xfail(reason=f"{dtype_name} not supported on {trace_mode} backend")
+        )
 
     # Get the dtype from ml_dtypes
     dtype = getattr(ml_dtypes, dtype_name)
@@ -2704,6 +2721,43 @@ def test_pad_edge_asymmetric(trace_mode):
         return np.pad(a, ((2, 1), (0, 3)), mode="edge")
 
     shape = (16, 32)
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(np.float32)
+    expected = kernel(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+@pytest.mark.parametrize("mode", ["reflect", "symmetric", "wrap"])
+def test_pad_structural(trace_mode, mode):
+    """Test np.pad with reflect/symmetric/wrap modes (asymmetric per axis)."""
+    if trace_mode == "hlo":
+        pytest.skip("HLO pad supports only 'constant' and 'edge' modes")
+
+    def kernel(a):
+        return np.pad(a, ((2, 1), (1, 3)), mode=mode)
+
+    shape = (16, 32)
+    in0 = np.random.uniform(0.0, 1.0, size=shape).astype(np.float32)
+    expected = kernel(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_diff_prepend_append(trace_mode):
+    """Test np.diff with prepend and append scalars."""
+    if trace_mode == "hlo":
+        pytest.skip("HLO diff ignores prepend/append")
+
+    def kernel(a):
+        return np.diff(a, prepend=0.0, append=1.0, axis=-1)
+
+    shape = (32, 64)
     in0 = np.random.uniform(0.0, 1.0, size=shape).astype(np.float32)
     expected = kernel(in0)
     if NEURON_AVAILABLE:

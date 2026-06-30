@@ -35,6 +35,9 @@ def attention_kernel(
     cache_v,
     start_pos: Optional[nt.tensor],
     o_weight,
+    freqs_cos_cache=None,
+    freqs_sin_cache=None,
+    causal_mask_cache=None,
 ):
     """
     Unified attention kernel for Qwen3.
@@ -81,19 +84,33 @@ def attention_kernel(
 
     # RoPE
     max_seq_len = cache_k.shape[1]
-    freqs_cos, freqs_sin = compute_cos_sin_cache(
-        head_dim, max_seq_len, base=1000000, dtype=nl.bfloat16
-    )
     if is_prefill:
+        # Prefill: the needed rows are a static prefix, so slice the comptime
+        # cache directly (no full-cache promotion needed).
+        freqs_cos, freqs_sin = compute_cos_sin_cache(
+            head_dim, max_seq_len, base=1000000, dtype=nl.bfloat16
+        )
         freqs_cos = freqs_cos[0:seq_len]
         freqs_sin = freqs_sin[0:seq_len]
     else:
-        # Promote comptime numpy arrays to runtime tensors so they can be
-        # indexed with the runtime tensor start_pos.
-        freqs_cos = tensor_apis.constant(freqs_cos)
-        freqs_sin = tensor_apis.constant(freqs_sin)
-        freqs_cos = freqs_cos[start_pos]
-        freqs_sin = freqs_sin[start_pos]
+        # Decode: the row is selected by the runtime tensor start_pos, so the
+        # whole cache must be a runtime tensor.  The caches are passed in as
+        # kernel inputs (freqs_cos_cache/freqs_sin_cache) rather than promoted
+        # from a comptime numpy array: a full (max_seq_len, head_dim) constant
+        # would lower to one run-length fill per row on the nkigen-lite backend
+        # and blow its constant limit.  Falling back to the comptime constant
+        # keeps the HLO path and any caller that doesn't pass caches working.
+        if freqs_cos_cache is not None and freqs_sin_cache is not None:
+            freqs_cos = freqs_cos_cache[start_pos]
+            freqs_sin = freqs_sin_cache[start_pos]
+        else:
+            freqs_cos, freqs_sin = compute_cos_sin_cache(
+                head_dim, max_seq_len, base=1000000, dtype=nl.bfloat16
+            )
+            freqs_cos = tensor_apis.constant(freqs_cos)
+            freqs_sin = tensor_apis.constant(freqs_sin)
+            freqs_cos = freqs_cos[start_pos]
+            freqs_sin = freqs_sin[start_pos]
     xq, xk = apply_rotary_emb_kernel(xq, xk, freqs_cos, freqs_sin)
 
     # KV cache update
@@ -121,14 +138,33 @@ def attention_kernel(
 
     # Comptime: causal mask is a numpy array computed from constants at compile
     # time. Promote to runtime tensor so it can participate in ops with runtime tensors.
-    causal_mask = np.triu(np.ones((k_seq_len, k_seq_len)) * -100000, k=1).astype(
-        scores.dtype
-    )
-    causal_mask = tensor_apis.constant(causal_mask)
     # Apply causal mask
     if is_prefill:
-        scores = scores + np.expand_dims(causal_mask[:seq_len, :k_seq_len], axis=[0, 1])
+        # Build the mask at the sliced (seq_len, k_seq_len) shape directly rather
+        # than materializing the full (k_seq_len, k_seq_len) and slicing after the
+        # constant promotion: triu of the slice equals the slice of triu, and the
+        # full mask (e.g. 4096x4096) would otherwise be promoted as a huge
+        # non-uniform constant (one run-length fill per row, all live at once).
+        causal_mask = np.triu(
+            np.ones((seq_len, k_seq_len)) * -100000, k=1
+        ).astype(scores.dtype)
+        causal_mask = tensor_apis.constant(causal_mask)
+        scores = scores + np.expand_dims(causal_mask, axis=[0, 1])
     else:
+        # Decode: the mask row is selected by the runtime start_pos, so the
+        # whole (k_seq_len, k_seq_len) mask must be a runtime tensor.  Like the
+        # RoPE caches, it's passed in as a kernel input (causal_mask_cache)
+        # rather than promoted from a comptime numpy array, which would lower to
+        # one run-length fill per row and overflow the nkigen-lite constant
+        # limit.  Falling back to the comptime constant keeps the HLO path and
+        # callers that don't pass the cache working.
+        if causal_mask_cache is not None:
+            causal_mask = causal_mask_cache
+        else:
+            causal_mask = np.triu(
+                np.ones((k_seq_len, k_seq_len)) * -100000, k=1
+            ).astype(scores.dtype)
+            causal_mask = tensor_apis.constant(causal_mask)
         scores = scores + np.expand_dims(
             causal_mask[start_pos, :k_seq_len], axis=[0, 1]
         )

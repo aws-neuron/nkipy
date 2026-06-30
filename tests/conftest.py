@@ -9,11 +9,27 @@ import pytest
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
 
-# Trace mode fixture - tests will run with HLO tracing
-@pytest.fixture(params=["hlo"])
+# Trace mode fixture - tests will run with HLO and nkigen-lite tracing
+@pytest.fixture(params=["hlo", "nkigen-lite"])
 def trace_mode(request):
-    """Fixture to run tests with HLO tracing mode"""
+    """Fixture to run tests with HLO and nkigen-lite tracing modes"""
     return request.param
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_call(item):
+    """Mark NotImplementedError as xfail for nkigen-lite tests.
+
+    Many ops (diag, tril, flip, argmax, etc.) are only implemented for
+    the HLO backend.  Rather than skipping them statically, we let them
+    run and treat NotImplementedError as an expected failure — this way
+    they automatically start passing as ops are added.
+    """
+    outcome = yield
+    if outcome.excinfo is not None:
+        exc_type, exc_value, _ = outcome.excinfo
+        if exc_type is NotImplementedError and "nkigen-lite" in item.nodeid:
+            pytest.xfail(f"not implemented for nkigen-lite: {exc_value}")
 
 
 def _num_visible_core():
@@ -64,3 +80,4 @@ def pytest_configure(config):
 
         # acquire one Neuron core to do the test
         os.environ["NEURON_RT_NUM_CORES"] = "1"
+        os.environ["NEURON_RT_VISIBLE_CORES"] = str(core_idx)

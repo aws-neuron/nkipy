@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
-from ml_dtypes import bfloat16, float8_e4m3, float8_e5m2
+from ml_dtypes import bfloat16, float8_e4m3, float8_e4m3fn, float8_e5m2
 
 from ._spike import NrtModel, SystemTraceSession
 from .logger import get_logger
@@ -182,11 +182,19 @@ class SpikeModel:
         self, actual_dtype, expected_dtype, tensor_name: str, is_input: bool
     ):
         tensor_type = "Input" if is_input else "Output"
-        # FIXME: Pending NRT proper handling of FP8 Dtypes
-        if actual_dtype in {np.dtype(float8_e4m3), np.dtype(float8_e5m2)}:
-            assert expected_dtype == "int8", (
-                f"{tensor_type} {tensor_name}: expected dtype int8 for fp8 types, "
-                f"got {expected_dtype}"
+        # FIXME: Pending NRT proper handling of FP8 Dtypes.
+        # NRT does not carry FP8 dtypes through the neff metadata: e4m3/e5m2
+        # surface as "int8" and e4m3fn surfaces as "unknown".  The data still
+        # round-trips correctly, so accept either reported placeholder.
+        fp8_dtypes = {
+            np.dtype(float8_e4m3),
+            np.dtype(float8_e4m3fn),
+            np.dtype(float8_e5m2),
+        }
+        if actual_dtype in fp8_dtypes:
+            assert expected_dtype in {"int8", "unknown"}, (
+                f"{tensor_type} {tensor_name}: expected dtype int8/unknown for "
+                f"fp8 types, got {expected_dtype}"
             )
         else:
             # Strict dtype checking

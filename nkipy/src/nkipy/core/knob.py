@@ -60,7 +60,7 @@ def knob(
             reduction_tile=reduction_tile,
         )
         return tensor
-    elif backend == "hlo":
+    elif backend in ("hlo", "nkigen-lite"):
         warnings.warn(
             "knob() annotations are only effective with backend='nkigen'. "
             "Ignoring annotation.",
