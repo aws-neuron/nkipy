@@ -245,5 +245,108 @@ def main():
         print(f"    DMA-bound floor @ {bw:.1f} TB/s: {total_dma_gb / (bw*1000) * 1000:.1f} ms")
 
 
+def device_time_layer(n_warmup=5, n_iters=20):
+    """Compile + load the single fused transformer layer and time it in
+    isolation on device, so we can separate per-layer cost from the
+    surrounding token-embedding / final-norm / host overhead.
+
+    The whole model is 28 identical copies of this layer (plus embedding and
+    final norm), so ``28 * per_layer`` should account for nearly all of the
+    end-to-end latency. A large gap would point at the non-layer ops or host
+    dispatch overhead instead.
+    """
+    import time
+    from config import BUILD_DIR
+    from nkipy.runtime import DeviceKernel, DeviceTensor
+
+    config = get_config("0.6b")
+    dt = config.dtype
+    cos, sin = compute_qwen3_cos_sin(
+        max_model_len=config.max_model_len,
+        head_dim=config.head_dim,
+        theta=config.rope_theta,
+    )
+    cos_d = DeviceTensor.from_numpy(cos.astype(np.float32), "cos")
+    sin_d = DeviceTensor.from_numpy(sin.astype(np.float32), "sin")
+    qkv_size = (
+        config.num_attention_heads + 2 * config.num_key_value_heads
+    ) * config.head_dim
+    H = config.hidden_size
+    S = config.max_model_len
+    B = config.max_batch_size
+    inter = config.intermediate_size
+
+    def z(shape):
+        return np.zeros(shape, dtype=dt)
+
+    print("Compiling + loading the fused layer kernel...")
+    kernel = DeviceKernel.compile_and_load(
+        kernel=NKIPyKernel.trace(transformer_layer_kernel, backend="nkigen-lite"),
+        hidden_states=z((B, S, H)),
+        input_layernorm_weight=z(H),
+        qkv_weight=z((H, qkv_size)),
+        o_weight=z((config.num_attention_heads * config.head_dim, H)),
+        q_norm_weight=z(config.head_dim),
+        k_norm_weight=z(config.head_dim),
+        cos=cos_d,
+        sin=sin_d,
+        post_attention_layernorm_weight=z(H),
+        gate_up_weight=z((H, 2 * inter)),
+        down_weight=z((inter, H)),
+        gate_up_bias=z(2 * inter),
+        down_bias=z(H),
+        config=config,
+        compute_dtype=dt,
+        name="qwen3_layer_profile",
+        build_dir=BUILD_DIR,
+        additional_compiler_args=" --lnc 2",
+    )
+
+    def dev(arr, name):
+        return DeviceTensor.from_numpy(arr, name)
+
+    inputs = {
+        "hidden_states": dev(z((B, S, H)), "hidden_states"),
+        "input_layernorm_weight": dev(z(H), "iln"),
+        "qkv_weight": dev(z((H, qkv_size)), "qkv"),
+        "o_weight": dev(z((config.num_attention_heads * config.head_dim, H)), "ow"),
+        "q_norm_weight": dev(z(config.head_dim), "qn"),
+        "k_norm_weight": dev(z(config.head_dim), "kn"),
+        "cos": cos_d,
+        "sin": sin_d,
+        "post_attention_layernorm_weight": dev(z(H), "pln"),
+        "gate_up_weight": dev(z((H, 2 * inter)), "gu"),
+        "down_weight": dev(z((inter, H)), "dw"),
+        "gate_up_bias": dev(z(2 * inter), "gub"),
+        "down_bias": dev(z(H), "db"),
+    }
+    out = dev(z((B, S, H)), "layer_out")
+    (out_name,) = kernel.output_tensors_info.keys()
+    outputs = {out_name: out}
+
+    for _ in range(n_warmup):
+        kernel(inputs=inputs, outputs=outputs)
+    lat = []
+    for _ in range(n_iters):
+        t = time.perf_counter()
+        kernel(inputs=inputs, outputs=outputs)
+        lat.append((time.perf_counter() - t) * 1000)
+    lat = np.array(lat)
+
+    n_layers = config.num_hidden_layers
+    print("\n" + "=" * 60)
+    print("Device timing — single fused transformer layer")
+    print("=" * 60)
+    print(f"  per-layer:   mean {lat.mean():.3f} ms   min {lat.min():.3f}   "
+          f"std {lat.std():.3f}  (n={n_iters})")
+    print(f"  x{n_layers} layers: {lat.mean() * n_layers:.1f} ms")
+    print(f"  (full-model e2e benchmark is ~174 ms; the remainder is token "
+          f"embedding + final norm + {n_layers} host dispatches)")
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+    if "--device" in sys.argv:
+        device_time_layer()
+    else:
+        main()
