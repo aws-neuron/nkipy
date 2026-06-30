@@ -437,3 +437,106 @@ class TestLowerHW:
         _lower_and_check_hw(
             compile_and_run, build, {"x": x, "w": w}, (128, 512)
         )
+
+
+class TestCollapsedElementwise:
+    """Rank>=3 elementwise segments collapse leading dims onto the partition.
+
+    These shapes mirror the multi-batch attention segments in the fused Qwen3
+    layer, where the old per-tile path used only out[-2] partition lanes and
+    unrolled prod(out[:-2]) iterations. Verified at the interpreter level and
+    (selectively) on hardware. See ``_try_emit_collapsed_ew`` in
+    ``direct_lower.py``.
+    """
+
+    # -- interpreter --
+
+    def test_mul_4d_full(self):
+        rng = np.random.default_rng(0)
+        x = rng.standard_normal((1, 128, 16, 64)).astype(np.float32)
+        y = rng.standard_normal((1, 128, 16, 64)).astype(np.float32)
+
+        def build(b):
+            a = b.add_input("x", (1, 128, 16, 64))
+            c = b.add_input("y", (1, 128, 16, 64))
+            b.set_outputs({"z": b.mul(a, c)})
+
+        _lower_and_check_interp(build, {"x": x, "y": y}, (1, 128, 16, 64))
+
+    def test_mul_4d_free_size1_broadcast(self):
+        """(1,128,16,128) * (1,128,16,1): free-size-1 operand broadcasts."""
+        rng = np.random.default_rng(1)
+        x = rng.standard_normal((1, 128, 16, 128)).astype(np.float32)
+        s = rng.standard_normal((1, 128, 16, 1)).astype(np.float32)
+
+        def build(b):
+            a = b.add_input("x", (1, 128, 16, 128))
+            c = b.add_input("s", (1, 128, 16, 1))
+            b.set_outputs({"z": b.mul(a, c)})
+
+        _lower_and_check_interp(build, {"x": x, "s": s}, (1, 128, 16, 128))
+
+    def test_var_4d_constant(self):
+        """Chain with constants on a 4D free-size-1 shape (RMSNorm variance)."""
+        rng = np.random.default_rng(2)
+        x = np.abs(rng.standard_normal((1, 128, 16, 1)).astype(np.float32)) + 0.1
+
+        def build(b):
+            a = b.add_input("x", (1, 128, 16, 1))
+            eps = b.constant(1e-5, (1, 128, 16, 1), DType.F32)
+            b.set_outputs({"z": b.sqrt(b.add(b.mul(a, a), eps))})
+
+        _lower_and_check_interp(build, {"x": x}, (1, 128, 16, 1), atol=1e-4)
+
+    def test_sub_exp_4d(self):
+        rng = np.random.default_rng(3)
+        x = rng.standard_normal((1, 16, 128, 128)).astype(np.float32) * 0.1
+        m = rng.standard_normal((1, 16, 128, 128)).astype(np.float32) * 0.1
+
+        def build(b):
+            a = b.add_input("x", (1, 16, 128, 128))
+            c = b.add_input("m", (1, 16, 128, 128))
+            b.set_outputs({"z": b.exp(b.sub(a, c))})
+
+        _lower_and_check_interp(build, {"x": x, "m": m}, (1, 16, 128, 128), atol=1e-4)
+
+    # -- hardware --
+
+    def test_mul_4d_full_hw(self, compile_and_run):
+        rng = np.random.default_rng(0)
+        x = rng.standard_normal((1, 128, 16, 64)).astype(np.float32)
+        y = rng.standard_normal((1, 128, 16, 64)).astype(np.float32)
+
+        def build(b):
+            a = b.add_input("x", (1, 128, 16, 64))
+            c = b.add_input("y", (1, 128, 16, 64))
+            b.set_outputs({"z": b.mul(a, c)})
+
+        _lower_and_check_hw(
+            compile_and_run, build, {"x": x, "y": y}, (1, 128, 16, 64)
+        )
+
+    def test_mul_4d_free_size1_broadcast_hw(self, compile_and_run):
+        rng = np.random.default_rng(1)
+        x = rng.standard_normal((1, 128, 16, 128)).astype(np.float32)
+        s = rng.standard_normal((1, 128, 16, 1)).astype(np.float32)
+
+        def build(b):
+            a = b.add_input("x", (1, 128, 16, 128))
+            c = b.add_input("s", (1, 128, 16, 1))
+            b.set_outputs({"z": b.mul(a, c)})
+
+        _lower_and_check_hw(
+            compile_and_run, build, {"x": x, "s": s}, (1, 128, 16, 128)
+        )
+
+    def test_var_4d_constant_hw(self, compile_and_run):
+        rng = np.random.default_rng(2)
+        x = np.abs(rng.standard_normal((1, 128, 16, 1)).astype(np.float32)) + 0.1
+
+        def build(b):
+            a = b.add_input("x", (1, 128, 16, 1))
+            eps = b.constant(1e-5, (1, 128, 16, 1), DType.F32)
+            b.set_outputs({"z": b.sqrt(b.add(b.mul(a, a), eps))})
+
+        _lower_and_check_hw(compile_and_run, build, {"x": x}, (1, 128, 16, 1))

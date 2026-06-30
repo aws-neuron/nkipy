@@ -288,6 +288,116 @@ def _canonical_layout(rank: int) -> Layout:
     return Layout(i_dims=i_dims, p_dims=p_dims, f_dims=f_dims)
 
 
+def _collapse_ew_shape(shape: tuple[int, ...], rep_shape: tuple[int, ...]):
+    """Collapse a value's shape to the 2D ``(P, F)`` form of an elementwise
+    segment whose representative output is ``rep_shape``.
+
+    The segment loops a canonical row-major layout: the last axis is the free
+    dim and *all* leading axes fold into the partition. When every value in the
+    segment shares the rep's free extent (or is free-size-1), the whole op
+    reduces to one ``(prod(rep[:-1]), rep[-1])`` loop — packing the 128-lane
+    partition instead of iterating the leading dims one element at a time.
+
+    Returns the collapsed ``(P, F)`` for *shape*, or ``None`` if it can't align
+    to the rep (different free extent and not free-size-1; or rank mismatch
+    that isn't a clean broadcast). ``None`` makes the caller fall back to the
+    generic per-tile path.
+    """
+    if len(rep_shape) < 3:
+        return None  # 0/1/2-D already packs the partition; no collapse needed
+    rep_P = prod(rep_shape[:-1])
+    rep_F = rep_shape[-1]
+
+    if shape == rep_shape:
+        return (rep_P, rep_F)
+    # Right-align (numpy broadcast rules): a lower-rank operand broadcasts over
+    # the rep's leading axes.
+    if len(shape) > len(rep_shape):
+        return None
+    al = (1,) * (len(rep_shape) - len(shape)) + tuple(shape)
+    P = prod(al[:-1])
+    F = al[-1]
+    # Free dim must match the rep (full) or be 1 (per-row scalar broadcast).
+    if F != rep_F and F != 1:
+        return None
+    # Partition must match the rep (full) or be 1 (broadcast across all rows).
+    if P != rep_P and P != 1:
+        return None
+    return (P, F)
+
+
+def _try_emit_collapsed_ew(
+    nb: Builder, ops: list, hbm_map: dict[str, Value], rep_shape: tuple[int, ...],
+) -> bool:
+    """Emit a rank>=3 elementwise segment via leading-dims-onto-partition
+    collapse. Returns False (emitting nothing) when the segment can't be
+    cleanly collapsed, so the caller runs the generic per-tile path.
+
+    Every external input and every op result must collapse to the rep's
+    ``(P, F)`` (see ``_collapse_ew_shape``). When it does, we reinterpret each
+    HBM buffer to its collapsed 2D shape with a zero-copy view, build a 2D
+    ``hbm_map`` / ``layouts`` view, and reuse the existing 2D tile machinery
+    (``_emit_ew_tile``) — which already handles F/P broadcasting of size-1
+    operands via ``emit_binary_op``.
+    """
+    if len(rep_shape) < 3:
+        return False
+
+    segment_results = {r.name for op in ops for r in op.results}
+
+    # Gather every value that needs a collapsed shape: external inputs and all
+    # results. Validate each collapses; bail (no emission) on any mismatch.
+    values: dict[str, Value] = {}
+    for op in ops:
+        for inp in op.inputs:
+            if inp.name not in segment_results:
+                values[inp.name] = inp
+        for r in op.results:
+            values[r.name] = r
+
+    collapsed: dict[str, tuple[int, int]] = {}
+    for name, v in values.items():
+        pf = _collapse_ew_shape(v.type.shape, rep_shape)
+        if pf is None:
+            return False
+        collapsed[name] = pf
+
+    # Build 2D HBM views and a parallel hbm_map / layouts keyed by the same
+    # names the tile machinery uses.
+    view_map: dict[str, Value] = {}
+    view_layouts: dict[str, Layout] = {}
+    rep_2d = (prod(rep_shape[:-1]), rep_shape[-1])
+    for name, pf in collapsed.items():
+        hbm_val = hbm_map[name]
+        # A genuine reshape (collapse) needs a view; an already-2D buffer of the
+        # right shape is used directly.
+        if tuple(hbm_val.type.shape) == pf:
+            view_map[name] = hbm_val
+        else:
+            view_map[name] = nb.view(hbm_val, pf)
+        view_layouts[name] = _canonical_layout(2)
+
+    rep_layout = _canonical_layout(2)
+    tile_sizes = compute_tile_sizes(rep_2d, rep_layout)
+    loop_dims = [(d, rep_2d[d], tile_sizes[d])
+                 for d in sorted(tile_sizes.keys())
+                 if tile_sizes[d] < rep_2d[d]]
+
+    shape_override = {name: pf for name, pf in collapsed.items()}
+
+    def _emit_nested(depth: int, indices: dict[int, int]):
+        if depth >= len(loop_dims):
+            _emit_ew_tile(nb, ops, view_layouts, view_map, rep_layout, rep_2d,
+                          tile_sizes, indices, segment_results, shape_override)
+            return
+        d, extent, ts = loop_dims[depth]
+        for i in range(ceildiv(extent, ts)):
+            _emit_nested(depth + 1, {**indices, d: i})
+
+    _emit_nested(0, {})
+    return True
+
+
 def _emit_elementwise_segment(
     nb: Builder, ops: list, layouts: dict[str, Layout], hbm_map: dict[str, Value],
 ) -> None:
@@ -297,6 +407,15 @@ def _emit_elementwise_segment(
     # coordinates — the declared layout of individual values is irrelevant.
     rep_val = ops[-1].results[0]
     rep_shape = rep_val.type.shape
+
+    # Fast path: collapse leading dims onto the partition. A rank>=3 segment
+    # otherwise tiles only out[-2] as the partition and unrolls prod(out[:-2])
+    # leading-dim iterations one at a time (e.g. (1,128,16,64) uses 16 of 128
+    # lanes and unrolls 128 times). Collapsing to (prod(shape[:-1]), shape[-1])
+    # packs the partition and runs a single 2D loop.
+    if _try_emit_collapsed_ew(nb, ops, hbm_map, rep_shape):
+        return
+
     rep_layout = _canonical_layout(len(rep_shape))
     tile_sizes = compute_tile_sizes(rep_shape, rep_layout)
 
@@ -325,8 +444,17 @@ def _emit_ew_tile(
     rep_layout: Layout, rep_shape: tuple[int, ...],
     tile_sizes: dict[int, int], indices: dict[int, int],
     segment_results: set[str],
+    shape_override: dict[str, tuple[int, ...]] | None = None,
 ) -> None:
-    """Emit one tile of fused elementwise computation."""
+    """Emit one tile of fused elementwise computation.
+
+    ``shape_override`` (collapsed-path only) maps a value name to the shape the
+    tile machinery should treat it as, instead of its declared N-D shape. The
+    collapsed path reshapes HBM buffers to 2D views but the op results still
+    carry their original N-D types, so ``constant`` (which sizes its tile from
+    the result type) needs the 2D shape to match the rest of the tile.
+    """
+    shape_override = shape_override or {}
     tile_map: dict[str, Value] = {}
     rep_tile = on_chip_shape(rep_shape, rep_layout, tile_sizes, indices)
 
@@ -385,7 +513,7 @@ def _emit_ew_tile(
             nb.tensor_tensor_arith(result, mask_x, mask_y, NisaArithOp.ADD)
             tile_map[out_name] = result
         elif op.opcode == "constant":
-            out_shape = op.results[0].type.shape
+            out_shape = shape_override.get(out_name, op.results[0].type.shape)
             const_layout = _canonical_layout(len(out_shape))
             const_tile_sizes = compute_tile_sizes(out_shape, const_layout)
             const_tile = on_chip_shape(out_shape, const_layout, const_tile_sizes, indices)
