@@ -252,5 +252,91 @@ class TestConcat:
         _check(graph, {"x0": a, "x1": b_arr, "y": np.zeros_like(expected)}, expected)
 
 
+class TestCollapsedLastAxis:
+    """Pipeline-path slice/concat on the last axis of rank>=3 tensors.
+
+    These exercise the collapse-leading-dims-onto-partition fast paths in
+    ``emit_slice`` / ``emit_concat`` (reached via ``lower_to_nki``), which the
+    standalone ``lower_slice`` / ``lower_concat`` API above does not cover.
+    Shapes mirror the RoPE-half concat/slice in the fused Qwen3 layer.
+    """
+
+    @staticmethod
+    def _run(build_fn, inputs, out_shape, atol=1e-5):
+        from nkigen_lite.tensor_ir.ir import Builder, run as tensor_run
+        from nkigen_lite.tensor_ir.passes.lower_to_nki import lower_to_nki
+
+        b = Builder("t")
+        build_fn(b)
+        ref = tensor_run(b.graph, inputs)
+        nki_graph = lower_to_nki(b.graph)
+
+        nki_inputs = dict(inputs)
+        nki_inputs["o_out"] = np.zeros(out_shape, dtype=np.float32)
+        interp = nki_run(nki_graph, nki_inputs)
+        np.testing.assert_allclose(
+            interp["o"], ref["o"], atol=atol, rtol=atol,
+            err_msg="Interpreter mismatch",
+        )
+
+        if not HAS_NKI:
+            pytest.skip("nki not installed")
+        opts = nb_kb.CompileOptions(target="trn2")
+        kernel_fn = build_kb_kernel(nki_graph)
+        hw_outputs = {"o_out": np.zeros(out_shape, dtype=np.float32)}
+        nb_kb.compile_and_execute(
+            kernel_fn, inputs=dict(inputs), outputs=hw_outputs, compile_opts=opts,
+        )
+        np.testing.assert_allclose(
+            hw_outputs["o_out"], ref["o"], atol=atol, rtol=atol, err_msg="HW mismatch",
+        )
+
+    def test_concat_last_axis_4d(self):
+        rng = np.random.default_rng(0)
+        a = rng.standard_normal((1, 128, 16, 64)).astype(np.float32)
+        c = rng.standard_normal((1, 128, 16, 64)).astype(np.float32)
+
+        def build(b):
+            ta = b.add_input("a", (1, 128, 16, 64))
+            tc = b.add_input("c", (1, 128, 16, 64))
+            b.set_outputs({"o": b.concat([ta, tc], axis=3)})
+
+        self._run(build, {"a": a, "c": c}, (1, 128, 16, 128))
+
+    def test_concat_last_axis_uneven_widths(self):
+        rng = np.random.default_rng(1)
+        a = rng.standard_normal((1, 64, 4, 32)).astype(np.float32)
+        c = rng.standard_normal((1, 64, 4, 16)).astype(np.float32)
+        d = rng.standard_normal((1, 64, 4, 48)).astype(np.float32)
+
+        def build(b):
+            ta = b.add_input("a", (1, 64, 4, 32))
+            tc = b.add_input("c", (1, 64, 4, 16))
+            td = b.add_input("d", (1, 64, 4, 48))
+            b.set_outputs({"o": b.concat([ta, tc, td], axis=3)})
+
+        self._run(build, {"a": a, "c": c, "d": d}, (1, 64, 4, 96))
+
+    def test_slice_last_axis_4d_low(self):
+        rng = np.random.default_rng(2)
+        x = rng.standard_normal((1, 128, 16, 128)).astype(np.float32)
+
+        def build(b):
+            tx = b.add_input("x", (1, 128, 16, 128))
+            b.set_outputs({"o": b.slice(tx, starts=(0, 0, 0, 0), stops=(1, 128, 16, 64))})
+
+        self._run(build, {"x": x}, (1, 128, 16, 64))
+
+    def test_slice_last_axis_4d_high(self):
+        rng = np.random.default_rng(3)
+        x = rng.standard_normal((1, 128, 16, 128)).astype(np.float32)
+
+        def build(b):
+            tx = b.add_input("x", (1, 128, 16, 128))
+            b.set_outputs({"o": b.slice(tx, starts=(0, 0, 0, 64), stops=(1, 128, 16, 128))})
+
+        self._run(build, {"x": x}, (1, 128, 16, 64))
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--no-header", "-q"])

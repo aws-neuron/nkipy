@@ -820,6 +820,47 @@ def _emit_reshape_diff_f(nb, x_hbm, y_hbm, in_shape, out_shape, dtype):
                     cur_col = 0
 
 
+def _collapse_to_2d(nb: Builder, hbm, shape, lead, last):
+    """Reinterpret a row-major HBM buffer of *shape* as 2D ``(lead, last)``.
+
+    ``lead * last`` must equal ``prod(shape)``. A reshape preserves row-major
+    flat order and HBM buffers are contiguous, so this is a zero-copy view (no
+    data movement). Returns the original buffer untouched when it already has
+    the target 2D shape.
+    """
+    if tuple(hbm.type.shape) == (lead, last):
+        return hbm
+    return nb.view(hbm, (lead, last))
+
+
+def _emit_2d_window_copy(
+    nb: Builder, src_2d, dst_2d, src_f_off: int, dst_f_off: int, f_width: int,
+    dtype,
+) -> None:
+    """Copy a full-height column window ``[f_off, f_off+f_width)`` from a 2D HBM
+    source to a 2D HBM destination, tiling the partition at 128 and the free
+    dim at the per-partition SBUF budget. One load + store per (P, F) tile.
+
+    Used by the collapsed slice/concat fast paths: both reduce to "copy a
+    contiguous last-axis window across all the (collapsed) leading rows".
+    """
+    P = src_2d.type.shape[0]
+    cap = max_free_elems(dtype)
+    for p_i in range(ceildiv(P, PARTITION_MAX)):
+        p_off = p_i * PARTITION_MAX
+        p_size = min(PARTITION_MAX, P - p_off)
+        for f_i in range(ceildiv(f_width, cap)):
+            fo = f_i * cap
+            fw = min(cap, f_width - fo)
+            tile = nb.dma_copy(
+                nb.alloc((p_size, fw), dtype, MemorySpace.SBUF),
+                src_2d, (DimSlice(p_off, p_size), DimSlice(src_f_off + fo, fw)),
+            )
+            nb.dma_copy(
+                dst_2d, tile, (DimSlice(p_off, p_size), DimSlice(dst_f_off + fo, fw))
+            )
+
+
 def emit_slice(nb: Builder, x_hbm, y_hbm, in_shape, out_shape, starts, dtype,
                strides=None) -> None:
     """Emit slice tiling into an existing Builder."""
@@ -830,6 +871,19 @@ def emit_slice(nb: Builder, x_hbm, y_hbm, in_shape, out_shape, starts, dtype,
     has_non_unit_stride = any(s != 1 for s in strides)
     if has_non_unit_stride:
         _emit_strided_slice(nb, x_hbm, y_hbm, in_shape, out_shape, starts, strides, dtype)
+        return
+
+    # Fast path: a rank>=3 slice that touches only the last axis (all leading
+    # dims kept in full) collapses to a 2D last-axis window. The leading dims
+    # fold onto the partition via a zero-copy view, so a single 2D tiled loop
+    # packs all 128 lanes instead of unrolling prod(out[:-2]) one-row copies.
+    if (rank >= 3
+            and all(starts[i] == 0 and out_shape[i] == in_shape[i] for i in range(rank - 1))):
+        lead = prod(in_shape[:-1])
+        src_2d = _collapse_to_2d(nb, x_hbm, in_shape, lead, in_shape[-1])
+        dst_2d = _collapse_to_2d(nb, y_hbm, out_shape, lead, out_shape[-1])
+        _emit_2d_window_copy(
+            nb, src_2d, dst_2d, starts[-1], 0, out_shape[-1], dtype)
         return
 
     tile_p = min(out_shape[-2], PARTITION_MAX) if rank >= 2 else 1
@@ -921,9 +975,27 @@ def _emit_strided_slice(nb, x_hbm, y_hbm, in_shape, out_shape, starts, strides, 
 def emit_concat(nb: Builder, input_hbms: list, y_hbm, input_shapes: list, axis: int, dtype) -> None:
     """Emit concat tiling into an existing Builder."""
     rank = len(input_shapes[0])
+    if axis < 0:
+        axis += rank
     out_shape = list(input_shapes[0])
     out_shape[axis] = sum(s[axis] for s in input_shapes)
     out_shape = tuple(out_shape)
+
+    # Fast path: a rank>=3 concat on the last axis (all non-axis dims match by
+    # definition) collapses to a 2D last-axis assembly. Each input becomes a
+    # column window of the 2D output; leading dims fold onto the partition via
+    # zero-copy views, so each input is one 2D tiled loop over all 128 lanes
+    # instead of unrolling prod(shape[:-2]) one-row copies.
+    if rank >= 3 and axis == rank - 1:
+        lead = prod(out_shape[:-1])
+        dst_2d = _collapse_to_2d(nb, y_hbm, out_shape, lead, out_shape[-1])
+        dst_f_off = 0
+        for inp_idx, inp_shape in enumerate(input_shapes):
+            w = inp_shape[-1]
+            src_2d = _collapse_to_2d(nb, input_hbms[inp_idx], inp_shape, lead, w)
+            _emit_2d_window_copy(nb, src_2d, dst_2d, 0, dst_f_off, w, dtype)
+            dst_f_off += w
+        return
 
     concat_offset = 0
     for inp_idx, inp_shape in enumerate(input_shapes):
