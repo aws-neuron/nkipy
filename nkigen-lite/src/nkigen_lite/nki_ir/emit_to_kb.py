@@ -179,6 +179,9 @@ def _emit_op(op: Op, tiles: dict[str, object]) -> None:
         tile = nb.compiler.alloc((1, 1), nb.int32, space=nb.sbuf)
         nisa.memset(dst=tile, value=float(value))
         reg = nisa.load_register(tile[0:1, 0])
+        # The scratch tile is dead once loaded into the register; release it so
+        # it doesn't leak (no nki_ir alloc op backs it for insert_deallocs).
+        nb.compiler.release(tile)
         tiles[op.result.name] = reg
 
     elif op.opcode == "affine":
@@ -377,24 +380,35 @@ def _emit_op(op: Op, tiles: dict[str, object]) -> None:
         # tensor_scalar_arith requires f32; upcast if needed
         needs_cast = (op.inputs[1].type.dtype != DType.F32)
         if needs_cast:
+            # These f32 scratch tiles are allocated directly through KB (they
+            # have no nki_ir alloc op), so insert_deallocs can't free them.
+            # Release each explicitly after its last use, or they pin SBUF for
+            # the rest of the kernel and accumulate across every cast.
+            scratch = []
             x_f32 = nb.compiler.alloc(
                 op.inputs[1].type.shape, nb.float32, space=nb.sbuf)
+            scratch.append(x_f32)
             nisa.tensor_copy(dst=x_f32, src=x)
             op0_f32 = nb.compiler.alloc(
                 op.inputs[2].type.shape, nb.float32, space=nb.sbuf)
+            scratch.append(op0_f32)
             nisa.tensor_copy(dst=op0_f32, src=operand0)
             if "operand1" in kwargs:
                 op1_orig = kwargs["operand1"]
                 op1_f32 = nb.compiler.alloc(
                     op.inputs[3].type.shape, nb.float32, space=nb.sbuf)
+                scratch.append(op1_f32)
                 nisa.tensor_copy(dst=op1_f32, src=op1_orig)
                 kwargs["operand1"] = op1_f32
             dst_f32 = nb.compiler.alloc(
                 op.inputs[0].type.shape, nb.float32, space=nb.sbuf)
+            scratch.append(dst_f32)
             nisa.tensor_scalar_arith(
                 dst=dst_f32, src=x_f32, operand0=op0_f32, op0=op0, **kwargs,
             )
             nisa.tensor_copy(dst=dst, src=dst_f32)
+            for t in scratch:
+                nb.compiler.release(t)
         else:
             nisa.tensor_scalar_arith(
                 dst=dst, src=x, operand0=operand0, op0=op0, **kwargs,
@@ -588,9 +602,12 @@ def _emit_op(op: Op, tiles: dict[str, object]) -> None:
         nisa.tensor_copy(dst=dst, src=on_false)
         pred_type = op.inputs[1].type
         if pred_type.dtype not in (DType.U8, DType.U16, DType.U32):
+            # KB-level scratch with no nki_ir alloc op; release after use so
+            # insert_deallocs' blind spot doesn't leak it.
             pred_u8 = nb.compiler.alloc(pred_type.shape, nb.uint8, space=nb.sbuf)
             nisa.tensor_copy(dst=pred_u8, src=pred)
             nisa.copy_predicated(dst=dst, pred_mask=pred_u8, src=on_true)
+            nb.compiler.release(pred_u8)
         else:
             nisa.copy_predicated(dst=dst, pred_mask=pred, src=on_true)
         tiles[op.result.name] = dst

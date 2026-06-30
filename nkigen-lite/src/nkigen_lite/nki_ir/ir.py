@@ -1182,9 +1182,12 @@ class Builder:
 
         Maps to KB's ``TileView.view(new_shape, dtype)``.
         Total byte size must match.  Zero-copy in KB (view transform).
+
+        Permitted on HBM as well as on-chip operands: a reshape preserves
+        row-major flat order, so reinterpreting a contiguous HBM buffer to a
+        new shape needs no data movement (KB skips the partition-size check
+        for HBM tiles).
         """
-        if x.type.memory == MemorySpace.HBM:
-            raise ValueError("view: operand must be on-chip")
         out_dtype = dtype if dtype is not None else x.type.dtype
         old_bytes = prod(x.type.shape) * _DTYPE_BYTES[x.type.dtype]
         new_bytes = prod(new_shape) * _DTYPE_BYTES[out_dtype]

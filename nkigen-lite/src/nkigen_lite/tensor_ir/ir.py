@@ -409,15 +409,14 @@ class Builder:
 
         Lowers to the canonical hardware scan: ceil(k/8) rounds of ``max8``
         (next 8 largest) + ``match_replace8`` (record indices, mask taken
-        values with -inf).  ``F`` must be in [8, 16384].  Indices are uint32
-        because the DVE index instruction requires a uint16/uint32 AP.
+        values with -inf).  ``max8`` reads at most 16384 free elements per call;
+        wider ``F`` is tiled and merged in the lowering (see ``_emit_topk_op``).
+        Indices are uint32 because the DVE index instruction requires a
+        uint16/uint32 AP.
         """
         if x.type.rank != 2:
             raise ValueError(f"topk: input must be 2-D, got rank {x.type.rank}")
         P, F = x.type.shape
-        # max8 needs a free dim >= 8; the lowering pads with -inf when F < 8.
-        if F > 16384:
-            raise ValueError(f"topk: free dim must be <= 16384, got {F}")
         if not (1 <= k <= F):
             raise ValueError(f"topk: k must be in [1, {F}], got {k}")
         val_t = TensorType((P, k), x.type.dtype)

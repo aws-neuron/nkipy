@@ -181,10 +181,18 @@ def flat_range_to_src_chunks(
 # ---------------------------------------------------------------------------
 
 
-def compute_tile_sizes(shape: tuple[int, ...], layout: Layout) -> dict[int, int]:
+def compute_tile_sizes(
+    shape: tuple[int, ...], layout: Layout, dtype: "DType | None" = None
+) -> dict[int, int]:
     """Compute per-dimension tile sizes.
 
-    I-dims: 1, outer P-dims: 1, innermost P-dim: min(extent, 128), F-dims: full.
+    I-dims: 1, outer P-dims: 1, innermost P-dim: min(extent, 128). F-dims are
+    full except the innermost, which is capped so one tile row fits a single
+    SBUF partition (a vocab-wide row, e.g. [1, 37984], would otherwise need a
+    150 KB tile and overflow once a few are live).  The lowering loops already
+    iterate ceil(extent / tile) tiles, so a smaller innermost-F tile is just
+    more iterations.  ``dtype`` selects the byte budget; when omitted, the
+    conservative F32 budget is used.
     """
     tiles: dict[int, int] = {}
     for d in layout.i_dims:
@@ -192,8 +200,20 @@ def compute_tile_sizes(shape: tuple[int, ...], layout: Layout) -> dict[int, int]
     p_dims = layout.p_dims
     for i, d in enumerate(p_dims):
         tiles[d] = min(shape[d], PARTITION_MAX) if i == len(p_dims) - 1 else 1
-    for d in layout.f_dims:
-        tiles[d] = shape[d]
+    f_dims = layout.f_dims
+    cap = max_free_elems(dtype) if dtype is not None else max_free_elems(DType.F32)
+    for i, d in enumerate(f_dims):
+        if i == len(f_dims) - 1:
+            # Innermost F: cap to the per-partition budget divided by the outer
+            # F extents already committed (so the full on-chip free size stays
+            # within budget).
+            outer_f = 1
+            for j, dd in enumerate(f_dims):
+                if j != i:
+                    outer_f *= shape[dd]
+            tiles[d] = max(1, min(shape[d], cap // max(1, outer_f)))
+        else:
+            tiles[d] = shape[d]
     return tiles
 
 

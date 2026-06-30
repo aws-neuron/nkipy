@@ -119,8 +119,15 @@ def lower_graph(graph: Graph, layouts: dict[str, Layout]) -> nki_ir.Graph:
         if key not in hbm_map:
             hbm_map[key] = nb.add_input(key, _nki_shape(out_val.type.shape), out_val.type.dtype)
 
-    # Allocate HBM intermediates for all op results
+    # Allocate HBM intermediates for all op results.  Skip reshape results:
+    # a reshape preserves row-major flat order, so its result is emitted as a
+    # zero-copy view of the (row-major contiguous) input HBM buffer rather than
+    # a fresh allocation + copy.  Allocating here would leave a large dead HBM
+    # buffer (an expert weight reshape is ~100 MB).  Scalar reshapes still need
+    # a real buffer (() promotion), so don't skip those.
     for op in graph.ops:
+        if op.opcode == "reshape" and _is_view_reshape(op):
+            continue
         for r in op.results:
             if r.name not in hbm_map:
                 hbm_map[r.name] = nb.alloc(
@@ -467,9 +474,29 @@ def _emit_transpose_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
     )
 
 
+def _is_view_reshape(op) -> bool:
+    """True if a reshape can be lowered as a zero-copy HBM view.
+
+    A reshape preserves row-major flat order, and HBM buffers are row-major
+    contiguous, so reinterpreting one to a new shape needs no data movement.
+    The only exception is reshapes involving a rank-0 (scalar) shape, which
+    the lowering promotes () -> (1,); those keep the explicit copy path so the
+    byte sizes the view checks still line up.
+    """
+    inp_val = op.inputs[0]
+    out_val = op.results[0]
+    return len(inp_val.type.shape) > 0 and len(out_val.type.shape) > 0
+
+
 def _emit_reshape_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
     inp_val = op.inputs[0]
     out_val = op.results[0]
+    if _is_view_reshape(op):
+        # Zero-copy: reinterpret the input HBM buffer to the output shape.
+        # The result was deliberately not pre-allocated (see lower_graph), so
+        # downstream consumers read this view directly.
+        hbm_map[out_val.name] = nb.view(hbm_map[inp_val.name], out_val.type.shape)
+        return
     emit_reshape(
         nb, hbm_map[inp_val.name], hbm_map[out_val.name],
         inp_val.type.shape, out_val.type.shape, inp_val.type.dtype,
@@ -562,14 +589,68 @@ def _emit_iota_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
             nb.dma_copy(dst_hbm, tile, dst_slices)
 
 
+# max8 / match_replace8 read at most this many free elements per call (a real
+# hardware limit the MLIR verifier enforces).  Wider rows are tiled.
+TOPK_FREE_MAX = 16384
+
+
+def _topk_scan(nb: Builder, data: Value, P: int, k: int, vdtype, idtype):
+    """Run the max8 + match_replace8 scan over a resident (P, W>=8) SBUF tile.
+
+    Returns ``(vals_sbuf (P, kp), idx_sbuf (P, kp))`` where ``kp = ceil(k/8)*8``
+    (the fold-aligned width); callers slice the first ``k`` columns.  Indices
+    are positions within ``data``.  Assembling the per-fold 8-wide results into
+    one wide SBUF tile needs sub-tile column writes, which nki_ir lacks, so the
+    folds round-trip through an HBM scratch buffer.
+    """
+    n_fold = (k + 7) // 8
+    kp = n_fold * 8
+    if n_fold == 1:
+        val8 = nb.max8(nb.alloc((P, 8), vdtype, MemorySpace.SBUF), data)
+        idx8 = nb.alloc((P, 8), idtype, MemorySpace.SBUF)
+        _, idx8 = nb.match_replace8(data, idx8, data, val8, float("-inf"))
+        return val8, idx8
+    val_scratch = nb.alloc((P, kp), vdtype, MemorySpace.HBM)
+    idx_scratch = nb.alloc((P, kp), idtype, MemorySpace.HBM)
+    for fold in range(n_fold):
+        val8 = nb.max8(nb.alloc((P, 8), vdtype, MemorySpace.SBUF), data)
+        idx8 = nb.alloc((P, 8), idtype, MemorySpace.SBUF)
+        data, idx8 = nb.match_replace8(data, idx8, data, val8, float("-inf"))
+        col = DimSlice(fold * 8, 8)
+        nb.dma_copy(val_scratch, val8, (DimSlice(0, P), col))
+        nb.dma_copy(idx_scratch, idx8, (DimSlice(0, P), col))
+    vals = nb.dma_copy(nb.alloc((P, kp), vdtype, MemorySpace.SBUF),
+                       val_scratch, (DimSlice(0, P), DimSlice(0, kp)))
+    idxs = nb.dma_copy(nb.alloc((P, kp), idtype, MemorySpace.SBUF),
+                       idx_scratch, (DimSlice(0, P), DimSlice(0, kp)))
+    return vals, idxs
+
+
+def _load_topk_data(nb: Builder, src_hbm, P: int, off: int, f: int, vdtype):
+    """Load src_hbm[:, off:off+f] into a (P, max(f,8)) SBUF tile, padding the
+    tail with -inf so max8's >=8 free-dim requirement always holds."""
+    width = max(f, 8)
+    if width == f:
+        return nb.dma_copy(nb.alloc((P, width), vdtype, MemorySpace.SBUF),
+                           src_hbm, (DimSlice(0, P), DimSlice(off, f)))
+    padded = nb.memset(nb.alloc((P, width), vdtype, MemorySpace.SBUF), float("-inf"))
+    loaded = nb.dma_copy(nb.alloc((P, f), vdtype, MemorySpace.SBUF),
+                         src_hbm, (DimSlice(0, P), DimSlice(off, f)))
+    return _overlay_columns(nb, padded, loaded, f)
+
+
 def _emit_topk_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
     """Lower topk via the canonical hardware scan (max8 + match_replace8).
 
-    The source (P, F) tile is loaded once into SBUF and kept resident; each
-    fold reads the next 8 largest (max8) and masks them to -inf in place
-    (match_replace8), which also yields their indices.  Each fold's results
-    are DMA-stored to the matching column slice of the (P, k) output buffers,
-    so no SBUF sub-tile writes are needed.  ceil(k/8) folds cover any k.
+    The source (P, F) tile is loaded into SBUF; each fold reads the next 8
+    largest (max8) and masks them to -inf in place (match_replace8), which also
+    yields their indices.  ceil(k/8) folds cover any k.
+
+    When F exceeds the max8 free-dim limit, the row is split into chunks of
+    <= TOPK_FREE_MAX: each chunk is scanned for its local top-k (indices
+    rebased to global), then the chunk winners (n_chunks * k candidates) are
+    merged with a second scan, and a gather maps the merged positions back to
+    the global indices.
     """
     src_val = op.inputs[0]
     val_out, idx_out = op.results[0], op.results[1]
@@ -581,37 +662,73 @@ def _emit_topk_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
     vdtype = val_out.type.dtype
     idtype = idx_out.type.dtype
 
-    # max8/match_replace8 need a free dim >= 8; pad with -inf when F < 8.
-    width = max(F, 8)
-    if width == F:
-        data = nb.dma_copy(
-            nb.alloc((P, width), vdtype, MemorySpace.SBUF),
-            src_hbm, (DimSlice(0, P), DimSlice(0, F)),
-        )
-    else:
-        padded = nb.memset(nb.alloc((P, width), vdtype, MemorySpace.SBUF), float("-inf"))
-        loaded = nb.dma_copy(
-            nb.alloc((P, F), vdtype, MemorySpace.SBUF),
-            src_hbm, (DimSlice(0, P), DimSlice(0, F)),
-        )
-        data = _overlay_columns(nb, padded, loaded, F)
+    if F <= TOPK_FREE_MAX:
+        data = _load_topk_data(nb, src_hbm, P, 0, F, vdtype)
+        vals, idxs = _topk_scan(nb, data, P, k, vdtype, idtype)
+        v_store = vals if k == _aligned(k) else _first_cols(nb, vals, k)
+        i_store = idxs if k == _aligned(k) else _first_cols(nb, idxs, k)
+        nb.dma_copy(val_hbm, v_store, (DimSlice(0, P), DimSlice(0, k)))
+        nb.dma_copy(idx_hbm, i_store, (DimSlice(0, P), DimSlice(0, k)))
+        return
 
-    # Scanning loop: each fold grabs the next 8 largest (max8) and records
-    # their indices while masking them to -inf (match_replace8) so the next
-    # fold sees the following elements.  match_replace8 (not the gen2-only
-    # find_index8) supplies indices on current hardware.
-    n_fold = (k + 7) // 8
-    for fold in range(n_fold):
-        keep = min(8, k - fold * 8)
-        val8 = nb.max8(nb.alloc((P, 8), vdtype, MemorySpace.SBUF), data)
-        idx8 = nb.alloc((P, 8), idtype, MemorySpace.SBUF)
-        data, idx8 = nb.match_replace8(data, idx8, data, val8, float("-inf"))
+    n_chunks = ceildiv(F, TOPK_FREE_MAX)
+    cand = n_chunks * k
+    if cand > TOPK_FREE_MAX:
+        raise NotImplementedError(
+            f"topk: F={F}, k={k} needs {cand} merge candidates, exceeds "
+            f"{TOPK_FREE_MAX}; a multi-level merge is not implemented"
+        )
 
-        col = DimSlice(fold * 8, keep)
-        v_store = val8 if keep == 8 else _first_cols(nb, val8, keep)
-        i_store = idx8 if keep == 8 else _first_cols(nb, idx8, keep)
-        nb.dma_copy(val_hbm, v_store, (DimSlice(0, P), col))
-        nb.dma_copy(idx_hbm, i_store, (DimSlice(0, P), col))
+    # Per-chunk local top-k, with indices rebased to global, gathered into
+    # candidate buffers (P, cand).
+    cand_vals_hbm = nb.alloc((P, cand), vdtype, MemorySpace.HBM)
+    cand_idx_hbm = nb.alloc((P, cand), idtype, MemorySpace.HBM)
+    for c in range(n_chunks):
+        off = c * TOPK_FREE_MAX
+        fc = min(TOPK_FREE_MAX, F - off)
+        data = _load_topk_data(nb, src_hbm, P, off, fc, vdtype)
+        vals, idxs = _topk_scan(nb, data, P, k, vdtype, idtype)
+        if off != 0:
+            # Rebase local indices to global: idx += off.
+            off_tile = nb.constant(float(off), (P, 1), idtype, MemorySpace.SBUF)
+            idxs = nb.tensor_scalar_arith(
+                nb.alloc(idxs.type.shape, idtype, MemorySpace.SBUF),
+                idxs, off_tile, nki_ir.NisaArithOp.ADD,
+            )
+        col = DimSlice(c * k, k)
+        v_store = vals if k == _aligned(k) else _first_cols(nb, vals, k)
+        i_store = idxs if k == _aligned(k) else _first_cols(nb, idxs, k)
+        nb.dma_copy(cand_vals_hbm, v_store, (DimSlice(0, P), col))
+        nb.dma_copy(cand_idx_hbm, i_store, (DimSlice(0, P), col))
+
+    # Merge: scan the candidate values for the global top-k, then gather the
+    # corresponding global indices by the merged positions.
+    cand_data = _load_topk_data(nb, cand_vals_hbm, P, 0, cand, vdtype)
+    width = max(cand, 8)
+    cand_idx_sbuf = nb.memset(
+        nb.alloc((P, width), idtype, MemorySpace.SBUF), 0.0)
+    cand_idx_sbuf = _overlay_columns(
+        nb,
+        cand_idx_sbuf,
+        nb.dma_copy(nb.alloc((P, cand), idtype, MemorySpace.SBUF),
+                    cand_idx_hbm, (DimSlice(0, P), DimSlice(0, cand))),
+        cand,
+    )
+    mvals, mpos = _topk_scan(nb, cand_data, P, k, vdtype, idtype)
+    # gather: global_idx[p, i] = cand_idx_sbuf[p, mpos[p, i]]
+    gidx = nb.gather(
+        nb.alloc(mpos.type.shape, idtype, MemorySpace.SBUF),
+        cand_idx_sbuf, mpos,
+    )
+    v_store = mvals if k == _aligned(k) else _first_cols(nb, mvals, k)
+    i_store = gidx if k == _aligned(k) else _first_cols(nb, gidx, k)
+    nb.dma_copy(val_hbm, v_store, (DimSlice(0, P), DimSlice(0, k)))
+    nb.dma_copy(idx_hbm, i_store, (DimSlice(0, P), DimSlice(0, k)))
+
+
+def _aligned(k: int) -> int:
+    """Fold-aligned width ceil(k/8)*8 (the column count _topk_scan returns)."""
+    return ((k + 7) // 8) * 8
 
 
 def _emit_gather_along_axis_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
