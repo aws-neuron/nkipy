@@ -29,6 +29,7 @@ mock.patch.object(dist, "get_rank", lambda *a, **k: 0).start()
 
 from config import Config  # noqa: E402
 from kernels.transformer_layer import transformer_layer  # noqa: E402
+from nkipy.core.compile import CompilationTarget  # noqa: E402
 from nkipy.core.trace import NKIPyKernel  # noqa: E402
 from nkipy.runtime import DeviceKernel, DeviceTensor  # noqa: E402
 
@@ -78,26 +79,40 @@ def compile_cte_layer(backend="nkigen-lite"):
     if backend != "hlo":
         kernel_fn = NKIPyKernel.trace(transformer_layer, backend=backend)
 
-    return DeviceKernel.compile_and_load(
+    # Compile only (the OOM was a compile-time failure).  Call _trace_and_compile
+    # directly rather than compile_and_load: the latter would, after a successful
+    # compile, go through the SPMD broadcast + device load, which need a real
+    # torch.distributed group and a Neuron core that this single-process repro
+    # doesn't have.  A returned NEFF path proves compilation succeeded.
+    neff_path, _ = DeviceKernel._trace_and_compile(
         kernel_fn,
-        name="cte_layer_repro",
-        x=x,
-        start_pos=None,
-        qkv_weight=_dt((HIDDEN, QKV_OUT)),
-        o_weight=_dt((O_IN, HIDDEN)),
-        input_weight=_dt((HIDDEN,)),
-        q_norm_weight=_dt((HEAD_DIM,)),
-        k_norm_weight=_dt((HEAD_DIM,)),
-        post_attention_weight=_dt((HIDDEN,)),
-        router_weight=_dt((HIDDEN, N_EXPERTS)),
-        gate_up_weight=_dt((N_EXPERTS, HIDDEN, 2 * INTERMEDIATE)),
-        down_weight=_dt((N_EXPERTS, INTERMEDIATE, HIDDEN)),
-        cache_k=DeviceTensor.from_numpy(cache, "cache_k"),
-        cache_v=DeviceTensor.from_numpy(cache, "cache_v"),
-        configs=cfg,
-        build_dir="./build_repro",
+        "cte_layer_repro",
+        (),
+        dict(
+            x=x,
+            start_pos=None,
+            qkv_weight=_dt((HIDDEN, QKV_OUT)),
+            o_weight=_dt((O_IN, HIDDEN)),
+            input_weight=_dt((HIDDEN,)),
+            q_norm_weight=_dt((HEAD_DIM,)),
+            k_norm_weight=_dt((HEAD_DIM,)),
+            post_attention_weight=_dt((HIDDEN,)),
+            router_weight=_dt((HIDDEN, N_EXPERTS)),
+            gate_up_weight=_dt((N_EXPERTS, HIDDEN, 2 * INTERMEDIATE)),
+            down_weight=_dt((N_EXPERTS, INTERMEDIATE, HIDDEN)),
+            cache_k=DeviceTensor.from_numpy(cache, "cache_k"),
+            cache_v=DeviceTensor.from_numpy(cache, "cache_v"),
+            configs=cfg,
+        ),
         additional_compiler_args=cfg.additional_compiler_args_nkipy,
+        use_cached_if_exists=False,
+        build_dir="./build_repro",
+        target=CompilationTarget.DEFAULT,
     )
+    assert neff_path is not None and os.path.exists(neff_path), (
+        f"compilation did not produce a NEFF: {neff_path}"
+    )
+    return neff_path
 
 
 def test_cte_layer_compiles_nkigen_lite():
