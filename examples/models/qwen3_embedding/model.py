@@ -1,5 +1,6 @@
 """Qwen3-Embedding model for Trainium with configurable kernel execution."""
 
+import os
 from typing import Optional
 
 import numpy as np
@@ -17,7 +18,7 @@ from nkipy.runtime import DeviceKernel, DeviceTensor
 
 logger = get_logger()
 
-BACKEND = "nkigen-lite"
+BACKEND = os.environ.get("QWEN3_BACKEND", "nkigen-lite")
 
 
 def _bind_output(kernel, tensor):

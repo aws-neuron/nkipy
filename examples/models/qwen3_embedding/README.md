@@ -47,6 +47,22 @@ export NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS=16
 
 Note: LNC (Logical NeuronCore) is set at compile time via `--lnc` flag, not via `NEURON_LOGICAL_NC_CONFIG` at runtime.
 
+### Backend benchmarking (HLO vs nkigen-lite)
+
+Select the backend with `QWEN3_BACKEND` (`hlo` or `nkigen-lite`, default
+`nkigen-lite`). Clean `build/` between backend switches:
+
+```bash
+rm -rf build/ && QWEN3_BACKEND=hlo         python example_retrieval.py --benchmark
+rm -rf build/ && QWEN3_BACKEND=nkigen-lite python example_retrieval.py --benchmark
+```
+
+`profile_layer.py` statically profiles one fused transformer layer on the
+nkigen-lite backend (op + HBM-DMA counts, attributed per high-level op) to find
+lowering hotspots without touching hardware. The running performance tracker —
+baseline, progress log, and backlog — is in
+[`nkigen-lite/PERFORMANCE.md`](../../../nkigen-lite/PERFORMANCE.md).
+
 ## Modifying the Code
 
 After changing code, clean the kernel cache:
