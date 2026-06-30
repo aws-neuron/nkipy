@@ -358,6 +358,135 @@ def _emit_broadcast_scalar(nb: Builder, x_hbm, y_hbm, out_shape, dtype) -> None:
             nb.dma_copy(y_hbm, dst, dst_slices)
 
 
+def _collapse_broadcast(in_shape, out_shape):
+    """Collapse a broadcast into a canonical ``(L, B, T)`` decomposition.
+
+    ``in_shape`` is right-aligned to ``out_shape`` (missing leading dims are
+    size 1, per numpy broadcasting rules). Every output axis is then either a
+    *keep* axis (input extent already matches) or a *broadcast* axis (input
+    extent is 1, output > 1).
+
+    When all broadcast axes form a single contiguous run, the whole op reduces
+    to three flat extents:
+      - ``L`` = product of the keep axes *before* the run,
+      - ``B`` = product of the broadcast run,
+      - ``T`` = product of the keep axes *after* the run.
+    The input is then a contiguous ``(L, 1, T)`` tensor and the output a
+    contiguous ``(L, B, T)`` tensor (both row-major, so the reshape is a
+    zero-copy HBM view).
+
+    Returns ``(L, B, T)`` for the single-run case, or ``None`` when the
+    broadcast axes are non-contiguous (multiple runs) — callers fall back to
+    the generic per-tile lowering.
+    """
+    R = len(out_shape)
+    in_al = (1,) * (R - len(in_shape)) + tuple(in_shape)
+    b_axes = []
+    for i in range(R):
+        if in_al[i] == out_shape[i]:
+            continue  # keep axis (includes trivial 1 -> 1)
+        if in_al[i] == 1 and out_shape[i] > 1:
+            b_axes.append(i)
+        else:
+            raise ValueError(
+                f"broadcast: axis {i} not broadcastable {in_al[i]} -> {out_shape[i]}"
+            )
+    if not b_axes:
+        return None  # pure copy / no expansion; let the generic path handle it
+    # Require a single contiguous run of broadcast axes.
+    if b_axes != list(range(b_axes[0], b_axes[-1] + 1)):
+        return None
+    bstart, bend = b_axes[0], b_axes[-1]
+    L = math.prod(out_shape[:bstart]) if bstart > 0 else 1
+    B = math.prod(out_shape[bstart:bend + 1])
+    T = math.prod(out_shape[bend + 1:]) if bend + 1 < R else 1
+    return L, B, T
+
+
+def _emit_collapsed_broadcast(nb: Builder, x_hbm, y_hbm, L, B, T, dtype) -> None:
+    """Emit a single-run broadcast lowered through the canonical ``(L, B, T)``.
+
+    Both HBM tensors are reshaped to the collapsed form via zero-copy views,
+    then one of three partition-efficient strategies is chosen by which of the
+    three extents the broadcast sits between:
+
+      - ``T == 1`` (broadcast is the innermost axis): F-broadcast over ``(L, B)``
+        — partition over ``L``, replicate the per-row scalar across ``B`` with
+        a single ``tensor_scalar`` multiply per tile.
+      - ``L == 1`` (broadcast spans the leading axes): P-broadcast over
+        ``(B, T)`` — every output row is the same ``(T,)`` source row, so a
+        stride-0 partition load fans it across up to 128 rows per store.
+      - otherwise (genuine middle broadcast): load each ``(<=128, T)`` block of
+        the source once and store it to each of the ``B`` output copies.
+
+    All three pack the 128-wide partition and tile the free dim to the SBUF
+    budget, replacing the old per-batch-element DMA loop.
+    """
+    from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import max_free_elems
+
+    cap = max_free_elems(dtype)
+
+    if T == 1:
+        # F-broadcast on (L, B): out[l, b] = in[l, 0].
+        src = nb.view(x_hbm, (L, 1))
+        dst = nb.view(y_hbm, (L, B))
+        for p_i in range(ceildiv(L, PARTITION_MAX)):
+            p_off = p_i * PARTITION_MAX
+            p_size = min(PARTITION_MAX, L - p_off)
+            src_tile = nb.dma_copy(
+                nb.alloc((p_size, 1), dtype, MemorySpace.SBUF),
+                src, (DimSlice(p_off, p_size), DimSlice(0, 1)),
+            )
+            for f_i in range(ceildiv(B, cap)):
+                f_off = f_i * cap
+                f_size = min(cap, B - f_off)
+                ones = nb.constant(1.0, (p_size, f_size), dtype, MemorySpace.SBUF)
+                rep = nb.tensor_scalar_arith(
+                    nb.alloc((p_size, f_size), dtype, MemorySpace.SBUF),
+                    ones, src_tile, NisaArithOp.MULTIPLY,
+                )
+                nb.dma_copy(dst, rep, (DimSlice(p_off, p_size), DimSlice(f_off, f_size)))
+        return
+
+    if L == 1:
+        # P-broadcast on (B, T): every output row equals the single source row.
+        src = nb.view(x_hbm, (1, T))
+        dst = nb.view(y_hbm, (B, T))
+        for p_i in range(ceildiv(B, PARTITION_MAX)):
+            p_off = p_i * PARTITION_MAX
+            p_size = min(PARTITION_MAX, B - p_off)
+            for f_i in range(ceildiv(T, cap)):
+                f_off = f_i * cap
+                f_size = min(cap, T - f_off)
+                # Stride-0 partition load fans the one source row across p_size rows.
+                rep = nb.dma_copy(
+                    nb.alloc((p_size, f_size), dtype, MemorySpace.SBUF),
+                    src, (DimSlice(0, p_size, stride=0), DimSlice(f_off, f_size)),
+                )
+                nb.dma_copy(dst, rep, (DimSlice(p_off, p_size), DimSlice(f_off, f_size)))
+        return
+
+    # Genuine middle broadcast (L, B, T): copy each source (<=128, T) block to
+    # all B output slices. Load once per block, store B times.
+    src = nb.view(x_hbm, (L, 1, T))
+    dst = nb.view(y_hbm, (L, B, T))
+    for p_i in range(ceildiv(L, PARTITION_MAX)):
+        p_off = p_i * PARTITION_MAX
+        p_size = min(PARTITION_MAX, L - p_off)
+        for f_i in range(ceildiv(T, cap)):
+            f_off = f_i * cap
+            f_size = min(cap, T - f_off)
+            tile = nb.dma_copy(
+                nb.alloc((p_size, f_size), dtype, MemorySpace.SBUF),
+                src, (DimSlice(p_off, p_size), DimSlice(0, 1), DimSlice(f_off, f_size)),
+            )
+            for b in range(B):
+                nb.dma_copy(
+                    dst, tile,
+                    (DimSlice(p_off, p_size), DimSlice(b, 1), DimSlice(f_off, f_size)),
+                )
+
+
 def emit_broadcast_to(nb: Builder, x_hbm, y_hbm, in_shape, out_shape, dtype) -> None:
     """Emit broadcast_to tiling into an existing Builder."""
     from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import broadcast_partition
@@ -365,6 +494,14 @@ def emit_broadcast_to(nb: Builder, x_hbm, y_hbm, in_shape, out_shape, dtype) -> 
     # Scalar input: load the single element and broadcast to all output tiles
     if len(in_shape) == 0:
         _emit_broadcast_scalar(nb, x_hbm, y_hbm, out_shape, dtype)
+        return
+
+    # Fast path: collapse a single contiguous broadcast run into (L, B, T) and
+    # lower it with a partition-packed strategy. Falls back to the generic
+    # per-tile loop below for multi-run broadcasts (rare).
+    collapsed = _collapse_broadcast(in_shape, out_shape)
+    if collapsed is not None:
+        _emit_collapsed_broadcast(nb, x_hbm, y_hbm, *collapsed, dtype)
         return
 
     rank = len(out_shape)
