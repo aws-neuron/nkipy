@@ -113,22 +113,31 @@ def lower_matmul(
         """Build batch slices for output C."""
         return [DimSlice(bi, 1) for bi in batch_idx]
 
-    def _emit_tile(nb: Builder, batch_idx: tuple[int, ...], m_off: int, m_size: int, n_off: int, n_size: int):
-        """Emit one (m_tile, n_tile) output tile with K accumulation."""
-        psum = nb.alloc((m_size, n_size), DType.F32, MemorySpace.PSUM)
-        psum = nb.memset(psum, 0.0)
-
+    def _load_a_stats(nb: Builder, batch_idx: tuple[int, ...], m_off: int, m_size: int):
+        """Load + transpose A's K-tiles for this (batch, m) once. A's stationary
+        operand depends only on (m, k), so it is reused across all N-tiles."""
+        stats = []
         for k_i in range(n_k_tiles):
             k_off = k_i * tile_k
             k_size = min(tile_k, K - k_off)
-
             a_slices = _a_batch_slices(batch_idx) + [DimSlice(m_off, m_size), DimSlice(k_off, k_size)]
             a_tile = nb.dma_copy(
                 nb.alloc((m_size, k_size), dtype, MemorySpace.SBUF),
                 a_hbm,
                 tuple(a_slices),
             )
-            a_stat = nb.transpose(a_tile, (1, 0))
+            stats.append(nb.transpose(a_tile, (1, 0)))
+        return stats
+
+    def _emit_tile(nb: Builder, batch_idx, a_stats, m_off, m_size, n_off, n_size):
+        """Emit one (m_tile, n_tile) output tile with K accumulation, reusing
+        the pre-transposed A stationary tiles."""
+        psum = nb.alloc((m_size, n_size), DType.F32, MemorySpace.PSUM)
+        psum = nb.memset(psum, 0.0)
+
+        for k_i in range(n_k_tiles):
+            k_off = k_i * tile_k
+            k_size = min(tile_k, K - k_off)
 
             b_slices = _b_batch_slices(batch_idx) + [DimSlice(k_off, k_size), DimSlice(n_off, n_size)]
             b_mov = nb.dma_copy(
@@ -137,7 +146,7 @@ def lower_matmul(
                 tuple(b_slices),
             )
 
-            nb.matmul(psum, a_stat, b_mov, accumulate=(k_i > 0))
+            nb.matmul(psum, a_stats[k_i], b_mov, accumulate=(k_i > 0))
 
         c_sbuf = nb.tensor_copy(
             nb.alloc((m_size, n_size), DType.F32, MemorySpace.SBUF), psum
@@ -150,10 +159,11 @@ def lower_matmul(
         for m_i in range(n_m_tiles):
             m_off = m_i * tile_m
             m_size = min(tile_m, M - m_off)
+            a_stats = _load_a_stats(b_builder, batch_idx, m_off, m_size)
             for n_i in range(n_n_tiles):
                 n_off = n_i * tile_n
                 n_size = min(tile_n, N - n_off)
-                _emit_tile(b_builder, batch_idx, m_off, m_size, n_off, n_size)
+                _emit_tile(b_builder, batch_idx, a_stats, m_off, m_size, n_off, n_size)
 
     b_builder.set_outputs({"c": c_hbm})
     return b_builder.graph
@@ -214,6 +224,24 @@ def emit_matmul(
         for m_i in range(n_m_tiles):
             m_off = m_i * tile_m
             m_size = min(tile_m, M - m_off)
+
+            # Load + transpose the K-tiles of A's stationary operand ONCE per
+            # (batch, m). A's transposed tiles depend only on (m, k), not on n,
+            # so the old code redundantly re-loaded and re-transposed them for
+            # every N-tile (n_n_tiles x too many). Each (k_size, m_size) tile is
+            # <= 128x128 (<=512 B/partition), so holding all K-tiles resident
+            # stays well within SBUF even for large K.
+            a_stats = []
+            for k_i in range(n_k_tiles):
+                k_off = k_i * tile_k
+                k_size = min(tile_k, K - k_off)
+                a_slices = _a_batch_slices(batch_idx) + [DimSlice(m_off, m_size), DimSlice(k_off, k_size)]
+                a_tile = nb.dma_copy(
+                    nb.alloc((m_size, k_size), dtype, MemorySpace.SBUF),
+                    a_hbm, tuple(a_slices),
+                )
+                a_stats.append(nb.transpose(a_tile, (1, 0)))
+
             for n_i in range(n_n_tiles):
                 n_off = n_i * tile_n
                 n_size = min(tile_n, N - n_off)
@@ -225,20 +253,13 @@ def emit_matmul(
                     k_off = k_i * tile_k
                     k_size = min(tile_k, K - k_off)
 
-                    a_slices = _a_batch_slices(batch_idx) + [DimSlice(m_off, m_size), DimSlice(k_off, k_size)]
-                    a_tile = nb.dma_copy(
-                        nb.alloc((m_size, k_size), dtype, MemorySpace.SBUF),
-                        a_hbm, tuple(a_slices),
-                    )
-                    a_stat = nb.transpose(a_tile, (1, 0))
-
                     b_slices = _b_batch_slices(batch_idx) + [DimSlice(k_off, k_size), DimSlice(n_off, n_size)]
                     b_mov = nb.dma_copy(
                         nb.alloc((k_size, n_size), dtype, MemorySpace.SBUF),
                         b_hbm, tuple(b_slices),
                     )
 
-                    nb.matmul(psum, a_stat, b_mov, accumulate=(k_i > 0))
+                    nb.matmul(psum, a_stats[k_i], b_mov, accumulate=(k_i > 0))
 
                 c_sbuf = nb.tensor_copy(
                     nb.alloc((m_size, n_size), DType.F32, MemorySpace.SBUF), psum
