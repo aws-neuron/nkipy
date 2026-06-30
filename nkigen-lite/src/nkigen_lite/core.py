@@ -179,7 +179,11 @@ class Op:
             else:
                 a_parts.append(f"{k}={val}")
         a = f" {{{', '.join(a_parts)}}}" if a_parts else ""
-        return f"{outs} = {self.opcode}({ins}){a}"
+        # Side-effecting ops (e.g. dealloc, store dma_copy) have no results;
+        # omit the "<lhs> = " prefix so they don't render with a dangling "= ".
+        if self.results:
+            return f"{outs} = {self.opcode}({ins}){a}"
+        return f"{self.opcode}({ins}){a}"
 
 
 # ===========================
