@@ -51,11 +51,27 @@ from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
 # ---------------------------------------------------------------------------
 
 
+def _collapsed_pf(shape: tuple[int, ...]) -> tuple[int, int]:
+    """Collapse a shape to the ``(prod(shape[:-1]), shape[-1])`` 2D form the
+    elementwise lowering tiles over (all leading axes fold onto the partition).
+    """
+    if len(shape) == 0:
+        return (1, 1)
+    return (prod(shape[:-1]), shape[-1])
+
+
 def _segment_ops(graph: Graph, layouts: dict[str, Layout]) -> list[list]:
     """Segment graph ops into elementwise groups and individual non-elementwise ops.
 
-    Elementwise ops are grouped only if their output layouts are compatible
-    (same P/F dim assignment). A layout flip breaks the group.
+    Elementwise ops are grouped only if they share both:
+      - the same P/F dim assignment (layout); a layout flip breaks the group, and
+      - a compatible collapsed ``(P, F)`` shape — every op in a group must fold
+        to the same partition/free extents (size-1 broadcasts aside). A group
+        that mixed, say, ``(1,128,8,64)`` (collapsed P=1024) with
+        ``(1,128,1,64)`` (collapsed P=128) cannot share one collapsed tile loop:
+        the fast collapse path would reject it and the generic fallback would put
+        the size-1 axis on the partition and unroll the 128-wide axis one element
+        at a time. Splitting keeps each group collapsible.
 
     Returns a list of segments. Each segment is either:
       - A list of consecutive elementwise ops (grouped)
@@ -64,6 +80,18 @@ def _segment_ops(graph: Graph, layouts: dict[str, Layout]) -> list[list]:
     segments = []
     current_ew = []
     current_pf = None  # (p_dims, f_dims) of current group
+    # Distinct non-1 collapsed extents seen in the current group (None until set).
+    group_p = None
+    group_f = None
+
+    def _flush():
+        nonlocal current_ew, current_pf, group_p, group_f
+        if current_ew:
+            segments.append(current_ew)
+            current_ew = []
+        current_pf = None
+        group_p = None
+        group_f = None
 
     for op in graph.ops:
         if op.opcode in ELEMENTWISE_OPCODES:
@@ -74,17 +102,27 @@ def _segment_ops(graph: Graph, layouts: dict[str, Layout]) -> list[list]:
             else:
                 pf = current_pf
 
+            cp, cf = _collapsed_pf(op.results[0].type.shape)
+            # A second distinct non-1 partition (or free) extent can't share the
+            # group's collapsed tile loop.
+            shape_conflict = (
+                (cp != 1 and group_p is not None and cp != group_p)
+                or (cf != 1 and group_f is not None and cf != group_f)
+            )
+
             if current_ew and current_pf is not None and pf != current_pf:
-                segments.append(current_ew)
-                current_ew = []
+                _flush()
+            elif current_ew and shape_conflict:
+                _flush()
 
             current_ew.append(op)
             current_pf = pf
+            if cp != 1:
+                group_p = cp
+            if cf != 1:
+                group_f = cf
         else:
-            if current_ew:
-                segments.append(current_ew)
-                current_ew = []
-                current_pf = None
+            _flush()
             segments.append([op])
 
     if current_ew:

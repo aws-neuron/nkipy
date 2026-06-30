@@ -106,7 +106,60 @@ def test_bug5_for_loop_silently_dropped():
 # - rank-3 + rank-1 weight: works (covered by rmsnorm test).
 # - rank-4 with rank-2 broadcast across multiple leading axes (RoPE): not yet
 #   handled — requires structured replication that simple flatten can't do.
+# See also perf-1 below: a rank-4 RoPE q/k mix no longer unrolls the sequence
+# axis (segmenter splits on a second distinct collapsed extent).
 
 
 # smell-4 (late `Graph` import in lower_to_nki): fixed; the function now
 # uses the module-level `Graph` import via the `_verify` helper.
+
+
+# ---------------------------------------------------------------------------
+# perf-1: mixed-collapse elementwise segment unrolled a packed axis
+# ---------------------------------------------------------------------------
+# RoPE applies the same cos/sin to a q tensor (1, S, Hq, D) and a k tensor
+# (1, S, Hk, D) with Hq != Hk. The layout solver classifies both with the same
+# (p_dims, f_dims), so the segmenter used to merge their elementwise ops into one
+# group. The group then collapsed to two different partition extents
+# (prod(1,S,Hq) vs prod(1,S,Hk)), the fast leading-dims-onto-partition path
+# bailed, and the generic fallback put the size-1-ish axis on the partition and
+# unrolled S one element at a time — an S-fold op blowup (8351 nki ops for S=128
+# RoPE). The segmenter now splits on a second distinct collapsed extent so each
+# group stays cleanly collapsible.
+
+def test_perf1_mixed_collapse_elementwise_no_blowup():
+    """q-path (Hq=8) and k-path (Hk=1) elementwise ops must not share a segment
+    and unroll the sequence axis. Checks correctness and a bounded op count."""
+    np.random.seed(0)
+    S, Hq, Hk, D = 64, 8, 1, 16
+    xq = np.random.randn(1, S, Hq, D).astype(np.float32)
+    xk = np.random.randn(1, S, Hk, D).astype(np.float32)
+    cq = np.random.randn(1, S, Hq, D).astype(np.float32)
+    ck = np.random.randn(1, S, Hk, D).astype(np.float32)
+
+    def build(b):
+        q = b.add_input("xq", (1, S, Hq, D))
+        k = b.add_input("xk", (1, S, Hk, D))
+        wq = b.add_input("cq", (1, S, Hq, D))
+        wk = b.add_input("ck", (1, S, Hk, D))
+        # Interleave the q/k chains the way attention does, so the trace order
+        # puts both shapes' ops adjacent (the merge condition).
+        b.set_outputs({"oq": b.mul(q, wq), "ok": b.mul(k, wk)})
+
+    _lower_and_run(
+        build,
+        {"xq": xq, "xk": xk, "cq": cq, "ck": ck},
+        {"oq": (1, S, Hq, D), "ok": (1, S, Hk, D)},
+    )
+
+    # Op-count guard on the precise symptom: before the fix the merged segment
+    # put the size-1-ish axis on the partition and unrolled S=64, emitting one
+    # compute op per (sequence, ...) element (128 tensor_tensor_arith). A clean
+    # collapse tiles each mul over the packed partition — a handful of ops.
+    b = Builder("t")
+    build(b)
+    nki_graph = lower_to_nki(b.graph)
+    n_compute = sum(1 for o in nki_graph.ops if o.opcode == "tensor_tensor_arith")
+    assert n_compute <= 8, (
+        f"mixed-collapse elementwise unrolled to {n_compute} compute ops"
+    )

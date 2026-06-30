@@ -93,6 +93,26 @@ Re-run `profile_layer.py` after any lowering change to refresh these counts.
 
 ## Progress log
 
+### 2026-06-30 — elementwise segmenter: split on a second collapsed extent (RoPE)
+- **Change:** `direct_lower.py:_segment_ops` now breaks an elementwise group
+  when an op would introduce a second distinct non-1 collapsed `(P, F)` extent
+  (new `_collapsed_pf` helper). The layout solver gives RoPE's q tensor
+  `(1,128,8,64)` and k tensor `(1,128,1,64)` the same `(p_dims, f_dims)`, so
+  consecutive q/k elementwise ops were merged into one segment whose ops
+  collapse to two partition extents (prod 1024 vs 128). The fast collapse path
+  (`_try_emit_collapsed_ew`) then bailed and the generic fallback put the
+  size-1-ish axis on the partition and unrolled seq=128 one element at a time
+  (one merged segment alone = 4,864 ops). Splitting keeps each group cleanly
+  collapsible.
+- **Effect (pattern-level):** standalone RoPE q/k `(1,128,{8,1},128)` **8,351 →
+  1,754 nki ops (4.8x)**; the worst segment 4,864 → ~100 ops. Scales with
+  prefill sequence length (the unrolled axis). Other building blocks unchanged.
+- **Numerics:** exact (0.0 abs err vs numpy, interpreter).
+- **Tests:** `test_lowering_issues.py::test_perf1_mixed_collapse_elementwise_no_blowup`
+  (compute-op count guard: 128 → ≤8). New dumper:
+  `examples/models/qwen3/dump_nki_ir.py` + `nki_ir_dumps/` (qwen3 MoE building
+  blocks, TP=4 per-rank shapes).
+
 ### 2026-06-30 — reduce over trailing axis: collapse leading dims onto partition
 - **Change:** `direct_lower_reduce.py:_emit_f_reduce_inline` gained a fast path
   (`_try_emit_collapsed_f_reduce`) for rank>=3 F-reduces over a trailing-suffix
