@@ -42,6 +42,7 @@ from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
     build_slices,
     ceildiv,
     clamped_extent,
+    max_free_elems,
 )
 
 
@@ -823,9 +824,79 @@ def emit_reduce(
         _emit_mixed_reduce_inline(nb, op, layouts, hbm_map)
 
 
+def _try_emit_collapsed_f_reduce(
+    nb: Builder, op, hbm_map: dict[str, Value],
+) -> bool:
+    """Reduce over a trailing-suffix free axis by collapsing all leading dims
+    onto the partition. Returns False (emitting nothing) when not applicable.
+
+    A reduce like ``(1, 16, 128, 128) -> (1, 16, 128, 1)`` over the last axis
+    is logically ``(prod(shape[:-1]), shape[-1]) -> (prod(shape[:-1]), 1)``: a
+    2-D reduce of the free axis. The old per-tile path instead put only
+    ``shape[-2]`` on the partition (16 lanes for the 4-D attention tensor) and
+    iterated the other leading dims one row at a time (~640 nki ops/reduce).
+    Collapsing folds ``1*16*128 = 2048`` rows onto the partition, so it tiles
+    at 128 (16 full tiles) and reduces each in one ``tensor_reduce_arith`` —
+    matching how HLO lowers softmax's reduce (reduce then reshape to 2-D).
+
+    Only fires for ``sum``/``max``/``min`` over a contiguous trailing run of
+    axes with ``keepdims=True`` (the canonical/decomposed form; ``mean`` has
+    already been rewritten to ``sum`` + scale by the decompose pass). Anything
+    else falls through to the general per-tile path.
+    """
+    inp_val = op.inputs[0]
+    out_val = op.results[0]
+    inp_shape = inp_val.type.shape
+    rank = len(inp_shape)
+    axis = sorted(op.attrs["axis"])
+    kind = op.attrs["kind"]
+
+    # Require: keepdims, a known reduce op, and the reduced axes form the
+    # trailing suffix of the shape (so leading dims collapse cleanly).
+    if not op.attrs.get("keepdims", False) or kind not in REDUCE_OPS:
+        return False
+    if rank < 3:
+        return False  # 2-D already packs the partition
+    if axis != list(range(rank - len(axis), rank)):
+        return False  # reduced axes are not the trailing suffix
+
+    lead = prod(inp_shape[: axis[0]])     # collapsed partition extent
+    red = prod(inp_shape[axis[0]:])       # reduced free extent
+    dtype = inp_val.type.dtype
+
+    # The reduced free extent must fit one SBUF partition row; bail otherwise
+    # (the general path's finer F tiling handles the wide-row case).
+    if red > max_free_elems(dtype):
+        return False
+
+    src_2d = nb.view(hbm_map[inp_val.name], (lead, red))
+    dst_2d = nb.view(hbm_map[out_val.name], (lead, 1))
+    reduce_nki_op = REDUCE_OPS[kind]
+
+    for p_i in range(ceildiv(lead, PARTITION_MAX)):
+        p_off = p_i * PARTITION_MAX
+        p_size = min(PARTITION_MAX, lead - p_off)
+        src = nb.dma_copy(
+            nb.alloc((p_size, red), dtype, MemorySpace.SBUF),
+            src_2d, (DimSlice(p_off, p_size), DimSlice(0, red)),
+        )
+        dst = nb.tensor_reduce_arith(
+            nb.alloc((p_size, 1), dtype, MemorySpace.SBUF),
+            src, reduce_nki_op, num_r_dim=1, keepdims=True,
+        )
+        nb.dma_copy(dst_2d, dst, (DimSlice(p_off, p_size), DimSlice(0, 1)))
+    return True
+
+
 def _emit_f_reduce_inline(
     nb: Builder, op, layouts: dict[str, Layout], hbm_map: dict[str, Value],
 ) -> None:
+    # Fast path: collapse leading dims onto the partition for a trailing-axis
+    # reduce (packs all 128 lanes; mirrors HLO's reduce-then-reshape). Falls
+    # back to the general per-tile path below when not applicable.
+    if _try_emit_collapsed_f_reduce(nb, op, hbm_map):
+        return
+
     inp_val = op.inputs[0]
     out_val = op.results[0]
     inp_layout = layouts[inp_val.name]

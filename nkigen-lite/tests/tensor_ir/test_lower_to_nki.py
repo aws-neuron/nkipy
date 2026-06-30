@@ -540,3 +540,62 @@ class TestCollapsedElementwise:
             b.set_outputs({"z": b.sqrt(b.add(b.mul(a, a), eps))})
 
         _lower_and_check_hw(compile_and_run, build, {"x": x}, (1, 128, 16, 1))
+
+
+class TestCollapsedReduce:
+    """Rank>=3 reduce over a trailing free axis collapses leading dims onto the
+    partition (mirrors HLO's reduce-then-reshape for softmax). The old per-tile
+    path used only shape[-2] partition lanes and iterated the other leading
+    dims one row at a time. See ``_try_emit_collapsed_f_reduce``.
+    """
+
+    def test_softmax_max_reduce_4d(self):
+        rng = np.random.default_rng(0)
+        x = rng.standard_normal((1, 16, 128, 128)).astype(np.float32)
+
+        def build(b):
+            tx = b.add_input("x", (1, 16, 128, 128))
+            b.set_outputs({"o": b.reduce(tx, axis=(3,), keepdims=True, kind="max")})
+
+        _lower_and_check_interp(build, {"x": x}, (1, 16, 128, 1))
+
+    def test_softmax_sum_reduce_4d(self):
+        rng = np.random.default_rng(1)
+        x = rng.standard_normal((1, 16, 128, 128)).astype(np.float32)
+
+        def build(b):
+            tx = b.add_input("x", (1, 16, 128, 128))
+            b.set_outputs({"o": b.reduce(tx, axis=(3,), keepdims=True, kind="sum")})
+
+        _lower_and_check_interp(build, {"x": x}, (1, 16, 128, 1))
+
+    def test_qk_norm_reduce_4d(self):
+        # (1,128,16,128) reduce over head_dim — Q/K RMSNorm in the layer.
+        rng = np.random.default_rng(2)
+        x = rng.standard_normal((1, 128, 16, 128)).astype(np.float32)
+
+        def build(b):
+            tx = b.add_input("x", (1, 128, 16, 128))
+            b.set_outputs({"o": b.reduce(tx, axis=(3,), keepdims=True, kind="sum")})
+
+        _lower_and_check_interp(build, {"x": x}, (1, 128, 16, 1))
+
+    def test_softmax_max_reduce_4d_hw(self, compile_and_run):
+        rng = np.random.default_rng(0)
+        x = rng.standard_normal((1, 16, 128, 128)).astype(np.float32)
+
+        def build(b):
+            tx = b.add_input("x", (1, 16, 128, 128))
+            b.set_outputs({"o": b.reduce(tx, axis=(3,), keepdims=True, kind="max")})
+
+        _lower_and_check_hw(compile_and_run, build, {"x": x}, (1, 16, 128, 1))
+
+    def test_softmax_sum_reduce_4d_hw(self, compile_and_run):
+        rng = np.random.default_rng(1)
+        x = rng.standard_normal((1, 16, 128, 128)).astype(np.float32)
+
+        def build(b):
+            tx = b.add_input("x", (1, 16, 128, 128))
+            b.set_outputs({"o": b.reduce(tx, axis=(3,), keepdims=True, kind="sum")})
+
+        _lower_and_check_hw(compile_and_run, build, {"x": x}, (1, 16, 128, 1))

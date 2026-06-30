@@ -93,6 +93,30 @@ Re-run `profile_layer.py` after any lowering change to refresh these counts.
 
 ## Progress log
 
+### 2026-06-30 — reduce over trailing axis: collapse leading dims onto partition
+- **Change:** `direct_lower_reduce.py:_emit_f_reduce_inline` gained a fast path
+  (`_try_emit_collapsed_f_reduce`) for rank>=3 F-reduces over a trailing-suffix
+  axis with keepdims: view the input as `(prod(leading), reduced)` 2-D, tile
+  the partition at 128, reduce the free axis in one `tensor_reduce_arith` per
+  tile. The old path used only `shape[-2]` partition lanes (16 for the 4-D
+  attention tensor) and iterated the other leading dims one row at a time
+  (~640 ops/reduce). Mirrors how HLO's BIR lowers softmax (reduce → reshape to
+  2-D). Wide reduced rows (> SBUF budget) fall back to the general path.
+- **Effect (pattern-level):** standalone softmax `(1,16,128,128)` **2,644 →
+  1,080 nki ops (2.4x)**, device **1.07 → 0.70 ms (1.54x)**; a 4-D last-axis
+  reduce **961 → 179 ops (5.4x)**.
+- **End-to-end embedding:** ~unchanged (174 ms). Reduce was already only ~290
+  nki ops/layer (~2%) in this model — softmax is reduce-dominated in isolation
+  but a small slice of the embedding layer, which is still elementwise- and
+  matmul-bound. This fix matters for reduce/softmax-heavy models and is correct
+  + verified regardless.
+- **Numerics:** unchanged, min cosine 0.9997 vs HF.
+- **Tests:** `test_lower_to_nki.py::TestCollapsedReduce` (5 interp + HW cases).
+- **Reference:** compared against HLO BIR (`penguin.py`): identical 8-op
+  softmax compiles to **18 instructions/core** on HLO vs our 1,080 nki ops —
+  HLO additionally fuses the whole max/sub/exp/sum/div chain on-chip (no HBM
+  round-trips between ops), which is the remaining SBUF-residency lever.
+
 ### 2026-06-30 — concat + slice on last axis: collapse leading dims onto partition
 - **Change:** `direct_lower_memory.py:emit_concat` / `emit_slice` gained fast
   paths for rank>=3 ops on the last axis. Shared helpers `_collapse_to_2d`
@@ -140,12 +164,38 @@ Re-run `profile_layer.py` after any lowering change to refresh these counts.
 
 ---
 
+## Per-pattern device comparison (profile_patterns.py)
+
+Building-block kernels timed in isolation on device, both backends (trn2, f32,
+batch=1 seq=128, Qwen3-Embedding-0.6B shapes). `nki_ops` is the lowered
+nkigen-lite instruction count; wall-clock tracks it closely (~0.4 µs/op).
+
+```bash
+cd examples/models/qwen3_embedding
+rm -rf build_pat/ && QWEN3_BACKEND=hlo         uv run python profile_patterns.py
+rm -rf build_pat/ && QWEN3_BACKEND=nkigen-lite uv run python profile_patterns.py
+```
+
+| pattern | HLO ms | nkigen-lite ms | slowdown | nki ops |
+|---------|-------:|---------------:|---------:|--------:|
+| swiglu_act (pure elementwise) | 0.132 | 0.117 | **0.9x** ✅ | 24 |
+| rmsnorm | 0.128 | 0.156 | 1.2x | 112 |
+| layernorm | 0.137 | 0.242 | 1.7x | 206 |
+| softmax (after reduce fix) | 0.119 | 0.696 | 5.9x | 1,080 |
+| matmul_gup | 0.172 | 0.708 | 4.1x | 1,049 |
+| feedforward | 0.210 | 1.111 | 5.3x | 1,624 |
+
+Slowdown tracks nki-op count → instruction-issue bound. `swiglu_act` at parity
+proves the collapse approach reaches HLO when an op lowers to few instructions.
+Remaining gaps: softmax (HBM round-trips between the chained ops — SBUF
+residency, #1 below) and matmul (tiling emits ~1k ops for one GEMM, #3).
+
 ## Backlog (ordered by expected impact)
 
-After the broadcast + elementwise + concat/slice fixes, the per-layer top
-offenders are now `elementwise` (5,604 over 51 calls, ~110/call), `matmul`
+After the broadcast + elementwise + concat/slice + reduce fixes, the per-layer
+top offenders are now `elementwise` (5,604 over 51 calls, ~110/call), `matmul`
 (2,184), `concat` (915), `broadcast_to` (715), `transpose` (534), `reduce`
-(290), `slice` (177).
+(302), `slice` (177).
 
 1. **Keep intermediates in SBUF across consecutive ops** — avoid the per-op HBM
    round-trip for chained elementwise/broadcast/reduce. This is now the biggest
@@ -156,9 +206,11 @@ offenders are now `elementwise` (5,604 over 51 calls, ~110/call), `matmul`
 2. **Fuse broadcasts into their elementwise consumer** — most broadcasts only
    feed an `add`/`mul`; `tensor_scalar` / `tensor_tensor` can broadcast inline
    without materializing through HBM. (Partly subsumed by #1.)
-3. **matmul** (~2.2k ops/layer, ~364/call) — revisit the tiling once
-   data-movement is handled.
-4. **transpose** (~0.5k) and **reduce** (~0.3k) — lower priority.
+3. **matmul** (~2.2k ops/layer, ~364/call) — per-pattern profiling shows one
+   `(128,1024)@(1024,6144)` GEMM lowers to ~1,049 nki ops and runs 4.1x slower
+   than HLO. The tiling over-emits load/copy instructions; high aggregate impact
+   (6 matmuls/layer).
+4. **transpose** (~0.5k) — lower priority. **reduce** is done (collapse fix).
 5. **`_emit_hbm_copy` final output copy** — still loops `prod(shape[:-2])`
    per-batch DMAs; matters when a collapsible op's result is a graph output
    (surfaced in standalone slice profiling, minor inside the fused layer).
@@ -170,6 +222,14 @@ offenders are now `elementwise` (5,604 over 51 calls, ~110/call), `matmul`
 - `profile_layer.py` is a **static** analysis (op + DMA counts from the lowered
   graph) — fast, deterministic, no hardware needed. Use it to predict and
   attribute, then confirm wall-clock with the benchmark of record.
+  `profile_layer.py --device` times one fused layer in isolation (×28 ≈ the
+  full model, confirming the layer is ~100% of runtime).
+- `profile_patterns.py` times building-block kernels (rmsnorm/softmax/ffn/…) per
+  backend with nki-op counts — use it to localize a gap to one pattern.
+- For an HLO reference, compile the same kernel on the HLO backend with a
+  `build_dir`: the `SaveTemps` pipeline writes `penguin.py` (BIR op graph) and
+  `log-neuron-cc.txt` (per-core instruction counts, e.g. "instructions=18") into
+  the build dir. Diff op counts and layouts against the nkigen-lite lowering.
 - Always `rm -rf build/` between backend switches and after lowering changes;
   a stale kernel cache has produced wrong output that looked like a numerical
   bug.
