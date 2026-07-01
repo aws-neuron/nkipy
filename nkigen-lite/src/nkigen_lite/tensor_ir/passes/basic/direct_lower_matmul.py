@@ -113,6 +113,13 @@ def lower_matmul(
         """Build batch slices for output C."""
         return [DimSlice(bi, 1) for bi in batch_idx]
 
+    # M==1 fast path: A is a single row (1, K), so its transpose to (K, 1) is a
+    # pure layout reinterpret — the K elements are contiguous in HBM either way.
+    # View A's HBM buffer as (K, 1) (zero-copy) and DMA each K-tile straight into
+    # a (k_size, 1) stationary tile, skipping the per-K-tile dma_transpose. See
+    # emit_matmul for the full rationale. Only for a non-batched A.
+    a_k1_view = b_builder.view(a_hbm, (K, 1)) if (M == 1 and not a_batch) else None
+
     def _load_a_stats(nb: Builder, batch_idx: tuple[int, ...], m_off: int, m_size: int):
         """Load + transpose A's K-tiles for this (batch, m) once. A's stationary
         operand depends only on (m, k), so it is reused across all N-tiles."""
@@ -120,6 +127,12 @@ def lower_matmul(
         for k_i in range(n_k_tiles):
             k_off = k_i * tile_k
             k_size = min(tile_k, K - k_off)
+            if a_k1_view is not None:
+                stats.append(nb.dma_copy(
+                    nb.alloc((k_size, 1), dtype, MemorySpace.SBUF),
+                    a_k1_view, (DimSlice(k_off, k_size), DimSlice(0, 1)),
+                ))
+                continue
             a_slices = _a_batch_slices(batch_idx) + [DimSlice(m_off, m_size), DimSlice(k_off, k_size)]
             a_tile = nb.dma_copy(
                 nb.alloc((m_size, k_size), dtype, MemorySpace.SBUF),
@@ -219,6 +232,19 @@ def emit_matmul(
             slices.append(DimSlice(0 if d == 1 else bi, 1))
         return slices
 
+    # M==1 fast path: the stationary operand A is a single row (1, K), so its
+    # transpose to (K, 1) is a pure layout reinterpret — the K elements are
+    # contiguous in HBM either way. Reshape A's HBM buffer to put K on the
+    # partition (zero-copy row-major view) and DMA each K-tile straight into a
+    # (k_size, 1) stationary tile, skipping the per-K-tile dma_transpose. This is
+    # how HLO lowers the matrix-vector dots in the per-token MoE experts, and it
+    # removes n_k_tiles transposes per matmul (16 per (1,2048)@(2048,384) gate-up
+    # GEMM alone). Only for a non-batched A (a batched A's leading dims would sit
+    # between the row and K, so the (…,1,K)->(…,K,1) collapse wouldn't be a view).
+    a_k1_view = None
+    if M == 1 and not a_batch:
+        a_k1_view = nb.view(a_hbm, (K, 1))
+
     for batch_flat in range(n_batch_total):
         batch_idx = _batch_indices(batch_flat) if batch_dims else ()
         for m_i in range(n_m_tiles):
@@ -235,6 +261,13 @@ def emit_matmul(
             for k_i in range(n_k_tiles):
                 k_off = k_i * tile_k
                 k_size = min(tile_k, K - k_off)
+                if a_k1_view is not None:
+                    # (K,1) view: load k-tile directly with K on the partition.
+                    a_stats.append(nb.dma_copy(
+                        nb.alloc((k_size, 1), dtype, MemorySpace.SBUF),
+                        a_k1_view, (DimSlice(k_off, k_size), DimSlice(0, 1)),
+                    ))
+                    continue
                 a_slices = _a_batch_slices(batch_idx) + [DimSlice(m_off, m_size), DimSlice(k_off, k_size)]
                 a_tile = nb.dma_copy(
                     nb.alloc((m_size, k_size), dtype, MemorySpace.SBUF),

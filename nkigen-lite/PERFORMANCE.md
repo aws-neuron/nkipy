@@ -51,17 +51,20 @@ QWEN3_BACKEND=<hlo|nkigen-lite> uv run torchrun --nproc-per-node 4 \
 | HLO (reference) | 57.3 ms | 19.5 ms | 50.3 tok/s | 1.0x |
 | nkigen-lite — original baseline | — | — | ~0.23 tok/s | ~220x |
 | nkigen-lite — pre-KV-cache-fix | 7296 ms | 2614 ms | 0.38 tok/s | ~132x |
-| nkigen-lite — current | **3344 ms** | **1632 ms** | **0.61 tok/s** | **~82x** |
+| nkigen-lite — KV-cache fix | 3344 ms | 1632 ms | 0.61 tok/s | ~82x |
+| nkigen-lite — current (+M=1 matmul) | **3269 ms** | **1620 ms** | **0.62 tok/s** | **~81x** |
 
 (HLO row re-measured on the same box; slightly faster than the earlier 38.1
 tok/s reading, so the vs-HLO ratios shifted accordingly.)
 
-The KV-cache-collapse fix (below) cut TTFT 2.2x and decode 1.6x by removing the
-per-sequence-row unroll of the `cache[:, :seq]=x` update on the 4096-tall cache.
-The remaining ~82x gap is dominated by the **fully-unrolled 64-expert MoE
-loop** (per-token, per-expert tiny GEMMs + per-expert weight gathers), which the
-embedding model doesn't have and which the collapse-onto-partition fixes don't
-touch. That loop is the main remaining 30B lever.
+The KV-cache-collapse fix cut TTFT 2.2x by removing the per-sequence-row unroll
+of the `cache[:, :seq]=x` update. The M=1 matmul fix (below) shaved another ~2%
+by dropping the systolic transposes from the per-token MoE GEMMs. The remaining
+~81x gap is dominated by the **fully-unrolled 64-expert MoE loop** — but the BIR
+shows the cost is *per-op HBM scaffolding* (alloc/dma/dealloc per op), not the
+compute or the matmul structure (HLO keeps the same 64-dot/64-gather structure,
+just ~4x denser per pair). Closing it needs **cross-op SBUF residency**, the
+systemic lever at the top of the backlog — not more per-op fast paths.
 
 ---
 
@@ -97,6 +100,28 @@ Re-run `profile_layer.py` after any lowering change to refresh these counts.
 ---
 
 ## Progress log
+
+### 2026-06-30 — matmul: transpose-free stationary load for M=1 (matrix-vector)
+- **Change:** `direct_lower_matmul.py` (`emit_matmul` + `lower_matmul`) added an
+  M==1 fast path. The stationary operand A is `(1, K)`; the tensor engine wants
+  it as `(K, 1)` (K on partition), which the generic path builds with a
+  per-K-tile `dma_transpose`. But `(1,K)->(K,1)` is a pure row-major reinterpret
+  (the K elements are contiguous in HBM either way), so we view A's HBM buffer as
+  `(K,1)` (zero-copy) and DMA each K-tile straight into a `(k_size,1)` stationary
+  tile — no transpose. This is exactly how HLO lowers the per-token MoE expert
+  dots (`mhlo.dot` with `contract_dims=[0]`, zero transposes). Non-batched A only.
+- **Effect:** MoE expert GEMM `(1,2048)@(2048,384)` **172 -> 125 nki ops**, 16
+  transposes -> 0; isolated MoE-expert feed-forward **136 -> 125 BIR
+  instructions** (now *below* HLO's 143). Fused 30B prefill layer 71,324 ->
+  67,996 nki ops.
+- **End-to-end 30B (TP=4):** TTFT 3344 -> 3269 ms, decode p50 1632 -> 1620 ms,
+  0.61 -> 0.62 tok/s. Modest e2e (transposes were a small fraction of the layer);
+  the win is per-op quality + it generalizes to every matrix-vector matmul
+  (decode attention, router, MoE). Output verified correct.
+- **Numerics:** exact/within tol on device across MoE shapes, K-tiled, remainder.
+- **Tests:** `test_direct_lower_matmul.py::TestMatrixVector` (5 HW cases).
+- **Takeaway:** per-op matmul lowering now matches HLO; the residual 30B gap is
+  HBM-round-trip scaffolding (SBUF residency), not matmul structure.
 
 ### 2026-06-30 — KV-cache update: collapse non-last-axis slice/concat/copy onto partition
 - **Change:** `direct_lower_memory.py` `emit_slice` / `emit_concat` gained fast

@@ -89,6 +89,29 @@ class TestRank2:
         _check((512, 256), (256, 512))
 
 
+class TestMatrixVector:
+    """M=1 matrix-vector products take the transpose-free fast path: A (1, K)
+    is loaded as a (K, 1) stationary via a zero-copy HBM view, no dma_transpose.
+    Shapes mirror the per-token MoE expert GEMMs (gate-up and down projections).
+    """
+
+    def test_moe_gate_up(self):
+        _check((1, 2048), (2048, 384))
+
+    def test_moe_down(self):
+        _check((1, 192), (192, 2048))
+
+    def test_k_tiled(self):
+        # K > 128 exercises the multi-K-tile stationary loads.
+        _check((1, 512), (512, 128))
+
+    def test_k_remainder(self):
+        _check((1, 100), (100, 64))
+
+    def test_tiny(self):
+        _check((1, 6), (6, 4))
+
+
 class TestBatched:
     """Batched matmul with matching batch dims."""
 
