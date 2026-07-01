@@ -861,6 +861,65 @@ def _emit_2d_window_copy(
             )
 
 
+def _emit_2d_rows_copy(
+    nb: Builder, src_2d, dst_2d, src_r_off: int, dst_r_off: int, n_rows: int,
+    width: int, dtype,
+) -> None:
+    """Copy a full-width row window ``[r_off, r_off+n_rows)`` from a 2D HBM
+    source to a 2D HBM destination, tiling the partition (row axis) at 128 and
+    the free dim at the per-partition SBUF budget. One load + store per tile.
+
+    The counterpart to ``_emit_2d_window_copy``: that windows the free (column)
+    axis; this windows the partition (row) axis. Used by the non-last-axis
+    slice/concat fast paths, where the operated axis folds onto the partition so
+    the copy packs all 128 lanes instead of unrolling the leading rows one at a
+    time.
+    """
+    cap = max_free_elems(dtype)
+    for p_i in range(ceildiv(n_rows, PARTITION_MAX)):
+        p_off = p_i * PARTITION_MAX
+        p_size = min(PARTITION_MAX, n_rows - p_off)
+        for f_i in range(ceildiv(width, cap)):
+            fo = f_i * cap
+            fw = min(cap, width - fo)
+            tile = nb.dma_copy(
+                nb.alloc((p_size, fw), dtype, MemorySpace.SBUF),
+                src_2d, (DimSlice(src_r_off + p_off, p_size), DimSlice(fo, fw)),
+            )
+            nb.dma_copy(
+                dst_2d, tile, (DimSlice(dst_r_off + p_off, p_size), DimSlice(fo, fw))
+            )
+
+
+def _emit_axis_window_copy(
+    nb, src_hbm, dst_hbm, in_shape, out_shape, axis, src_axis_off, dst_axis_off,
+    axis_extent, dtype,
+) -> None:
+    """Copy a window along a non-last ``axis``, all other axes kept full.
+
+    Handles the ``cache[:, off:off+n] = x`` / concat-on-a-leading-axis pattern.
+    Folds the tensor into a 3D ``(L, A, T)`` grouping — ``L = prod(shape[:axis])``
+    (axes before the operated one), ``A`` = that axis's extent, ``T =
+    prod(shape[axis+1:])`` (everything after, incl. the last dim) — then, per
+    outer index, views the ``(A, T)`` block as 2D and copies a row window that
+    packs the partition. When ``L == 1`` (the common KV-cache / batch-1 case)
+    this is a single partition-tiled row-window copy instead of one DMA per
+    leading row.
+    """
+    L = prod(in_shape[:axis]) if axis > 0 else 1
+    T = prod(in_shape[axis + 1:]) if axis + 1 < len(in_shape) else 1
+    A_in = in_shape[axis]
+    A_out = out_shape[axis]
+    src_2d = _collapse_to_2d(nb, src_hbm, in_shape, L * A_in, T)
+    dst_2d = _collapse_to_2d(nb, dst_hbm, out_shape, L * A_out, T)
+    for outer in range(L):
+        _emit_2d_rows_copy(
+            nb, src_2d, dst_2d,
+            outer * A_in + src_axis_off, outer * A_out + dst_axis_off,
+            axis_extent, T, dtype,
+        )
+
+
 def emit_slice(nb: Builder, x_hbm, y_hbm, in_shape, out_shape, starts, dtype,
                strides=None) -> None:
     """Emit slice tiling into an existing Builder."""
@@ -885,6 +944,21 @@ def emit_slice(nb: Builder, x_hbm, y_hbm, in_shape, out_shape, starts, dtype,
         _emit_2d_window_copy(
             nb, src_2d, dst_2d, starts[-1], 0, out_shape[-1], dtype)
         return
+
+    # Fast path: a rank>=3 slice that touches only ONE non-last axis (every
+    # other axis, incl. the last, kept full) folds the operated axis onto the
+    # partition. This is the read side of a KV-cache update — slicing
+    # (1,4096,1,128) on axis 1 otherwise tiles shape[-2]=1 lane and unrolls the
+    # 4096 rows one at a time.
+    if rank >= 3:
+        cut = [i for i in range(rank)
+               if not (starts[i] == 0 and out_shape[i] == in_shape[i])]
+        if len(cut) == 1 and cut[0] < rank - 1:
+            a = cut[0]
+            _emit_axis_window_copy(
+                nb, x_hbm, y_hbm, in_shape, out_shape, a,
+                starts[a], 0, out_shape[a], dtype)
+            return
 
     tile_p = min(out_shape[-2], PARTITION_MAX) if rank >= 2 else 1
     tile_f = out_shape[-1] if rank >= 2 else out_shape[0]
@@ -995,6 +1069,20 @@ def emit_concat(nb: Builder, input_hbms: list, y_hbm, input_shapes: list, axis: 
             src_2d = _collapse_to_2d(nb, input_hbms[inp_idx], inp_shape, lead, w)
             _emit_2d_window_copy(nb, src_2d, dst_2d, 0, dst_f_off, w, dtype)
             dst_f_off += w
+        return
+
+    # Fast path: a rank>=3 concat on a non-last axis folds that axis onto the
+    # partition (all other axes match by definition). Each input becomes a row
+    # window of the (L, A_out, T) output. This is the write side of a KV-cache
+    # update — concat on axis 1 of (1,4096,1,128) otherwise tiles shape[-2]=1
+    # lane and unrolls the 4096 rows one at a time.
+    if rank >= 3 and axis < rank - 1:
+        axis_offset = 0
+        for inp_idx, inp_shape in enumerate(input_shapes):
+            _emit_axis_window_copy(
+                nb, input_hbms[inp_idx], y_hbm, inp_shape, out_shape, axis,
+                0, axis_offset, inp_shape[axis], dtype)
+            axis_offset += inp_shape[axis]
         return
 
     concat_offset = 0

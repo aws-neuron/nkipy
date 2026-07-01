@@ -163,3 +163,48 @@ def test_perf1_mixed_collapse_elementwise_no_blowup():
     assert n_compute <= 8, (
         f"mixed-collapse elementwise unrolled to {n_compute} compute ops"
     )
+
+
+# ---------------------------------------------------------------------------
+# perf-2: concat/slice on a non-last axis unrolled the leading (sequence) axis
+# ---------------------------------------------------------------------------
+# The KV-cache update `cache[:, :seq] = x` lowers to a concat on axis 1 of a
+# (1, max_seq_len, n_kv, head_dim) tensor, and its read-back to a slice on the
+# same axis. Both used to tile shape[-2] (= n_kv, often 1) as the partition and
+# unroll prod(shape[:-2]) = max_seq_len leading rows one DMA at a time — e.g.
+# (1, 4096, 1, 128) emitted ~12k ops per concat/slice, ~44% of the whole 30B
+# layer. The fast path now folds the operated axis onto the partition (an
+# (L, A, T) view), packing 128 lanes. The full-tensor HBM output copy got the
+# same rank>=3 collapse.
+
+def test_perf2_kv_cache_concat_slice_no_seq_unroll():
+    """concat/slice on a non-last axis of a tall (1, S, 1, D) tensor must fold
+    S onto the partition, not unroll it. Checks correctness and op count."""
+    np.random.seed(0)
+    S, NEW, D = 512, 8, 64  # S tall enough that a per-row unroll would dominate
+    old = np.random.randn(1, S - NEW, 1, D).astype(np.float32)
+    new = np.random.randn(1, NEW, 1, D).astype(np.float32)
+    full = np.random.randn(1, S, 1, D).astype(np.float32)
+
+    # concat (cache write): [new, old] along axis 1 -> (1, S, 1, D)
+    def build_concat(b):
+        n = b.add_input("new", (1, NEW, 1, D))
+        o = b.add_input("old", (1, S - NEW, 1, D))
+        b.set_outputs({"y": b.concat([n, o], axis=1)})
+
+    _lower_and_run(build_concat, {"new": new, "old": old}, {"y": (1, S, 1, D)})
+
+    # slice (cache read): x[:, :S-NEW] along axis 1
+    def build_slice(b):
+        x = b.add_input("x", (1, S, 1, D))
+        b.set_outputs({"y": b.slice(x, (0, 0, 0, 0), (1, S - NEW, 1, D))})
+
+    _lower_and_run(build_slice, {"x": full}, {"y": (1, S - NEW, 1, D)})
+
+    # Op-count guard: a per-sequence-row unroll would emit O(S) DMAs (~1000+ for
+    # concat's two inputs). The collapsed path tiles S at 128 → a few dozen.
+    for name, build in [("concat", build_concat), ("slice", build_slice)]:
+        b = Builder("t")
+        build(b)
+        n_dma = sum(1 for o in lower_to_nki(b.graph).ops if o.opcode == "dma_copy")
+        assert n_dma < 64, f"{name} unrolled the sequence axis: {n_dma} DMAs"

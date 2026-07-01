@@ -25,9 +25,9 @@ QWEN3_BACKEND=nkigen-lite uv run python example_retrieval.py --benchmark
 
 | Backend | Mean latency | Throughput | vs HLO |
 |---------|-------------:|-----------:|-------:|
-| HLO (reference) | 8.57 ms | 116.7 inf/s | 1.0x |
+| HLO (reference) | 8.56 ms | 116.8 inf/s | 1.0x |
 | nkigen-lite — original baseline | 1007.20 ms | 0.99 inf/s | 118x |
-| nkigen-lite — current | **174.07 ms** | **5.74 inf/s** | **20x** |
+| nkigen-lite — current | **166.75 ms** | **6.00 inf/s** | **19.5x** |
 
 Runs are very stable (std < 0.2 ms), so deltas below noise are meaningful.
 
@@ -48,15 +48,20 @@ QWEN3_BACKEND=<hlo|nkigen-lite> uv run torchrun --nproc-per-node 4 \
 
 | Backend | TTFT | Decode p50 | Throughput | vs HLO |
 |---------|-----:|-----------:|-----------:|-------:|
-| HLO (reference) | 62.4 ms | 25.9 ms | 38.1 tok/s | 1.0x |
-| nkigen-lite — original baseline | — | — | ~0.23 tok/s | ~165x |
-| nkigen-lite — current | 7296 ms | 2614 ms | 0.38 tok/s | ~100x |
+| HLO (reference) | 57.3 ms | 19.5 ms | 50.3 tok/s | 1.0x |
+| nkigen-lite — original baseline | — | — | ~0.23 tok/s | ~220x |
+| nkigen-lite — pre-KV-cache-fix | 7296 ms | 2614 ms | 0.38 tok/s | ~132x |
+| nkigen-lite — current | **3344 ms** | **1632 ms** | **0.61 tok/s** | **~82x** |
 
-The lowering fixes carry over (~0.23 → 0.38 tok/s, ~1.65x), but the 30B gap is
-still ~100x because its dominant cost is the **fully-unrolled 64-expert MoE
-loop**, which the embedding model doesn't have and which these
-collapse-onto-partition fixes don't touch. That loop is the main 30B lever and
-is not yet addressed.
+(HLO row re-measured on the same box; slightly faster than the earlier 38.1
+tok/s reading, so the vs-HLO ratios shifted accordingly.)
+
+The KV-cache-collapse fix (below) cut TTFT 2.2x and decode 1.6x by removing the
+per-sequence-row unroll of the `cache[:, :seq]=x` update on the 4096-tall cache.
+The remaining ~82x gap is dominated by the **fully-unrolled 64-expert MoE
+loop** (per-token, per-expert tiny GEMMs + per-expert weight gathers), which the
+embedding model doesn't have and which the collapse-onto-partition fixes don't
+touch. That loop is the main remaining 30B lever.
 
 ---
 
@@ -93,6 +98,29 @@ Re-run `profile_layer.py` after any lowering change to refresh these counts.
 
 ## Progress log
 
+### 2026-06-30 — KV-cache update: collapse non-last-axis slice/concat/copy onto partition
+- **Change:** `direct_lower_memory.py` `emit_slice` / `emit_concat` gained fast
+  paths for a rank>=3 slice/concat on a **non-last** axis (all other axes kept
+  full), and `direct_lower.py:_emit_hbm_copy` collapses a full rank>=3 copy to
+  2D. New shared helpers `_emit_2d_rows_copy` (partition = row axis) and
+  `_emit_axis_window_copy` (fold the operated axis onto the partition via an
+  `(L, A, T)` view). The KV-cache update `cache[:, :seq] = x` lowers to a
+  concat on axis 1 of `(1, 4096, 1, nkv, D)`-shaped tensors and its read-back to
+  a slice on the same axis; both used to tile `shape[-2]` (= 1 kv-head lane) and
+  unroll the 4096 sequence rows one DMA at a time (~12k ops each). Folding the
+  sequence axis onto the 128-lane partition tiles it in ~32 steps.
+- **Effect (fused prefill layer):** **168,658 → 71,324 nki ops (2.4x)**; the
+  KV-cache concat/slice/copy (~74k ops, ~44% of the layer) drops to a few
+  hundred. Python lowering time 2.8 → 1.0s; neuronx-cc compile went from
+  >10 min to ~2 min (build dir 650M → 307M).
+- **End-to-end 30B (TP=4):** **TTFT 7296 → 3344 ms (2.2x)**, decode p50
+  2614 → 1632 ms (1.6x), throughput 0.38 → 0.61 tok/s (1.6x), ~82x vs HLO.
+  Output verified correct ("...Paris. ...London...").
+- **Numerics:** exact (0.0 abs err vs numpy) across concat/slice on axis 1,
+  mid-axis offsets, and L>1 outer batches.
+- **Tests:** `test_lowering_issues.py::test_perf2_kv_cache_concat_slice_no_seq_unroll`
+  (DMA-count guard). Existing `test_direct_lower_memory.py` unchanged (760 pass).
+
 ### 2026-06-30 — elementwise segmenter: split on a second collapsed extent (RoPE)
 - **Change:** `direct_lower.py:_segment_ops` now breaks an elementwise group
   when an op would introduce a second distinct non-1 collapsed `(P, F)` extent
@@ -112,6 +140,10 @@ Re-run `profile_layer.py` after any lowering change to refresh these counts.
   (compute-op count guard: 128 → ≤8). New dumper:
   `examples/models/qwen3/dump_nki_ir.py` + `nki_ir_dumps/` (qwen3 MoE building
   blocks, TP=4 per-rank shapes).
+- **End-to-end embedding:** **174.07 → 166.75 ms (1.04x)**, 20x → 19.5x vs HLO
+  (HLO 8.56 ms). Numerics gate unchanged (min cosine 0.9997). The embedding
+  layer has only one RoPE op at seq=128, so the e2e move is modest; the win
+  scales with prefill length and matters most for 30B TTFT.
 
 ### 2026-06-30 — reduce over trailing axis: collapse leading dims onto partition
 - **Change:** `direct_lower_reduce.py:_emit_f_reduce_inline` gained a fast path

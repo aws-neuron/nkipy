@@ -230,6 +230,29 @@ def _emit_hbm_copy(nb: Builder, src: Value, dst: Value, shape: tuple[int, ...]):
         tile = nb.dma_copy(nb.alloc((1, 1), src.type.dtype, MemorySpace.SBUF), src, src_slices)
         nb.dma_copy(dst, tile, dst_slices)
         return
+
+    # Fast path: a full copy preserves row-major flat order, so a rank>=3 tensor
+    # collapses to 2D (prod(shape[:-1]), shape[-1]) via zero-copy views and tiles
+    # all leading axes onto the 128-lane partition. The generic path below tiles
+    # only shape[-2] as the partition and unrolls prod(shape[:-2]) leading-dim
+    # iterations one at a time — e.g. a (1,4096,1,128) KV-cache copy uses 1 of
+    # 128 lanes and unrolls 4096 times. Only when the row width shape[-1] alone
+    # fits the SBUF free budget (else the flat collapse would need per-row
+    # sub-tiling the generic path already handles via tile_f).
+    if len(shape) >= 3 and shape[-1] <= max_free_elems(src.type.dtype):
+        lead = prod(shape[:-1])
+        src_2d = src if tuple(src.type.shape) == (lead, shape[-1]) else nb.view(src, (lead, shape[-1]))
+        dst_2d = dst if tuple(dst.type.shape) == (lead, shape[-1]) else nb.view(dst, (lead, shape[-1]))
+        for p_i in range(ceildiv(lead, PARTITION_MAX)):
+            p_off = p_i * PARTITION_MAX
+            p_size = min(PARTITION_MAX, lead - p_off)
+            tile = nb.dma_copy(
+                nb.alloc((p_size, shape[-1]), src.type.dtype, MemorySpace.SBUF),
+                src_2d, (DimSlice(p_off, p_size), DimSlice(0, shape[-1])),
+            )
+            nb.dma_copy(dst_2d, tile, (DimSlice(p_off, p_size), DimSlice(0, shape[-1])))
+        return
+
     tile_p = min(shape[-2], PARTITION_MAX) if len(shape) >= 2 else 1
     f_extent = shape[-1] if len(shape) >= 2 else shape[0]
     p_extent = shape[-2] if len(shape) >= 2 else 1
