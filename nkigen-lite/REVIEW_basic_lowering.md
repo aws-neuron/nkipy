@@ -28,7 +28,7 @@ Fix direction: loop over all chunks (splitting the on-chip tile per chunk),
 mirroring `_prefix_row_segments` in `direct_lower_memory.py`, which solved the
 same problem for reshape.
 
-### 2. [ ] Comparison/bitwise ops don't support free-dim broadcast
+### 2. [x] Comparison/bitwise ops don't support free-dim broadcast
 
 `direct_lower_utils.py:445-470` (`emit_binary_op`). The compare and bitwise
 branches only handle partition broadcast (`broadcast_partition` when the
@@ -72,7 +72,7 @@ Fix direction: tile F at `max_free_elems(dtype)` (gpsimd path) /
 `PSUM_FREE_MAX` (matmul path) with an outer F loop; the elementwise path's
 `compute_tile_sizes` already shows the pattern.
 
-### 4. [ ] `_first_cols` reads out of bounds for k in 9..15 (any k>8 not a multiple of 8)
+### 4. [x] `_first_cols` reads out of bounds for k in 9..15 (any k>8 not a multiple of 8)
 
 `direct_lower.py:1061-1070`. The scratch is hard-coded `(P, 8)` but callers
 pass `kp`-wide tiles (`kp = ceil(k/8)*8`). For `k = 12`: tile is `(P, 16)`,
@@ -113,7 +113,7 @@ prevented at least two of the divergences above.
 or the compare-XOR-select pattern used in `_emit_floor` (integer masks, no
 0*inf) would be safe.
 
-### 7. [ ] `_emit_topk_op` doesn't tile P
+### 7. [x] `_emit_topk_op` doesn't tile P
 
 `direct_lower.py:831` uses `P` straight from the source shape in `(P, 8)`
 allocs; anything over 128 rows overflows the partition. `gather_along_axis`
@@ -159,8 +159,14 @@ importable as `nki_ir.NisaReduceOp`. Harmless under
 instead of `max_free_elems`. Two notions of "fits in SBUF" in one package will
 eventually disagree; unify on `max_free_elems`.
 
-### 13. [ ] `emit_matmul` assumes F32 output dtype
+### 13. [x] `emit_matmul` assumes F32 output dtype
 
 The PSUM→SBUF copy is always F32 regardless of the result dtype; a bf16 matmul
 result would be a silent dtype mismatch at the final `dma_copy`. Fine if matmul
 results are F32 by construction — add an assert to make the contract explicit.
+
+**Resolution: it was a real bug, not just a missing assert.** The bf16 FFN
+tests in test_shape_coverage.py lower matmuls with bf16 result buffers; the
+F32-staged c_sbuf was DMA'd into them as a silent dtype mismatch. The
+PSUM->SBUF tensor_copy now stages in the destination buffer's dtype
+(tensor_copy casts), so bf16 results get a bf16 store.

@@ -58,6 +58,11 @@ def emit_matmul(
     M, K = a_shape[-2], a_shape[-1]
     N = b_shape[-1]
 
+    # PSUM accumulates in F32; the PSUM->SBUF tensor_copy stages the result in
+    # the destination buffer's dtype (tensor_copy casts), so a bf16 c_hbm gets
+    # a bf16 store rather than a silent F32/bf16 mismatch at the dma_copy.
+    out_dtype = c_hbm.type.dtype
+
     a_batch = a_shape[:-2]
     b_batch = b_shape[:-2]
     out_batch = np.broadcast_shapes(a_batch, b_batch) if (a_batch or b_batch) else ()
@@ -159,7 +164,7 @@ def emit_matmul(
                     nb.matmul(psum, a_stats[k_i], b_mov, accumulate=(k_i > 0))
 
                 c_sbuf = nb.tensor_copy(
-                    nb.alloc((m_size, n_size), DType.F32, MemorySpace.SBUF), psum
+                    nb.alloc((m_size, n_size), out_dtype, MemorySpace.SBUF), psum
                 )
                 c_slices = [DimSlice(bi, 1) for bi in batch_idx] + [DimSlice(m_off, m_size), DimSlice(n_off, n_size)]
                 nb.dma_copy(c_hbm, c_sbuf, tuple(c_slices))

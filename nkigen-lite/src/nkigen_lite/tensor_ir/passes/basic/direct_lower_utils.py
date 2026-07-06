@@ -466,34 +466,45 @@ ELEMENTWISE_OPCODES = frozenset({
 # ---------------------------------------------------------------------------
 
 
+def _materialize_broadcast(nb: Builder, x: Value, out_shape: tuple[int, int]) -> Value:
+    """Broadcast a tile to ``out_shape`` on both axes, materializing the result.
+
+    Partition (P) broadcast goes through the HBM scratch round-trip
+    (``broadcast_partition``); free (F) broadcast replicates the per-row
+    scalar with a ones-multiply (``tensor_scalar_arith``). Used by the
+    compare/bitwise paths, whose tensor_tensor ops require exactly matching
+    shapes — unlike arith, which has a native tensor_scalar form.
+    """
+    p, f = x.type.shape
+    out_p, out_f = out_shape
+    if p == 1 and out_p > 1:
+        x = broadcast_partition(nb, x, (out_p, f))
+        p = out_p
+    if f == 1 and out_f > 1:
+        ones = nb.constant(1.0, (p, out_f), x.type.dtype, MemorySpace.SBUF)
+        rep = nb.alloc((p, out_f), x.type.dtype, MemorySpace.SBUF)
+        x = nb.tensor_scalar_arith(rep, ones, x, nki_ir.NisaArithOp.MULTIPLY)
+    return x
+
+
 def emit_binary_op(nb: Builder, out_dtype: DType, a: Value, b: Value, opcode: str) -> Value:
     """Emit a binary elementwise op with broadcast alignment."""
-    if opcode in COMPARE_OPS:
-        cmp_op = COMPARE_OPS[opcode]
+    if opcode in COMPARE_OPS or opcode in BITWISE_OPS:
+        # tensor_tensor_compare / _bitvec require exactly matching shapes, so
+        # materialize size-1 operands on both axes (the arith path below can
+        # instead use the native tensor_scalar form for F-size-1 operands).
         if a.type.shape != b.type.shape:
             ap, af = a.type.shape
             bp, bf = b.type.shape
             out_shape = (max(ap, bp), max(af, bf))
-            if a.type.shape != out_shape:
-                a = broadcast_partition(nb, a, out_shape) if ap < out_shape[0] else a
-            if b.type.shape != out_shape:
-                b = broadcast_partition(nb, b, out_shape) if bp < out_shape[0] else b
-        # Comparison ops produce same dtype as input (1.0/0.0 float)
-        dst = nb.alloc(a.type.shape, a.type.dtype, MemorySpace.SBUF)
-        return nb.tensor_tensor_compare(dst, a, b, cmp_op)
-    if opcode in BITWISE_OPS:
-        bitvec_op = BITWISE_OPS[opcode]
-        if a.type.shape != b.type.shape:
-            # Broadcast smaller operand to match
-            ap, af = a.type.shape
-            bp, bf = b.type.shape
-            out_shape = (max(ap, bp), max(af, bf))
-            if a.type.shape != out_shape:
-                a = broadcast_partition(nb, a, out_shape) if ap < out_shape[0] else a
-            if b.type.shape != out_shape:
-                b = broadcast_partition(nb, b, out_shape) if bp < out_shape[0] else b
+            a = _materialize_broadcast(nb, a, out_shape)
+            b = _materialize_broadcast(nb, b, out_shape)
+        if opcode in COMPARE_OPS:
+            # Comparison ops produce same dtype as input (1.0/0.0 float)
+            dst = nb.alloc(a.type.shape, a.type.dtype, MemorySpace.SBUF)
+            return nb.tensor_tensor_compare(dst, a, b, COMPARE_OPS[opcode])
         dst = nb.alloc(a.type.shape, out_dtype, MemorySpace.SBUF)
-        return nb.tensor_tensor_bitvec(dst, a, b, bitvec_op)
+        return nb.tensor_tensor_bitvec(dst, a, b, BITWISE_OPS[opcode])
     arith_op = BINARY_OPS[opcode]
     if a.type.shape == b.type.shape:
         dst = nb.alloc(a.type.shape, out_dtype, MemorySpace.SBUF)

@@ -283,3 +283,44 @@ def test_p_reduce_wide_f_legal_tiles():
         ref = tensor_run(b.graph, {"x": xv})["y"]
         out = nki_run(g, {"x": xv, "y_out": np.zeros((1, shape[1]), np.float32)})["y"]
         np.testing.assert_allclose(out, ref, atol=1e-2, rtol=1e-4)
+
+
+# REVIEW_basic_lowering.md items 2, 4, 7:
+#  - item 2: compare/bitwise ops lacked free-dim broadcast (greater(x, y[:, :1])
+#    raised 'shapes must match'); now materialized via a ones-multiply.
+#  - item 4: topk's _first_cols used a hard-coded 8-wide HBM scratch, reading
+#    out of bounds for k in 9..15 (silently — slice bounds are unchecked).
+#  - item 7: topk didn't tile the partition, so P > 128 emitted illegal tiles.
+
+def test_compare_broadcast():
+    np.random.seed(0)
+    for sa, sb in [((128, 64), (128, 1)),   # F-broadcast
+                   ((128, 64), (1, 64)),    # P-broadcast
+                   ((128, 64), (1, 1))]:    # both
+        x = np.random.randn(*sa).astype(np.float32)
+        y = np.random.randn(*sb).astype(np.float32)
+
+        def build(b):
+            tx = b.add_input("x", sa)
+            ty = b.add_input("y", sb)
+            b.set_outputs({"z": b.greater(tx, ty)})
+
+        _lower_and_run(build, {"x": x, "y": y}, {"z": sa})
+
+
+@pytest.mark.parametrize("P,F,k", [
+    (4, 100, 12),    # item 4: k in 9..15 (fold-aligned width 16 > old scratch)
+    (4, 100, 20),    # k > 16
+    (200, 64, 8),    # item 7: P > PARTITION_MAX
+    (2, 20000, 12),  # chunked-F merge path with unaligned k
+])
+def test_topk_k_and_p_coverage(P, F, k):
+    np.random.seed(0)
+    x = np.random.randn(P, F).astype(np.float32)
+
+    def build(b):
+        t = b.add_input("x", (P, F))
+        vals, idxs = b.topk(t, k)
+        b.set_outputs({"v": vals, "i": idxs})
+
+    _lower_and_run(build, {"x": x}, {"v": (P, k), "i": (P, k)}, atol=1e-6)
