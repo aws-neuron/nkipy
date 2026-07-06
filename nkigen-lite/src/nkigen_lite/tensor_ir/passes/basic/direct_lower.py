@@ -178,10 +178,7 @@ def lower_graph(graph: Graph, layouts: dict[str, Layout]) -> nki_ir.Graph:
     segments = _segment_ops(graph, layouts)
     for segment in segments:
         if segment[0].opcode in ELEMENTWISE_OPCODES:
-            # Further split if any input has an incompatible layout
-            sub_segments = _split_on_layout_conflict(segment, layouts, hbm_map)
-            for sub_seg in sub_segments:
-                _emit_elementwise_segment(nb, sub_seg, layouts, hbm_map)
+            _emit_elementwise_segment(nb, segment, layouts, hbm_map)
         elif segment[0].opcode == "reduce":
             _emit_reduce_op(nb, segment[0], layouts, hbm_map)
         elif segment[0].opcode == "matmul":
@@ -283,55 +280,6 @@ def _emit_hbm_copy(nb: Builder, src: Value, dst: Value, shape: tuple[int, ...]):
                     src, slices,
                 )
                 nb.dma_copy(dst, tile, slices)
-
-
-def _split_on_layout_conflict(
-    ops: list, layouts: dict[str, Layout], hbm_map: dict[str, Value],
-) -> list[list]:
-    """Split an elementwise segment when an input has an incompatible layout.
-
-    An input is incompatible if its P/F dims differ from the segment's rep
-    AND its shape (after considering the layout) would produce a tile with
-    different (P, F) dimensions that can't be aligned via broadcasting.
-    """
-    if len(ops) <= 1:
-        return [ops]
-
-    rep_layout = layouts[ops[-1].results[0].name]
-    segment_results = {r.name for op in ops for r in op.results}
-
-    # Check each op's inputs for layout conflicts
-    sub_segments = []
-    current = []
-    for op in ops:
-        has_conflict = False
-        for inp in op.inputs:
-            if inp.name in segment_results:
-                continue
-            if inp.name not in layouts:
-                continue
-            inp_layout = layouts[inp.name]
-            if (inp_layout.p_dims != rep_layout.p_dims and
-                inp_layout.f_dims != rep_layout.f_dims):
-                # Check if it's a broadcast (size-1 dim) — those are OK
-                inp_shape = inp.type.shape
-                inp_p_ext = prod(inp_shape[d] for d in inp_layout.p_dims) if inp_layout.p_dims else 1
-                inp_f_ext = prod(inp_shape[d] for d in inp_layout.f_dims) if inp_layout.f_dims else 1
-                if inp_p_ext > 1 and inp_f_ext > 1:
-                    has_conflict = True
-                    break
-
-        if has_conflict:
-            if current:
-                sub_segments.append(current)
-                current = []
-            sub_segments.append([op])
-        else:
-            current.append(op)
-
-    if current:
-        sub_segments.append(current)
-    return sub_segments
 
 
 # ---------------------------------------------------------------------------
@@ -557,23 +505,16 @@ def _emit_ew_tile(
             cond = tile_map[op.inputs[0].name]
             x_true = tile_map[op.inputs[1].name]
             y_false = tile_map[op.inputs[2].name]
-            from nkigen_lite.nki_ir.ir import NisaArithOp
-            # NKI pattern: result = cond*x + (1-cond)*y
-            # cond is float (1.0/0.0), same dtype as x/y
+            # result = y (copy), then overwrite with x where cond > 0.
+            # copy_predicated never evaluates arithmetic on the unselected
+            # branch, so where(mask, scores, -inf) stays -inf/scores — the
+            # old cond*x + (1-cond)*y form produced NaN whenever the
+            # unselected branch was inf (0 * inf), which is exactly the
+            # masked-attention pattern.
             shape = x_true.type.shape
-            # inv_cond = 1.0 - cond
-            ones = nb.constant(1.0, shape, out_dtype, MemorySpace.SBUF)
-            inv_cond = nb.alloc(shape, out_dtype, MemorySpace.SBUF)
-            nb.tensor_tensor_arith(inv_cond, ones, cond, NisaArithOp.SUBTRACT)
-            # mask_x = cond * x
-            mask_x = nb.alloc(shape, out_dtype, MemorySpace.SBUF)
-            nb.tensor_tensor_arith(mask_x, cond, x_true, NisaArithOp.MULTIPLY)
-            # mask_y = inv_cond * y
-            mask_y = nb.alloc(shape, out_dtype, MemorySpace.SBUF)
-            nb.tensor_tensor_arith(mask_y, inv_cond, y_false, NisaArithOp.MULTIPLY)
-            # result = mask_x + mask_y
             result = nb.alloc(shape, out_dtype, MemorySpace.SBUF)
-            nb.tensor_tensor_arith(result, mask_x, mask_y, NisaArithOp.ADD)
+            nb.tensor_copy(result, y_false)
+            nb.copy_predicated(result, cond, x_true)
             tile_map[out_name] = result
         elif op.opcode == "constant":
             out_shape = shape_override.get(out_name, op.results[0].type.shape)

@@ -6,7 +6,7 @@ can start from a failing case.
 
 ## Confirmed bugs
 
-### 1. [ ] Transpose passthrough-partition path crashes on unaligned collapsed B
+### 1. [x] Transpose passthrough-partition path crashes on unaligned collapsed B
 
 `direct_lower_transpose.py:227` (`_lower_transpose_passthrough_partition`) and
 the duplicated code in `emit_transpose` (`direct_lower_transpose.py:464`).
@@ -47,7 +47,7 @@ which works for `add`/`mul` but not `greater`/`equal`/etc.
 Fix direction: materialize the free-axis broadcast before comparing (e.g. the
 ones-multiply `tensor_scalar_arith` pattern used in `_lower_f_broadcast`).
 
-### 3. [ ] P-reduce emits SBUF/PSUM tiles exceeding hardware limits when F is wide
+### 3. [x] P-reduce emits SBUF/PSUM tiles exceeding hardware limits when F is wide
 
 Both P-reduce strategies take the free extent at full width with no cap:
 
@@ -87,7 +87,7 @@ k = 3, 8, 12, 20 (and the F > TOPK_FREE_MAX chunked-merge path).
 
 ## Design / robustness
 
-### 5. [ ] Dedup `lower_*` vs `emit_*` — divergence is already happening
+### 5. [x] Dedup `lower_*` vs `emit_*` — divergence is already happening
 
 Nearly every module carries two copies of the same tiling logic: a standalone
 `lower_*` building its own graph (used only by unit tests) and an `emit_*`
@@ -105,7 +105,7 @@ Fix direction: make `lower_*` a thin wrapper (create Builder + HBM inputs,
 call `emit_*`, set outputs); delete `lower_elementwise`. This would have
 prevented at least two of the divergences above.
 
-### 6. [ ] `where` lowering is numerically unsafe for masked-softmax patterns
+### 6. [x] `where` lowering is numerically unsafe for masked-softmax patterns
 
 `direct_lower.py:554-575`. `cond*x + (1-cond)*y` produces NaN whenever the
 *unselected* branch is `inf`/`-inf`/NaN (`0 * inf = NaN`). Attention masks
@@ -119,13 +119,13 @@ or the compare-XOR-select pattern used in `_emit_floor` (integer masks, no
 allocs; anything over 128 rows overflows the partition. `gather_along_axis`
 right next to it tiles P at `PARTITION_MAX`; topk should do the same.
 
-### 8. [ ] `_emit_iota_op` doesn't cap tile_f
+### 8. [x] `_emit_iota_op` doesn't cap tile_f
 
 `direct_lower.py:749`: `tile_f = shape[-1]` with no `max_free_elems` guard —
 a vocab-wide iota `(1, 128256)` would blow the per-partition SBUF budget.
 One-line fix, same as elsewhere.
 
-### 9. [ ] `_split_on_layout_conflict` condition possibly wrong (or unnecessary)
+### 9. [x] `_split_on_layout_conflict` condition possibly wrong (or unnecessary)
 
 `direct_lower.py:312-313`: a conflict is flagged only when *both* p_dims *and*
 f_dims differ. An input whose partition assignment alone differs (same f_dims)
@@ -134,20 +134,26 @@ disagree with its producer's. Since HBM is addressed logically this may be
 intentionally safe — but then the whole check may be unnecessary; if not, the
 condition should be `or`. Decide and document either way.
 
+**Resolution: deleted.** The elementwise path loads/stores every value with
+a canonical row-major layout and addresses HBM by logical coordinates, so the
+solver's declared layouts cannot make a segment incorrect. Verified: the only
+graph in the repo that triggered the split (`build_rope`) lowers correctly
+without it, and the full suite passes with the check removed.
+
 ## Minor
 
-### 10. [ ] Dead code: `flat_range_to_src_slices`
+### 10. [x] Dead code: `flat_range_to_src_slices`
 
 `direct_lower_utils.py:72` — superseded by `flat_range_to_src_chunks`,
 referenced only in that function's docstring. Delete.
 
-### 11. [ ] Undefined-name annotation `NisaReduceOp`
+### 11. [x] Undefined-name annotation `NisaReduceOp`
 
 `direct_lower_reduce.py:202` annotates `reduce_nki_op: NisaReduceOp` — only
 importable as `nki_ir.NisaReduceOp`. Harmless under
 `from __future__ import annotations`, but breaks runtime introspection.
 
-### 12. [ ] Transpose fast-path uses its own SBUF budget constant
+### 12. [x] Transpose fast-path uses its own SBUF budget constant
 
 `direct_lower_transpose.py:186-188`: hard-coded `49152 // bytes_per_elem`
 instead of `max_free_elems`. Two notions of "fits in SBUF" in one package will
