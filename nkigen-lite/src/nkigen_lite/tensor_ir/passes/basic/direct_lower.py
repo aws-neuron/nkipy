@@ -514,7 +514,14 @@ def _emit_ew_tile(
             shape = x_true.type.shape
             result = nb.alloc(shape, out_dtype, MemorySpace.SBUF)
             nb.tensor_copy(result, y_false)
-            nb.copy_predicated(result, cond, x_true)
+            # copy_predicated requires an integer pred_mask; cond is float
+            # (1.0/0.0) here, so cast it through a u8 scratch tile.
+            if cond.type.dtype not in (DType.U8, DType.U16, DType.U32):
+                pred_u8 = nb.alloc(cond.type.shape, DType.U8, MemorySpace.SBUF)
+                nb.tensor_copy(pred_u8, cond)
+                nb.copy_predicated(result, pred_u8, x_true)
+            else:
+                nb.copy_predicated(result, cond, x_true)
             tile_map[out_name] = result
         elif op.opcode == "constant":
             out_shape = shape_override.get(out_name, op.results[0].type.shape)
