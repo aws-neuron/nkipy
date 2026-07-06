@@ -134,6 +134,19 @@ def _segment_ops(graph: Graph) -> list[list]:
 # ---------------------------------------------------------------------------
 
 
+def _is_view_slice(op) -> bool:
+    """True if a ``slice`` can be lowered as a zero-copy offset view.
+
+    A static-start, stride-1 slice is a contiguous per-dim window of its
+    (row-major) source: a consumer that loads via per-dim ``DimSlice``s reads
+    the same data by adding the slice's ``starts`` into its own offsets — no
+    copy, no HBM buffer. Non-unit strides can't compose this way (the DMA would
+    need the consumer to also carry the stride), so those keep the copy path.
+    """
+    strides = op.attrs.get("strides")
+    return strides is None or all(s == 1 for s in strides)
+
+
 def lower_graph(graph: Graph) -> nki_ir.Graph:
     """Lower a full tensor IR graph to NKI IR with HBM boundaries."""
     nb = Builder("direct_lower")
@@ -142,6 +155,34 @@ def lower_graph(graph: Graph) -> nki_ir.Graph:
     def _nki_shape(shape):
         """NKI requires at least rank-1 tensors."""
         return shape if len(shape) > 0 else (1,)
+
+    # View-eligible slices: name -> the slice op. Lowered lazily — an
+    # elementwise consumer composes the slice's base offset into its own loads
+    # (no buffer, no copy); any other consumer (or a graph output) triggers
+    # ``_resolve``, which materializes the buffer + copy once, on first use.
+    slice_views: dict[str, object] = {
+        op.results[0].name: op
+        for op in graph.ops
+        if op.opcode == "slice" and _is_view_slice(op)
+    }
+
+    def _resolve(name: str) -> Value:
+        """Return the HBM buffer for ``name``, materializing a pending
+        slice-view (and any slice-view source it chains through) on demand."""
+        if name in hbm_map:
+            return hbm_map[name]
+        op = slice_views[name]
+        src_hbm = _resolve(op.inputs[0].name)
+        out_val = op.results[0]
+        buf = nb.alloc(_nki_shape(out_val.type.shape), out_val.type.dtype,
+                       MemorySpace.HBM)
+        emit_slice(
+            nb, src_hbm, buf, op.inputs[0].type.shape, out_val.type.shape,
+            op.attrs["starts"], out_val.type.dtype,
+            strides=op.attrs.get("strides"),
+        )
+        hbm_map[name] = buf
+        return buf
 
     # Allocate HBM inputs
     for v in graph.inputs:
@@ -197,6 +238,8 @@ def lower_graph(graph: Graph) -> nki_ir.Graph:
     for op in graph.ops:
         if op.opcode == "reshape" and _is_view_reshape(op):
             continue
+        if op.results and op.results[0].name in slice_views:
+            continue  # lowered lazily as an offset view (or materialized on use)
         for r in op.results:
             if r.name in seg_of and r.name not in escapes:
                 continue
@@ -205,10 +248,18 @@ def lower_graph(graph: Graph) -> nki_ir.Graph:
                     _nki_shape(r.type.shape), r.type.dtype, MemorySpace.HBM
                 )
 
-    # Lower each segment
+    # Lower each segment.  Non-elementwise emitters read their inputs' HBM
+    # buffers directly, so materialize any pending slice-view an input chains
+    # through before the emitter runs.  Elementwise segments compose the offset
+    # themselves (see ``_emit_elementwise_segment``), so they are exempt.
     for segment in segments:
+        if segment[0].opcode not in ELEMENTWISE_OPCODES:
+            for inp in segment[0].inputs:
+                if inp.name in slice_views:
+                    _resolve(inp.name)
+
         if segment[0].opcode in ELEMENTWISE_OPCODES:
-            _emit_elementwise_segment(nb, segment, hbm_map)
+            _emit_elementwise_segment(nb, segment, hbm_map, slice_views, _resolve)
         elif segment[0].opcode == "reduce":
             _emit_reduce_op(nb, segment[0], hbm_map)
         elif segment[0].opcode == "matmul":
@@ -218,6 +269,8 @@ def lower_graph(graph: Graph) -> nki_ir.Graph:
         elif segment[0].opcode == "reshape":
             _emit_reshape_op(nb, segment[0], hbm_map)
         elif segment[0].opcode == "slice":
+            if segment[0].results[0].name in slice_views:
+                continue  # zero-copy offset view; no emission
             _emit_slice_op(nb, segment[0], hbm_map)
         elif segment[0].opcode == "concat":
             _emit_concat_op(nb, segment[0], hbm_map, const_values)
@@ -240,7 +293,7 @@ def lower_graph(graph: Graph) -> nki_ir.Graph:
 
     # Copy final results to output buffers
     for out_name, out_val in graph.outputs.items():
-        src = hbm_map[out_val.name]
+        src = _resolve(out_val.name)
         dst = hbm_map[f"{out_name}_out"]
         if src is not dst:
             _emit_hbm_copy(nb, src, dst, out_val.type.shape)
@@ -388,6 +441,7 @@ def _collapse_ew_shape(shape: tuple[int, ...], rep_shape: tuple[int, ...]):
 
 def _try_emit_collapsed_ew(
     nb: Builder, ops: list, hbm_map: dict[str, Value], rep_shape: tuple[int, ...],
+    resolve=None,
 ) -> bool:
     """Emit a rank>=3 elementwise segment via leading-dims-onto-partition
     collapse. Returns False (emitting nothing) when the segment can't be
@@ -399,6 +453,10 @@ def _try_emit_collapsed_ew(
     ``hbm_map`` view, and reuse the existing 2D tile machinery
     (``_emit_ew_tile``) — which already handles F/P broadcasting of size-1
     operands via ``emit_binary_op``.
+
+    Slice-view inputs are materialized first (``resolve``): this path builds a
+    2D view of each input with ``nb.view``, which KB rejects on a sliced tile,
+    so an offset view can't be composed here (unlike the generic path below).
     """
     if len(rep_shape) < 3:
         return False
@@ -421,6 +479,15 @@ def _try_emit_collapsed_ew(
         if pf is None:
             return False
         collapsed[name] = pf
+
+    # Past the bail points: materialize any pending slice-view input now (this
+    # path reshapes each buffer with nb.view, which KB rejects on a sliced
+    # tile). Doing it here rather than earlier lets a non-collapsible segment
+    # fall through to the generic path, which composes the offset with no copy.
+    if resolve is not None:
+        for name in collapsed:
+            if name not in segment_results and name not in hbm_map:
+                resolve(name)
 
     # Build 2D HBM views keyed by the same names the tile machinery uses.
     # A segment-internal result with no HBM buffer (dead store eliminated)
@@ -463,8 +530,18 @@ def _try_emit_collapsed_ew(
 
 def _emit_elementwise_segment(
     nb: Builder, ops: list, hbm_map: dict[str, Value],
+    slice_views: dict | None = None, resolve=None,
 ) -> None:
-    """Emit a fused elementwise segment: one tiled loop for all ops."""
+    """Emit a fused elementwise segment: one tiled loop for all ops.
+
+    ``slice_views``/``resolve`` support slice-as-view: a foldable slice input
+    (in ``slice_views``) is read from its source buffer with the slice's base
+    offset added into the load, so no copy or HBM buffer is emitted for it. The
+    generic per-tile path composes the offset directly; the rank>=3 collapse
+    path can't (KB won't ``.view()`` a sliced tile), so it materializes such
+    inputs via ``resolve`` first.
+    """
+    slice_views = slice_views or {}
     # Prune ops whose results neither escape (have an HBM buffer) nor feed a
     # kept op later in the segment — e.g. constants whose only consumer is a
     # concat that splat-fills them. Emitting them would burn a memset per tile.
@@ -490,7 +567,7 @@ def _emit_elementwise_segment(
     # leading-dim iterations one at a time (e.g. (1,128,16,64) uses 16 of 128
     # lanes and unrolls 128 times). Collapsing to (prod(shape[:-1]), shape[-1])
     # packs the partition and runs a single 2D loop.
-    if _try_emit_collapsed_ew(nb, ops, hbm_map, rep_shape):
+    if _try_emit_collapsed_ew(nb, ops, hbm_map, rep_shape, resolve):
         return
 
     seg_dtype = _segment_dtype(ops)
@@ -500,6 +577,16 @@ def _emit_elementwise_segment(
     # Which values are produced within this segment (stay on-chip)
     segment_results = {r.name for op in ops for r in op.results}
 
+    # Slice-view inputs read by this segment: map name -> (source HBM buffer,
+    # per-dim base offsets) so the tile load adds the offset instead of copying.
+    slice_srcs: dict[str, tuple[Value, tuple[int, ...]]] = {}
+    for op in ops:
+        for inp in op.inputs:
+            if inp.name in slice_views and inp.name not in segment_results:
+                sop = slice_views[inp.name]
+                src_hbm = resolve(sop.inputs[0].name) if resolve else hbm_map[sop.inputs[0].name]
+                slice_srcs[inp.name] = (src_hbm, tuple(sop.attrs["starts"]))
+
     # Loop dims
     loop_dims = [(d, rep_shape[d], tile_sizes[d])
                  for d in sorted(tile_sizes.keys())
@@ -508,7 +595,8 @@ def _emit_elementwise_segment(
     def _emit_nested(depth: int, indices: dict[int, int]):
         if depth >= len(loop_dims):
             _emit_ew_tile(nb, ops, hbm_map, rep_layout, rep_shape,
-                          tile_sizes, indices, segment_results, seg_dtype)
+                          tile_sizes, indices, segment_results, seg_dtype,
+                          slice_srcs=slice_srcs)
             return
         d, extent, ts = loop_dims[depth]
         for i in range(ceildiv(extent, ts)):
@@ -524,6 +612,7 @@ def _emit_ew_tile(
     segment_results: set[str],
     seg_dtype: DType,
     shape_override: dict[str, tuple[int, ...]] | None = None,
+    slice_srcs: dict[str, tuple[Value, tuple[int, ...]]] | None = None,
 ) -> None:
     """Emit one tile of fused elementwise computation.
 
@@ -536,8 +625,16 @@ def _emit_ew_tile(
     collapsed path reshapes HBM buffers to 2D views but the op results still
     carry their original N-D types, so ``constant`` (which sizes its tile from
     the result type) needs the 2D shape to match the rest of the tile.
+
+    ``slice_srcs`` (slice-as-view) maps an input name to ``(source_buffer,
+    starts)``: the input is a static-start, stride-1 slice with no buffer of
+    its own, so its tile loads from the source with each per-dim start added
+    into the load offset. The slice preserves rank, so the tile layout is
+    computed from the *slice* shape (keeping the rep-loop alignment) and only
+    the offsets shift.
     """
     shape_override = shape_override or {}
+    slice_srcs = slice_srcs or {}
     tile_map: dict[str, Value] = {}
     rep_tile = on_chip_shape(rep_shape, rep_layout, tile_sizes, indices)
 
@@ -546,6 +643,22 @@ def _emit_ew_tile(
     for op in ops:
         for inp in op.inputs:
             if inp.name in tile_map or inp.name in segment_results:
+                continue
+            if inp.name in slice_srcs:
+                # Slice-as-view: load from the slice's source, shifting each
+                # tile offset by the slice's per-dim start. Tile layout comes
+                # from the slice's own (output) shape.
+                src_hbm, starts = slice_srcs[inp.name]
+                val_shape = inp.type.shape
+                val_layout = _canonical_layout(len(val_shape))
+                val_tile_sizes = compute_tile_sizes(val_shape, val_layout, seg_dtype)
+                val_tile = on_chip_shape(val_shape, val_layout, val_tile_sizes, indices)
+                slices = hbm_slices(val_shape, val_layout, val_tile_sizes,
+                                     indices, rep_layout)
+                slices = [DimSlice(s.offset + st, s.size, s.stride)
+                          for s, st in zip(slices, starts)]
+                dst = nb.alloc(val_tile, inp.type.dtype, MemorySpace.SBUF)
+                tile_map[inp.name] = nb.dma_copy(dst, src_hbm, slices)
                 continue
             hbm_val = hbm_map[inp.name]
             val_layout = _canonical_layout(len(hbm_val.type.shape))

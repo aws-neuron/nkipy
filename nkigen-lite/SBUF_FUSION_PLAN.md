@@ -98,8 +98,19 @@ loads compose through (the view-reshape rebind is the existing prototype).
   into the `DimSlice`s. This is also the 2D-(P,F)-normalization consolidation
   from the review — collapse-to-2D becomes the normal form, not a per-op
   fast path.
-- [ ] **slice as view** (contiguous, static starts): base-offset added to the
-  consumer's slices; no load-compute-store sequence emitted.
+- [x] **slice as view** (contiguous, static starts): done via JIT
+  materialization rather than a global descriptor. A static-start, stride-1
+  `slice` preserves rank, so an elementwise consumer just adds the slice's
+  per-dim `starts` into its own tile-load offsets (`slice_srcs` in
+  `_emit_ew_tile`) — no buffer, no copy. `lower_graph` records these in
+  `slice_views` and skips their allocation/emission; any *other* consumer
+  (reshape/matmul/reduce/transpose/concat, the rank≥3 collapse path, or a graph
+  output) calls `_resolve`, which materializes the buffer + copy once (KB
+  refuses `.view()` on a sliced tile, so only the generic EW path can compose —
+  HW-verified). Non-unit strides keep the copy path. qwen3 MoE: 41633 → 40993
+  nki ops (−640, −1.5%); dma_copy 11369 → 11113. The `slice` attribution
+  category disappears — the hot gate/up `(384,)→(192,)×128` split and top-k
+  index slices fold into their consumers.
 - [ ] **batch-only transpose as view** (no P↔F swap): pure coordinate
   remapping on the consumer's slices, as `emit_transpose` already proves.
 - [ ] Re-run `profile_layer.py`; record op counts before/after.
@@ -163,3 +174,4 @@ Fusions, in order of expected payoff (re-profile after Phase 1 to confirm):
 | 2026-07-05 | Phase 0.5: packed gather + splat concat | 42805 nki (9.2x), 11577 dma_copy | gather_rows 20416→1920, elementwise →3274, concat →6739; indirect DMAs 6720→128 |
 | 2026-07-05 | HW benchmark, 30B MoE TP=4, n=64 | TTFT 3280 ms (was 4596), decode p50 2333 ms (was 2500) | 1.40x TTFT, 1.07x decode vs same-day pre-branch baseline (964b5ff), same box, fresh builds. NOTE: the repo's benchmark_report.json (07-01: TTFT 3309 / p50 1625) predates the basic-lowering-cleanup merge and is NOT a valid before-point — decode regressed ~1.5x at that merge, independent of this branch. Decode profile (L=1): 17984→14761 nki ops, but decode's hot gather/concat fixes barely apply per-token; matmul+transpose dominate. |
 | 2026-07-05 | Phase 1: fold broadcast_to into elementwise consumers | 41633 nki (9.0x), 11369 dma_copy | broadcast_to 105 calls/1438 ops → 7 calls/700 ops (only GQA middles remain); elementwise unchanged (native F/P broadcast). Fold runs pre-decompose, also fixing the div-denominator precision round-trip. |
+| 2026-07-06 | Phase 1: slice as view (offset fold + JIT materialize) | 40993 nki (8.8x), 11113 dma_copy | slice attribution 1149 ops/714 dmas → 0 (folded into EW consumers or materialized off the profiled wrapper); elementwise 3240→3264 (composed offset loads). Foldable slices: static-start, stride-1. All 695 tensor_ir tests + 11 new slice-view tests (7 interp, 4 HW) pass. |

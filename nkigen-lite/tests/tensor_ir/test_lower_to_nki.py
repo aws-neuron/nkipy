@@ -626,3 +626,157 @@ class TestCollapsedReduce:
             b.set_outputs({"o": b.reduce(tx, axis=(3,), keepdims=True, kind="sum")})
 
         _lower_and_check_hw(compile_and_run, build, {"x": x}, (1, 16, 128, 1))
+
+
+class TestSliceAsView:
+    """A static-start, stride-1 slice is lowered as a zero-copy offset view:
+    an elementwise consumer composes the slice's base offset into its own
+    loads (no buffer, no copy); any other consumer (reshape, graph output)
+    materializes the slice once, on demand. See ``_is_view_slice`` /
+    ``slice_views`` in ``direct_lower.py``.
+    """
+
+    # -- interpreter --
+
+    def test_split_gate_up_mul(self):
+        """Mirrors the MoE gate/up split: slice a (384,) row into two (192,)
+        halves that feed an elementwise mul — both slices fold into the mul's
+        loads with no intermediate buffer."""
+        rng = np.random.default_rng(0)
+        x = rng.standard_normal((384,)).astype(np.float32)
+
+        def build(b):
+            tx = b.add_input("x", (384,))
+            gate, up = b.split(tx, 2, axis=0)  # two (192,) slices
+            b.set_outputs({"y": b.mul(b.silu(gate), up)})
+
+        _lower_and_check_interp(build, {"x": x}, (192,), atol=1e-4)
+
+    def test_slice_2d_partition_axis_elementwise(self):
+        """Slice on the partition axis (rows 8:200 of a (256,128) tensor),
+        result feeds an elementwise add — the offset composes into the tiled
+        2D load across both partition tiles."""
+        rng = np.random.default_rng(1)
+        x = rng.standard_normal((256, 128)).astype(np.float32)
+        bias = rng.standard_normal((192, 128)).astype(np.float32)
+
+        def build(b):
+            tx = b.add_input("x", (256, 128))
+            tb = b.add_input("bias", (192, 128))
+            s = b.slice(tx, (8, 0), (200, 128))
+            b.set_outputs({"y": b.add(s, tb)})
+
+        _lower_and_check_interp(build, {"x": x, "bias": bias}, (192, 128))
+
+    def test_slice_last_axis_window_elementwise(self):
+        """Slice a last-axis window (cols 1024:1152 of a (1,8,1280) tensor)
+        feeding a unary — a mid-tensor column offset folded into the load."""
+        rng = np.random.default_rng(2)
+        x = rng.standard_normal((1, 8, 1280)).astype(np.float32)
+
+        def build(b):
+            tx = b.add_input("x", (1, 8, 1280))
+            s = b.slice(tx, (0, 0, 1024), (1, 8, 1152))
+            b.set_outputs({"y": b.relu(s)})
+
+        _lower_and_check_interp(build, {"x": x}, (1, 8, 128), atol=1e-4)
+
+    def test_slice_as_graph_output_materializes(self):
+        """A slice that IS a graph output has no elementwise consumer to fold
+        into, so it materializes via the copy path."""
+        rng = np.random.default_rng(3)
+        x = rng.standard_normal((16, 64)).astype(np.float32)
+
+        def build(b):
+            tx = b.add_input("x", (16, 64))
+            b.set_outputs({"y": b.slice(tx, (4, 0), (12, 64))})
+
+        _lower_and_check_interp(build, {"x": x}, (8, 64))
+
+    def test_slice_then_reshape_materializes(self):
+        """A slice feeding a reshape (not elementwise) materializes, then the
+        reshape views the materialized buffer."""
+        rng = np.random.default_rng(4)
+        x = rng.standard_normal((4, 96)).astype(np.float32)
+
+        def build(b):
+            tx = b.add_input("x", (4, 96))
+            s = b.slice(tx, (0, 0), (4, 64))     # (4, 64)
+            b.set_outputs({"y": b.reshape(s, (4, 8, 8))})
+
+        _lower_and_check_interp(build, {"x": x}, (4, 8, 8))
+
+    def test_strided_slice_not_view(self):
+        """A non-unit-stride slice can't compose as an offset view; it keeps
+        the (correct) copy path."""
+        rng = np.random.default_rng(5)
+        x = rng.standard_normal((1, 8, 256)).astype(np.float32)
+
+        def build(b):
+            tx = b.add_input("x", (1, 8, 256))
+            s = b.slice(tx, (0, 0, 0), (1, 8, 256), strides=(1, 1, 2))
+            b.set_outputs({"y": b.neg(s)})
+
+        _lower_and_check_interp(build, {"x": x}, (1, 8, 128), atol=1e-4)
+
+    def test_chained_slice_view(self):
+        """A slice of a slice, feeding elementwise: the inner slice materializes
+        (its consumer is another slice, not elementwise) and the outer composes
+        its offset onto the materialized inner buffer."""
+        rng = np.random.default_rng(6)
+        x = rng.standard_normal((320,)).astype(np.float32)
+
+        def build(b):
+            tx = b.add_input("x", (320,))
+            inner = b.slice(tx, (64,), (320,))   # (256,)  -> x[64:320]
+            outer = b.slice(inner, (0,), (128,))  # (128,) -> x[64:192]
+            b.set_outputs({"y": b.relu(outer)})
+
+        _lower_and_check_interp(build, {"x": x}, (128,), atol=1e-4)
+
+    # -- hardware --
+
+    def test_split_gate_up_mul_hw(self, compile_and_run):
+        rng = np.random.default_rng(0)
+        x = rng.standard_normal((384,)).astype(np.float32)
+
+        def build(b):
+            tx = b.add_input("x", (384,))
+            gate, up = b.split(tx, 2, axis=0)
+            b.set_outputs({"y": b.mul(b.silu(gate), up)})
+
+        _lower_and_check_hw(compile_and_run, build, {"x": x}, (192,))
+
+    def test_slice_2d_partition_axis_elementwise_hw(self, compile_and_run):
+        rng = np.random.default_rng(1)
+        x = rng.standard_normal((256, 128)).astype(np.float32)
+        bias = rng.standard_normal((192, 128)).astype(np.float32)
+
+        def build(b):
+            tx = b.add_input("x", (256, 128))
+            tb = b.add_input("bias", (192, 128))
+            s = b.slice(tx, (8, 0), (200, 128))
+            b.set_outputs({"y": b.add(s, tb)})
+
+        _lower_and_check_hw(compile_and_run, build, {"x": x, "bias": bias}, (192, 128))
+
+    def test_slice_last_axis_window_elementwise_hw(self, compile_and_run):
+        rng = np.random.default_rng(2)
+        x = rng.standard_normal((1, 8, 1280)).astype(np.float32)
+
+        def build(b):
+            tx = b.add_input("x", (1, 8, 1280))
+            s = b.slice(tx, (0, 0, 1024), (1, 8, 1152))
+            b.set_outputs({"y": b.relu(s)})
+
+        _lower_and_check_hw(compile_and_run, build, {"x": x}, (1, 8, 128))
+
+    def test_slice_as_graph_output_materializes_hw(self, compile_and_run):
+        rng = np.random.default_rng(3)
+        x = rng.standard_normal((16, 64)).astype(np.float32)
+
+        def build(b):
+            tx = b.add_input("x", (16, 64))
+            b.set_outputs({"y": b.slice(tx, (4, 0), (12, 64))})
+
+        _lower_and_check_hw(compile_and_run, build, {"x": x}, (8, 64))
