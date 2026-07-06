@@ -40,6 +40,8 @@ from nkigen_lite.nki_ir.insert_deallocs import insert_deallocs
 from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
     ceildiv,
     flat_range_to_src_chunks,
+    max_free_elems,
+    prefix_row_segments,
     row_major_strides,
     unravel,
 )
@@ -179,17 +181,14 @@ def _can_use_passthrough_partition(
     Requirements:
       - Collapsed rank == 3 with perm == (0, 2, 1): leading dim is passthrough
         and only the last two dims are swapped.
-      - I * J (the product of the two transposed dims) fits in SBUF free dim.
+      - I * J (the product of the two transposed dims) fits in SBUF free dim
+        (two tiles are live at once — src + transposed dst — which the shared
+        ``max_free_elems`` budget already accounts for).
     """
     if len(c_perm) != 3 or c_perm != (0, 2, 1):
         return False
     _B, I, J = c_in
-    free_elts = I * J
-    # SBUF free-dim budget: need two tiles (src + dst) each of width I*J or J*I.
-    # Conservative limit: 48 KiB per tile for f32 -> 12288 elements.
-    bytes_per_elem = {DType.F32: 4, DType.F16: 2, DType.BF16: 2}.get(dtype, 4)
-    max_free = 49152 // bytes_per_elem
-    return free_elts <= max_free
+    return I * J <= max_free_elems(dtype)
 
 
 def emit_transpose(
@@ -218,24 +217,29 @@ def emit_transpose(
         out_strides = row_major_strides(out_shape)
         for p0 in range(0, B, PARTITION_MAX):
             p_size = min(PARTITION_MAX, B - p0)
-            src_chunks = flat_range_to_src_chunks(
-                p0 * I * J, p_size * I * J, in_shape, in_strides)
-            (src_slices, _), = src_chunks
-            tile = nb.dma_copy(
-                nb.alloc((p_size, I * J), dtype, MemorySpace.SBUF),
-                x_hbm, src_slices,
-            )
-            # Source tile row layout is I groups of J contiguous elements; the
-            # AP walks J at stride 1 then I at stride J, i.e. (J outer, I inner).
-            src_view = nb.access_pattern(
-                tile, [[I * J, p_size], [1, J], [J, I]]
-            )
-            dst_tile = nb.alloc((p_size, J, I), dtype, MemorySpace.SBUF)
-            nb.tensor_copy(dst_tile, src_view)
-            dst_chunks = flat_range_to_src_chunks(
-                p0 * J * I, p_size * J * I, out_shape, out_strides)
-            (dst_slices, _), = dst_chunks
-            nb.dma_copy(y_hbm, dst_tile, dst_slices)
+            # When B collapses several leading dims, a 128-row tile is a single
+            # HBM rectangle only if its boundaries land on a leading-dim
+            # boundary of BOTH shapes (I*J == J*I elements per row on each
+            # side, so one segmentation covers both). Split into segments that
+            # are one rectangle on both sides — e.g. (2,100,8,64) perm
+            # (0,1,3,2): B=200 collapses (2,100), and the second tile's rows
+            # [128,200) straddle the boundary at row 100.
+            for rows, src_slices, dst_slices in prefix_row_segments(
+                p0, p_size, I * J, in_shape, in_strides, out_shape, out_strides,
+            ):
+                tile = nb.dma_copy(
+                    nb.alloc((rows, I * J), dtype, MemorySpace.SBUF),
+                    x_hbm, src_slices,
+                )
+                # Source tile row layout is I groups of J contiguous elements;
+                # the AP walks J at stride 1 then I at stride J, i.e.
+                # (J outer, I inner).
+                src_view = nb.access_pattern(
+                    tile, [[I * J, rows], [1, J], [J, I]]
+                )
+                dst_tile = nb.alloc((rows, J, I), dtype, MemorySpace.SBUF)
+                nb.tensor_copy(dst_tile, src_view)
+                nb.dma_copy(y_hbm, dst_tile, dst_slices)
         return
 
     if c_rank < 2:

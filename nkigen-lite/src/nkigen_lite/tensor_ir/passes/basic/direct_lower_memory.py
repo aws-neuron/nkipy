@@ -34,8 +34,11 @@ from nkigen_lite.nki_ir.ir import (
 from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
     build_out_slices,
     ceildiv,
+    collapse_view,
     flat_range_to_src_chunks,
+    iter_pf_tiles,
     max_free_elems,
+    prefix_row_segments,
     row_major_strides,
     unravel,
 )
@@ -83,41 +86,6 @@ def _largest_common_prefix(in_shape: tuple[int, ...], out_shape: tuple[int, ...]
 
     common = prefixes(in_shape) & prefixes(out_shape)
     return max(common)
-
-
-def _prefix_row_segments(r0, p, free, in_shape, in_strides, out_shape, out_strides):
-    """Split partition rows [r0, r0+p) into segments that are a single
-    rectangle on *both* the source and destination.
-
-    A 128-row tile only forms one source/destination rectangle when its row
-    boundaries coincide with a leading-dim boundary of *each* shape. When
-    ``p_common`` is not itself such a boundary (e.g. reshaping (10,30,20) ->
-    (300,20): tiles cut at rows 128/256, mid-way through the 30-row source
-    blocks), the tile spans several rectangles. We find the row-boundary cut
-    points each side induces, merge them, and yield ``(rows, src_slices,
-    dst_slices)`` per segment — each a single rectangle on both sides.
-    """
-    def cut_rows(chunks):
-        # Cumulative covered rows at each chunk boundary (relative to r0).
-        cuts, acc = [], 0
-        for _slices, covered in chunks:
-            acc += covered // free
-            cuts.append(acc)
-        return cuts
-
-    src_chunks = flat_range_to_src_chunks(r0 * free, p * free, in_shape, in_strides)
-    dst_chunks = flat_range_to_src_chunks(r0 * free, p * free, out_shape, out_strides)
-    bounds = sorted(set(cut_rows(src_chunks) + cut_rows(dst_chunks)))
-
-    lo = 0
-    for hi in bounds:
-        rows = hi - lo
-        (src_slices, _), = flat_range_to_src_chunks(
-            (r0 + lo) * free, rows * free, in_shape, in_strides)
-        (dst_slices, _), = flat_range_to_src_chunks(
-            (r0 + lo) * free, rows * free, out_shape, out_strides)
-        yield rows, src_slices, dst_slices
-        lo = hi
 
 
 # ---------------------------------------------------------------------------
@@ -346,7 +314,7 @@ def _emit_reshape_via_prefix(nb, x_hbm, y_hbm, in_shape, out_shape, p_common, dt
         # A tile of p rows may straddle leading-dim boundaries of either shape,
         # in which case it is not a single rectangle. Split it into segments
         # that are one rectangle on both sides and emit a load+view+store each.
-        for rows, src_slices, dst_slices in _prefix_row_segments(
+        for rows, src_slices, dst_slices in prefix_row_segments(
             r0, p, in_free, in_shape, in_strides, out_shape, out_strides):
             tile = nb.dma_copy(
                 nb.alloc((rows, in_free), dtype, MemorySpace.SBUF), x_hbm, src_slices)
@@ -518,16 +486,8 @@ def _emit_reshape_diff_f(nb, x_hbm, y_hbm, in_shape, out_shape, dtype):
 
 
 def _collapse_to_2d(nb: Builder, hbm, shape, lead, last):
-    """Reinterpret a row-major HBM buffer of *shape* as 2D ``(lead, last)``.
-
-    ``lead * last`` must equal ``prod(shape)``. A reshape preserves row-major
-    flat order and HBM buffers are contiguous, so this is a zero-copy view (no
-    data movement). Returns the original buffer untouched when it already has
-    the target 2D shape.
-    """
-    if tuple(hbm.type.shape) == (lead, last):
-        return hbm
-    return nb.view(hbm, (lead, last))
+    """Reinterpret a row-major HBM buffer as 2D (shared ``collapse_view``)."""
+    return collapse_view(nb, hbm, lead, last)
 
 
 def _emit_2d_window_copy(
@@ -542,20 +502,14 @@ def _emit_2d_window_copy(
     contiguous last-axis window across all the (collapsed) leading rows".
     """
     P = src_2d.type.shape[0]
-    cap = max_free_elems(dtype)
-    for p_i in range(ceildiv(P, PARTITION_MAX)):
-        p_off = p_i * PARTITION_MAX
-        p_size = min(PARTITION_MAX, P - p_off)
-        for f_i in range(ceildiv(f_width, cap)):
-            fo = f_i * cap
-            fw = min(cap, f_width - fo)
-            tile = nb.dma_copy(
-                nb.alloc((p_size, fw), dtype, MemorySpace.SBUF),
-                src_2d, (DimSlice(p_off, p_size), DimSlice(src_f_off + fo, fw)),
-            )
-            nb.dma_copy(
-                dst_2d, tile, (DimSlice(p_off, p_size), DimSlice(dst_f_off + fo, fw))
-            )
+    for p_off, p_size, fo, fw in iter_pf_tiles(P, f_width, dtype):
+        tile = nb.dma_copy(
+            nb.alloc((p_size, fw), dtype, MemorySpace.SBUF),
+            src_2d, (DimSlice(p_off, p_size), DimSlice(src_f_off + fo, fw)),
+        )
+        nb.dma_copy(
+            dst_2d, tile, (DimSlice(p_off, p_size), DimSlice(dst_f_off + fo, fw))
+        )
 
 
 def _emit_2d_rows_copy(
@@ -572,20 +526,14 @@ def _emit_2d_rows_copy(
     the copy packs all 128 lanes instead of unrolling the leading rows one at a
     time.
     """
-    cap = max_free_elems(dtype)
-    for p_i in range(ceildiv(n_rows, PARTITION_MAX)):
-        p_off = p_i * PARTITION_MAX
-        p_size = min(PARTITION_MAX, n_rows - p_off)
-        for f_i in range(ceildiv(width, cap)):
-            fo = f_i * cap
-            fw = min(cap, width - fo)
-            tile = nb.dma_copy(
-                nb.alloc((p_size, fw), dtype, MemorySpace.SBUF),
-                src_2d, (DimSlice(src_r_off + p_off, p_size), DimSlice(fo, fw)),
-            )
-            nb.dma_copy(
-                dst_2d, tile, (DimSlice(dst_r_off + p_off, p_size), DimSlice(fo, fw))
-            )
+    for p_off, p_size, fo, fw in iter_pf_tiles(n_rows, width, dtype):
+        tile = nb.dma_copy(
+            nb.alloc((p_size, fw), dtype, MemorySpace.SBUF),
+            src_2d, (DimSlice(src_r_off + p_off, p_size), DimSlice(fo, fw)),
+        )
+        nb.dma_copy(
+            dst_2d, tile, (DimSlice(dst_r_off + p_off, p_size), DimSlice(fo, fw))
+        )
 
 
 def _emit_axis_window_copy(

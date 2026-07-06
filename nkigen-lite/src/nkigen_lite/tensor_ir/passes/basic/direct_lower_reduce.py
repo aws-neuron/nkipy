@@ -32,6 +32,7 @@ from nkigen_lite.nki_ir.ir import (
     DimSlice,
     MemorySpace,
     PARTITION_MAX,
+    PSUM_FREE_MAX,
 )
 from nkigen_lite.nki_ir import ir as nki_ir
 from nkigen_lite.nki_ir.insert_deallocs import insert_deallocs
@@ -44,6 +45,7 @@ from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
     build_slices,
     ceildiv,
     clamped_extent,
+    collapse_view,
     max_free_elems,
 )
 
@@ -127,8 +129,8 @@ def _try_emit_collapsed_f_reduce(
     if red > max_free_elems(dtype):
         return False
 
-    src_2d = nb.view(hbm_map[inp_val.name], (lead, red))
-    dst_2d = nb.view(hbm_map[out_val.name], (lead, 1))
+    src_2d = collapse_view(nb, hbm_map[inp_val.name], lead, red)
+    dst_2d = collapse_view(nb, hbm_map[out_val.name], lead, 1)
     reduce_nki_op = REDUCE_OPS[kind]
 
     for p_i in range(ceildiv(lead, PARTITION_MAX)):
@@ -260,6 +262,7 @@ def _emit_p_reduce_inline(
 
     reduced_p_dims = tuple(d for d in inp_layout.p_dims if d in axis)
     kept_p_dims = tuple(d for d in inp_layout.p_dims if d not in axis)
+    f_dims = inp_layout.f_dims
 
     inp_tile_sizes: dict[int, int] = {}
     for d in inp_layout.i_dims:
@@ -268,8 +271,17 @@ def _emit_p_reduce_inline(
         inp_tile_sizes[d] = 1
     for i, d in enumerate(reduced_p_dims):
         inp_tile_sizes[d] = min(inp_shape[d], PARTITION_MAX) if i == len(reduced_p_dims) - 1 else 1
-    for d in inp_layout.f_dims:
-        inp_tile_sizes[d] = inp_shape[d]
+    # F is kept (pure P-reduce), so it can be tiled freely: outer F full,
+    # innermost capped so the (P, F) tile fits the per-partition SBUF budget.
+    # A wide F (e.g. reducing (256, 131072) over axis 0) otherwise allocates
+    # a 512 KB/partition tile, ~3x over capacity.
+    f_cap = max_free_elems(dtype)
+    outer_f = prod(inp_shape[d] for d in f_dims[:-1]) if len(f_dims) > 1 else 1
+    for i, d in enumerate(f_dims):
+        if i == len(f_dims) - 1:
+            inp_tile_sizes[d] = max(1, min(inp_shape[d], f_cap // max(1, outer_f)))
+        else:
+            inp_tile_sizes[d] = inp_shape[d]
 
     out_tile_sizes: dict[int, int] = {}
     for d in inp_layout.i_dims:
@@ -278,11 +290,12 @@ def _emit_p_reduce_inline(
         out_tile_sizes[d] = 1
     for d in reduced_p_dims:
         out_tile_sizes[d] = out_shape[d]
-    for d in inp_layout.f_dims:
-        out_tile_sizes[d] = out_shape[d]
+    for d in f_dims:
+        out_tile_sizes[d] = inp_tile_sizes[d]  # F unchanged by a P-reduce
 
     outer_loop_dims = [(d, inp_shape[d], inp_tile_sizes[d])
-                       for d in sorted(set(inp_layout.i_dims) | set(kept_p_dims))
+                       for d in sorted(set(inp_layout.i_dims) | set(kept_p_dims)
+                                       | set(f_dims))
                        if inp_tile_sizes[d] < inp_shape[d]]
     accum_loop_dims = [(d, inp_shape[d], inp_tile_sizes[d])
                        for d in sorted(reduced_p_dims)
@@ -373,7 +386,7 @@ def _emit_p_reduce_matmul_inline(
 
     reduced_p_dims = tuple(d for d in inp_layout.p_dims if d in axis)
     kept_p_dims = tuple(d for d in inp_layout.p_dims if d not in axis)
-    f_extent = prod(inp_shape[d] for d in inp_layout.f_dims)
+    f_dims = inp_layout.f_dims
     total_p = prod(inp_shape[d] for d in reduced_p_dims)
 
     inp_tile_sizes: dict[int, int] = {}
@@ -383,8 +396,16 @@ def _emit_p_reduce_matmul_inline(
         inp_tile_sizes[d] = 1
     for i, d in enumerate(reduced_p_dims):
         inp_tile_sizes[d] = min(inp_shape[d], PARTITION_MAX) if i == len(reduced_p_dims) - 1 else 1
-    for d in inp_layout.f_dims:
-        inp_tile_sizes[d] = inp_shape[d]
+    # F is the matmul's moving free dim N and the PSUM accumulator width, so
+    # the innermost F is capped at PSUM_FREE_MAX (512). Wider F (e.g. 1024)
+    # otherwise allocates an illegal PSUM tile; each F-window accumulates
+    # independently since a P-reduce leaves F untouched.
+    outer_f = prod(inp_shape[d] for d in f_dims[:-1]) if len(f_dims) > 1 else 1
+    for i, d in enumerate(f_dims):
+        if i == len(f_dims) - 1:
+            inp_tile_sizes[d] = max(1, min(inp_shape[d], PSUM_FREE_MAX // max(1, outer_f)))
+        else:
+            inp_tile_sizes[d] = inp_shape[d]
 
     out_tile_sizes: dict[int, int] = {}
     for d in inp_layout.i_dims:
@@ -393,11 +414,12 @@ def _emit_p_reduce_matmul_inline(
         out_tile_sizes[d] = 1
     for d in reduced_p_dims:
         out_tile_sizes[d] = out_shape[d]  # keepdims: 1
-    for d in inp_layout.f_dims:
-        out_tile_sizes[d] = out_shape[d]
+    for d in f_dims:
+        out_tile_sizes[d] = inp_tile_sizes[d]  # F unchanged by a P-reduce
 
     outer_loop_dims = [(d, inp_shape[d], inp_tile_sizes[d])
-                       for d in sorted(set(inp_layout.i_dims) | set(kept_p_dims))
+                       for d in sorted(set(inp_layout.i_dims) | set(kept_p_dims)
+                                       | set(f_dims))
                        if inp_tile_sizes[d] < inp_shape[d]]
     p_loop_dims = [(d, inp_shape[d], inp_tile_sizes[d])
                    for d in sorted(reduced_p_dims)
@@ -405,14 +427,15 @@ def _emit_p_reduce_matmul_inline(
 
     def _outer_nested(depth: int, outer_indices: dict[int, int]):
         if depth >= len(outer_loop_dims):
-            # PSUM accumulator: (M=1, N=F)
-            psum = nb.alloc((1, f_extent), DType.F32, MemorySpace.PSUM)
+            f_ext = clamped_extent(f_dims, inp_shape, inp_tile_sizes, outer_indices)
+            # PSUM accumulator: (M=1, N=F_window)
+            psum = nb.alloc((1, f_ext), DType.F32, MemorySpace.PSUM)
             psum = nb.memset(psum, 0.0)
 
             def _load_and_matmul(indices: dict[int, int]):
                 p_ext = clamped_extent(reduced_p_dims, inp_shape, inp_tile_sizes, indices)
                 slices = build_slices(inp_shape, inp_tile_sizes, indices)
-                src_tile = nb.alloc((p_ext, f_extent), dtype, MemorySpace.SBUF)
+                src_tile = nb.alloc((p_ext, f_ext), dtype, MemorySpace.SBUF)
                 src_tile = nb.dma_copy(src_tile, hbm_map[inp_val.name], slices)
                 ones = nb.alloc((p_ext, 1), dtype, MemorySpace.SBUF)
                 ones = nb.memset(ones, 1.0)
@@ -433,17 +456,17 @@ def _emit_p_reduce_matmul_inline(
                 _load_and_matmul(outer_indices)
 
             # Copy PSUM -> SBUF
-            sbuf_out = nb.alloc((1, f_extent), DType.F32, MemorySpace.SBUF)
+            sbuf_out = nb.alloc((1, f_ext), DType.F32, MemorySpace.SBUF)
             sbuf_out = nb.tensor_copy(sbuf_out, psum)
 
             if kind == "mean":
-                scale = nb.constant(1.0 / float(total_p), (1, f_extent), DType.F32, MemorySpace.SBUF)
-                mean_dst = nb.alloc((1, f_extent), DType.F32, MemorySpace.SBUF)
+                scale = nb.constant(1.0 / float(total_p), (1, f_ext), DType.F32, MemorySpace.SBUF)
+                mean_dst = nb.alloc((1, f_ext), DType.F32, MemorySpace.SBUF)
                 sbuf_out = nb.tensor_tensor_arith(mean_dst, sbuf_out, scale, nki_ir.NisaArithOp.MULTIPLY)
 
             out_dtype = out_val.type.dtype
             if out_dtype != DType.F32:
-                cast_dst = nb.alloc((1, f_extent), out_dtype, MemorySpace.SBUF)
+                cast_dst = nb.alloc((1, f_ext), out_dtype, MemorySpace.SBUF)
                 sbuf_out = nb.cast(cast_dst, sbuf_out)
 
             out_slices = build_slices(out_shape, out_tile_sizes, outer_indices)

@@ -252,14 +252,20 @@ def _check_tile_constraints(tt: TileType, context: str) -> list[str]:
             f"{context}: PSUM free size {tt.free_size} "
             f"exceeds max {PSUM_FREE_MAX}"
         )
-    if tt.memory == MemorySpace.SBUF and tt.size_bytes > SBUF_PER_PARTITION_BYTES:
+    # Capacity limits are per partition: a (P, F) tile occupies F elements in
+    # each of its P partitions, so the per-partition footprint is the free
+    # size, not size_bytes (the total across partitions — comparing that
+    # against per-partition capacity falsely flags any tile wider than ~1/128
+    # of a partition, e.g. every 128x256 PSUM matmul accumulator).
+    free_bytes = tt.free_size * _DTYPE_BYTES[tt.dtype]
+    if tt.memory == MemorySpace.SBUF and free_bytes > SBUF_PER_PARTITION_BYTES:
         errors.append(
-            f"{context}: SBUF tile {tt.size_bytes} bytes "
+            f"{context}: SBUF tile {free_bytes} bytes/partition "
             f"exceeds per-partition capacity {SBUF_PER_PARTITION_BYTES}"
         )
-    if tt.memory == MemorySpace.PSUM and tt.size_bytes > PSUM_PER_PARTITION_BYTES:
+    if tt.memory == MemorySpace.PSUM and free_bytes > PSUM_PER_PARTITION_BYTES:
         errors.append(
-            f"{context}: PSUM tile {tt.size_bytes} bytes "
+            f"{context}: PSUM tile {free_bytes} bytes/partition "
             f"exceeds capacity {PSUM_PER_PARTITION_BYTES}"
         )
     return errors

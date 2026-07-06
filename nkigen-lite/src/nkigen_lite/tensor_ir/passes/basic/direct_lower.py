@@ -36,10 +36,12 @@ from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
     ELEMENTWISE_OPCODES,
     UNARY_OPS,
     ceildiv,
+    collapse_view,
     compute_tile_sizes,
     emit_binary_op,
     emit_unary_op,
     hbm_slices,
+    iter_pf_tiles,
     max_free_elems,
     on_chip_shape,
     unravel,
@@ -241,16 +243,16 @@ def _emit_hbm_copy(nb: Builder, src: Value, dst: Value, shape: tuple[int, ...]):
     # sub-tiling the generic path already handles via tile_f).
     if len(shape) >= 3 and shape[-1] <= max_free_elems(src.type.dtype):
         lead = prod(shape[:-1])
-        src_2d = src if tuple(src.type.shape) == (lead, shape[-1]) else nb.view(src, (lead, shape[-1]))
-        dst_2d = dst if tuple(dst.type.shape) == (lead, shape[-1]) else nb.view(dst, (lead, shape[-1]))
-        for p_i in range(ceildiv(lead, PARTITION_MAX)):
-            p_off = p_i * PARTITION_MAX
-            p_size = min(PARTITION_MAX, lead - p_off)
+        src_2d = collapse_view(nb, src, lead, shape[-1])
+        dst_2d = collapse_view(nb, dst, lead, shape[-1])
+        for p_off, p_size, f_off, f_size in iter_pf_tiles(
+            lead, shape[-1], src.type.dtype
+        ):
             tile = nb.dma_copy(
-                nb.alloc((p_size, shape[-1]), src.type.dtype, MemorySpace.SBUF),
-                src_2d, (DimSlice(p_off, p_size), DimSlice(0, shape[-1])),
+                nb.alloc((p_size, f_size), src.type.dtype, MemorySpace.SBUF),
+                src_2d, (DimSlice(p_off, p_size), DimSlice(f_off, f_size)),
             )
-            nb.dma_copy(dst_2d, tile, (DimSlice(p_off, p_size), DimSlice(0, shape[-1])))
+            nb.dma_copy(dst_2d, tile, (DimSlice(p_off, p_size), DimSlice(f_off, f_size)))
         return
 
     tile_p = min(shape[-2], PARTITION_MAX) if len(shape) >= 2 else 1
@@ -746,7 +748,10 @@ def _emit_iota_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
     rank = len(shape)
 
     tile_p = min(shape[-2], PARTITION_MAX) if rank >= 2 else 1
-    tile_f = shape[-1] if rank >= 2 else shape[0]
+    f_extent = shape[-1] if rank >= 2 else shape[0]
+    # Cap the free extent to the per-partition SBUF budget: a vocab-wide iota
+    # (e.g. (1, 128256)) would otherwise allocate an oversized tile.
+    tile_f = min(f_extent, max_free_elems(dtype))
     p_extent = shape[-2] if rank >= 2 else 1
     batch_dims = list(shape[:-2]) if rank > 2 else []
     n_batch = prod(batch_dims) if batch_dims else 1
@@ -759,23 +764,26 @@ def _emit_iota_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
         for p_i in range(ceildiv(p_extent, tile_p)):
             p_off = p_i * tile_p
             p_size = min(tile_p, p_extent - p_off)
+            for f_i in range(ceildiv(f_extent, tile_f)):
+                f_off = f_i * tile_f
+                f_size = min(tile_f, f_extent - f_off)
 
-            if dim == f_axis:
-                pattern, ch_mul, offset = [[1, tile_f]], 0, 0
-            elif rank >= 2 and dim == p_axis:
-                pattern, ch_mul, offset = [[0, tile_f]], 1, p_off
-            else:
-                # batch axis: every element in this tile shares the index
-                pattern, ch_mul, offset = [[0, tile_f]], 0, int(batch_idx[dim])
+                if dim == f_axis:
+                    pattern, ch_mul, offset = [[1, f_size]], 0, f_off
+                elif rank >= 2 and dim == p_axis:
+                    pattern, ch_mul, offset = [[0, f_size]], 1, p_off
+                else:
+                    # batch axis: every element in this tile shares the index
+                    pattern, ch_mul, offset = [[0, f_size]], 0, int(batch_idx[dim])
 
-            tile = nb.alloc((p_size, tile_f), dtype, MemorySpace.SBUF)
-            tile = nb.iota(tile, pattern=pattern, offset=offset, channel_multiplier=ch_mul)
+                tile = nb.alloc((p_size, f_size), dtype, MemorySpace.SBUF)
+                tile = nb.iota(tile, pattern=pattern, offset=offset, channel_multiplier=ch_mul)
 
-            dst_slices = [DimSlice(bi, 1) for bi in batch_idx]
-            if rank >= 2:
-                dst_slices.append(DimSlice(p_off, p_size))
-            dst_slices.append(DimSlice(0, tile_f))
-            nb.dma_copy(dst_hbm, tile, dst_slices)
+                dst_slices = [DimSlice(bi, 1) for bi in batch_idx]
+                if rank >= 2:
+                    dst_slices.append(DimSlice(p_off, p_size))
+                dst_slices.append(DimSlice(f_off, f_size))
+                nb.dma_copy(dst_hbm, tile, dst_slices)
 
 
 # max8 / match_replace8 read at most this many free elements per call (a real

@@ -44,6 +44,38 @@ def max_free_elems(dtype: DType) -> int:
     return max(1, (SBUF_PER_PARTITION_BYTES // 4) // elem_bytes)
 
 
+def collapse_view(nb: Builder, hbm: Value, lead: int, last: int) -> Value:
+    """Reinterpret a row-major HBM buffer as 2D ``(lead, last)``.
+
+    ``lead * last`` must equal the buffer's element count. A reshape preserves
+    row-major flat order and HBM buffers are contiguous, so this is a
+    zero-copy view (no data movement). Returns the original buffer untouched
+    when it already has the target 2D shape.
+    """
+    if tuple(hbm.type.shape) == (lead, last):
+        return hbm
+    return nb.view(hbm, (lead, last))
+
+
+def iter_pf_tiles(P: int, F: int, dtype: DType):
+    """Yield ``(p_off, p_size, f_off, f_size)`` over a 2D ``(P, F)`` extent.
+
+    The single place that encodes the data-movement tile budget: partition
+    tiled at PARTITION_MAX (128 lanes), free dim tiled at
+    ``max_free_elems(dtype)`` so each tile fits the per-partition SBUF
+    budget. Every collapse-onto-partition fast path should loop with this
+    rather than hand-rolling its own bounds.
+    """
+    cap = max_free_elems(dtype)
+    for p_i in range(ceildiv(P, PARTITION_MAX)):
+        p_off = p_i * PARTITION_MAX
+        p_size = min(PARTITION_MAX, P - p_off)
+        for f_i in range(ceildiv(F, cap)):
+            f_off = f_i * cap
+            f_size = min(cap, F - f_off)
+            yield p_off, p_size, f_off, f_size
+
+
 # ---------------------------------------------------------------------------
 # Index utilities
 # ---------------------------------------------------------------------------
@@ -69,46 +101,6 @@ def row_major_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
     return tuple(reversed(strides))
 
 
-def flat_range_to_src_slices(
-    flat_offset: int,
-    n_elements: int,
-    shape: tuple[int, ...],
-    strides: tuple[int, ...],
-) -> list[DimSlice]:
-    """Convert a flat element range to source DimSlices.
-
-    Given a contiguous range [flat_offset, flat_offset + n_elements) in
-    row-major order, express it as a rectangular slice in the source shape.
-    """
-    rank = len(shape)
-    start_indices = []
-    remaining = flat_offset
-    for s in strides:
-        start_indices.append(remaining // s)
-        remaining %= s
-
-    inner_product = 1
-    split_dim = rank - 1
-    for d in range(rank - 1, -1, -1):
-        if n_elements >= inner_product * shape[d] and start_indices[d] == 0:
-            inner_product *= shape[d]
-            split_dim = d - 1
-        else:
-            split_dim = d
-            break
-
-    slices = []
-    for d in range(rank):
-        if d < split_dim:
-            slices.append(DimSlice(start_indices[d], 1))
-        elif d == split_dim:
-            size_on_dim = n_elements // (prod(shape[d + 1:]) if d < rank - 1 else 1)
-            slices.append(DimSlice(start_indices[d], size_on_dim))
-        else:
-            slices.append(DimSlice(0, shape[d]))
-    return slices
-
-
 def flat_range_to_src_chunks(
     flat_offset: int,
     n_elements: int,
@@ -117,12 +109,10 @@ def flat_range_to_src_chunks(
 ) -> list[tuple[list[DimSlice], int]]:
     """Decompose a contiguous flat range into maximal rectangular sub-slices.
 
-    ``flat_range_to_src_slices`` expresses a contiguous range as a *single*
-    rectangle, which only works when the range starts at a leading-dim
-    boundary and stays within one. A range that crosses such a boundary (e.g.
-    collapsing ``(3, 100, 8)`` into ``(300, 8)`` and loading a 128-row tile)
-    cannot be a single rectangle, and the single-rectangle form silently
-    truncates at the first boundary.
+    A contiguous flat range is a *single* rectangle only when it starts at a
+    leading-dim boundary and stays within one. A range that crosses such a
+    boundary (e.g. collapsing ``(3, 100, 8)`` into ``(300, 8)`` and loading a
+    128-row tile) cannot be a single rectangle.
 
     This splits ``[flat_offset, flat_offset + n_elements)`` into a list of
     ``(src_slices, covered)`` pairs, each a maximal rectangle, that together
@@ -174,6 +164,42 @@ def flat_range_to_src_chunks(
         chunks.append((slices, covered))
         pos += covered
     return chunks
+
+
+def prefix_row_segments(r0, p, free, in_shape, in_strides, out_shape, out_strides):
+    """Split partition rows [r0, r0+p) into segments that are a single
+    rectangle on *both* the source and destination.
+
+    Both shapes are treated as ``(rows, free)`` row-major data. A 128-row tile
+    only forms one source/destination rectangle when its row boundaries
+    coincide with a leading-dim boundary of *each* shape. When the collapsed
+    row count is not itself such a boundary (e.g. reshaping (10,30,20) ->
+    (300,20): tiles cut at rows 128/256, mid-way through the 30-row source
+    blocks), the tile spans several rectangles. We find the row-boundary cut
+    points each side induces, merge them, and yield ``(rows, src_slices,
+    dst_slices)`` per segment — each a single rectangle on both sides.
+    """
+    def cut_rows(chunks):
+        # Cumulative covered rows at each chunk boundary (relative to r0).
+        cuts, acc = [], 0
+        for _slices, covered in chunks:
+            acc += covered // free
+            cuts.append(acc)
+        return cuts
+
+    src_chunks = flat_range_to_src_chunks(r0 * free, p * free, in_shape, in_strides)
+    dst_chunks = flat_range_to_src_chunks(r0 * free, p * free, out_shape, out_strides)
+    bounds = sorted(set(cut_rows(src_chunks) + cut_rows(dst_chunks)))
+
+    lo = 0
+    for hi in bounds:
+        rows = hi - lo
+        (src_slices, _), = flat_range_to_src_chunks(
+            (r0 + lo) * free, rows * free, in_shape, in_strides)
+        (dst_slices, _), = flat_range_to_src_chunks(
+            (r0 + lo) * free, rows * free, out_shape, out_strides)
+        yield rows, src_slices, dst_slices
+        lo = hi
 
 
 # ---------------------------------------------------------------------------

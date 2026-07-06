@@ -32,7 +32,11 @@ from nkigen_lite.nki_ir.ir import (
     PSUM_FREE_MAX,
 )
 
-from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import ceildiv
+from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
+    ceildiv,
+    collapse_view,
+    iter_pf_tiles,
+)
 
 
 def lower_broadcast(
@@ -191,69 +195,52 @@ def _emit_collapsed_broadcast(nb: Builder, x_hbm, y_hbm, L, B, T, dtype) -> None
     All three pack the 128-wide partition and tile the free dim to the SBUF
     budget, replacing the old per-batch-element DMA loop.
     """
-    from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import max_free_elems
-
-    cap = max_free_elems(dtype)
-
     if T == 1:
         # F-broadcast on (L, B): out[l, b] = in[l, 0].
-        src = nb.view(x_hbm, (L, 1))
-        dst = nb.view(y_hbm, (L, B))
-        for p_i in range(ceildiv(L, PARTITION_MAX)):
-            p_off = p_i * PARTITION_MAX
-            p_size = min(PARTITION_MAX, L - p_off)
-            src_tile = nb.dma_copy(
-                nb.alloc((p_size, 1), dtype, MemorySpace.SBUF),
-                src, (DimSlice(p_off, p_size), DimSlice(0, 1)),
-            )
-            for f_i in range(ceildiv(B, cap)):
-                f_off = f_i * cap
-                f_size = min(cap, B - f_off)
-                ones = nb.constant(1.0, (p_size, f_size), dtype, MemorySpace.SBUF)
-                rep = nb.tensor_scalar_arith(
-                    nb.alloc((p_size, f_size), dtype, MemorySpace.SBUF),
-                    ones, src_tile, NisaArithOp.MULTIPLY,
+        src = collapse_view(nb, x_hbm, L, 1)
+        dst = collapse_view(nb, y_hbm, L, B)
+        src_tiles: dict[int, object] = {}  # per-partition-row scalar, keyed by p_off
+        for p_off, p_size, f_off, f_size in iter_pf_tiles(L, B, dtype):
+            if p_off not in src_tiles:
+                src_tiles[p_off] = nb.dma_copy(
+                    nb.alloc((p_size, 1), dtype, MemorySpace.SBUF),
+                    src, (DimSlice(p_off, p_size), DimSlice(0, 1)),
                 )
-                nb.dma_copy(dst, rep, (DimSlice(p_off, p_size), DimSlice(f_off, f_size)))
+            ones = nb.constant(1.0, (p_size, f_size), dtype, MemorySpace.SBUF)
+            rep = nb.tensor_scalar_arith(
+                nb.alloc((p_size, f_size), dtype, MemorySpace.SBUF),
+                ones, src_tiles[p_off], NisaArithOp.MULTIPLY,
+            )
+            nb.dma_copy(dst, rep, (DimSlice(p_off, p_size), DimSlice(f_off, f_size)))
         return
 
     if L == 1:
         # P-broadcast on (B, T): every output row equals the single source row.
-        src = nb.view(x_hbm, (1, T))
-        dst = nb.view(y_hbm, (B, T))
-        for p_i in range(ceildiv(B, PARTITION_MAX)):
-            p_off = p_i * PARTITION_MAX
-            p_size = min(PARTITION_MAX, B - p_off)
-            for f_i in range(ceildiv(T, cap)):
-                f_off = f_i * cap
-                f_size = min(cap, T - f_off)
-                # Stride-0 partition load fans the one source row across p_size rows.
-                rep = nb.dma_copy(
-                    nb.alloc((p_size, f_size), dtype, MemorySpace.SBUF),
-                    src, (DimSlice(0, p_size, stride=0), DimSlice(f_off, f_size)),
-                )
-                nb.dma_copy(dst, rep, (DimSlice(p_off, p_size), DimSlice(f_off, f_size)))
+        src = collapse_view(nb, x_hbm, 1, T)
+        dst = collapse_view(nb, y_hbm, B, T)
+        for p_off, p_size, f_off, f_size in iter_pf_tiles(B, T, dtype):
+            # Stride-0 partition load fans the one source row across p_size rows.
+            rep = nb.dma_copy(
+                nb.alloc((p_size, f_size), dtype, MemorySpace.SBUF),
+                src, (DimSlice(0, p_size, stride=0), DimSlice(f_off, f_size)),
+            )
+            nb.dma_copy(dst, rep, (DimSlice(p_off, p_size), DimSlice(f_off, f_size)))
         return
 
     # Genuine middle broadcast (L, B, T): copy each source (<=128, T) block to
     # all B output slices. Load once per block, store B times.
     src = nb.view(x_hbm, (L, 1, T))
     dst = nb.view(y_hbm, (L, B, T))
-    for p_i in range(ceildiv(L, PARTITION_MAX)):
-        p_off = p_i * PARTITION_MAX
-        p_size = min(PARTITION_MAX, L - p_off)
-        for f_i in range(ceildiv(T, cap)):
-            f_off = f_i * cap
-            f_size = min(cap, T - f_off)
-            tile = nb.dma_copy(
-                nb.alloc((p_size, f_size), dtype, MemorySpace.SBUF),
-                src, (DimSlice(p_off, p_size), DimSlice(0, 1), DimSlice(f_off, f_size)),
+    for p_off, p_size, f_off, f_size in iter_pf_tiles(L, T, dtype):
+        tile = nb.dma_copy(
+            nb.alloc((p_size, f_size), dtype, MemorySpace.SBUF),
+            src, (DimSlice(p_off, p_size), DimSlice(0, 1), DimSlice(f_off, f_size)),
+        )
+        for b in range(B):
+            nb.dma_copy(
+                dst, tile,
+                (DimSlice(p_off, p_size), DimSlice(b, 1), DimSlice(f_off, f_size)),
             )
-            for b in range(B):
-                nb.dma_copy(
-                    dst, tile,
-                    (DimSlice(p_off, p_size), DimSlice(b, 1), DimSlice(f_off, f_size)),
-                )
 
 
 def emit_broadcast_to(nb: Builder, x_hbm, y_hbm, in_shape, out_shape, dtype) -> None:
