@@ -1,17 +1,19 @@
 """Direct lowering of broadcast_to from tensor IR to NKI IR.
 
-Supports broadcasting a single dimension (I, P, or F) from size 1 to size N
-within any-rank tensors. The broadcast dimension determines the strategy:
+``emit_broadcast_to`` is the single implementation. Its main path collapses a
+contiguous run of broadcast axes into a canonical ``(L, B, T)`` decomposition
+(see ``_collapse_broadcast``) and picks a partition-packed strategy by which
+extent the run sits between:
 
-  - I-dim (batch): loop over output batch indices, load source with fixed
-    index 0 on the broadcast dim, store to each output batch slice.
-  - P-dim (partition): tensor engine trick — construct an all-ones stationary
-    vector ones[1, P] and compute ones.T @ src[1, F] -> dst[P, F].
-  - F-dim (free): vector engine — use tensor_scalar_arith to multiply a
-    full-size ones tile (P, F) by the source (P, 1), broadcasting along F.
+  - innermost (``T == 1``): replicate a per-row scalar across the free dim
+    with one ``tensor_scalar`` multiply per tile,
+  - leading (``L == 1``): stride-0 partition load fans one source row across
+    up to 128 partition rows per store,
+  - middle: load each source block once, store it to each of the ``B`` copies.
 
-The caller specifies which dimension (by axis index) is being broadcast and
-to what size. The input must have size 1 on that axis.
+Non-contiguous (multi-run) broadcasts fall back to a generic per-tile loop.
+``lower_broadcast`` is a thin standalone-graph wrapper for the single-axis
+1 -> N case.
 """
 
 from __future__ import annotations
@@ -47,11 +49,7 @@ def lower_broadcast(
         broadcast_axis: Which axis is being broadcast (0-indexed).
         dtype: Element type.
 
-    The axis is classified as I (batch), P (partition), or F (free) based on
-    its position relative to the last two dims:
-      - axis < rank-2: I-dim (batch)
-      - axis == rank-2: P-dim (partition, second-to-last)
-      - axis == rank-1: F-dim (free, last)
+    Thin wrapper over ``emit_broadcast_to``.
     """
     rank = len(in_shape)
     if rank < 2:
@@ -75,239 +73,10 @@ def lower_broadcast(
                 f"{in_shape[i]} vs {out_shape[i]}"
             )
 
-    if broadcast_axis < rank - 2:
-        return _lower_i_broadcast(in_shape, out_shape, broadcast_axis, dtype)
-    elif broadcast_axis == rank - 2:
-        return _lower_p_broadcast(in_shape, out_shape, dtype)
-    else:
-        return _lower_f_broadcast(in_shape, out_shape, dtype)
-
-
-def _lower_i_broadcast(
-    in_shape: tuple[int, ...],
-    out_shape: tuple[int, ...],
-    broadcast_axis: int,
-    dtype: DType,
-) -> Graph:
-    """I-dim broadcast: loop over output batch, load source with index 0."""
-    rank = len(in_shape)
-    P = in_shape[-2]
-    F = in_shape[-1]
-    broadcast_size = out_shape[broadcast_axis]
-
-    batch_dims = list(out_shape[:-2])
-    n_batch = math.prod(batch_dims) if batch_dims else 1
-
-    tile_p = min(P, PARTITION_MAX)
-    tile_f = min(F, PSUM_FREE_MAX)
-
-    b = Builder("broadcast_i")
+    b = Builder("broadcast")
     x_hbm = b.add_input("x", in_shape, dtype)
     y_hbm = b.add_input("y", out_shape, dtype)
-
-    def _batch_indices(flat_idx: int) -> tuple[int, ...]:
-        indices = []
-        remaining = flat_idx
-        for d in reversed(batch_dims):
-            indices.append(remaining % d)
-            remaining //= d
-        return tuple(reversed(indices))
-
-    def _src_slices(batch_idx: tuple[int, ...], p_off: int, p_size: int, f_off: int, f_size: int):
-        slices = []
-        for i, d in enumerate(in_shape[:-2]):
-            if i == broadcast_axis:
-                slices.append(DimSlice(0, 1))
-            else:
-                slices.append(DimSlice(batch_idx[i], 1))
-        slices.append(DimSlice(p_off, p_size))
-        slices.append(DimSlice(f_off, f_size))
-        return tuple(slices)
-
-    def _dst_slices(batch_idx: tuple[int, ...], p_off: int, p_size: int, f_off: int, f_size: int):
-        slices = []
-        for i in range(rank - 2):
-            slices.append(DimSlice(batch_idx[i], 1))
-        slices.append(DimSlice(p_off, p_size))
-        slices.append(DimSlice(f_off, f_size))
-        return tuple(slices)
-
-    n_p_tiles = ceildiv(P, tile_p)
-    n_f_tiles = ceildiv(F, tile_f)
-
-    for batch_flat in range(n_batch):
-        batch_idx = _batch_indices(batch_flat)
-        for p_i in range(n_p_tiles):
-            p_off = p_i * tile_p
-            p_size = min(tile_p, P - p_off)
-            for f_i in range(n_f_tiles):
-                f_off = f_i * tile_f
-                f_size = min(tile_f, F - f_off)
-                tile = b.dma_copy(
-                    b.alloc((p_size, f_size), dtype, MemorySpace.SBUF),
-                    x_hbm,
-                    _src_slices(batch_idx, p_off, p_size, f_off, f_size),
-                )
-                b.dma_copy(y_hbm, tile, _dst_slices(batch_idx, p_off, p_size, f_off, f_size))
-
-    b.set_outputs({"y": y_hbm})
-    return b.graph
-
-
-def _lower_p_broadcast(
-    in_shape: tuple[int, ...],
-    out_shape: tuple[int, ...],
-    dtype: DType,
-) -> Graph:
-    """P-dim broadcast: ones[1,P].T @ src[1,F] -> dst[P,F] via tensor engine."""
-    rank = len(in_shape)
-    P_out = out_shape[-2]
-    F = in_shape[-1]
-
-    batch_dims = list(out_shape[:-2])
-    n_batch = math.prod(batch_dims) if batch_dims else 1
-
-    tile_p = min(P_out, PARTITION_MAX)
-    tile_f = min(F, PSUM_FREE_MAX)
-
-    b = Builder("broadcast_p")
-    x_hbm = b.add_input("x", in_shape, dtype)
-    y_hbm = b.add_input("y", out_shape, DType.F32)
-
-    def _batch_indices(flat_idx: int) -> tuple[int, ...]:
-        indices = []
-        remaining = flat_idx
-        for d in reversed(batch_dims):
-            indices.append(remaining % d)
-            remaining //= d
-        return tuple(reversed(indices))
-
-    def _src_slices(batch_idx: tuple[int, ...], f_off: int, f_size: int):
-        slices = []
-        for i in range(rank - 2):
-            slices.append(DimSlice(batch_idx[i], 1))
-        slices.append(DimSlice(0, 1))
-        slices.append(DimSlice(f_off, f_size))
-        return tuple(slices)
-
-    def _dst_slices(batch_idx: tuple[int, ...], p_off: int, p_size: int, f_off: int, f_size: int):
-        slices = []
-        for i in range(rank - 2):
-            slices.append(DimSlice(batch_idx[i], 1))
-        slices.append(DimSlice(p_off, p_size))
-        slices.append(DimSlice(f_off, f_size))
-        return tuple(slices)
-
-    n_p_tiles = ceildiv(P_out, tile_p)
-    n_f_tiles = ceildiv(F, tile_f)
-
-    for batch_flat in range(n_batch):
-        batch_idx = _batch_indices(batch_flat)
-        for p_i in range(n_p_tiles):
-            p_off = p_i * tile_p
-            p_size = min(tile_p, P_out - p_off)
-
-            # Stationary: ones[1, p_size] — K=1, M=p_size
-            ones_stat = b.constant(1.0, (1, p_size), dtype, MemorySpace.SBUF)
-
-            for f_i in range(n_f_tiles):
-                f_off = f_i * tile_f
-                f_size = min(tile_f, F - f_off)
-
-                # Moving: src[1, f_size] — K=1, N=f_size
-                src_mov = b.dma_copy(
-                    b.alloc((1, f_size), dtype, MemorySpace.SBUF),
-                    x_hbm,
-                    _src_slices(batch_idx, f_off, f_size),
-                )
-
-                # matmul: ones[1, p_size].T @ src[1, f_size] -> psum[p_size, f_size]
-                psum = b.alloc((p_size, f_size), DType.F32, MemorySpace.PSUM)
-                b.matmul(psum, ones_stat, src_mov, accumulate=False)
-
-                # PSUM -> SBUF -> HBM
-                out_sbuf = b.tensor_copy(
-                    b.alloc((p_size, f_size), DType.F32, MemorySpace.SBUF), psum
-                )
-                b.dma_copy(y_hbm, out_sbuf, _dst_slices(batch_idx, p_off, p_size, f_off, f_size))
-
-    b.set_outputs({"y": y_hbm})
-    return b.graph
-
-
-def _lower_f_broadcast(
-    in_shape: tuple[int, ...],
-    out_shape: tuple[int, ...],
-    dtype: DType,
-) -> Graph:
-    """F-dim broadcast: tensor_scalar_arith(ones(P,F), src(P,1), MULTIPLY)."""
-    rank = len(in_shape)
-    P = in_shape[-2]
-    F_out = out_shape[-1]
-
-    batch_dims = list(out_shape[:-2])
-    n_batch = math.prod(batch_dims) if batch_dims else 1
-
-    tile_p = min(P, PARTITION_MAX)
-    tile_f = min(F_out, PSUM_FREE_MAX)
-
-    b = Builder("broadcast_f")
-    x_hbm = b.add_input("x", in_shape, dtype)
-    y_hbm = b.add_input("y", out_shape, dtype)
-
-    def _batch_indices(flat_idx: int) -> tuple[int, ...]:
-        indices = []
-        remaining = flat_idx
-        for d in reversed(batch_dims):
-            indices.append(remaining % d)
-            remaining //= d
-        return tuple(reversed(indices))
-
-    def _src_slices(batch_idx: tuple[int, ...], p_off: int, p_size: int):
-        slices = []
-        for i in range(rank - 2):
-            slices.append(DimSlice(batch_idx[i], 1))
-        slices.append(DimSlice(p_off, p_size))
-        slices.append(DimSlice(0, 1))
-        return tuple(slices)
-
-    def _dst_slices(batch_idx: tuple[int, ...], p_off: int, p_size: int, f_off: int, f_size: int):
-        slices = []
-        for i in range(rank - 2):
-            slices.append(DimSlice(batch_idx[i], 1))
-        slices.append(DimSlice(p_off, p_size))
-        slices.append(DimSlice(f_off, f_size))
-        return tuple(slices)
-
-    n_p_tiles = ceildiv(P, tile_p)
-    n_f_tiles = ceildiv(F_out, tile_f)
-
-    for batch_flat in range(n_batch):
-        batch_idx = _batch_indices(batch_flat)
-        for p_i in range(n_p_tiles):
-            p_off = p_i * tile_p
-            p_size = min(tile_p, P - p_off)
-
-            # Load source (P_tile, 1) — the scalar operand for broadcast
-            src_tile = b.dma_copy(
-                b.alloc((p_size, 1), dtype, MemorySpace.SBUF),
-                x_hbm,
-                _src_slices(batch_idx, p_off, p_size),
-            )
-
-            for f_i in range(n_f_tiles):
-                f_off = f_i * tile_f
-                f_size = min(tile_f, F_out - f_off)
-
-                # ones(p_size, f_size) — the "x" tensor in tensor_scalar_arith
-                ones_tile = b.constant(1.0, (p_size, f_size), dtype, MemorySpace.SBUF)
-
-                # dst = ones * src (broadcast src along F via tensor_scalar_arith)
-                dst = b.alloc((p_size, f_size), dtype, MemorySpace.SBUF)
-                dst = b.tensor_scalar_arith(dst, ones_tile, src_tile, NisaArithOp.MULTIPLY)
-
-                b.dma_copy(y_hbm, dst, _dst_slices(batch_idx, p_off, p_size, f_off, f_size))
-
+    emit_broadcast_to(b, x_hbm, y_hbm, in_shape, out_shape, dtype)
     b.set_outputs({"y": y_hbm})
     return b.graph
 

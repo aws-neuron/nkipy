@@ -1,7 +1,9 @@
-"""Tests for direct_lower_elementwise.
+"""Tests for elementwise lowering through the orchestrated ``lower_graph``.
 
-Verifies that the direct elementwise lowering produces correct NKI IR by
-running the numpy interpreter then executing on real Trainium hardware.
+Verifies that elementwise segments produce correct NKI IR by running the
+numpy interpreter then executing on real Trainium hardware.  (Previously
+tested the standalone ``direct_lower_elementwise`` module, which was legacy
+and has been removed; the orchestrator path is the only implementation.)
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ from nkigen_lite.tensor_ir.passes.layout_solver import solve_graph
 from nkigen_lite.nki_ir import run as nki_run
 from nkigen_lite.nki_ir.emit_to_kb import build_kb_kernel
 
-from nkigen_lite.tensor_ir.passes.basic.direct_lower_elementwise import lower_elementwise
+from nkigen_lite.tensor_ir.passes.basic.direct_lower import lower_graph
 
 try:
     import nki.compiler.kernel_builder as nb_kb
@@ -41,7 +43,7 @@ def _lower_and_check(build_fn, inputs, atol=1e-5):
     graph = b.graph
 
     layouts = solve_graph(graph)
-    nki_graph = lower_elementwise(graph, layouts)
+    nki_graph = lower_graph(graph, layouts)
 
     ref = tensor_run(graph, inputs)
 
@@ -303,36 +305,6 @@ class TestMultiOutput:
         _lower_and_check(build, {
             "x": rng.standard_normal((64, 128)).astype(np.float32),
         })
-
-
-# ---------------------------------------------------------------------------
-# Unsupported op rejection
-# ---------------------------------------------------------------------------
-
-
-class TestUnsupported:
-    def test_matmul_rejected(self):
-        def build(b):
-            a = b.add_input("a", (128, 256), DType.F32)
-            w = b.add_input("w", (256, 128), DType.F32)
-            b.set_outputs({"y": b.matmul(a, w)})
-
-        b = TensorBuilder("t")
-        build(b)
-        layouts = solve_graph(b.graph)
-        with pytest.raises(NotImplementedError, match="matmul"):
-            lower_elementwise(b.graph, layouts)
-
-    def test_reduce_rejected(self):
-        def build(b):
-            x = b.add_input("x", (128, 256), DType.F32)
-            b.set_outputs({"y": b.reduce(x, axis=-1, kind="sum", keepdims=True)})
-
-        b = TensorBuilder("t")
-        build(b)
-        layouts = solve_graph(b.graph)
-        with pytest.raises(NotImplementedError, match="reduce"):
-            lower_elementwise(b.graph, layouts)
 
 
 if __name__ == "__main__":
