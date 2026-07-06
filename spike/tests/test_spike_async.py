@@ -1,8 +1,5 @@
 """
 Tests for Spike async/nonblock functionality.
-
-NOTE: These tests require actual NeuronCore hardware and a compiled NEFF model.
-They serve as integration tests and usage examples.
 """
 
 import os
@@ -38,29 +35,18 @@ def _matmul_shapes(test_mode):
 
 @pytest.fixture(scope="module")
 def neff_path(request):
-    """Compile a matmul kernel for testing.
+    """Return the path to the pre-compiled matmul NEFF for the current --test-mode.
 
-    Shape is chosen based on --test-mode (see _matmul_shapes):
-      correctness  -- small (128x256) x (256x128), fast enough for CPU reference check
-      overlapping  -- large, balanced so write+read ~= exec with weights pre-written
+    The NEFF is chosen based on --test-mode; its shape matches _matmul_shapes:
+      correctness  -- matmul_small.neff, small (128x256) x (256x128), fast enough for CPU reference check
+      overlapping  -- matmul_large.neff, large, balanced so write+read ~= exec with weights pre-written
     """
-    from nkipy.core.compile import compile_to_neff, trace
-
-    def my_matmul(x, y):
-        return np.matmul(x, y)
-
     test_mode = request.config.getoption("--test-mode")
-    x_shape, y_shape = _matmul_shapes(test_mode)
-    x = np.zeros(x_shape, dtype=np.float16)
-    y = np.zeros(y_shape, dtype=np.float16)
-
-    traced_kernel = trace(my_matmul)
-    traced_kernel.specialize(x, y)
-
-    output_dir = os.path.join(os.path.dirname(__file__), "artifacts")
-    neff_path = compile_to_neff(trace_kernel=traced_kernel, output_dir=output_dir)
-
-    return neff_path
+    neff_name = "matmul_large.neff" if test_mode == "overlapping" else "matmul_small.neff"
+    path = os.path.join(os.path.dirname(__file__), "artifacts", neff_name)
+    if not os.path.exists(path):
+        pytest.skip(f"NEFF artifact not found: {path}")
+    return path
 
 
 @pytest.fixture(scope="module")
@@ -77,21 +63,22 @@ def spike_async():
 def model_and_tensors(request, neff_path, spike_async):
     """Load model and prepare input/output tensors for matmul.
 
-    Data and shape are chosen based on --test-mode:
-      correctness  -- small (128x256) x (256x128) with random values for numerical verification
-      overlapping  -- large (4096x8192) x (8192x4096) with zeros to demonstrate async overlap
+    Data and shape are chosen based on --test-mode (see _matmul_shapes):
+      correctness  -- small with random values for numerical verification
+      overlapping  -- large, with zeros, balanced so write+read ~= exec to demonstrate async overlap
     """
     # Load model
     model = spike_async.load_model(neff_path, core_id=0)
 
     # Create input arrays for matmul
     test_mode = request.config.getoption("--test-mode")
+    x_shape, y_shape = _matmul_shapes(test_mode)
     if test_mode == "overlapping":
-        x = np.zeros((4096, 8192), dtype=np.float16)
-        y = np.zeros((8192, 4096), dtype=np.float16)
+        x = np.zeros(x_shape, dtype=np.float16)
+        y = np.zeros(y_shape, dtype=np.float16)
     else:  # correctness
-        x = np.random.rand(128, 256).astype(np.float16)
-        y = np.random.rand(256, 128).astype(np.float16)
+        x = np.random.rand(*x_shape).astype(np.float16)
+        y = np.random.rand(*y_shape).astype(np.float16)
 
     num_pipelines = request.config.getoption("--num-pipelines")
 
