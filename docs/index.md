@@ -44,6 +44,7 @@ user_guide/distributed_execution
 
 dev_guide/extending_language
 dev_guide/testing
+dev_guide/running_on_hardware
 dev_guide/building_docs
 api/index
 ```
