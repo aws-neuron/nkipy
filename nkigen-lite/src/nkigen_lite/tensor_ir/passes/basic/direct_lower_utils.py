@@ -18,7 +18,7 @@ from nkigen_lite.nki_ir.ir import (
     SBUF_PER_PARTITION_BYTES,
 )
 from nkigen_lite.nki_ir import ir as nki_ir
-from nkigen_lite.tensor_ir.passes.layout_solver import Layout
+from nkigen_lite.tensor_ir.passes.layout import Layout
 
 
 # ---------------------------------------------------------------------------

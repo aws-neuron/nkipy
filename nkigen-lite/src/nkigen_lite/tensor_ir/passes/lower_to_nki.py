@@ -1,7 +1,8 @@
 """Top-level lowering pipeline: tensor_ir → nki_ir.
 
-Pipeline: canonicalize → decompose → layout_solver → direct_lower
-Produces legal NKI IR directly.
+Pipeline: canonicalize → decompose → direct_lower
+Produces legal NKI IR directly. Layouts are decided per segment inside
+direct_lower (see passes/layout.py), not as a separate global pass.
 """
 
 from __future__ import annotations
@@ -10,14 +11,12 @@ from nkigen_lite.core import Graph
 from nkigen_lite import nki_ir
 from nkigen_lite.tensor_ir.passes.canonicalize import canonicalize
 from nkigen_lite.tensor_ir.passes.decompose import decompose
-from nkigen_lite.tensor_ir.passes.layout_solver import Layout, solve_graph
 from nkigen_lite.tensor_ir.passes.hardware import HardwareProfile, TRN2
 
 
 def lower_to_nki(
     graph: Graph,
     target: HardwareProfile = TRN2,
-    layouts: dict[str, Layout] | None = None,
     skip_canonicalize: bool = False,
     skip_decompose: bool = False,
     verify_each_phase: bool = False,
@@ -30,7 +29,6 @@ def lower_to_nki(
             this pipeline reads it yet (tile-legality constants are instead
             imported directly from nki_ir.ir). Accepted for forward
             compatibility with a future cost model / multi-target lowering.
-        layouts: Pre-assigned layouts (skips layout solver if given).
         skip_canonicalize: Skip the canonicalize pass.
         skip_decompose: Skip the decompose pass.
         verify_each_phase: Run Graph.verify after every nki_ir phase.
@@ -44,10 +42,6 @@ def lower_to_nki(
     if not skip_decompose:
         decompose(graph)
 
-    # Phase 3: layout solving
-    if layouts is None:
-        layouts = solve_graph(graph)
-
-    # Phase 4: direct lower to nki_ir
+    # Phase 3: direct lower to nki_ir (per-segment layout decisions)
     from nkigen_lite.tensor_ir.passes.basic.direct_lower import lower_graph
-    return lower_graph(graph, layouts)
+    return lower_graph(graph)

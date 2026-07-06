@@ -59,9 +59,9 @@ def test_bug1_matmul_m_greater_than_partition_max():
 
 
 # bug-3: _propagate rewrites priority to ELEMENTWISE
-# This was a bug in the old layout_analysis.py constraint system.
-# The replacement layout_solver.py uses direct layout propagation via
-# _adapt_layout (no priority system) so this class of bug doesn't apply.
+# This was a bug in the old layout_analysis.py constraint system. Layouts
+# are now decided per segment at emission (passes/layout.py) — there is no
+# cross-value propagation, so this class of bug doesn't apply.
 
 
 # ---------------------------------------------------------------------------
@@ -262,7 +262,6 @@ def test_transpose_collapsed_leading_dim_unaligned():
 # always uses gpsimd.
 
 def test_p_reduce_wide_f_legal_tiles():
-    from nkigen_lite.tensor_ir.passes.layout_solver import solve_graph
     from nkigen_lite.tensor_ir.passes.basic.direct_lower_reduce import (
         lower_p_reduce_gpsimd,
         lower_p_reduce_matmul,
@@ -275,8 +274,7 @@ def test_p_reduce_wide_f_legal_tiles():
         x = b.add_input("x", shape, DType.F32)
         y = b.reduce(x, axis=(0,), kind="sum", keepdims=True)
         b.set_outputs({"y": y})
-        layouts = solve_graph(b.graph)
-        g = fn(b.graph, layouts)
+        g = fn(b.graph)
         errs = g.verify()
         assert not errs, f"{fn.__name__} emitted illegal tiles: {errs[:2]}"
         xv = np.random.randn(*shape).astype(np.float32)

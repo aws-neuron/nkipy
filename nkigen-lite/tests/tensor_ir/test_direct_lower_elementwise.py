@@ -13,7 +13,6 @@ import pytest
 
 from nkigen_lite.core import DType
 from nkigen_lite.tensor_ir.ir import Builder as TensorBuilder, run as tensor_run
-from nkigen_lite.tensor_ir.passes.layout_solver import solve_graph
 from nkigen_lite.nki_ir import run as nki_run
 from nkigen_lite.nki_ir.emit_to_kb import build_kb_kernel
 
@@ -42,8 +41,7 @@ def _lower_and_check(build_fn, inputs, atol=1e-5):
     build_fn(b)
     graph = b.graph
 
-    layouts = solve_graph(graph)
-    nki_graph = lower_graph(graph, layouts)
+    nki_graph = lower_graph(graph)
 
     ref = tensor_run(graph, inputs)
 

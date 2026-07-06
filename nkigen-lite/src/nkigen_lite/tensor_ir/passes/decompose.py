@@ -12,7 +12,7 @@ Pipeline:
   tensor_ir graph (canonical ops)
     → decompose()        # lower unsupported ops
   tensor_ir graph (decomposed ops, only NISA-supported opcodes)
-    → layout_solver → direct_lower
+    → direct_lower
 
 Floor-divide precision strategy
 ================================

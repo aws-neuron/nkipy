@@ -1,7 +1,8 @@
 """Direct lowering of tensor IR reduce ops to NKI IR.
 
-Lowers reduce ops from tensor IR to tiled NKI IR, given the tensor IR graph
-and layout solver results. Supports two classes of reduction:
+Lowers reduce ops from tensor IR to tiled NKI IR. The input's I/P/F layout
+is decided locally (``default_layout``) — it classifies each reduced axis as
+a P- or F-reduction. Supports two classes of reduction:
 
 1. P-dim reduction (cross-lane): reduces along partition dimensions.
    Two strategies:
@@ -36,7 +37,7 @@ from nkigen_lite.nki_ir.ir import (
 )
 from nkigen_lite.nki_ir import ir as nki_ir
 from nkigen_lite.nki_ir.insert_deallocs import insert_deallocs
-from nkigen_lite.tensor_ir.passes.layout_solver import Layout
+from nkigen_lite.tensor_ir.passes.layout import default_layout
 
 from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
     COMBINE_INIT,
@@ -56,7 +57,7 @@ from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
 
 
 def emit_reduce(
-    nb: Builder, op, layouts: dict[str, Layout], hbm_map: dict[str, Value],
+    nb: Builder, op, hbm_map: dict[str, Value],
     strategy: str = "gpsimd",
 ) -> None:
     """Emit a reduce op into an existing Builder with pre-allocated HBM buffers.
@@ -65,21 +66,21 @@ def emit_reduce(
     supports all kinds) or "matmul" (tensor engine, sum/mean only).
     """
     inp_val = op.inputs[0]
-    inp_layout = layouts[inp_val.name]
+    inp_layout = default_layout(inp_val.type.shape)
     axis = set(op.attrs["axis"])
 
     f_axes = axis & set(inp_layout.f_dims)
     p_axes = axis & set(inp_layout.p_dims)
 
     if f_axes and not p_axes:
-        _emit_f_reduce_inline(nb, op, layouts, hbm_map)
+        _emit_f_reduce_inline(nb, op, hbm_map)
     elif p_axes and not f_axes:
         if strategy == "matmul":
-            _emit_p_reduce_matmul_inline(nb, op, layouts, hbm_map)
+            _emit_p_reduce_matmul_inline(nb, op, hbm_map)
         else:
-            _emit_p_reduce_inline(nb, op, layouts, hbm_map)
+            _emit_p_reduce_inline(nb, op, hbm_map)
     else:
-        _emit_mixed_reduce_inline(nb, op, layouts, hbm_map)
+        _emit_mixed_reduce_inline(nb, op, hbm_map)
 
 
 def _try_emit_collapsed_f_reduce(
@@ -149,7 +150,7 @@ def _try_emit_collapsed_f_reduce(
 
 
 def _emit_f_reduce_inline(
-    nb: Builder, op, layouts: dict[str, Layout], hbm_map: dict[str, Value],
+    nb: Builder, op, hbm_map: dict[str, Value],
 ) -> None:
     """F-dim reduction via tensor_reduce_arith on the vector engine.
 
@@ -159,7 +160,7 @@ def _emit_f_reduce_inline(
     """
     inp_val = op.inputs[0]
     out_val = op.results[0]
-    inp_layout = layouts[inp_val.name]
+    inp_layout = default_layout(inp_val.type.shape)
     inp_shape = inp_val.type.shape
     out_shape = out_val.type.shape
     kind = op.attrs["kind"]
@@ -236,7 +237,7 @@ def _emit_f_reduce_inline(
 
 
 def _emit_p_reduce_inline(
-    nb: Builder, op, layouts: dict[str, Layout], hbm_map: dict[str, Value],
+    nb: Builder, op, hbm_map: dict[str, Value],
 ) -> None:
     """P-dim reduction using GpSimd cross_lane_reduce_arith.
 
@@ -247,7 +248,7 @@ def _emit_p_reduce_inline(
     """
     inp_val = op.inputs[0]
     out_val = op.results[0]
-    inp_layout = layouts[inp_val.name]
+    inp_layout = default_layout(inp_val.type.shape)
     inp_shape = inp_val.type.shape
     out_shape = out_val.type.shape
     kind = op.attrs["kind"]
@@ -353,7 +354,7 @@ def _emit_p_reduce_inline(
 
 
 def _emit_p_reduce_matmul_inline(
-    nb: Builder, op, layouts: dict[str, Layout], hbm_map: dict[str, Value],
+    nb: Builder, op, hbm_map: dict[str, Value],
 ) -> None:
     """P-dim reduction using the matmul trick: ones.T @ x (sum/mean only).
 
@@ -365,7 +366,7 @@ def _emit_p_reduce_matmul_inline(
     """
     inp_val = op.inputs[0]
     out_val = op.results[0]
-    inp_layout = layouts[inp_val.name]
+    inp_layout = default_layout(inp_val.type.shape)
     inp_shape = inp_val.type.shape
     out_shape = out_val.type.shape
     kind = op.attrs["kind"]
@@ -480,7 +481,7 @@ def _emit_p_reduce_matmul_inline(
 
 
 def _emit_mixed_reduce_inline(
-    nb: Builder, op, layouts: dict[str, Layout], hbm_map: dict[str, Value],
+    nb: Builder, op, hbm_map: dict[str, Value],
 ) -> None:
     """Mixed P/F reduction: F-reduce each P-chunk, then combine across P.
 
@@ -489,7 +490,7 @@ def _emit_mixed_reduce_inline(
     """
     inp_val = op.inputs[0]
     out_val = op.results[0]
-    inp_layout = layouts[inp_val.name]
+    inp_layout = default_layout(inp_val.type.shape)
     inp_shape = inp_val.type.shape
     out_shape = out_val.type.shape
     kind = op.attrs["kind"]
@@ -612,7 +613,7 @@ def _find_reduce_op(graph: Graph):
 
 
 def _lower_via_emit(
-    graph: Graph, layouts: dict[str, Layout], name: str,
+    graph: Graph, name: str,
     strategy: str, force: str | None = None,
 ) -> nki_ir.Graph:
     """Shared wrapper: build a graph with HBM inputs and ``{out}_out`` buffers,
@@ -634,13 +635,13 @@ def _lower_via_emit(
         hbm_map[oval.name] = buf
 
     if force == "f":
-        _emit_f_reduce_inline(nb, reduce_op, layouts, hbm_map)
+        _emit_f_reduce_inline(nb, reduce_op, hbm_map)
     elif force == "p_gpsimd":
-        _emit_p_reduce_inline(nb, reduce_op, layouts, hbm_map)
+        _emit_p_reduce_inline(nb, reduce_op, hbm_map)
     elif force == "p_matmul":
-        _emit_p_reduce_matmul_inline(nb, reduce_op, layouts, hbm_map)
+        _emit_p_reduce_matmul_inline(nb, reduce_op, hbm_map)
     else:
-        emit_reduce(nb, reduce_op, layouts, hbm_map, strategy=strategy)
+        emit_reduce(nb, reduce_op, hbm_map, strategy=strategy)
 
     nb.set_outputs({n: hbm_map[f"{n}_out"] for n in graph.outputs})
     insert_deallocs(nb.graph)
@@ -649,7 +650,6 @@ def _lower_via_emit(
 
 def lower_reduce(
     graph: Graph,
-    layouts: dict[str, Layout],
     strategy: str = "gpsimd",
 ) -> nki_ir.Graph:
     """Lower a reduce op handling all legal axis combinations.
@@ -657,30 +657,21 @@ def lower_reduce(
     Thin wrapper over ``emit_reduce``. ``strategy`` selects the P-dim phase:
     "gpsimd" (default, all kinds) or "matmul" (sum/mean only).
     """
-    return _lower_via_emit(graph, layouts, "direct_reduce", strategy)
+    return _lower_via_emit(graph, "direct_reduce", strategy)
 
 
-def lower_f_reduce(
-    graph: Graph,
-    layouts: dict[str, Layout],
-) -> nki_ir.Graph:
+def lower_f_reduce(graph: Graph) -> nki_ir.Graph:
     """Lower a graph with a reduce op over F-dims to NKI IR."""
-    return _lower_via_emit(graph, layouts, "direct_f_reduce", "gpsimd", force="f")
+    return _lower_via_emit(graph, "direct_f_reduce", "gpsimd", force="f")
 
 
-def lower_p_reduce_gpsimd(
-    graph: Graph,
-    layouts: dict[str, Layout],
-) -> nki_ir.Graph:
+def lower_p_reduce_gpsimd(graph: Graph) -> nki_ir.Graph:
     """Lower P-dim reduction using GpSimd cross_lane_reduce_arith."""
     return _lower_via_emit(
-        graph, layouts, "direct_p_reduce_gpsimd", "gpsimd", force="p_gpsimd")
+        graph, "direct_p_reduce_gpsimd", "gpsimd", force="p_gpsimd")
 
 
-def lower_p_reduce_matmul(
-    graph: Graph,
-    layouts: dict[str, Layout],
-) -> nki_ir.Graph:
+def lower_p_reduce_matmul(graph: Graph) -> nki_ir.Graph:
     """Lower P-dim reduction via the matmul trick: ones.T @ x (sum/mean only)."""
     return _lower_via_emit(
-        graph, layouts, "direct_p_reduce_matmul", "matmul", force="p_matmul")
+        graph, "direct_p_reduce_matmul", "matmul", force="p_matmul")
