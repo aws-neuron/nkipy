@@ -6,12 +6,15 @@ NKI IR graph. Consecutive elementwise ops are grouped and lowered together
 reshape, slice, concat, broadcast_to) get their own load→compute→store
 sequence with HBM boundaries.
 
+Layouts are decided per segment, not per value: every segment boundary
+round-trips through HBM, which is layout-agnostic (row-major), so each
+emitter picks the layout for its own tile loop (see passes/layout.py).
+
 Usage:
     graph = build_some_pattern(...)
     canonicalize(graph)
     decompose(graph)
-    layouts = solve_graph(graph)
-    nki_graph = lower_graph(graph, layouts)
+    nki_graph = lower_graph(graph)
 """
 
 from __future__ import annotations
@@ -27,7 +30,7 @@ from nkigen_lite.nki_ir.ir import (
 )
 from nkigen_lite.nki_ir import ir as nki_ir
 from nkigen_lite.nki_ir.insert_deallocs import insert_deallocs
-from nkigen_lite.tensor_ir.passes.layout_solver import Layout
+from nkigen_lite.tensor_ir.passes.layout import Layout
 
 from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
     BINARY_OPS,
@@ -62,18 +65,21 @@ def _collapsed_pf(shape: tuple[int, ...]) -> tuple[int, int]:
     return (prod(shape[:-1]), shape[-1])
 
 
-def _segment_ops(graph: Graph, layouts: dict[str, Layout]) -> list[list]:
+def _segment_ops(graph: Graph) -> list[list]:
     """Segment graph ops into elementwise groups and individual non-elementwise ops.
 
-    Elementwise ops are grouped only if they share both:
-      - the same P/F dim assignment (layout); a layout flip breaks the group, and
-      - a compatible collapsed ``(P, F)`` shape — every op in a group must fold
-        to the same partition/free extents (size-1 broadcasts aside). A group
-        that mixed, say, ``(1,128,8,64)`` (collapsed P=1024) with
-        ``(1,128,1,64)`` (collapsed P=128) cannot share one collapsed tile loop:
-        the fast collapse path would reject it and the generic fallback would put
-        the size-1 axis on the partition and unroll the 128-wide axis one element
-        at a time. Splitting keeps each group collapsible.
+    Elementwise ops are grouped only if they have a compatible collapsed
+    ``(P, F)`` shape — every op in a group must fold to the same
+    partition/free extents (size-1 broadcasts aside). A group that mixed,
+    say, ``(1,128,8,64)`` (collapsed P=1024) with ``(1,128,1,64)`` (collapsed
+    P=128) cannot share one collapsed tile loop: the fast collapse path would
+    reject it and the generic fallback would put the size-1 axis on the
+    partition and unroll the 128-wide axis one element at a time. Splitting
+    keeps each group collapsible.
+
+    This is a purely shape-driven decision: emission uses one canonical
+    row-major layout for the whole group (see ``_emit_elementwise_segment``),
+    so there is no per-value layout to agree on.
 
     Returns a list of segments. Each segment is either:
       - A list of consecutive elementwise ops (grouped)
@@ -81,29 +87,20 @@ def _segment_ops(graph: Graph, layouts: dict[str, Layout]) -> list[list]:
     """
     segments = []
     current_ew = []
-    current_pf = None  # (p_dims, f_dims) of current group
     # Distinct non-1 collapsed extents seen in the current group (None until set).
     group_p = None
     group_f = None
 
     def _flush():
-        nonlocal current_ew, current_pf, group_p, group_f
+        nonlocal current_ew, group_p, group_f
         if current_ew:
             segments.append(current_ew)
             current_ew = []
-        current_pf = None
         group_p = None
         group_f = None
 
     for op in graph.ops:
         if op.opcode in ELEMENTWISE_OPCODES:
-            out_name = op.results[0].name
-            if out_name in layouts:
-                out_layout = layouts[out_name]
-                pf = (out_layout.p_dims, out_layout.f_dims)
-            else:
-                pf = current_pf
-
             cp, cf = _collapsed_pf(op.results[0].type.shape)
             # A second distinct non-1 partition (or free) extent can't share the
             # group's collapsed tile loop.
@@ -112,13 +109,10 @@ def _segment_ops(graph: Graph, layouts: dict[str, Layout]) -> list[list]:
                 or (cf != 1 and group_f is not None and cf != group_f)
             )
 
-            if current_ew and current_pf is not None and pf != current_pf:
-                _flush()
-            elif current_ew and shape_conflict:
+            if current_ew and shape_conflict:
                 _flush()
 
             current_ew.append(op)
-            current_pf = pf
             if cp != 1:
                 group_p = cp
             if cf != 1:
@@ -140,7 +134,7 @@ def _segment_ops(graph: Graph, layouts: dict[str, Layout]) -> list[list]:
 # ---------------------------------------------------------------------------
 
 
-def lower_graph(graph: Graph, layouts: dict[str, Layout]) -> nki_ir.Graph:
+def lower_graph(graph: Graph) -> nki_ir.Graph:
     """Lower a full tensor IR graph to NKI IR with HBM boundaries."""
     nb = Builder("direct_lower")
     hbm_map: dict[str, Value] = {}
@@ -159,7 +153,7 @@ def lower_graph(graph: Graph, layouts: dict[str, Layout]) -> nki_ir.Graph:
         if key not in hbm_map:
             hbm_map[key] = nb.add_input(key, _nki_shape(out_val.type.shape), out_val.type.dtype)
 
-    segments = _segment_ops(graph, layouts)
+    segments = _segment_ops(graph)
 
     # Which elementwise segment produced each value (results of non-elementwise
     # ops are absent: their emitters always store to HBM).
@@ -214,11 +208,11 @@ def lower_graph(graph: Graph, layouts: dict[str, Layout]) -> nki_ir.Graph:
     # Lower each segment
     for segment in segments:
         if segment[0].opcode in ELEMENTWISE_OPCODES:
-            _emit_elementwise_segment(nb, segment, layouts, hbm_map)
+            _emit_elementwise_segment(nb, segment, hbm_map)
         elif segment[0].opcode == "reduce":
-            _emit_reduce_op(nb, segment[0], layouts, hbm_map)
+            _emit_reduce_op(nb, segment[0], hbm_map)
         elif segment[0].opcode == "matmul":
-            _emit_matmul_op(nb, segment[0], layouts, hbm_map)
+            _emit_matmul_op(nb, segment[0], hbm_map)
         elif segment[0].opcode == "transpose":
             _emit_transpose_op(nb, segment[0], hbm_map)
         elif segment[0].opcode == "reshape":
@@ -228,7 +222,7 @@ def lower_graph(graph: Graph, layouts: dict[str, Layout]) -> nki_ir.Graph:
         elif segment[0].opcode == "concat":
             _emit_concat_op(nb, segment[0], hbm_map, const_values)
         elif segment[0].opcode == "broadcast_to":
-            _emit_broadcast_op(nb, segment[0], layouts, hbm_map)
+            _emit_broadcast_op(nb, segment[0], hbm_map)
         elif segment[0].opcode == "iota":
             _emit_iota_op(nb, segment[0], hbm_map)
         elif segment[0].opcode == "topk":
@@ -402,7 +396,7 @@ def _try_emit_collapsed_ew(
     Every external input and every op result must collapse to the rep's
     ``(P, F)`` (see ``_collapse_ew_shape``). When it does, we reinterpret each
     HBM buffer to its collapsed 2D shape with a zero-copy view, build a 2D
-    ``hbm_map`` / ``layouts`` view, and reuse the existing 2D tile machinery
+    ``hbm_map`` view, and reuse the existing 2D tile machinery
     (``_emit_ew_tile``) — which already handles F/P broadcasting of size-1
     operands via ``emit_binary_op``.
     """
@@ -428,12 +422,10 @@ def _try_emit_collapsed_ew(
             return False
         collapsed[name] = pf
 
-    # Build 2D HBM views and a parallel hbm_map / layouts keyed by the same
-    # names the tile machinery uses.  A segment-internal result with no HBM
-    # buffer (dead store eliminated) simply gets no view: the tile store loop
-    # skips names absent from the map.
+    # Build 2D HBM views keyed by the same names the tile machinery uses.
+    # A segment-internal result with no HBM buffer (dead store eliminated)
+    # simply gets no view: the tile store loop skips names absent from the map.
     view_map: dict[str, Value] = {}
-    view_layouts: dict[str, Layout] = {}
     rep_2d = (prod(rep_shape[:-1]), rep_shape[-1])
     for name, pf in collapsed.items():
         hbm_val = hbm_map.get(name)
@@ -445,7 +437,6 @@ def _try_emit_collapsed_ew(
             view_map[name] = hbm_val
         else:
             view_map[name] = nb.view(hbm_val, pf)
-        view_layouts[name] = _canonical_layout(2)
 
     seg_dtype = _segment_dtype(ops)
     rep_layout = _canonical_layout(2)
@@ -458,7 +449,7 @@ def _try_emit_collapsed_ew(
 
     def _emit_nested(depth: int, indices: dict[int, int]):
         if depth >= len(loop_dims):
-            _emit_ew_tile(nb, ops, view_layouts, view_map, rep_layout, rep_2d,
+            _emit_ew_tile(nb, ops, view_map, rep_layout, rep_2d,
                           tile_sizes, indices, segment_results, seg_dtype,
                           shape_override)
             return
@@ -471,7 +462,7 @@ def _try_emit_collapsed_ew(
 
 
 def _emit_elementwise_segment(
-    nb: Builder, ops: list, layouts: dict[str, Layout], hbm_map: dict[str, Value],
+    nb: Builder, ops: list, hbm_map: dict[str, Value],
 ) -> None:
     """Emit a fused elementwise segment: one tiled loop for all ops."""
     # Prune ops whose results neither escape (have an HBM buffer) nor feed a
@@ -516,7 +507,7 @@ def _emit_elementwise_segment(
 
     def _emit_nested(depth: int, indices: dict[int, int]):
         if depth >= len(loop_dims):
-            _emit_ew_tile(nb, ops, layouts, hbm_map, rep_layout, rep_shape,
+            _emit_ew_tile(nb, ops, hbm_map, rep_layout, rep_shape,
                           tile_sizes, indices, segment_results, seg_dtype)
             return
         d, extent, ts = loop_dims[depth]
@@ -527,7 +518,7 @@ def _emit_elementwise_segment(
 
 
 def _emit_ew_tile(
-    nb: Builder, ops: list, layouts: dict[str, Layout], hbm_map: dict[str, Value],
+    nb: Builder, ops: list, hbm_map: dict[str, Value],
     rep_layout: Layout, rep_shape: tuple[int, ...],
     tile_sizes: dict[int, int], indices: dict[int, int],
     segment_results: set[str],
@@ -647,13 +638,13 @@ from nkigen_lite.tensor_ir.passes.basic.direct_lower_reduce import (
 
 
 def _emit_reduce_op(
-    nb: Builder, op, layouts: dict[str, Layout], hbm_map: dict[str, Value],
+    nb: Builder, op, hbm_map: dict[str, Value],
 ) -> None:
-    emit_reduce(nb, op, layouts, hbm_map)
+    emit_reduce(nb, op, hbm_map)
 
 
 def _emit_matmul_op(
-    nb: Builder, op, layouts: dict[str, Layout], hbm_map: dict[str, Value],
+    nb: Builder, op, hbm_map: dict[str, Value],
 ) -> None:
     a_val, b_val = op.inputs
     c_val = op.results[0]
@@ -764,7 +755,7 @@ def _emit_concat_op(
     )
 
 
-def _emit_broadcast_op(nb: Builder, op, layouts: dict[str, Layout], hbm_map: dict[str, Value]) -> None:
+def _emit_broadcast_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
     inp_val = op.inputs[0]
     out_val = op.results[0]
     emit_broadcast_to(

@@ -51,6 +51,28 @@ fixed before Phase 1:
   misses the passthrough path because I*J=524288 exceeds the SBUF free
   budget. ~2.9k ops (6.7%) — not worth further effort before Phase 2.
 
+## Phase 0.75 — Segment-first layout (done)
+
+Design decision recorded 2026-07-05: layouts are **per-segment** decisions
+made by each emitter, not per-value graph properties. Every segment boundary
+round-trips through HBM, which is layout-agnostic (row-major), so a consumer
+segment can load a value in any layout regardless of how the producer stored
+it — there is no global layout problem until cross-segment SBUF residency
+exists (explicitly deferred below).
+
+- [x] **Delete the global layout solver** (`layout_solver.py` / `solve_graph`,
+  a five-phase propagation pass whose output only `_segment_ops` and
+  `emit_reduce` consumed — elementwise emission already ignored it in favor
+  of canonical row-major). Kept the useful parts in `passes/layout.py`:
+  the `Layout` (I/P/F) dataclass, `get_matmul_layouts` (the tensor-engine
+  hard constraint), and `default_layout` (scored I|P|F split).
+- [x] **Layout-free segmentation.** `_segment_ops` groups on collapsed-(P,F)
+  shape compatibility only; the layout-flip break (which could only split
+  groups spuriously, since emission never read the solved layouts) is gone.
+- [x] **Reduce classifies axes locally** via `default_layout` of its input.
+- [x] `lower_graph(graph)` / `lower_to_nki(graph)` no longer take or thread
+  a `layouts` dict.
+
 ## Phase 1 — Fuse data movement via HBM views
 
 Generalize `hbm_map` from name → buffer to name → buffer + access
@@ -87,7 +109,16 @@ Prerequisite infrastructure:
   bigger tiles).
 - [ ] **Single fusion-compatibility predicate**, replacing the duplicated
   `_segment_ops` / `_collapse_ew_shape` logic, so grouping and emission
-  provably agree.
+  provably agree. Segment-first and anchor-driven: the anchor op (matmul,
+  reduce) dictates the group's tile layout; the predicate asks whether a
+  follower can join the anchor's loop in that layout.
+- [ ] **Layout at fusion boundaries.** A matmul epilogue tile arrives in the
+  matmul output layout (P=M, F=N via `get_matmul_layouts`), not the canonical
+  row-major layout the elementwise tile machinery assumes — epilogue
+  callbacks must operate in the producer's tile layout. When a candidate
+  follower needs the value in a different layout, the resolution is "break
+  the segment" (spill through HBM), recorded explicitly rather than fused
+  wrong.
 
 Fusions, in order of expected payoff (re-profile after Phase 1 to confirm):
 
@@ -101,7 +132,12 @@ Fusions, in order of expected payoff (re-profile after Phase 1 to confirm):
 
 - Cross-segment SBUF residency (graph-level SBUF cache with liveness and
   spilling) — a real scheduler; revisit only if post-Phase-2 profiles show
-  it matters.
+  it matters. This is also the point where a *global* layout pass becomes
+  meaningful: once a value stays SBUF-resident between segments, the
+  producer's stored layout constrains the consumer, and layout conflicts
+  become real decisions (insert a conversion vs. break residency). Build it
+  then as constraint propagation with explicit conversion points — not
+  first-assignment-wins.
 - Loop constructs in the IR (unrolled emission is a scalability ceiling, not
   a bandwidth cost).
 
