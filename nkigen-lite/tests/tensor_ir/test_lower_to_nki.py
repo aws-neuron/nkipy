@@ -279,6 +279,33 @@ class TestLowerInterp:
 
         _lower_and_check_interp(build, {"x": x}, (1, 512))
 
+    def test_concat_constant_inputs_splat(self):
+        """Concat where some inputs are constants: the lowering splat-fills the
+        constant windows (no HBM constant buffer) — verify values still land.
+        Mirrors the MoE router-weights assembly (concat of ~130 tiny constants
+        with a few computed values)."""
+        x = np.random.randn(1, 5).astype(np.float32)
+
+        def build(b):
+            inp = b.add_input("x", (1, 5))
+            c1 = b.constant(2.5, (1, 3))
+            c2 = b.constant(-1.0, (1, 4))
+            b.set_outputs({"y": b.concat([c1, inp, c2, c1], axis=1)})
+
+        _lower_and_check_interp(build, {"x": x}, (1, 15))
+
+    def test_concat_constant_inputs_splat_axis0(self):
+        """Same as above but on the partition axis, rank 2, uneven extents."""
+        x = np.random.randn(3, 8).astype(np.float32)
+
+        def build(b):
+            inp = b.add_input("x", (3, 8))
+            c1 = b.constant(7.0, (2, 8))
+            c2 = b.constant(0.5, (140, 8))  # > PARTITION_MAX rows
+            b.set_outputs({"y": b.concat([c1, inp, c2], axis=0)})
+
+        _lower_and_check_interp(build, {"x": x}, (145, 8))
+
     def test_chained_matmul_k512_k128(self):
         """Test chained matmul with K=512 then K=128 (SwiGLU-like pattern).
 

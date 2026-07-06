@@ -691,14 +691,89 @@ def _emit_strided_slice(nb, x_hbm, y_hbm, in_shape, out_shape, starts, strides, 
             nb.dma_copy(y_hbm, tile, dst_slices)
 
 
-def emit_concat(nb: Builder, input_hbms: list, y_hbm, input_shapes: list, axis: int, dtype) -> None:
-    """Emit concat tiling into an existing Builder."""
+def _emit_splat_window(
+    nb: Builder, y_hbm, out_shape, axis: int, dst_axis_off: int,
+    axis_extent: int, value: float, dtype, tile_cache: dict,
+) -> None:
+    """Fill the output window ``[dst_axis_off, dst_axis_off+axis_extent)`` on
+    ``axis`` (all other axes full) with a constant — no HBM source involved.
+
+    Used by ``emit_concat`` for constant inputs: instead of materializing the
+    constant in HBM and copying it in, memset an SBUF tile and store it to the
+    window. ``tile_cache`` (shared across one concat's inputs) reuses the
+    memset tile for repeated (shape, value) pairs, so a concat of many equal
+    constants pays one memset and N stores.
+    """
+    L = prod(out_shape[:axis]) if axis > 0 else 1
+    T = prod(out_shape[axis + 1:]) if axis + 1 < len(out_shape) else 1
+    A_out = out_shape[axis]
+
+    def _tile(p: int, f: int):
+        key = (p, f, value)
+        if key not in tile_cache:
+            tile_cache[key] = nb.memset(
+                nb.alloc((p, f), dtype, MemorySpace.SBUF), value)
+        return tile_cache[key]
+
+    if T == 1:
+        # Each outer's window is a contiguous flat run; fill it as one
+        # (1, extent) row per free-dim tile instead of 1-wide partition tiles.
+        dst_2d = _collapse_to_2d(nb, y_hbm, out_shape, 1, L * A_out)
+        cap = max_free_elems(dtype)
+        for outer in range(L):
+            base = outer * A_out + dst_axis_off
+            for f_i in range(ceildiv(axis_extent, cap)):
+                f_off = f_i * cap
+                f_size = min(cap, axis_extent - f_off)
+                nb.dma_copy(
+                    dst_2d, _tile(1, f_size),
+                    (DimSlice(0, 1), DimSlice(base + f_off, f_size)),
+                )
+        return
+
+    dst_2d = _collapse_to_2d(nb, y_hbm, out_shape, L * A_out, T)
+    for outer in range(L):
+        base = outer * A_out + dst_axis_off
+        for p_off, p_size, f_off, f_size in iter_pf_tiles(axis_extent, T, dtype):
+            nb.dma_copy(
+                dst_2d, _tile(p_size, f_size),
+                (DimSlice(base + p_off, p_size), DimSlice(f_off, f_size)),
+            )
+
+
+def emit_concat(nb: Builder, input_hbms: list, y_hbm, input_shapes: list, axis: int, dtype,
+                splats: list | None = None) -> None:
+    """Emit concat tiling into an existing Builder.
+
+    ``splats`` (parallel to inputs, values ``None`` or a float) marks inputs
+    that are compile-time constants: those are filled directly into their
+    output window via memset + store (``_emit_splat_window``) — the
+    corresponding ``input_hbms`` entry may be ``None``.
+    """
     rank = len(input_shapes[0])
     if axis < 0:
         axis += rank
     out_shape = list(input_shapes[0])
     out_shape[axis] = sum(s[axis] for s in input_shapes)
     out_shape = tuple(out_shape)
+
+    if splats is not None and any(s is not None for s in splats):
+        tile_cache: dict = {}
+        concat_offset = 0
+        for inp_idx, inp_shape in enumerate(input_shapes):
+            # Right-aligned rank-normalize: a splat input's shape matches the
+            # output except on the concat axis, so the (L, A, T) decomposition
+            # is taken from out_shape.
+            if splats[inp_idx] is not None:
+                _emit_splat_window(
+                    nb, y_hbm, out_shape, axis, concat_offset,
+                    inp_shape[axis], splats[inp_idx], dtype, tile_cache)
+            else:
+                _emit_axis_window_copy(
+                    nb, input_hbms[inp_idx], y_hbm, inp_shape, out_shape,
+                    axis, 0, concat_offset, inp_shape[axis], dtype)
+            concat_offset += inp_shape[axis]
+        return
 
     # Fast path: a rank>=3 concat on the last axis (all non-axis dims match by
     # definition) collapses to a 2D last-axis assembly. Each input becomes a

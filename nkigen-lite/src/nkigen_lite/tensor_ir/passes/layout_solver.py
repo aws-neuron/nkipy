@@ -1,10 +1,21 @@
 """
-Layout Solver using the (perm, split_iter, split_p) framework.
+Layout Solver: assigns each value a three-way I/P/F dim classification.
 
-Three-way I/P/F classification:
   I (iteration): loop indices, bare-int DMA, not in SBUF tile
-  P (partition): SBUF dim-0, product ≤ 128, computes in parallel
+  P (partition): SBUF dim-0, computes in parallel
   F (free):      SBUF dim-1, contiguous per partition
+
+Whole dims are assigned to groups; dims are never split or reordered within
+a group (each group keeps ascending dim order). A P-extent larger than the
+hardware partition count (128) is legal here — downstream tiling
+(compute_tile_sizes) chunks the P group to fit; the solver's default-layout
+scoring merely stops rewarding P-extent beyond 128.
+
+Solving is seeded by matmul hard constraints (tensor engine fixes P/F for
+all three operands) and propagated outward through layout-preserving ops;
+values demanded in conflicting layouts keep the first assignment (no
+conversion is planned — every op currently round-trips through
+layout-agnostic HBM, so a conflict costs correctness nothing today).
 
 Uses nkigen_lite.core.Graph as the graph representation (SSA-based IR with
 object references and use-lists).
@@ -31,7 +42,8 @@ class Layout:
     """Layout assignment for a tensor: three-way I/P/F classification.
 
     i_dims — iteration dims (bare-int loop indices, not in SBUF tile)
-    p_dims — partition dims (SBUF dim-0, product ≤ 128)
+    p_dims — partition dims (SBUF dim-0; extent may exceed 128, tiling
+             chunks it to the hardware partition count downstream)
     f_dims — free dims (SBUF dim-1, contiguous per partition)
 
     Invariant: dims within each group are always sorted ascending (row-major

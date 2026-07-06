@@ -170,16 +170,27 @@ def lower_graph(graph: Graph, layouts: dict[str, Layout]) -> nki_ir.Graph:
                 for r in op.results:
                     seg_of[r.name] = si
 
+    # Splat values of constant-op results: concat inlines these (memset straight
+    # into the output window), so a constant consumed only by concats needs no
+    # HBM buffer, no store, and no emission at all.
+    const_values: dict[str, float] = {
+        op.results[0].name: op.attrs["value"]
+        for op in graph.ops if op.opcode == "constant"
+    }
+
     # A value produced inside an elementwise segment stays on-chip (tile_map)
     # for consumers in the same segment; it needs an HBM buffer + store only
     # when some *other* segment reads it, or it is a graph output. Everything
     # else is a dead store: skipping the allocation makes the (already
-    # guarded) store loops skip it too.
+    # guarded) store loops skip it too.  A constant read by a concat does not
+    # escape: concat inlines the splat instead of loading the buffer.
     escapes: set[str] = {out_val.name for out_val in graph.outputs.values()}
     for si, seg in enumerate(segments):
         for op in seg:
             for inp in op.inputs:
                 if inp.name in seg_of and seg_of[inp.name] != si:
+                    if op.opcode == "concat" and inp.name in const_values:
+                        continue
                     escapes.add(inp.name)
 
     # Allocate HBM intermediates for op results.  Skip reshape results:
@@ -215,7 +226,7 @@ def lower_graph(graph: Graph, layouts: dict[str, Layout]) -> nki_ir.Graph:
         elif segment[0].opcode == "slice":
             _emit_slice_op(nb, segment[0], hbm_map)
         elif segment[0].opcode == "concat":
-            _emit_concat_op(nb, segment[0], hbm_map)
+            _emit_concat_op(nb, segment[0], hbm_map, const_values)
         elif segment[0].opcode == "broadcast_to":
             _emit_broadcast_op(nb, segment[0], layouts, hbm_map)
         elif segment[0].opcode == "iota":
@@ -463,6 +474,20 @@ def _emit_elementwise_segment(
     nb: Builder, ops: list, layouts: dict[str, Layout], hbm_map: dict[str, Value],
 ) -> None:
     """Emit a fused elementwise segment: one tiled loop for all ops."""
+    # Prune ops whose results neither escape (have an HBM buffer) nor feed a
+    # kept op later in the segment — e.g. constants whose only consumer is a
+    # concat that splat-fills them. Emitting them would burn a memset per tile.
+    needed: set[str] = set()
+    kept: list = []
+    for op in reversed(ops):
+        if any(r.name in hbm_map or r.name in needed for r in op.results):
+            kept.append(op)
+            needed.update(inp.name for inp in op.inputs)
+    kept.reverse()
+    if not kept:
+        return
+    ops = kept
+
     # Use a canonical row-major layout for elementwise segments. HBM is
     # layout-agnostic, so all loads/stores address data by logical dimension
     # coordinates — the declared layout of individual values is irrelevant.
@@ -712,17 +737,30 @@ def _emit_slice_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
     )
 
 
-def _emit_concat_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
+def _emit_concat_op(
+    nb: Builder, op, hbm_map: dict[str, Value],
+    const_values: dict[str, float] | None = None,
+) -> None:
     out_val = op.results[0]
     axis = op.attrs["axis"]
     rank = len(out_val.type.shape)
     if axis < 0:
         axis += rank
-    input_hbms = [hbm_map[v.name] for v in op.inputs]
+    # Constant inputs are splat-filled straight into the output window (no HBM
+    # buffer, no load) — see emit_concat. Their hbm_map entry may not exist.
+    const_values = const_values or {}
+    splats = [const_values.get(v.name) for v in op.inputs]
+    input_hbms = [hbm_map.get(v.name) for v in op.inputs]
+    if any(h is None and s is None for h, s in zip(input_hbms, splats)):
+        raise KeyError(
+            f"concat input missing HBM buffer and not a constant: "
+            f"{[v.name for v in op.inputs]}"
+        )
     input_shapes = [v.type.shape for v in op.inputs]
     emit_concat(
         nb, input_hbms, hbm_map[out_val.name],
         input_shapes, axis, op.inputs[0].type.dtype,
+        splats=splats if any(s is not None for s in splats) else None,
     )
 
 
@@ -1049,6 +1087,55 @@ def _emit_scatter_rows_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
             )
 
 
+def _emit_gather_rows_packed(
+    nb: Builder, src_hbm, idx_hbm, out_hbm, N: int, W: int, M: int,
+    vdtype, idtype,
+) -> None:
+    """Gather wide rows with the partition packed.
+
+    Views the (N, W) table as (N*128, W/128): row ``i`` of the original table
+    becomes the 128 consecutive sub-rows ``i*128 + lane``. Per output row, the
+    dynamic index is fanned across the partition (stride-0 load), scaled by
+    128, and offset by a per-lane iota; one indirect DMA then fetches the whole
+    row as a (128, W/128) tile. 9 ops per row vs ``2 + 3*ceil(W/w_tile)`` for
+    the column-window path (~212 for an MoE expert weight).
+    """
+    sub_w = W // PARTITION_MAX
+    src_sub = nb.view(src_hbm, (N * PARTITION_MAX, sub_w))
+    out_sub = nb.view(out_hbm, (M * PARTITION_MAX, sub_w))
+
+    # Per-lane offset (p) and the scale constant, hoisted across rows.
+    lane = nb.iota(
+        nb.alloc((PARTITION_MAX, 1), idtype, MemorySpace.SBUF),
+        pattern=[[0, 1]], offset=0, channel_multiplier=1,
+    )
+    scale = nb.constant(
+        float(PARTITION_MAX), (PARTITION_MAX, 1), idtype, MemorySpace.SBUF)
+
+    for r in range(M):
+        # idx[r] fanned across all 128 lanes, then sub_idx = idx*128 + lane.
+        idx_rep = nb.dma_copy(
+            nb.alloc((PARTITION_MAX, 1), idtype, MemorySpace.SBUF),
+            idx_hbm, (DimSlice(r, PARTITION_MAX, stride=0), DimSlice(0, 1)),
+        )
+        scaled = nb.tensor_scalar_arith(
+            nb.alloc((PARTITION_MAX, 1), idtype, MemorySpace.SBUF),
+            idx_rep, scale, nki_ir.NisaArithOp.MULTIPLY,
+        )
+        sub_idx = nb.tensor_tensor_arith(
+            nb.alloc((PARTITION_MAX, 1), idtype, MemorySpace.SBUF),
+            scaled, lane, nki_ir.NisaArithOp.ADD,
+        )
+        row_tile = nb.dma_copy_indirect(
+            nb.alloc((PARTITION_MAX, sub_w), vdtype, MemorySpace.SBUF),
+            src_sub, sub_idx,
+        )
+        nb.dma_copy(
+            out_sub, row_tile,
+            (DimSlice(r * PARTITION_MAX, PARTITION_MAX), DimSlice(0, sub_w)),
+        )
+
+
 def _emit_gather_rows_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
     """Lower gather_rows: ``out[r, :] = src[idx[r], :]`` via the indirect DMA
     load (``dma_copy_indirect``), gathering whole rows from the (N, W) src HBM
@@ -1065,11 +1152,32 @@ def _emit_gather_rows_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
     vdtype = out_val.type.dtype
     idtype = idx_val.type.dtype
 
+    # Fast path: wide rows, few of them (the MoE expert-weight gather is M=1,
+    # W=786432). The generic path below windows each row into ceil(W/w_tile)
+    # column DMAs that use ONE of the 128 partition lanes each (~200+ ops per
+    # expert weight). A gathered row is contiguous in HBM, so instead view the
+    # table as (N*128, W/128), expand the dynamic index to the row's 128
+    # sub-rows (idx*128 + lane, via iota), and fetch the whole row with a
+    # single partition-packed indirect DMA (~12 ops). Only when it actually
+    # wins: packed emits ~9 ops per output row while the generic path amortizes
+    # its windows over 128-row chunks, so tall gathers keep the generic path.
+    w_tile = min(W, max_free_elems(vdtype))
+    n_windows = ceildiv(W, w_tile)
+    packed_cost = 6 + 9 * M
+    generic_cost = ceildiv(M, PARTITION_MAX) * (2 + 3 * n_windows)
+    if (
+        W % PARTITION_MAX == 0
+        and W // PARTITION_MAX <= max_free_elems(vdtype)
+        and packed_cost < generic_cost
+    ):
+        _emit_gather_rows_packed(
+            nb, src_hbm, idx_hbm, out_hbm, N, W, M, vdtype, idtype)
+        return
+
     # Tile the row width: a single (m_size, W) tile would overflow SBUF for
     # wide rows (e.g. an MoE expert's flattened weight, W=786432). Gather a
     # column window [w_off, w_off+w_size) per DMA, addressing the full row
     # stride W via row_width so the index still selects whole source rows.
-    w_tile = min(W, max_free_elems(vdtype))
     for m_i in range(ceildiv(M, PARTITION_MAX)):
         m_off = m_i * PARTITION_MAX
         m_size = min(PARTITION_MAX, M - m_off)

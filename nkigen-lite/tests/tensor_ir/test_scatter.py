@@ -137,6 +137,8 @@ GATHER_CASES = [
     (16, 8, 4),       # tiny
     (300, 16, 5),     # N > PARTITION_MAX (tall table, e.g. embedding)
     (64, 8, 200),     # M > PARTITION_MAX (gather tiling)
+    (4, 46080, 1),    # wide row, M=1 (partition-packed path, MoE expert weight)
+    (4, 131072, 3),   # wide row, M=3 (packed path with per-row index fan, r>0)
 ]
 
 
