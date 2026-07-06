@@ -29,6 +29,28 @@ Cheap, independent, no restructuring.
   aligned with the rep loop. No effect on the (all-F32) qwen3 profile; pays
   on bf16 models.
 
+## Phase 0.5 — Profile-driven hotspot fixes (added after baseline)
+
+The baseline attribution showed three hotspots the original plan under-ranked;
+fixed before Phase 1:
+
+- [x] **Partition-packed wide-row gather_rows.** The MoE expert-weight gather
+  (M=1, W=786432) emitted ~212 single-lane column-window indirect DMAs per
+  expert. Packed path: view the (N, W) table as (N*128, W/128), expand the
+  dynamic index to idx*128 + lane (iota), fetch the row as one
+  partition-packed indirect DMA. Cost model keeps tall gathers (embedding)
+  on the generic path. 20416 → 1920 gather ops.
+- [x] **Splat-fill constant concat inputs.** The router-weight assembly
+  concats ~130 scalar constants per token; each constant was materialized in
+  HBM and copied in. Now `emit_concat` memsets an SBUF tile and stores it
+  straight into the output window (per-concat tile cache; dead constants
+  pruned from elementwise segments). 7330 → 6739 concat ops **and**
+  elementwise 10270 → 3274 (the constants' emission was attributed there).
+- [x] Remaining transpose cost investigated: (1,4096,8,128) head/seq swaps
+  are pure DMA remapping already near-minimal; scores transpose (0,1,3,2)
+  misses the passthrough path because I*J=524288 exceeds the SBUF free
+  budget. ~2.9k ops (6.7%) — not worth further effort before Phase 2.
+
 ## Phase 1 — Fuse data movement via HBM views
 
 Generalize `hbm_map` from name → buffer to name → buffer + access
@@ -91,3 +113,4 @@ Fusions, in order of expected payoff (re-profile after Phase 1 to confirm):
 |------|--------|-----------------|-------|
 | 2026-07-05 | Baseline (plan created) | 80332 nki (17.3x), 23017 dma_copy | L=8; top: gather_rows 20416, matmul 11504, elementwise 10486 (3685 dmas), concat 7330 |
 | 2026-07-05 | Phase 0: dead-store elim + dtype-aware ew tiles | 79932 nki (17.2x), 22833 dma_copy | elementwise 10270 (3501 dmas); all-F32 model so dtype-aware tiling is a no-op here |
+| 2026-07-05 | Phase 0.5: packed gather + splat concat | 42805 nki (9.2x), 11577 dma_copy | gather_rows 20416→1920, elementwise →3274, concat →6739; indirect DMAs 6720→128 |

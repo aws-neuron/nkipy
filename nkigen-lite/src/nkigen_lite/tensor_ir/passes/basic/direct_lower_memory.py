@@ -692,22 +692,21 @@ def _emit_strided_slice(nb, x_hbm, y_hbm, in_shape, out_shape, starts, strides, 
 
 
 def _emit_splat_window(
-    nb: Builder, y_hbm, out_shape, axis: int, dst_axis_off: int,
+    nb: Builder, dst_2d, L: int, T: int, A_out: int, dst_axis_off: int,
     axis_extent: int, value: float, dtype, tile_cache: dict,
 ) -> None:
     """Fill the output window ``[dst_axis_off, dst_axis_off+axis_extent)`` on
-    ``axis`` (all other axes full) with a constant — no HBM source involved.
+    the concat axis (all other axes full) with a constant — no HBM source.
 
-    Used by ``emit_concat`` for constant inputs: instead of materializing the
-    constant in HBM and copying it in, memset an SBUF tile and store it to the
-    window. ``tile_cache`` (shared across one concat's inputs) reuses the
-    memset tile for repeated (shape, value) pairs, so a concat of many equal
-    constants pays one memset and N stores.
+    ``dst_2d`` is the output pre-collapsed by the caller: ``(1, L*A_out)``
+    when ``T == 1`` (the window is then a contiguous flat run per outer index)
+    or ``(L*A_out, T)`` otherwise. Used by ``emit_concat`` for constant
+    inputs: instead of materializing the constant in HBM and copying it in,
+    memset an SBUF tile and store it to the window. ``tile_cache`` (shared
+    across one concat's inputs) reuses the memset tile for repeated
+    (shape, value) pairs, so a concat of many equal constants pays one memset
+    and N stores.
     """
-    L = prod(out_shape[:axis]) if axis > 0 else 1
-    T = prod(out_shape[axis + 1:]) if axis + 1 < len(out_shape) else 1
-    A_out = out_shape[axis]
-
     def _tile(p: int, f: int):
         key = (p, f, value)
         if key not in tile_cache:
@@ -716,9 +715,8 @@ def _emit_splat_window(
         return tile_cache[key]
 
     if T == 1:
-        # Each outer's window is a contiguous flat run; fill it as one
-        # (1, extent) row per free-dim tile instead of 1-wide partition tiles.
-        dst_2d = _collapse_to_2d(nb, y_hbm, out_shape, 1, L * A_out)
+        # Fill as (1, extent) rows per free-dim tile instead of 1-wide
+        # partition tiles.
         cap = max_free_elems(dtype)
         for outer in range(L):
             base = outer * A_out + dst_axis_off
@@ -731,7 +729,6 @@ def _emit_splat_window(
                 )
         return
 
-    dst_2d = _collapse_to_2d(nb, y_hbm, out_shape, L * A_out, T)
     for outer in range(L):
         base = outer * A_out + dst_axis_off
         for p_off, p_size, f_off, f_size in iter_pf_tiles(axis_extent, T, dtype):
@@ -758,15 +755,22 @@ def emit_concat(nb: Builder, input_hbms: list, y_hbm, input_shapes: list, axis: 
     out_shape = tuple(out_shape)
 
     if splats is not None and any(s is not None for s in splats):
+        # (L, A, T) decomposition of the output around the concat axis; each
+        # input is a window of A. Collapse the destination once (all splat
+        # windows share the same 2D view).
+        L = prod(out_shape[:axis]) if axis > 0 else 1
+        T = prod(out_shape[axis + 1:]) if axis + 1 < len(out_shape) else 1
+        A_out = out_shape[axis]
+        if T == 1:
+            dst_2d = _collapse_to_2d(nb, y_hbm, out_shape, 1, L * A_out)
+        else:
+            dst_2d = _collapse_to_2d(nb, y_hbm, out_shape, L * A_out, T)
         tile_cache: dict = {}
         concat_offset = 0
         for inp_idx, inp_shape in enumerate(input_shapes):
-            # Right-aligned rank-normalize: a splat input's shape matches the
-            # output except on the concat axis, so the (L, A, T) decomposition
-            # is taken from out_shape.
             if splats[inp_idx] is not None:
                 _emit_splat_window(
-                    nb, y_hbm, out_shape, axis, concat_offset,
+                    nb, dst_2d, L, T, A_out, concat_offset,
                     inp_shape[axis], splats[inp_idx], dtype, tile_cache)
             else:
                 _emit_axis_window_copy(
