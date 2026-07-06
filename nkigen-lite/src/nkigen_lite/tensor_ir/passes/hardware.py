@@ -1,16 +1,35 @@
-"""Hardware profiles for Trainium/Inferentia targets.
+"""Hardware profile for the TRN2 (gen2) target.
 
-Each profile captures the timing and bandwidth parameters needed by the cost
-model. Add new targets (TRN3, TRN4, ...) as additional instances.
+NOT CURRENTLY WIRED UP: no cost model in nkigen-lite consumes these fields
+yet, and ``lower_to_nki``'s ``target`` parameter is accepted but never read
+— passing a different profile has no effect on lowering today. The
+timing/bandwidth numbers below are measured constants for TRN2/gen2 hardware,
+not a general spec; there is only one profile because nothing else has been
+measured. Extend with additional instances (TRN3, TRN4, ...) once a cost
+model or multi-target lowering actually reads ``target``.
+
+The partition/memory-capacity fields mirror the constants in
+``nki_ir.ir`` (``PARTITION_MAX``, ``SBUF_PER_PARTITION_BYTES``,
+``PSUM_PER_PARTITION_BYTES``), which are what the nki_ir graph verifier
+actually enforces — those remain the single source of truth for tile
+legality; this profile just exposes them alongside the cost-model fields.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+from nkigen_lite.nki_ir.ir import (
+    MATMUL_STATIONARY_FREE_MAX,
+    PARTITION_MAX,
+    PSUM_FREE_MAX,
+    PSUM_PER_PARTITION_BYTES,
+    SBUF_PER_PARTITION_BYTES,
+)
 
 
 @dataclass(frozen=True)
 class HardwareProfile:
-    """Hardware parameters for cost modeling and tile planning."""
+    """TRN2/gen2 timing, bandwidth, and tile-capacity parameters."""
 
     # DMA engine
     dma_bw_per_engine: float = 23e9       # bytes/sec per engine
@@ -35,19 +54,17 @@ class HardwareProfile:
     gpsimd_write_drain: float = 218e-9    # seconds
     gpsimd_sem_to_start: float = 186e-9   # seconds
 
-    # Partition constraints
-    partition_max: int = 128
-
-    # Memory capacities
-    psum_free_max: int = 512              # max F-elements in PSUM (matmul output)
-    matmul_stat_free_max: int = 128
-    sbuf_per_partition_bytes: int = 180_224
-    psum_per_partition_bytes: int = 16 * 1024
+    # Partition/memory constraints — mirrors nki_ir.ir; see module docstring.
+    partition_max: int = field(default=PARTITION_MAX)
+    psum_free_max: int = field(default=PSUM_FREE_MAX)
+    matmul_stat_free_max: int = field(default=MATMUL_STATIONARY_FREE_MAX)
+    sbuf_per_partition_bytes: int = field(default=SBUF_PER_PARTITION_BYTES)
+    psum_per_partition_bytes: int = field(default=PSUM_PER_PARTITION_BYTES)
 
     @property
     def dma_bw(self) -> float:
         return self.dma_bw_per_engine * self.dma_num_engines
 
 
-# Named targets
+# The only measured target so far — see module docstring.
 TRN2 = HardwareProfile()

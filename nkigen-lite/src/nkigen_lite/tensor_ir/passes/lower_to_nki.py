@@ -26,7 +26,10 @@ def lower_to_nki(
 
     Args:
         graph: tensor_ir Graph to lower.
-        target: Hardware target parameters.
+        target: Hardware target parameters. Currently unused — no pass in
+            this pipeline reads it yet (tile-legality constants are instead
+            imported directly from nki_ir.ir). Accepted for forward
+            compatibility with a future cost model / multi-target lowering.
         layouts: Pre-assigned layouts (skips layout solver if given).
         skip_canonicalize: Skip the canonicalize pass.
         skip_decompose: Skip the decompose pass.
