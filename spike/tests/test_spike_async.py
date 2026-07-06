@@ -26,21 +26,13 @@ except ImportError as e:
     pytest.skip(f"Required packages not available: {e}", allow_module_level=True)
 
 # Matmul shapes per --test-mode, expressed as (x_shape, y_shape) for out = x @ y.
-#
-# The "overlapping" shape is tuned so that, with the weights `y` pre-written once
-# (mimicking ML model parameters), a single iteration's `write x` + `read out`
-# data-movement time balances the matmul execution time (~4 ms each on the
-# reference hardware). The balance follows from the measured rates
-# (write 0.3125 ms/MiB, read 0.09375 ms/MiB, exec 1.46e-11 ms/MAC): writing x
-# (M*K) plus reading out (M*N) equals exec (M*K*N) when 1.79e-7/K + 5.96e-7/N ~=
-# 1.46e-11. All dims are powers of 2: K=32768, N=65536 satisfies it (the M factor
-# cancels, so M=128 just sets the absolute scale -- exec mid-range at ~4 ms).
-# Then write x = 8 MiB (2.5 ms), read out = 16 MiB (1.5 ms), exec ~= 4 ms.
-# Note: the pre-written weights y are 32768*65536 fp16 = 4 GiB per core.
 def _matmul_shapes(test_mode):
     if test_mode == "overlapping":
+        # Large enough for more overlapping opportunities
+        # Run roughly as long as the tensor_read/write for a good pipeline
         return (128, 32768), (32768, 65536)
-    else:  # correctness -- small enough for a CPU reference check
+    else:
+        # Small enough for a CPU reference check
         return (128, 256), (256, 128)
 
 
