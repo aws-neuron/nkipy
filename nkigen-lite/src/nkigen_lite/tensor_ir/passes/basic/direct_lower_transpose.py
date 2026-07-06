@@ -19,6 +19,9 @@ Optimization: adjacent dims that stay consecutive under the permutation are merg
 into a single axis before tiling (_collapse_perm). This dramatically reduces the
 number of batch iterations for cases like (Co, Ci, *K) -> (Co, *K, Ci) where the
 spatial dims K form a single contiguous run in the output.
+
+``emit_transpose`` / ``emit_transpose_te`` are the single implementations; the
+``lower_transpose_*`` entry points are thin standalone-graph wrappers over them.
 """
 
 from __future__ import annotations
@@ -32,10 +35,13 @@ from nkigen_lite.nki_ir.ir import (
     MemorySpace,
     PARTITION_MAX,
 )
+from nkigen_lite.nki_ir.insert_deallocs import insert_deallocs
 
 from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
     ceildiv,
     flat_range_to_src_chunks,
+    max_free_elems,
+    prefix_row_segments,
     row_major_strides,
     unravel,
 )
@@ -175,267 +181,14 @@ def _can_use_passthrough_partition(
     Requirements:
       - Collapsed rank == 3 with perm == (0, 2, 1): leading dim is passthrough
         and only the last two dims are swapped.
-      - I * J (the product of the two transposed dims) fits in SBUF free dim.
+      - I * J (the product of the two transposed dims) fits in SBUF free dim
+        (two tiles are live at once — src + transposed dst — which the shared
+        ``max_free_elems`` budget already accounts for).
     """
     if len(c_perm) != 3 or c_perm != (0, 2, 1):
         return False
     _B, I, J = c_in
-    free_elts = I * J
-    # SBUF free-dim budget: need two tiles (src + dst) each of width I*J or J*I.
-    # Conservative limit: 48 KiB per tile for f32 -> 12288 elements.
-    bytes_per_elem = {DType.F32: 4, DType.F16: 2, DType.BF16: 2}.get(dtype, 4)
-    max_free = 49152 // bytes_per_elem
-    return free_elts <= max_free
-
-
-def _lower_transpose_passthrough_partition(
-    in_shape: tuple[int, ...],
-    perm: tuple[int, ...],
-    c_in: tuple[int, ...],
-    groups: list[list[int]],
-    dtype: DType,
-) -> Graph:
-    """Fast transpose for (B, I, J) -> (B, J, I) using access-pattern remapping.
-
-    Folds the leading passthrough dim B into the partition. Loads tiles of
-    (P_tile, I*J) from HBM, uses access_pattern + tensor_copy to transpose
-    I and J on-chip, then stores (P_tile, J*I) to HBM. This matches what
-    the neuronx-cc compiler generates via its DVE transpose kernel.
-
-    Produces O(B/128) instructions instead of O(B * ceil(I/128) * ceil(J/128)).
-    """
-    out_shape = tuple(in_shape[p] for p in perm)
-    B, I, J = c_in
-
-    b = Builder("transpose_dma")
-    # Declare HBM tensors at original rank for correct emit_to_kb mapping
-    x_hbm = b.add_input("x", in_shape, dtype)
-    y_hbm = b.add_input("y", out_shape, dtype)
-
-    # We view both HBM tensors as 2D: (B, I*J) and (B, J*I)
-    # by providing DimSlices that flatten the inner dims.
-    in_strides = row_major_strides(in_shape)
-    out_strides = row_major_strides(out_shape)
-
-    for p0 in range(0, B, PARTITION_MAX):
-        p_size = min(PARTITION_MAX, B - p0)
-
-        # Load (p_size, I*J) from x_hbm
-        # The source region is p_size rows at the partition boundary of in_shape.
-        # Since B is a prefix-product of in_shape (from collapse), p0..p0+p_size
-        # maps to a contiguous region.
-        src_chunks = flat_range_to_src_chunks(
-            p0 * I * J, p_size * I * J, in_shape, in_strides
-        )
-        (src_slices, _), = src_chunks
-
-        tile = b.dma_copy(
-            b.alloc((p_size, I * J), dtype, MemorySpace.SBUF),
-            x_hbm, src_slices,
-        )
-
-        # On-chip transpose via access_pattern + tensor_copy.
-        # Source tile layout: (P, I*J) where each partition row stores
-        # I groups of J contiguous elements:
-        #   flat: i0_j0, i0_j1, ..., i0_{J-1}, i1_j0, ..., i_{I-1}_{J-1}
-        #
-        # We want output per row in (J outer, I inner) order:
-        #   j0_i0, j0_i1, ..., j0_{I-1}, j1_i0, ..., j_{J-1}_{I-1}
-        #
-        # Read via AP with transposed addressing, write to a fresh 2D tile.
-        # The AP reads (p_size, J*I) elements from tile by walking J positions
-        # at stride 1, then I positions at stride J:
-        #   [[I*J, p_size], [1, J], [J, I]]
-        src_view = b.access_pattern(
-            tile, [[I * J, p_size], [1, J], [J, I]]
-        )
-
-        # Allocate destination with matching shape and tensor_copy into it.
-        dst_tile = b.alloc((p_size, J, I), dtype, MemorySpace.SBUF)
-        b.tensor_copy(dst_tile, src_view)
-        b.dealloc(tile)
-
-        # Store (p_size, J*I) to y_hbm
-        dst_chunks = flat_range_to_src_chunks(
-            p0 * J * I, p_size * J * I, out_shape, out_strides
-        )
-        (dst_slices, _), = dst_chunks
-        b.dma_copy(y_hbm, dst_tile, dst_slices)
-        b.dealloc(dst_tile)
-
-    b.set_outputs({"y": y_hbm})
-    return b.graph
-
-
-def lower_transpose_dma(
-    in_shape: tuple[int, ...],
-    perm: tuple[int, ...] | None = None,
-    dtype: DType = DType.F32,
-) -> Graph:
-    """Lower arbitrary transpose via DMA engine.
-
-    Args:
-        in_shape: Input tensor shape, rank >= 2.
-        perm: Permutation of axes. None defaults to swapping last two dims.
-        dtype: Element type.
-
-    Batch dim reordering is handled by reading from remapped HBM coordinates.
-    P↔F swap (when needed) uses dma_transpose on-chip. Both P and F tiles
-    are capped at 128 since after transposing, either could be a partition dim.
-    """
-    rank = len(in_shape)
-    if rank < 2:
-        raise ValueError("input must be rank >= 2")
-    if perm is None:
-        perm = tuple(range(rank - 2)) + (rank - 1, rank - 2)
-    if sorted(perm) != list(range(rank)):
-        raise ValueError(f"invalid permutation: {perm}")
-
-    c_in, c_perm, groups, src_order = _collapse_perm(in_shape, perm)
-    c_out = tuple(c_in[p] for p in c_perm)
-    c_rank = len(c_out)
-    out_shape = tuple(in_shape[p] for p in perm)
-
-    # Fast path: when collapsed to (B, I, J) perm (0,2,1) and I*J fits in SBUF,
-    # fold B into partition and transpose via access-pattern remapping.
-    if _can_use_passthrough_partition(c_in, c_perm, dtype):
-        return _lower_transpose_passthrough_partition(
-            in_shape, perm, c_in, groups, dtype
-        )
-
-    b = Builder("transpose_dma")
-    x_hbm = b.add_input("x", in_shape, dtype)
-    y_hbm = b.add_input("y", out_shape, dtype)
-
-    if c_rank < 2:
-        # Identity permutation after collapse — fall back to uncollapsed.
-        groups = [[d] for d in perm]
-        c_out = out_shape
-        c_rank = rank
-        c_perm = perm
-
-    swap_pf = _needs_pf_swap(c_perm)
-    tile_p = min(c_out[-2], PARTITION_MAX)
-    tile_f = min(c_out[-1], PARTITION_MAX) if swap_pf else c_out[-1]
-
-    for src_slices, dst_slices, p_cov, f_cov in _tile_iter(
-        in_shape, perm, groups, c_out, c_rank, tile_p, tile_f
-    ):
-        if swap_pf:
-            tile = b.dma_copy(
-                b.alloc((f_cov, p_cov), dtype, MemorySpace.SBUF),
-                x_hbm, src_slices,
-            )
-            transposed = b.transpose(tile, (1, 0))
-            b.dealloc(tile)
-            b.dma_copy(y_hbm, transposed, dst_slices)
-            b.dealloc(transposed)
-        else:
-            tile = b.dma_copy(
-                b.alloc((p_cov, f_cov), dtype, MemorySpace.SBUF),
-                x_hbm, src_slices,
-            )
-            b.dma_copy(y_hbm, tile, dst_slices)
-            b.dealloc(tile)
-
-    b.set_outputs({"y": y_hbm})
-    return b.graph
-
-
-def lower_transpose_te(
-    in_shape: tuple[int, ...],
-    perm: tuple[int, ...] | None = None,
-    dtype: DType = DType.F32,
-) -> Graph:
-    """Lower arbitrary transpose via tensor engine (A.T @ I trick).
-
-    Args:
-        in_shape: Input tensor shape, rank >= 2.
-        perm: Permutation of axes. None defaults to swapping last two dims.
-        dtype: Element type.
-
-    Batch dim reordering is DMA slice remapping (same as DMA strategy). For
-    the P↔F swap, uses matmul:
-      stat[K=f_size, M=p_size].T @ I[K=f_size, N=f_size] -> dst[p_size, f_size]
-
-    The loaded source tile is (f_size, p_size) — used as stationary with K=f_size,
-    M=p_size. The identity I is (f_size, f_size). The result stat.T @ I is
-    (p_size, f_size) = the transposed tile.
-
-    Constraints: K=f_size <= 128, M=p_size <= 128, N=f_size <= 512.
-    So both tile_p and tile_f are capped at 128.
-
-    When no P↔F swap is needed, falls back to plain DMA copy.
-
-    Requires an identity matrix as HBM input ("eye").
-    """
-    rank = len(in_shape)
-    if rank < 2:
-        raise ValueError("input must be rank >= 2")
-    if perm is None:
-        perm = tuple(range(rank - 2)) + (rank - 1, rank - 2)
-    if sorted(perm) != list(range(rank)):
-        raise ValueError(f"invalid permutation: {perm}")
-
-    c_in, c_perm, groups, src_order = _collapse_perm(in_shape, perm)
-    c_out = tuple(c_in[p] for p in c_perm)
-    c_rank = len(c_out)
-    out_shape = tuple(in_shape[p] for p in perm)
-
-    if c_rank < 2:
-        groups = [[d] for d in perm]
-        c_out = out_shape
-        c_rank = rank
-        c_perm = perm
-
-    swap_pf = _needs_pf_swap(c_perm)
-    tile_p = min(c_out[-2], PARTITION_MAX)
-    tile_f = min(c_out[-1], PARTITION_MAX) if swap_pf else c_out[-1]
-    eye_size = tile_f if swap_pf else 0
-
-    bld = Builder("transpose_te")
-    x_hbm = bld.add_input("x", in_shape, dtype)
-    if swap_pf:
-        y_hbm = bld.add_input("y", out_shape, DType.F32)
-        eye_hbm = bld.add_input("eye", (eye_size, eye_size), dtype)
-    else:
-        y_hbm = bld.add_input("y", out_shape, dtype)
-
-    for src_slices, dst_slices, p_cov, f_cov in _tile_iter(
-        in_shape, perm, groups, c_out, c_rank, tile_p, tile_f
-    ):
-        if swap_pf:
-            stat = bld.dma_copy(
-                bld.alloc((f_cov, p_cov), dtype, MemorySpace.SBUF),
-                x_hbm, src_slices,
-            )
-            eye_tile = bld.dma_copy(
-                bld.alloc((f_cov, f_cov), dtype, MemorySpace.SBUF),
-                eye_hbm,
-                (DimSlice(0, f_cov), DimSlice(0, f_cov)),
-            )
-
-            psum = bld.alloc((p_cov, f_cov), DType.F32, MemorySpace.PSUM)
-            bld.matmul(psum, stat, eye_tile, accumulate=False)
-            bld.dealloc(stat)
-            bld.dealloc(eye_tile)
-
-            out_sbuf = bld.tensor_copy(
-                bld.alloc((p_cov, f_cov), DType.F32, MemorySpace.SBUF), psum
-            )
-            bld.dealloc(psum)
-            bld.dma_copy(y_hbm, out_sbuf, dst_slices)
-            bld.dealloc(out_sbuf)
-        else:
-            tile = bld.dma_copy(
-                bld.alloc((p_cov, f_cov), dtype, MemorySpace.SBUF),
-                x_hbm, src_slices,
-            )
-            bld.dma_copy(y_hbm, tile, dst_slices)
-            bld.dealloc(tile)
-
-    bld.set_outputs({"y": y_hbm})
-    return bld.graph
+    return I * J <= max_free_elems(dtype)
 
 
 def emit_transpose(
@@ -453,7 +206,10 @@ def emit_transpose(
     c_out = tuple(c_in[p] for p in c_perm)
     c_rank = len(c_out)
 
-    # Fast path: passthrough-partition (same logic as lower_transpose_dma)
+    # Fast path: (B, I, J) -> (B, J, I) with the leading collapsed dim folded
+    # onto the partition; the I/J swap happens on-chip via access-pattern
+    # remapping + tensor_copy (matches the neuronx-cc DVE transpose kernel).
+    # Produces O(B/128) instructions instead of O(B * ceil(I/128) * ceil(J/128)).
     if _can_use_passthrough_partition(c_in, c_perm, dtype):
         out_shape = tuple(in_shape[p] for p in perm)
         B, I, J = c_in
@@ -461,22 +217,29 @@ def emit_transpose(
         out_strides = row_major_strides(out_shape)
         for p0 in range(0, B, PARTITION_MAX):
             p_size = min(PARTITION_MAX, B - p0)
-            src_chunks = flat_range_to_src_chunks(
-                p0 * I * J, p_size * I * J, in_shape, in_strides)
-            (src_slices, _), = src_chunks
-            tile = nb.dma_copy(
-                nb.alloc((p_size, I * J), dtype, MemorySpace.SBUF),
-                x_hbm, src_slices,
-            )
-            src_view = nb.access_pattern(
-                tile, [[I * J, p_size], [1, J], [J, I]]
-            )
-            dst_tile = nb.alloc((p_size, J, I), dtype, MemorySpace.SBUF)
-            nb.tensor_copy(dst_tile, src_view)
-            dst_chunks = flat_range_to_src_chunks(
-                p0 * J * I, p_size * J * I, out_shape, out_strides)
-            (dst_slices, _), = dst_chunks
-            nb.dma_copy(y_hbm, dst_tile, dst_slices)
+            # When B collapses several leading dims, a 128-row tile is a single
+            # HBM rectangle only if its boundaries land on a leading-dim
+            # boundary of BOTH shapes (I*J == J*I elements per row on each
+            # side, so one segmentation covers both). Split into segments that
+            # are one rectangle on both sides — e.g. (2,100,8,64) perm
+            # (0,1,3,2): B=200 collapses (2,100), and the second tile's rows
+            # [128,200) straddle the boundary at row 100.
+            for rows, src_slices, dst_slices in prefix_row_segments(
+                p0, p_size, I * J, in_shape, in_strides, out_shape, out_strides,
+            ):
+                tile = nb.dma_copy(
+                    nb.alloc((rows, I * J), dtype, MemorySpace.SBUF),
+                    x_hbm, src_slices,
+                )
+                # Source tile row layout is I groups of J contiguous elements;
+                # the AP walks J at stride 1 then I at stride J, i.e.
+                # (J outer, I inner).
+                src_view = nb.access_pattern(
+                    tile, [[I * J, rows], [1, J], [J, I]]
+                )
+                dst_tile = nb.alloc((rows, J, I), dtype, MemorySpace.SBUF)
+                nb.tensor_copy(dst_tile, src_view)
+                nb.dma_copy(y_hbm, dst_tile, dst_slices)
         return
 
     if c_rank < 2:
@@ -505,3 +268,154 @@ def emit_transpose(
                 x_hbm, src_slices,
             )
             nb.dma_copy(y_hbm, tile, dst_slices)
+
+
+def emit_transpose_te(
+    nb: Builder,
+    x_hbm,
+    y_hbm,
+    eye_hbm,
+    in_shape: tuple[int, ...],
+    perm: tuple[int, ...],
+    dtype: DType = DType.F32,
+) -> None:
+    """Emit transpose tiling into an existing Builder (tensor engine strategy).
+
+    Batch dim reordering is DMA slice remapping (same as the DMA strategy). For
+    the P↔F swap, uses matmul:
+      stat[K=f_size, M=p_size].T @ I[K=f_size, N=f_size] -> dst[p_size, f_size]
+
+    The loaded source tile is (f_size, p_size) — used as stationary with
+    K=f_size, M=p_size. The identity I is (f_size, f_size). The result
+    stat.T @ I is (p_size, f_size) = the transposed tile.
+
+    Constraints: K=f_size <= 128, M=p_size <= 128, N=f_size <= 512.
+    So both tile_p and tile_f are capped at 128.
+
+    ``eye_hbm`` must be an HBM identity of at least (tile_f, tile_f) when the
+    permutation swaps P↔F; it is unused (may be None) otherwise, in which case
+    this degenerates to a plain DMA copy.
+    """
+    rank = len(in_shape)
+
+    c_in, c_perm, groups, src_order = _collapse_perm(in_shape, perm)
+    c_out = tuple(c_in[p] for p in c_perm)
+    c_rank = len(c_out)
+
+    if c_rank < 2:
+        groups = [[d] for d in perm]
+        c_out = tuple(in_shape[p] for p in perm)
+        c_rank = rank
+        c_perm = perm
+
+    swap_pf = _needs_pf_swap(c_perm)
+    tile_p = min(c_out[-2], PARTITION_MAX)
+    tile_f = min(c_out[-1], PARTITION_MAX) if swap_pf else c_out[-1]
+
+    if swap_pf and eye_hbm is None:
+        raise ValueError("emit_transpose_te: P↔F swap requires an eye_hbm identity")
+
+    for src_slices, dst_slices, p_cov, f_cov in _tile_iter(
+        in_shape, perm, groups, c_out, c_rank, tile_p, tile_f
+    ):
+        if swap_pf:
+            stat = nb.dma_copy(
+                nb.alloc((f_cov, p_cov), dtype, MemorySpace.SBUF),
+                x_hbm, src_slices,
+            )
+            eye_tile = nb.dma_copy(
+                nb.alloc((f_cov, f_cov), dtype, MemorySpace.SBUF),
+                eye_hbm,
+                (DimSlice(0, f_cov), DimSlice(0, f_cov)),
+            )
+
+            psum = nb.alloc((p_cov, f_cov), DType.F32, MemorySpace.PSUM)
+            nb.matmul(psum, stat, eye_tile, accumulate=False)
+
+            out_sbuf = nb.tensor_copy(
+                nb.alloc((p_cov, f_cov), DType.F32, MemorySpace.SBUF), psum
+            )
+            nb.dma_copy(y_hbm, out_sbuf, dst_slices)
+        else:
+            tile = nb.dma_copy(
+                nb.alloc((p_cov, f_cov), dtype, MemorySpace.SBUF),
+                x_hbm, src_slices,
+            )
+            nb.dma_copy(y_hbm, tile, dst_slices)
+
+
+# ---------------------------------------------------------------------------
+# Standalone graph wrappers
+# ---------------------------------------------------------------------------
+
+
+def _check_perm(
+    in_shape: tuple[int, ...], perm: tuple[int, ...] | None
+) -> tuple[int, ...]:
+    """Validate rank/perm, defaulting to a last-two-dims swap."""
+    rank = len(in_shape)
+    if rank < 2:
+        raise ValueError("input must be rank >= 2")
+    if perm is None:
+        perm = tuple(range(rank - 2)) + (rank - 1, rank - 2)
+    if sorted(perm) != list(range(rank)):
+        raise ValueError(f"invalid permutation: {perm}")
+    return perm
+
+
+def lower_transpose_dma(
+    in_shape: tuple[int, ...],
+    perm: tuple[int, ...] | None = None,
+    dtype: DType = DType.F32,
+) -> Graph:
+    """Lower arbitrary transpose via DMA engine into a standalone graph.
+
+    Thin wrapper over ``emit_transpose``: HBM inputs ``x``/``y``, one emit call.
+    """
+    perm = _check_perm(in_shape, perm)
+    out_shape = tuple(in_shape[p] for p in perm)
+
+    b = Builder("transpose_dma")
+    x_hbm = b.add_input("x", in_shape, dtype)
+    y_hbm = b.add_input("y", out_shape, dtype)
+    emit_transpose(b, x_hbm, y_hbm, in_shape, perm, dtype)
+    b.set_outputs({"y": y_hbm})
+    insert_deallocs(b.graph)
+    return b.graph
+
+
+def lower_transpose_te(
+    in_shape: tuple[int, ...],
+    perm: tuple[int, ...] | None = None,
+    dtype: DType = DType.F32,
+) -> Graph:
+    """Lower arbitrary transpose via tensor engine into a standalone graph.
+
+    Thin wrapper over ``emit_transpose_te``. When the permutation swaps P↔F the
+    graph takes an identity matrix as an extra HBM input ("eye") and the output
+    buffer is F32 (PSUM result dtype); otherwise no eye input is declared and
+    the emission degenerates to a plain DMA copy.
+    """
+    perm = _check_perm(in_shape, perm)
+    out_shape = tuple(in_shape[p] for p in perm)
+
+    c_in, c_perm, _groups, _src_order = _collapse_perm(in_shape, perm)
+    c_out = tuple(c_in[p] for p in c_perm)
+    if len(c_perm) < 2:
+        c_perm = perm
+        c_out = out_shape
+    swap_pf = _needs_pf_swap(c_perm)
+    eye_size = min(c_out[-1], PARTITION_MAX) if swap_pf else 0
+
+    bld = Builder("transpose_te")
+    x_hbm = bld.add_input("x", in_shape, dtype)
+    if swap_pf:
+        y_hbm = bld.add_input("y", out_shape, DType.F32)
+        eye_hbm = bld.add_input("eye", (eye_size, eye_size), dtype)
+    else:
+        y_hbm = bld.add_input("y", out_shape, dtype)
+        eye_hbm = None
+    emit_transpose_te(bld, x_hbm, y_hbm, eye_hbm, in_shape, perm, dtype)
+    bld.set_outputs({"y": y_hbm})
+    insert_deallocs(bld.graph)
+    return bld.graph

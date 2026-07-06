@@ -208,3 +208,119 @@ def test_perf2_kv_cache_concat_slice_no_seq_unroll():
         build(b)
         n_dma = sum(1 for o in lower_to_nki(b.graph).ops if o.opcode == "dma_copy")
         assert n_dma < 64, f"{name} unrolled the sequence axis: {n_dma} DMAs"
+
+
+# REVIEW_basic_lowering.md item 6: where must be inf-safe. The old
+# cond*x + (1-cond)*y form produced NaN whenever the unselected branch was
+# inf (0 * inf = NaN) — exactly the masked-attention where(mask, scores, -inf)
+# pattern. Now lowered via copy_predicated, which never evaluates arithmetic
+# on the unselected branch.
+
+def test_where_inf_safe():
+    np.random.seed(0)
+    S = 64
+    mask = (np.random.uniform(size=(S, S)) > 0.5).astype(np.float32)
+    scores = np.random.randn(S, S).astype(np.float32)
+
+    def build(b):
+        m = b.add_input("mask", (S, S))
+        s = b.add_input("scores", (S, S))
+        ninf = b.constant(float("-inf"), (S, S), DType.F32)
+        b.set_outputs({"r": b.where(m, s, ninf)})
+
+    b = Builder("t")
+    build(b)
+    nki_graph = lower_to_nki(b.graph)
+    out = nki_run(nki_graph, {
+        "mask": mask, "scores": scores,
+        "r_out": np.zeros((S, S), dtype=np.float32),
+    })["r"]
+    assert not np.isnan(out).any(), "where produced NaN on an inf branch"
+    np.testing.assert_array_equal(out, np.where(mask > 0, scores, -np.inf))
+
+
+# REVIEW_basic_lowering.md item 1: the transpose passthrough-partition fast
+# path crashed ('too many values to unpack') when the collapsed leading dim
+# is not 128-aligned: (2,100,8,64) perm (0,1,3,2) collapses B=200 from (2,100)
+# and the second 128-row tile straddles the boundary at row 100.
+
+def test_transpose_collapsed_leading_dim_unaligned():
+    np.random.seed(0)
+    x = np.random.randn(2, 100, 8, 64).astype(np.float32)
+
+    def build(b):
+        t = b.add_input("x", (2, 100, 8, 64))
+        b.set_outputs({"y": b.transpose(t, (0, 1, 3, 2))})
+
+    _lower_and_run(build, {"x": x}, {"y": (2, 100, 64, 8)})
+
+
+# REVIEW_basic_lowering.md item 3: P-reduce with a wide F emitted tiles over
+# hardware limits (gpsimd: SBUF per-partition overflow at full-F tiles;
+# matmul strategy: PSUM accumulator wider than PSUM_FREE_MAX). Both now tile
+# the innermost F. Checked through the standalone wrappers since lower_graph
+# always uses gpsimd.
+
+def test_p_reduce_wide_f_legal_tiles():
+    from nkigen_lite.tensor_ir.passes.layout_solver import solve_graph
+    from nkigen_lite.tensor_ir.passes.basic.direct_lower_reduce import (
+        lower_p_reduce_gpsimd,
+        lower_p_reduce_matmul,
+    )
+
+    np.random.seed(0)
+    for fn, shape in [(lower_p_reduce_gpsimd, (256, 131072)),
+                      (lower_p_reduce_matmul, (256, 1024))]:
+        b = Builder("t")
+        x = b.add_input("x", shape, DType.F32)
+        y = b.reduce(x, axis=(0,), kind="sum", keepdims=True)
+        b.set_outputs({"y": y})
+        layouts = solve_graph(b.graph)
+        g = fn(b.graph, layouts)
+        errs = g.verify()
+        assert not errs, f"{fn.__name__} emitted illegal tiles: {errs[:2]}"
+        xv = np.random.randn(*shape).astype(np.float32)
+        ref = tensor_run(b.graph, {"x": xv})["y"]
+        out = nki_run(g, {"x": xv, "y_out": np.zeros((1, shape[1]), np.float32)})["y"]
+        np.testing.assert_allclose(out, ref, atol=1e-2, rtol=1e-4)
+
+
+# REVIEW_basic_lowering.md items 2, 4, 7:
+#  - item 2: compare/bitwise ops lacked free-dim broadcast (greater(x, y[:, :1])
+#    raised 'shapes must match'); now materialized via a ones-multiply.
+#  - item 4: topk's _first_cols used a hard-coded 8-wide HBM scratch, reading
+#    out of bounds for k in 9..15 (silently — slice bounds are unchecked).
+#  - item 7: topk didn't tile the partition, so P > 128 emitted illegal tiles.
+
+def test_compare_broadcast():
+    np.random.seed(0)
+    for sa, sb in [((128, 64), (128, 1)),   # F-broadcast
+                   ((128, 64), (1, 64)),    # P-broadcast
+                   ((128, 64), (1, 1))]:    # both
+        x = np.random.randn(*sa).astype(np.float32)
+        y = np.random.randn(*sb).astype(np.float32)
+
+        def build(b):
+            tx = b.add_input("x", sa)
+            ty = b.add_input("y", sb)
+            b.set_outputs({"z": b.greater(tx, ty)})
+
+        _lower_and_run(build, {"x": x, "y": y}, {"z": sa})
+
+
+@pytest.mark.parametrize("P,F,k", [
+    (4, 100, 12),    # item 4: k in 9..15 (fold-aligned width 16 > old scratch)
+    (4, 100, 20),    # k > 16
+    (200, 64, 8),    # item 7: P > PARTITION_MAX
+    (2, 20000, 12),  # chunked-F merge path with unaligned k
+])
+def test_topk_k_and_p_coverage(P, F, k):
+    np.random.seed(0)
+    x = np.random.randn(P, F).astype(np.float32)
+
+    def build(b):
+        t = b.add_input("x", (P, F))
+        vals, idxs = b.topk(t, k)
+        b.set_outputs({"v": vals, "i": idxs})
+
+    _lower_and_run(build, {"x": x}, {"v": (P, k), "i": (P, k)}, atol=1e-6)

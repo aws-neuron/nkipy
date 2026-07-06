@@ -36,10 +36,12 @@ from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
     ELEMENTWISE_OPCODES,
     UNARY_OPS,
     ceildiv,
+    collapse_view,
     compute_tile_sizes,
     emit_binary_op,
     emit_unary_op,
     hbm_slices,
+    iter_pf_tiles,
     max_free_elems,
     on_chip_shape,
     unravel,
@@ -176,10 +178,7 @@ def lower_graph(graph: Graph, layouts: dict[str, Layout]) -> nki_ir.Graph:
     segments = _segment_ops(graph, layouts)
     for segment in segments:
         if segment[0].opcode in ELEMENTWISE_OPCODES:
-            # Further split if any input has an incompatible layout
-            sub_segments = _split_on_layout_conflict(segment, layouts, hbm_map)
-            for sub_seg in sub_segments:
-                _emit_elementwise_segment(nb, sub_seg, layouts, hbm_map)
+            _emit_elementwise_segment(nb, segment, layouts, hbm_map)
         elif segment[0].opcode == "reduce":
             _emit_reduce_op(nb, segment[0], layouts, hbm_map)
         elif segment[0].opcode == "matmul":
@@ -241,16 +240,16 @@ def _emit_hbm_copy(nb: Builder, src: Value, dst: Value, shape: tuple[int, ...]):
     # sub-tiling the generic path already handles via tile_f).
     if len(shape) >= 3 and shape[-1] <= max_free_elems(src.type.dtype):
         lead = prod(shape[:-1])
-        src_2d = src if tuple(src.type.shape) == (lead, shape[-1]) else nb.view(src, (lead, shape[-1]))
-        dst_2d = dst if tuple(dst.type.shape) == (lead, shape[-1]) else nb.view(dst, (lead, shape[-1]))
-        for p_i in range(ceildiv(lead, PARTITION_MAX)):
-            p_off = p_i * PARTITION_MAX
-            p_size = min(PARTITION_MAX, lead - p_off)
+        src_2d = collapse_view(nb, src, lead, shape[-1])
+        dst_2d = collapse_view(nb, dst, lead, shape[-1])
+        for p_off, p_size, f_off, f_size in iter_pf_tiles(
+            lead, shape[-1], src.type.dtype
+        ):
             tile = nb.dma_copy(
-                nb.alloc((p_size, shape[-1]), src.type.dtype, MemorySpace.SBUF),
-                src_2d, (DimSlice(p_off, p_size), DimSlice(0, shape[-1])),
+                nb.alloc((p_size, f_size), src.type.dtype, MemorySpace.SBUF),
+                src_2d, (DimSlice(p_off, p_size), DimSlice(f_off, f_size)),
             )
-            nb.dma_copy(dst_2d, tile, (DimSlice(p_off, p_size), DimSlice(0, shape[-1])))
+            nb.dma_copy(dst_2d, tile, (DimSlice(p_off, p_size), DimSlice(f_off, f_size)))
         return
 
     tile_p = min(shape[-2], PARTITION_MAX) if len(shape) >= 2 else 1
@@ -281,55 +280,6 @@ def _emit_hbm_copy(nb: Builder, src: Value, dst: Value, shape: tuple[int, ...]):
                     src, slices,
                 )
                 nb.dma_copy(dst, tile, slices)
-
-
-def _split_on_layout_conflict(
-    ops: list, layouts: dict[str, Layout], hbm_map: dict[str, Value],
-) -> list[list]:
-    """Split an elementwise segment when an input has an incompatible layout.
-
-    An input is incompatible if its P/F dims differ from the segment's rep
-    AND its shape (after considering the layout) would produce a tile with
-    different (P, F) dimensions that can't be aligned via broadcasting.
-    """
-    if len(ops) <= 1:
-        return [ops]
-
-    rep_layout = layouts[ops[-1].results[0].name]
-    segment_results = {r.name for op in ops for r in op.results}
-
-    # Check each op's inputs for layout conflicts
-    sub_segments = []
-    current = []
-    for op in ops:
-        has_conflict = False
-        for inp in op.inputs:
-            if inp.name in segment_results:
-                continue
-            if inp.name not in layouts:
-                continue
-            inp_layout = layouts[inp.name]
-            if (inp_layout.p_dims != rep_layout.p_dims and
-                inp_layout.f_dims != rep_layout.f_dims):
-                # Check if it's a broadcast (size-1 dim) — those are OK
-                inp_shape = inp.type.shape
-                inp_p_ext = prod(inp_shape[d] for d in inp_layout.p_dims) if inp_layout.p_dims else 1
-                inp_f_ext = prod(inp_shape[d] for d in inp_layout.f_dims) if inp_layout.f_dims else 1
-                if inp_p_ext > 1 and inp_f_ext > 1:
-                    has_conflict = True
-                    break
-
-        if has_conflict:
-            if current:
-                sub_segments.append(current)
-                current = []
-            sub_segments.append([op])
-        else:
-            current.append(op)
-
-    if current:
-        sub_segments.append(current)
-    return sub_segments
 
 
 # ---------------------------------------------------------------------------
@@ -555,23 +505,16 @@ def _emit_ew_tile(
             cond = tile_map[op.inputs[0].name]
             x_true = tile_map[op.inputs[1].name]
             y_false = tile_map[op.inputs[2].name]
-            from nkigen_lite.nki_ir.ir import NisaArithOp
-            # NKI pattern: result = cond*x + (1-cond)*y
-            # cond is float (1.0/0.0), same dtype as x/y
+            # result = y (copy), then overwrite with x where cond > 0.
+            # copy_predicated never evaluates arithmetic on the unselected
+            # branch, so where(mask, scores, -inf) stays -inf/scores — the
+            # old cond*x + (1-cond)*y form produced NaN whenever the
+            # unselected branch was inf (0 * inf), which is exactly the
+            # masked-attention pattern.
             shape = x_true.type.shape
-            # inv_cond = 1.0 - cond
-            ones = nb.constant(1.0, shape, out_dtype, MemorySpace.SBUF)
-            inv_cond = nb.alloc(shape, out_dtype, MemorySpace.SBUF)
-            nb.tensor_tensor_arith(inv_cond, ones, cond, NisaArithOp.SUBTRACT)
-            # mask_x = cond * x
-            mask_x = nb.alloc(shape, out_dtype, MemorySpace.SBUF)
-            nb.tensor_tensor_arith(mask_x, cond, x_true, NisaArithOp.MULTIPLY)
-            # mask_y = inv_cond * y
-            mask_y = nb.alloc(shape, out_dtype, MemorySpace.SBUF)
-            nb.tensor_tensor_arith(mask_y, inv_cond, y_false, NisaArithOp.MULTIPLY)
-            # result = mask_x + mask_y
             result = nb.alloc(shape, out_dtype, MemorySpace.SBUF)
-            nb.tensor_tensor_arith(result, mask_x, mask_y, NisaArithOp.ADD)
+            nb.tensor_copy(result, y_false)
+            nb.copy_predicated(result, cond, x_true)
             tile_map[out_name] = result
         elif op.opcode == "constant":
             out_shape = shape_override.get(out_name, op.results[0].type.shape)
@@ -746,7 +689,10 @@ def _emit_iota_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
     rank = len(shape)
 
     tile_p = min(shape[-2], PARTITION_MAX) if rank >= 2 else 1
-    tile_f = shape[-1] if rank >= 2 else shape[0]
+    f_extent = shape[-1] if rank >= 2 else shape[0]
+    # Cap the free extent to the per-partition SBUF budget: a vocab-wide iota
+    # (e.g. (1, 128256)) would otherwise allocate an oversized tile.
+    tile_f = min(f_extent, max_free_elems(dtype))
     p_extent = shape[-2] if rank >= 2 else 1
     batch_dims = list(shape[:-2]) if rank > 2 else []
     n_batch = prod(batch_dims) if batch_dims else 1
@@ -759,23 +705,26 @@ def _emit_iota_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
         for p_i in range(ceildiv(p_extent, tile_p)):
             p_off = p_i * tile_p
             p_size = min(tile_p, p_extent - p_off)
+            for f_i in range(ceildiv(f_extent, tile_f)):
+                f_off = f_i * tile_f
+                f_size = min(tile_f, f_extent - f_off)
 
-            if dim == f_axis:
-                pattern, ch_mul, offset = [[1, tile_f]], 0, 0
-            elif rank >= 2 and dim == p_axis:
-                pattern, ch_mul, offset = [[0, tile_f]], 1, p_off
-            else:
-                # batch axis: every element in this tile shares the index
-                pattern, ch_mul, offset = [[0, tile_f]], 0, int(batch_idx[dim])
+                if dim == f_axis:
+                    pattern, ch_mul, offset = [[1, f_size]], 0, f_off
+                elif rank >= 2 and dim == p_axis:
+                    pattern, ch_mul, offset = [[0, f_size]], 1, p_off
+                else:
+                    # batch axis: every element in this tile shares the index
+                    pattern, ch_mul, offset = [[0, f_size]], 0, int(batch_idx[dim])
 
-            tile = nb.alloc((p_size, tile_f), dtype, MemorySpace.SBUF)
-            tile = nb.iota(tile, pattern=pattern, offset=offset, channel_multiplier=ch_mul)
+                tile = nb.alloc((p_size, f_size), dtype, MemorySpace.SBUF)
+                tile = nb.iota(tile, pattern=pattern, offset=offset, channel_multiplier=ch_mul)
 
-            dst_slices = [DimSlice(bi, 1) for bi in batch_idx]
-            if rank >= 2:
-                dst_slices.append(DimSlice(p_off, p_size))
-            dst_slices.append(DimSlice(0, tile_f))
-            nb.dma_copy(dst_hbm, tile, dst_slices)
+                dst_slices = [DimSlice(bi, 1) for bi in batch_idx]
+                if rank >= 2:
+                    dst_slices.append(DimSlice(p_off, p_size))
+                dst_slices.append(DimSlice(f_off, f_size))
+                nb.dma_copy(dst_hbm, tile, dst_slices)
 
 
 # max8 / match_replace8 read at most this many free elements per call (a real
@@ -815,25 +764,30 @@ def _topk_scan(nb: Builder, data: Value, P: int, k: int, vdtype, idtype):
     return vals, idxs
 
 
-def _load_topk_data(nb: Builder, src_hbm, P: int, off: int, f: int, vdtype):
-    """Load src_hbm[:, off:off+f] into a (P, max(f,8)) SBUF tile, padding the
-    tail with -inf so max8's >=8 free-dim requirement always holds."""
+def _load_topk_data(nb: Builder, src_hbm, p_off: int, p_size: int,
+                    off: int, f: int, vdtype):
+    """Load src_hbm[p_off:p_off+p_size, off:off+f] into a (p_size, max(f,8))
+    SBUF tile, padding the tail with -inf so max8's >=8 free-dim requirement
+    always holds."""
     width = max(f, 8)
     if width == f:
-        return nb.dma_copy(nb.alloc((P, width), vdtype, MemorySpace.SBUF),
-                           src_hbm, (DimSlice(0, P), DimSlice(off, f)))
-    padded = nb.memset(nb.alloc((P, width), vdtype, MemorySpace.SBUF), float("-inf"))
-    loaded = nb.dma_copy(nb.alloc((P, f), vdtype, MemorySpace.SBUF),
-                         src_hbm, (DimSlice(0, P), DimSlice(off, f)))
+        return nb.dma_copy(nb.alloc((p_size, width), vdtype, MemorySpace.SBUF),
+                           src_hbm, (DimSlice(p_off, p_size), DimSlice(off, f)))
+    padded = nb.memset(nb.alloc((p_size, width), vdtype, MemorySpace.SBUF), float("-inf"))
+    loaded = nb.dma_copy(nb.alloc((p_size, f), vdtype, MemorySpace.SBUF),
+                         src_hbm, (DimSlice(p_off, p_size), DimSlice(off, f)))
     return _overlay_columns(nb, padded, loaded, f)
 
 
 def _emit_topk_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
     """Lower topk via the canonical hardware scan (max8 + match_replace8).
 
-    The source (P, F) tile is loaded into SBUF; each fold reads the next 8
-    largest (max8) and masks them to -inf in place (match_replace8), which also
-    yields their indices.  ceil(k/8) folds cover any k.
+    Rows are independent, so the partition is tiled at PARTITION_MAX and each
+    chunk of <=128 rows runs the full scan (a taller source previously
+    allocated an over-wide (P, .) tile). Per chunk: the source (p, F) tile is
+    loaded into SBUF; each fold reads the next 8 largest (max8) and masks
+    them to -inf in place (match_replace8), which also yields their indices.
+    ceil(k/8) folds cover any k.
 
     When F exceeds the max8 free-dim limit, the row is split into chunks of
     <= TOPK_FREE_MAX: each chunk is scanned for its local top-k (indices
@@ -851,13 +805,25 @@ def _emit_topk_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
     vdtype = val_out.type.dtype
     idtype = idx_out.type.dtype
 
+    for p_i in range(ceildiv(P, PARTITION_MAX)):
+        p_off = p_i * PARTITION_MAX
+        p_size = min(PARTITION_MAX, P - p_off)
+        _emit_topk_rows(nb, src_hbm, val_hbm, idx_hbm, p_off, p_size, F, k,
+                        vdtype, idtype)
+
+
+def _emit_topk_rows(nb: Builder, src_hbm, val_hbm, idx_hbm, p_off: int,
+                    p_size: int, F: int, k: int, vdtype, idtype) -> None:
+    """Emit the topk scan for one partition chunk of <=128 rows."""
+    out_rows = DimSlice(p_off, p_size)
+
     if F <= TOPK_FREE_MAX:
-        data = _load_topk_data(nb, src_hbm, P, 0, F, vdtype)
-        vals, idxs = _topk_scan(nb, data, P, k, vdtype, idtype)
+        data = _load_topk_data(nb, src_hbm, p_off, p_size, 0, F, vdtype)
+        vals, idxs = _topk_scan(nb, data, p_size, k, vdtype, idtype)
         v_store = vals if k == _aligned(k) else _first_cols(nb, vals, k)
         i_store = idxs if k == _aligned(k) else _first_cols(nb, idxs, k)
-        nb.dma_copy(val_hbm, v_store, (DimSlice(0, P), DimSlice(0, k)))
-        nb.dma_copy(idx_hbm, i_store, (DimSlice(0, P), DimSlice(0, k)))
+        nb.dma_copy(val_hbm, v_store, (out_rows, DimSlice(0, k)))
+        nb.dma_copy(idx_hbm, i_store, (out_rows, DimSlice(0, k)))
         return
 
     n_chunks = ceildiv(F, TOPK_FREE_MAX)
@@ -869,17 +835,17 @@ def _emit_topk_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
         )
 
     # Per-chunk local top-k, with indices rebased to global, gathered into
-    # candidate buffers (P, cand).
-    cand_vals_hbm = nb.alloc((P, cand), vdtype, MemorySpace.HBM)
-    cand_idx_hbm = nb.alloc((P, cand), idtype, MemorySpace.HBM)
+    # candidate buffers (p_size, cand).
+    cand_vals_hbm = nb.alloc((p_size, cand), vdtype, MemorySpace.HBM)
+    cand_idx_hbm = nb.alloc((p_size, cand), idtype, MemorySpace.HBM)
     for c in range(n_chunks):
         off = c * TOPK_FREE_MAX
         fc = min(TOPK_FREE_MAX, F - off)
-        data = _load_topk_data(nb, src_hbm, P, off, fc, vdtype)
-        vals, idxs = _topk_scan(nb, data, P, k, vdtype, idtype)
+        data = _load_topk_data(nb, src_hbm, p_off, p_size, off, fc, vdtype)
+        vals, idxs = _topk_scan(nb, data, p_size, k, vdtype, idtype)
         if off != 0:
             # Rebase local indices to global: idx += off.
-            off_tile = nb.constant(float(off), (P, 1), idtype, MemorySpace.SBUF)
+            off_tile = nb.constant(float(off), (p_size, 1), idtype, MemorySpace.SBUF)
             idxs = nb.tensor_scalar_arith(
                 nb.alloc(idxs.type.shape, idtype, MemorySpace.SBUF),
                 idxs, off_tile, nki_ir.NisaArithOp.ADD,
@@ -887,23 +853,23 @@ def _emit_topk_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
         col = DimSlice(c * k, k)
         v_store = vals if k == _aligned(k) else _first_cols(nb, vals, k)
         i_store = idxs if k == _aligned(k) else _first_cols(nb, idxs, k)
-        nb.dma_copy(cand_vals_hbm, v_store, (DimSlice(0, P), col))
-        nb.dma_copy(cand_idx_hbm, i_store, (DimSlice(0, P), col))
+        nb.dma_copy(cand_vals_hbm, v_store, (DimSlice(0, p_size), col))
+        nb.dma_copy(cand_idx_hbm, i_store, (DimSlice(0, p_size), col))
 
     # Merge: scan the candidate values for the global top-k, then gather the
     # corresponding global indices by the merged positions.
-    cand_data = _load_topk_data(nb, cand_vals_hbm, P, 0, cand, vdtype)
+    cand_data = _load_topk_data(nb, cand_vals_hbm, 0, p_size, 0, cand, vdtype)
     width = max(cand, 8)
     cand_idx_sbuf = nb.memset(
-        nb.alloc((P, width), idtype, MemorySpace.SBUF), 0.0)
+        nb.alloc((p_size, width), idtype, MemorySpace.SBUF), 0.0)
     cand_idx_sbuf = _overlay_columns(
         nb,
         cand_idx_sbuf,
-        nb.dma_copy(nb.alloc((P, cand), idtype, MemorySpace.SBUF),
-                    cand_idx_hbm, (DimSlice(0, P), DimSlice(0, cand))),
+        nb.dma_copy(nb.alloc((p_size, cand), idtype, MemorySpace.SBUF),
+                    cand_idx_hbm, (DimSlice(0, p_size), DimSlice(0, cand))),
         cand,
     )
-    mvals, mpos = _topk_scan(nb, cand_data, P, k, vdtype, idtype)
+    mvals, mpos = _topk_scan(nb, cand_data, p_size, k, vdtype, idtype)
     # gather: global_idx[p, i] = cand_idx_sbuf[p, mpos[p, i]]
     gidx = nb.gather(
         nb.alloc(mpos.type.shape, idtype, MemorySpace.SBUF),
@@ -911,8 +877,8 @@ def _emit_topk_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
     )
     v_store = mvals if k == _aligned(k) else _first_cols(nb, mvals, k)
     i_store = gidx if k == _aligned(k) else _first_cols(nb, gidx, k)
-    nb.dma_copy(val_hbm, v_store, (DimSlice(0, P), DimSlice(0, k)))
-    nb.dma_copy(idx_hbm, i_store, (DimSlice(0, P), DimSlice(0, k)))
+    nb.dma_copy(val_hbm, v_store, (out_rows, DimSlice(0, k)))
+    nb.dma_copy(idx_hbm, i_store, (out_rows, DimSlice(0, k)))
 
 
 def _aligned(k: int) -> int:
@@ -1059,11 +1025,17 @@ def _emit_gather_rows_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
 
 
 def _first_cols(nb: Builder, tile: Value, keep: int) -> Value:
-    """Return a (P, keep) SBUF tile holding the first ``keep`` columns of an
-    8-wide tile, via an HBM scratch round-trip (nki_ir has no SBUF sub-view)."""
-    P = tile.type.shape[0]
-    scratch = nb.alloc((P, 8), tile.type.dtype, MemorySpace.HBM)
-    nb.dma_copy(scratch, tile, (DimSlice(0, P), DimSlice(0, 8)))
+    """Return a (P, keep) SBUF tile holding the first ``keep`` columns of
+    ``tile``, via an HBM scratch round-trip (nki_ir has no SBUF sub-view).
+
+    The scratch is sized to the tile's full width: callers pass fold-aligned
+    ``kp = ceil(k/8)*8``-wide tiles, so ``keep`` can exceed 8 (e.g. k=12 on a
+    16-wide tile) — a hard-coded 8-wide scratch would leave columns 8..keep-1
+    reading past the buffer.
+    """
+    P, W = tile.type.shape
+    scratch = nb.alloc((P, W), tile.type.dtype, MemorySpace.HBM)
+    nb.dma_copy(scratch, tile, (DimSlice(0, P), DimSlice(0, W)))
     return nb.dma_copy(
         nb.alloc((P, keep), tile.type.dtype, MemorySpace.SBUF),
         scratch, (DimSlice(0, P), DimSlice(0, keep)),
