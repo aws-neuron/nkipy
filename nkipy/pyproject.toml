@@ -21,7 +21,7 @@ dependencies = ["numpy>=1.26", "neuronx-cc>=0.0,!=1.*,<3.0", "nki>=0.1.0"]
 
 [tool.uv.sources]
 neuronx-cc = { index = "neuron" }
-nki = { index = "neuron" }
+nki = { path = "../../private-nki-staging", editable = true }
 
 [tool.coverage.run]
 source = ["nkipy"]

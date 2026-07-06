@@ -836,7 +836,12 @@ def _emit_tile_loop(op: Op, tiles: dict[str, object]) -> None:
             for body_op in body_graph.ops:
                 _emit_op(body_op, inner)
 
-        nb.fori_loop(loop_bound, body_fn)
+        # unroll=True: KB's scf.for keeps PSUM/SBUF allocs from outside the
+        # loop live across the loop body (e.g. a matmul accumulator), which
+        # neuronx-cc's live-in/live-out BIR lowering currently mishandles for
+        # non-DRAM memory ("Live-in/Live-out MemoryLocation ... not allocated
+        # to MemoryType: DRAM"). Unrolling removes the scf.for entirely.
+        nb.fori_loop(loop_bound, body_fn, unroll=True)
     else:
         carried_init = [tiles[v.name] for v in op.inputs]
         carry_state = list(carried_init)
@@ -851,7 +856,7 @@ def _emit_tile_loop(op: Op, tiles: dict[str, object]) -> None:
             for j, out_val in enumerate(body_graph.output_values):
                 carry_state[j] = inner[out_val.name]
 
-        nb.fori_loop(static_extent, body_fn)
+        nb.fori_loop(static_extent, body_fn, unroll=True)
 
         for j, result_val in enumerate(op.results):
             tiles[result_val.name] = carry_state[j]
