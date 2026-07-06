@@ -163,6 +163,10 @@ class Compiler:
         use_neuronx_cc_python_interface: bool = False,
     ) -> Path:
         """Compile an HLOModule to NEFF via neuronx-cc."""
+        # Resolve to an absolute path: the compile below chdirs into work_dir,
+        # so a relative work_dir (e.g. "./build/...") would otherwise get
+        # doubled ("build/.../build/...") in the neuronx-cc input path.
+        work_dir = work_dir.resolve()
         hlo_pb_path = work_dir / "hlo_module.pb"
         proto = ir.to_proto()
         with open(hlo_pb_path, "wb") as f:

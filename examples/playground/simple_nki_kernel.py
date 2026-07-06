@@ -1,31 +1,30 @@
 #!/usr/bin/env python3
 """
-Simple NKI Beta2 Kernel Example using DeviceKernel and DeviceTensor
+Simple NKI Beta3 Kernel Example using DeviceKernel and DeviceTensor
 """
 
 import time
 
 import nki
-import nki.isa as nisa
 import nki.language as nl
 import numpy as np
 from nkipy.core import nki_op  # noqa: F401, make sure monkey patch is applied
 from nkipy.runtime import DeviceKernel, DeviceTensor
 
 
-@nki.jit(platform_target="trn2")
+@nki.jit
 def nki_tensor_add(a_input, b_input):
-    a_tile = sbuf.view(dtype=a_input.dtype, shape=a_input.shape)  # noqa: F821
-    nisa.dma_copy(dst=a_tile, src=a_input)
+    # Beta 3 frontend: index the inputs with affine ranges, load into SBUF,
+    # compute, then store the result into a fresh HBM output tensor.
+    ix = nl.affine_range(a_input.shape[0])
+    iy = nl.affine_range(a_input.shape[1])
 
-    b_tile = sbuf.view(dtype=b_input.dtype, shape=b_input.shape)  # noqa: F821
-    nisa.dma_copy(dst=b_tile, src=b_input)
+    a_tile = nl.load(a_input[ix, iy])
+    b_tile = nl.load(b_input[ix, iy])
+    c_tile = nl.add(a_tile, b_tile)
 
-    c_tile = sbuf.view(dtype=a_input.dtype, shape=a_input.shape)  # noqa: F821
-    nisa.tensor_tensor(dst=c_tile, data1=a_tile, data2=b_tile, op=nl.add)
-
-    c_output = hbm.view(dtype=a_input.dtype, shape=a_input.shape)  # noqa: F821
-    nisa.dma_copy(dst=c_output, src=c_tile)
+    c_output = nl.ndarray(a_input.shape, dtype=a_input.dtype, buffer=nl.shared_hbm)
+    nl.store(c_output[ix, iy], value=c_tile)
 
     return c_output
 
