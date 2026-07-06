@@ -111,8 +111,21 @@ loads compose through (the view-reshape rebind is the existing prototype).
   nki ops (−640, −1.5%); dma_copy 11369 → 11113. The `slice` attribution
   category disappears — the hot gate/up `(384,)→(192,)×128` split and top-k
   index slices fold into their consumers.
+- [x] **compose chained transposes** (done ahead of the "transpose as view"
+  item; higher payoff on the qwen3 graph). `transpose(transpose(x, p1), p2)` is
+  a single `transpose(x, compose)` with `compose[i] = p1[p2[i]]` — permuting
+  twice is permuting once. The chain materializes the intermediate through HBM
+  (load → remap → store → reload); the composed form skips it, and DCE drops the
+  inner transpose's whole materialization when it has no other consumer. New
+  tensor_ir peephole `passes/fold_transpose.py`, runs before decompose beside
+  `fold_broadcast`. The qwen3 attention path chains `(0,2,1,3)` then `(0,1,3,2)`
+  on a (1,8,4096,128) tensor to feed QK^T — one of the two ~16 MB attention
+  transposes folds away. qwen3 MoE: transpose 2864 → 2096 nki ops; total
+  40993 → 39968 (−1025, −2.5%); dma_copy 11113 → 10601.
 - [ ] **batch-only transpose as view** (no P↔F swap): pure coordinate
-  remapping on the consumer's slices, as `emit_transpose` already proves.
+  remapping on the consumer's slices, as `emit_transpose` already proves. (The
+  two remaining qwen3 transposes both swap P↔F, so this needs a new benchmark
+  to motivate — deferred until a batch-only-transpose hotspot shows up.)
 - [ ] Re-run `profile_layer.py`; record op counts before/after.
 
 ## Phase 2 — Segments own the loop, ops are tile callbacks
@@ -175,3 +188,4 @@ Fusions, in order of expected payoff (re-profile after Phase 1 to confirm):
 | 2026-07-05 | HW benchmark, 30B MoE TP=4, n=64 | TTFT 3280 ms (was 4596), decode p50 2333 ms (was 2500) | 1.40x TTFT, 1.07x decode vs same-day pre-branch baseline (964b5ff), same box, fresh builds. NOTE: the repo's benchmark_report.json (07-01: TTFT 3309 / p50 1625) predates the basic-lowering-cleanup merge and is NOT a valid before-point — decode regressed ~1.5x at that merge, independent of this branch. Decode profile (L=1): 17984→14761 nki ops, but decode's hot gather/concat fixes barely apply per-token; matmul+transpose dominate. |
 | 2026-07-05 | Phase 1: fold broadcast_to into elementwise consumers | 41633 nki (9.0x), 11369 dma_copy | broadcast_to 105 calls/1438 ops → 7 calls/700 ops (only GQA middles remain); elementwise unchanged (native F/P broadcast). Fold runs pre-decompose, also fixing the div-denominator precision round-trip. |
 | 2026-07-06 | Phase 1: slice as view (offset fold + JIT materialize) | 40993 nki (8.8x), 11113 dma_copy | slice attribution 1149 ops/714 dmas → 0 (folded into EW consumers or materialized off the profiled wrapper); elementwise 3240→3264 (composed offset loads). Foldable slices: static-start, stride-1. All 695 tensor_ir tests + 11 new slice-view tests (7 interp, 4 HW) pass. |
+| 2026-07-06 | Phase 1: compose chained transposes | 39968 nki (8.6x), 10601 dma_copy | transpose 2864→2096 ops (1056 dmas); one of the two 4096-wide attention transposes folds away (`(0,2,1,3)`∘`(0,1,3,2)` → `(0,2,3,1)`). New `fold_transpose.py` peephole. 6 interp + 2 HW fold tests pass; transpose+lowering HW suites (35 tests) green on trn2. |
