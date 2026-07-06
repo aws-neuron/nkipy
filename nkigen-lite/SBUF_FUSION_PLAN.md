@@ -17,15 +17,17 @@ and record op counts / timing in the Progress log below.
 
 Cheap, independent, no restructuring.
 
-- [ ] **Dead-store elimination in elementwise segments.**
-  `lower_graph` pre-allocates an HBM buffer for every op result and
-  `_emit_ew_tile` stores every result, including segment-internal
-  intermediates nobody reads from HBM. Compute liveness against the
-  segmentation (consumed by a later segment or a graph output?); skip the
-  HBM allocation and the store for segment-internal values.
-- [ ] **Dtype-aware tile sizes for elementwise.**
-  Elementwise never passes `dtype` to `compute_tile_sizes`, so bf16 segments
-  tile at the conservative F32 budget — half the achievable tile width.
+- [x] **Dead-store elimination in elementwise segments.**
+  `lower_graph` computes escape analysis against the segmentation: an
+  elementwise result gets an HBM buffer + store only if consumed by another
+  segment or a graph output. Modest on the qwen3 MoE layer (−184 DMAs, −5%
+  of elementwise DMAs): segments average ~2 ops and most results escape into
+  reshapes/matmuls. Will compound once Phase 2 grows the groups.
+- [x] **Dtype-aware tile sizes for elementwise.**
+  Segments now tile to their widest dtype (`_segment_dtype`) instead of the
+  F32 default. One shared dtype per segment keeps per-value slice offsets
+  aligned with the rep loop. No effect on the (all-F32) qwen3 profile; pays
+  on bf16 models.
 
 ## Phase 1 — Fuse data movement via HBM views
 
@@ -87,4 +89,5 @@ Fusions, in order of expected payoff (re-profile after Phase 1 to confirm):
 
 | Date | Change | qwen3 layer ops | Notes |
 |------|--------|-----------------|-------|
-| 2026-07-05 | Baseline (plan created) | — | fill in from profile_layer.py |
+| 2026-07-05 | Baseline (plan created) | 80332 nki (17.3x), 23017 dma_copy | L=8; top: gather_rows 20416, matmul 11504, elementwise 10486 (3685 dmas), concat 7330 |
+| 2026-07-05 | Phase 0: dead-store elim + dtype-aware ew tiles | 79932 nki (17.2x), 22833 dma_copy | elementwise 10270 (3501 dmas); all-F32 model so dtype-aware tiling is a no-op here |

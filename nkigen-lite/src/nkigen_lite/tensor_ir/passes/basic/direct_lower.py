@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from math import prod
 
-from nkigen_lite.core import DType, Graph, Value
+from nkigen_lite.core import DType, Graph, Value, _DTYPE_BYTES
 from nkigen_lite.nki_ir.ir import (
     Builder,
     DimSlice,
@@ -159,23 +159,48 @@ def lower_graph(graph: Graph, layouts: dict[str, Layout]) -> nki_ir.Graph:
         if key not in hbm_map:
             hbm_map[key] = nb.add_input(key, _nki_shape(out_val.type.shape), out_val.type.dtype)
 
-    # Allocate HBM intermediates for all op results.  Skip reshape results:
+    segments = _segment_ops(graph, layouts)
+
+    # Which elementwise segment produced each value (results of non-elementwise
+    # ops are absent: their emitters always store to HBM).
+    seg_of: dict[str, int] = {}
+    for si, seg in enumerate(segments):
+        if seg[0].opcode in ELEMENTWISE_OPCODES:
+            for op in seg:
+                for r in op.results:
+                    seg_of[r.name] = si
+
+    # A value produced inside an elementwise segment stays on-chip (tile_map)
+    # for consumers in the same segment; it needs an HBM buffer + store only
+    # when some *other* segment reads it, or it is a graph output. Everything
+    # else is a dead store: skipping the allocation makes the (already
+    # guarded) store loops skip it too.
+    escapes: set[str] = {out_val.name for out_val in graph.outputs.values()}
+    for si, seg in enumerate(segments):
+        for op in seg:
+            for inp in op.inputs:
+                if inp.name in seg_of and seg_of[inp.name] != si:
+                    escapes.add(inp.name)
+
+    # Allocate HBM intermediates for op results.  Skip reshape results:
     # a reshape preserves row-major flat order, so its result is emitted as a
     # zero-copy view of the (row-major contiguous) input HBM buffer rather than
     # a fresh allocation + copy.  Allocating here would leave a large dead HBM
     # buffer (an expert weight reshape is ~100 MB).  Scalar reshapes still need
-    # a real buffer (() promotion), so don't skip those.
+    # a real buffer (() promotion), so don't skip those.  Also skip elementwise
+    # results that never escape their segment (see above).
     for op in graph.ops:
         if op.opcode == "reshape" and _is_view_reshape(op):
             continue
         for r in op.results:
+            if r.name in seg_of and r.name not in escapes:
+                continue
             if r.name not in hbm_map:
                 hbm_map[r.name] = nb.alloc(
                     _nki_shape(r.type.shape), r.type.dtype, MemorySpace.HBM
                 )
 
-    # Segment and lower
-    segments = _segment_ops(graph, layouts)
+    # Lower each segment
     for segment in segments:
         if segment[0].opcode in ELEMENTWISE_OPCODES:
             _emit_elementwise_segment(nb, segment, layouts, hbm_map)
@@ -299,6 +324,25 @@ def _canonical_layout(rank: int) -> Layout:
     return Layout(i_dims=i_dims, p_dims=p_dims, f_dims=f_dims)
 
 
+def _segment_dtype(ops: list) -> DType:
+    """Widest dtype touched by a segment.
+
+    Every value in a segment shares the rep's tile loop, so all
+    ``compute_tile_sizes`` calls must use one byte budget — offsets are
+    ``idx * tile_size`` and would misalign if values tiled differently. The
+    binding constraint is the largest element, so tile to that; an all-bf16
+    segment gets twice the F32-default tile width.
+    """
+    best = DType.F32
+    best_bytes = 0
+    for op in ops:
+        for v in list(op.inputs) + list(op.results):
+            b = _DTYPE_BYTES[v.type.dtype]
+            if b > best_bytes:
+                best, best_bytes = v.type.dtype, b
+    return best
+
+
 def _collapse_ew_shape(shape: tuple[int, ...], rep_shape: tuple[int, ...]):
     """Collapse a value's shape to the 2D ``(P, F)`` form of an elementwise
     segment whose representative output is ``rep_shape``.
@@ -374,12 +418,16 @@ def _try_emit_collapsed_ew(
         collapsed[name] = pf
 
     # Build 2D HBM views and a parallel hbm_map / layouts keyed by the same
-    # names the tile machinery uses.
+    # names the tile machinery uses.  A segment-internal result with no HBM
+    # buffer (dead store eliminated) simply gets no view: the tile store loop
+    # skips names absent from the map.
     view_map: dict[str, Value] = {}
     view_layouts: dict[str, Layout] = {}
     rep_2d = (prod(rep_shape[:-1]), rep_shape[-1])
     for name, pf in collapsed.items():
-        hbm_val = hbm_map[name]
+        hbm_val = hbm_map.get(name)
+        if hbm_val is None:
+            continue
         # A genuine reshape (collapse) needs a view; an already-2D buffer of the
         # right shape is used directly.
         if tuple(hbm_val.type.shape) == pf:
@@ -388,8 +436,9 @@ def _try_emit_collapsed_ew(
             view_map[name] = nb.view(hbm_val, pf)
         view_layouts[name] = _canonical_layout(2)
 
+    seg_dtype = _segment_dtype(ops)
     rep_layout = _canonical_layout(2)
-    tile_sizes = compute_tile_sizes(rep_2d, rep_layout)
+    tile_sizes = compute_tile_sizes(rep_2d, rep_layout, seg_dtype)
     loop_dims = [(d, rep_2d[d], tile_sizes[d])
                  for d in sorted(tile_sizes.keys())
                  if tile_sizes[d] < rep_2d[d]]
@@ -399,7 +448,8 @@ def _try_emit_collapsed_ew(
     def _emit_nested(depth: int, indices: dict[int, int]):
         if depth >= len(loop_dims):
             _emit_ew_tile(nb, ops, view_layouts, view_map, rep_layout, rep_2d,
-                          tile_sizes, indices, segment_results, shape_override)
+                          tile_sizes, indices, segment_results, seg_dtype,
+                          shape_override)
             return
         d, extent, ts = loop_dims[depth]
         for i in range(ceildiv(extent, ts)):
@@ -427,8 +477,9 @@ def _emit_elementwise_segment(
     if _try_emit_collapsed_ew(nb, ops, hbm_map, rep_shape):
         return
 
+    seg_dtype = _segment_dtype(ops)
     rep_layout = _canonical_layout(len(rep_shape))
-    tile_sizes = compute_tile_sizes(rep_shape, rep_layout)
+    tile_sizes = compute_tile_sizes(rep_shape, rep_layout, seg_dtype)
 
     # Which values are produced within this segment (stay on-chip)
     segment_results = {r.name for op in ops for r in op.results}
@@ -441,7 +492,7 @@ def _emit_elementwise_segment(
     def _emit_nested(depth: int, indices: dict[int, int]):
         if depth >= len(loop_dims):
             _emit_ew_tile(nb, ops, layouts, hbm_map, rep_layout, rep_shape,
-                          tile_sizes, indices, segment_results)
+                          tile_sizes, indices, segment_results, seg_dtype)
             return
         d, extent, ts = loop_dims[depth]
         for i in range(ceildiv(extent, ts)):
@@ -455,9 +506,14 @@ def _emit_ew_tile(
     rep_layout: Layout, rep_shape: tuple[int, ...],
     tile_sizes: dict[int, int], indices: dict[int, int],
     segment_results: set[str],
+    seg_dtype: DType,
     shape_override: dict[str, tuple[int, ...]] | None = None,
 ) -> None:
     """Emit one tile of fused elementwise computation.
+
+    ``seg_dtype`` is the segment-wide tiling dtype (see ``_segment_dtype``);
+    every ``compute_tile_sizes`` call in the segment must use it so the
+    per-value slices align with the rep's loop.
 
     ``shape_override`` (collapsed-path only) maps a value name to the shape the
     tile machinery should treat it as, instead of its declared N-D shape. The
@@ -477,7 +533,8 @@ def _emit_ew_tile(
                 continue
             hbm_val = hbm_map[inp.name]
             val_layout = _canonical_layout(len(hbm_val.type.shape))
-            val_tile_sizes = compute_tile_sizes(hbm_val.type.shape, val_layout)
+            val_tile_sizes = compute_tile_sizes(
+                hbm_val.type.shape, val_layout, seg_dtype)
             val_tile = on_chip_shape(hbm_val.type.shape, val_layout, val_tile_sizes, indices)
             slices = hbm_slices(hbm_val.type.shape, val_layout, val_tile_sizes,
                                  indices, rep_layout)
@@ -526,19 +583,21 @@ def _emit_ew_tile(
         elif op.opcode == "constant":
             out_shape = shape_override.get(out_name, op.results[0].type.shape)
             const_layout = _canonical_layout(len(out_shape))
-            const_tile_sizes = compute_tile_sizes(out_shape, const_layout)
+            const_tile_sizes = compute_tile_sizes(out_shape, const_layout, seg_dtype)
             const_tile = on_chip_shape(out_shape, const_layout, const_tile_sizes, indices)
             tile_map[out_name] = nb.constant(
                 op.attrs["value"], const_tile, out_dtype, MemorySpace.SBUF
             )
 
-    # Store results — use canonical layout of the output's own rank
+    # Store results — use canonical layout of the output's own rank.  Values
+    # absent from hbm_map are segment-internal (dead-store eliminated).
     for op in ops:
         out_name = op.results[0].name
         if out_name in tile_map and out_name in hbm_map:
             hbm_dst = hbm_map[out_name]
             out_layout = _canonical_layout(len(hbm_dst.type.shape))
-            out_tile_sizes = compute_tile_sizes(hbm_dst.type.shape, out_layout)
+            out_tile_sizes = compute_tile_sizes(
+                hbm_dst.type.shape, out_layout, seg_dtype)
             slices = hbm_slices(hbm_dst.type.shape, out_layout, out_tile_sizes,
                                  indices, rep_layout)
             nb.dma_copy(hbm_dst, tile_map[out_name], slices)
