@@ -79,6 +79,20 @@ Generalize `hbm_map` from name → buffer to name → buffer + access
 descriptor, so pure data-movement ops become metadata that consumers' DMA
 loads compose through (the view-reshape rebind is the existing prototype).
 
+- [x] **broadcast_to as fold** (done differently than planned — no view
+  descriptor needed). A `broadcast_to` feeding only elementwise binary ops is
+  pure waste: the vector/scalar engine broadcasts a size-1 *free* dim natively
+  (`tensor_scalar_arith`) and a partition-1 operand is fanned by the load, so
+  the consumer can read the un-broadcast source directly. New tensor_ir
+  peephole `passes/fold_broadcast.py` rewires collapse-safe broadcasts
+  (source right-aligned + collapsed to 2D has P∈{1,rep_P}, F∈{1,rep_F}) to
+  their source and drops the broadcast. Runs *before* decompose, so
+  `div(a, broadcast_to(b))` → `div(a,b)` → `mul(a, reciprocal(b))` — this also
+  removes the extra HBM round-trip that decompose.py flags as the source of a
+  residual ~1/65536 floor-divide precision error. Middle broadcasts (GQA head
+  expansion `(1,8,1,64)→(1,8,8,64)`) are *not* collapse-safe and stay
+  materialized. qwen3 MoE: broadcast_to 105 calls/1438 ops → 7 calls/700 ops;
+  total 42805 → 41633 nki ops (−2.7%). All 7 remaining are legit GQA middles.
 - [ ] **Shared "materialize a tile from a viewed value" load helper.**
   All emitters load through one helper that composes the access descriptor
   into the `DimSlice`s. This is also the 2D-(P,F)-normalization consolidation
@@ -86,9 +100,6 @@ loads compose through (the view-reshape rebind is the existing prototype).
   fast path.
 - [ ] **slice as view** (contiguous, static starts): base-offset added to the
   consumer's slices; no load-compute-store sequence emitted.
-- [ ] **broadcast_to as view**: stride-0 `DimSlice` on broadcast axes (the DMA
-  engine already supports this — see `broadcast_partition` and the collapsed
-  broadcast path).
 - [ ] **batch-only transpose as view** (no P↔F swap): pure coordinate
   remapping on the consumer's slices, as `emit_transpose` already proves.
 - [ ] Re-run `profile_layer.py`; record op counts before/after.
@@ -151,3 +162,4 @@ Fusions, in order of expected payoff (re-profile after Phase 1 to confirm):
 | 2026-07-05 | Phase 0: dead-store elim + dtype-aware ew tiles | 79932 nki (17.2x), 22833 dma_copy | elementwise 10270 (3501 dmas); all-F32 model so dtype-aware tiling is a no-op here |
 | 2026-07-05 | Phase 0.5: packed gather + splat concat | 42805 nki (9.2x), 11577 dma_copy | gather_rows 20416→1920, elementwise →3274, concat →6739; indirect DMAs 6720→128 |
 | 2026-07-05 | HW benchmark, 30B MoE TP=4, n=64 | TTFT 3280 ms (was 4596), decode p50 2333 ms (was 2500) | 1.40x TTFT, 1.07x decode vs same-day pre-branch baseline (964b5ff), same box, fresh builds. NOTE: the repo's benchmark_report.json (07-01: TTFT 3309 / p50 1625) predates the basic-lowering-cleanup merge and is NOT a valid before-point — decode regressed ~1.5x at that merge, independent of this branch. Decode profile (L=1): 17984→14761 nki ops, but decode's hot gather/concat fixes barely apply per-token; matmul+transpose dominate. |
+| 2026-07-05 | Phase 1: fold broadcast_to into elementwise consumers | 41633 nki (9.0x), 11369 dma_copy | broadcast_to 105 calls/1438 ops → 7 calls/700 ops (only GQA middles remain); elementwise unchanged (native F/P broadcast). Fold runs pre-decompose, also fixing the div-denominator precision round-trip. |

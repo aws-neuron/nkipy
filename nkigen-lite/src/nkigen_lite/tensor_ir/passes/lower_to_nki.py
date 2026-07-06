@@ -1,6 +1,6 @@
 """Top-level lowering pipeline: tensor_ir → nki_ir.
 
-Pipeline: canonicalize → decompose → direct_lower
+Pipeline: canonicalize → fold_broadcast → decompose → direct_lower
 Produces legal NKI IR directly. Layouts are decided per segment inside
 direct_lower (see passes/layout.py), not as a separate global pass.
 """
@@ -11,6 +11,7 @@ from nkigen_lite.core import Graph
 from nkigen_lite import nki_ir
 from nkigen_lite.tensor_ir.passes.canonicalize import canonicalize
 from nkigen_lite.tensor_ir.passes.decompose import decompose
+from nkigen_lite.tensor_ir.passes.fold_broadcast import fold_broadcast
 from nkigen_lite.tensor_ir.passes.hardware import HardwareProfile, TRN2
 
 
@@ -39,6 +40,10 @@ def lower_to_nki(
     # Phase 1-2: simplify tensor_ir
     if not skip_canonicalize:
         canonicalize(graph)
+    # Fold collapse-safe broadcasts into elementwise consumers before decompose
+    # so a div's broadcast denominator becomes reciprocal-then-broadcast (native
+    # F/P broadcast on-chip) rather than a materialized HBM round-trip.
+    fold_broadcast(graph)
     if not skip_decompose:
         decompose(graph)
 
