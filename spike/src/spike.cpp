@@ -734,24 +734,27 @@ std::optional<NonBlockResult> Spike::try_poll() {
 }
 
 NrtModel Spike::wrap_model(nrt_model_t *ptr) {
-  uint32_t core_id = ptr->start_vnc;
-  uint32_t rank_id = ptr->gid;
-  uint32_t world_size = ptr->vnc_count;
+  uint32_t core_id = NrtRuntime::get_model_lnc(ptr);
+  // FIXME: We have no way to get rank_id from the model using public NRT APIs.
+  // Okay for now as it is never actually used.
+  uint32_t rank_id = 0;
+  uint32_t world_size = 1;
   // FIXME: Value of cc_enabled is fake, but no one uses it, so it is fine for
   // the purpose.
   return NrtModel(ptr, core_id, true, rank_id, world_size);
 }
 
 NrtTensor Spike::wrap_tensor(nrt_tensor_t *ptr) {
-  if (ptr->sto->vtpb_idx == -1) {
+  uint32_t core_id = NrtRuntime::get_tensor_lnc(ptr);
+
+  if (core_id == -1) {
     // CPU tensor wrapping not supported
     throw SpikeError("Wrapping a CPU tensor is not supported");
   }
 
-  size_t size = ptr->_size;
-  const char *name = ptr->name;
-  // Use vtpb_idx as the core ID (this is the logical NC ID)
-  uint32_t core_id = ptr->sto->vtpb_idx;
+  size_t size = NrtRuntime::get_tensor_size(ptr);
+  // FIXME: get its real name when NRT provides such public API
+  const char *name = "wrapped_tensor";
   return NrtTensor(ptr, core_id, size, name, this);
 }
 
