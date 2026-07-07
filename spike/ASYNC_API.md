@@ -13,7 +13,7 @@ The Spike runtime supports two levels of asynchronous operation:
 
 ## When to Use SpikeAsync
 
-### Overlapping Operations for Better Hardware Utilization
+SpikeAsync exists to keep the hardware busy by overlapping operations that would otherwise block one another.
 
 A typical inference task follows a sequential pattern: **tensor write → execute → tensor read**. Done naively, each step blocks the next, leaving hardware idle.
 
@@ -39,46 +39,33 @@ for i in range(n):
     spike_async.submit(inference(model, data[i], in_tensor[i], out_tensor[i]))
 ```
 
-### Why Not Just Use Stream APIs?
+## Choosing an Execution Pattern
 
-You may wonder whether CUDA-style stream APIs already solve this. They do provide asynchronous dispatch, but two problems make them awkward for this pattern.
+SpikeAsync gives you three ways to express asynchronous work, and they compose freely: **streams** (in-order sequencing), **coroutines** (async/await), and **explicit dependencies** (the `deps=` parameter). Which one fits depends on the shape of your work.
 
-#### Problem 1: CPU Work Cannot Overlap Naturally
+### Streams: simple linear chains
 
-Streams sequence GPU/device operations, but inserting CPU logic between async operations breaks the overlap. Consider a loop that runs a matmul on device, copies the result to host, then runs a CPU function on it:
+Streams sequence the operations enqueued on them, and independent streams run concurrently. They are the right tool when your workload is **a set of simple linear chains** — for example, N independent `write → execute → read` pipelines, one per stream — with no cross-chain dependencies and no CPU logic that has to run partway through a chain.
 
-```cpp
-// Attempt with CUDA streams
-for (int i = 0; i < n; ++i) {
-    cudaStream_t stream;
-    cudaStreamCreate(&stream);
+Streams get awkward in the two situations below, where coroutines or explicit dependencies are the better fit.
 
-    matmul<<<..., stream>>>(dev_out[i], dev_in[i]);
-    cudaMemcpyAsync(host_out[i], dev_out[i], stream);
-    cpu_function(host_out[i]);  // WRONG: runs before matmul/copy finish
-}
+### Coroutines: interleaving CPU work with device operations
+
+A stream sequences device operations, but it cannot resume CPU-side logic precisely when a specific operation *in the middle* of the chain completes. Drop a CPU function between two stream operations and it either runs too early (before the prior op finishes) or forces you to block on the whole stream, which kills overlap across chains.
+
+Coroutines solve this: each `await` suspends only that coroutine until the awaited operation finishes, while other submitted coroutines — including their CPU work — keep making progress.
+
+```python
+async def pipeline(dev_in, dev_out):
+    await spike_async.execute(matmul_model, dev_in, dev_out)
+    host_out = await spike_async.tensor_read(dev_out)
+    cpu_function(host_out)  # runs exactly when this pipeline's read completes
+
+for i in range(n):
+    spike_async.submit(pipeline(dev_in[i], dev_out[i]))
 ```
 
-Adding `cudaStreamSynchronize` fixes correctness but kills overlap — the CPU waits for each iteration before the next begins:
-
-```
-Matmul -> Copy -> CPU
-                      Matmul -> Copy -> CPU
-                                            Matmul -> Copy -> CPU
-```
-
-Pulling the CPU work out after a `cudaDeviceSynchronize` improves device overlap, but all CPU work is serialized at the end — you cannot overlap CPU work with device work:
-
-```
-Matmul -> Copy
-          Matmul -> Copy
-                    Matmul -> Copy
-                                    CPU -> CPU -> CPU
-```
-
-The core issue is that **stream APIs have no mechanism to resume CPU-side logic precisely when a specific prior operation completes**, without callbacks or restructuring the program into a state machine.
-
-SpikeAsync achieves the fully-overlapped target pipeline naturally:
+This overlaps each iteration's CPU work with other iterations' device work:
 
 ```
 Matmul -> Copy -> CPU
@@ -86,21 +73,11 @@ Matmul -> Copy -> CPU
                     Matmul -> Copy -> CPU
 ```
 
-```python
-async def pipeline(dev_in, dev_out):
-    await spike_async.execute(matmul_model, dev_in, dev_out)
-    host_out = await spike_async.tensor_read(dev_out)
-    cpu_function(host_out)
+### Explicit dependencies: complex dependency graphs
 
-for i in range(n):
-    spike_async.submit(pipeline(dev_in[i], dev_out[i]))
-```
+Streams model dependencies coarsely: everything on a stream is ordered, and anything cross-stream needs explicit events. When the dependency graph is a DAG rather than a set of chains, wiring it up with streams and events is error-prone — a misplaced wait silently over- or under-constrains the ordering.
 
-Each `await` suspends only that coroutine until the awaited operation finishes, while other submitted coroutines continue to make progress — including their CPU work.
-
-#### Problem 2: Fine-Grained Dependency Control Is Unnatural
-
-Stream APIs model dependencies coarsely: all operations in a stream are ordered, and cross-stream synchronization requires explicit events between streams. Consider this dependency graph, which arises naturally when two independent models feed into a third, while a fourth model only needs the second:
+Consider two independent models feeding a third, while a fourth needs only the second:
 
 ```
 model_a ──┐
@@ -110,45 +87,7 @@ model_b ──┘
    └─────────► model_d
 ```
 
-With CUDA streams, you must manually create streams, record events, and wire up waits:
-
-```cpp
-cudaStream_t s1, s2, s3, s4;
-cudaStreamCreate(&s1);
-cudaStreamCreate(&s2);
-cudaStreamCreate(&s3);
-cudaStreamCreate(&s4);
-
-// Run model_a and model_b in parallel
-run_model<<<..., s1>>>(model_a, ...);
-run_model<<<..., s2>>>(model_b, ...);
-
-// Record events to mark completion
-cudaEvent_t event_a, event_b;
-cudaEventCreate(&event_a);
-cudaEventCreate(&event_b);
-cudaEventRecord(event_a, s1);
-cudaEventRecord(event_b, s2);
-
-// model_c waits for both a and b
-cudaStreamWaitEvent(s3, event_a);
-cudaStreamWaitEvent(s3, event_b);
-run_model<<<..., s3>>>(model_c, ...);
-
-// model_d waits only for b — easy to accidentally add event_a here too
-cudaStreamWaitEvent(s4, event_b);
-run_model<<<..., s4>>>(model_d, ...);
-
-// Cleanup
-cudaEventDestroy(event_a);
-cudaEventDestroy(event_b);
-cudaStreamDestroy(s1); cudaStreamDestroy(s2);
-cudaStreamDestroy(s3); cudaStreamDestroy(s4);
-```
-
-The dependency structure is buried in scattered `cudaStreamWaitEvent` calls. A misplaced wait or a forgotten event silently introduces wrong ordering or unnecessary serialization.
-
-With SpikeAsync's `deps=` parameter, the same graph is expressed directly:
+The `deps=` parameter expresses this directly, co-locating each dependency with the operation it constrains:
 
 ```python
 fut_a = spike_async.execute(model_a, in_a, out_a)
@@ -161,7 +100,7 @@ fut_c = spike_async.execute(model_c, in_c, out_c, deps=[fut_a, fut_b])
 fut_d = spike_async.execute(model_d, in_d, out_d, deps=[fut_b])
 ```
 
-Each operation declares exactly what it depends on, co-located with the operation itself. There are no streams to create, no events to record, and no risk of accidentally over-constraining or under-constraining the graph.
+There are no streams to create, no events to record, and no risk of accidentally over- or under-constraining the graph.
 
 ## High-Level Async API
 
