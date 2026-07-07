@@ -338,6 +338,77 @@ def hbm_slices(
 
 
 # ---------------------------------------------------------------------------
+# Canonical row-major layout + the shared tile load/store helpers
+# ---------------------------------------------------------------------------
+
+
+def canonical_layout(rank: int) -> Layout:
+    """Canonical row-major layout: last dim = F, penultimate = P, rest = I.
+
+    HBM is layout-agnostic (row-major contiguous), so every elementwise
+    load/store addresses data by logical coordinates in this one layout — the
+    declared layout of individual values is irrelevant across a segment
+    boundary. This is the normal form the tile machinery loops over.
+    """
+    if rank == 0:
+        return Layout(i_dims=(), p_dims=(), f_dims=())
+    if rank == 1:
+        return Layout(i_dims=(), p_dims=(), f_dims=(0,))
+    f_dims = (rank - 1,)
+    p_dims = (rank - 2,)
+    i_dims = tuple(range(rank - 2))
+    return Layout(i_dims=i_dims, p_dims=p_dims, f_dims=f_dims)
+
+
+def load_input_tile(
+    nb: Builder,
+    src_hbm: Value,
+    val_shape: tuple[int, ...],
+    val_dtype: DType,
+    seg_dtype: DType,
+    indices: dict[int, int],
+    rep_layout: Layout,
+    offsets: tuple[int, ...] | None = None,
+) -> Value:
+    """Materialize one tile of a viewed value from HBM into SBUF.
+
+    The single load path for elementwise emission: it computes the value's own
+    canonical row-major layout, tiles it with the segment dtype, maps the rep
+    loop indices onto its dims, and DMAs the tile in. ``offsets`` composes an
+    access descriptor into the load — a slice-as-view input passes its per-dim
+    ``starts`` so the tile reads ``src_hbm`` shifted by the slice window with no
+    copy of its own (the slice preserves rank, so the tile layout still comes
+    from ``val_shape`` and only the base offset shifts).
+    """
+    val_layout = canonical_layout(len(val_shape))
+    val_tile_sizes = compute_tile_sizes(val_shape, val_layout, seg_dtype)
+    val_tile = on_chip_shape(val_shape, val_layout, val_tile_sizes, indices)
+    slices = hbm_slices(val_shape, val_layout, val_tile_sizes, indices, rep_layout)
+    if offsets is not None:
+        slices = [DimSlice(s.offset + off, s.size, s.stride)
+                  for s, off in zip(slices, offsets)]
+    dst = nb.alloc(val_tile, val_dtype, MemorySpace.SBUF)
+    return nb.dma_copy(dst, src_hbm, slices)
+
+
+def store_output_tile(
+    nb: Builder,
+    hbm_dst: Value,
+    tile: Value,
+    seg_dtype: DType,
+    indices: dict[int, int],
+    rep_layout: Layout,
+) -> None:
+    """Store one SBUF tile back to its HBM buffer — the store counterpart to
+    ``load_input_tile``, using the destination's own canonical layout."""
+    out_layout = canonical_layout(len(hbm_dst.type.shape))
+    out_tile_sizes = compute_tile_sizes(hbm_dst.type.shape, out_layout, seg_dtype)
+    slices = hbm_slices(hbm_dst.type.shape, out_layout, out_tile_sizes,
+                        indices, rep_layout)
+    nb.dma_copy(hbm_dst, tile, slices)
+
+
+# ---------------------------------------------------------------------------
 # Output slice helper
 # ---------------------------------------------------------------------------
 

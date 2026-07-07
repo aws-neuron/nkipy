@@ -25,7 +25,7 @@ from nkigen_lite.nki_ir.ir import (
     PSUM_FREE_MAX,
 )
 
-from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import ceildiv
+from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import ceildiv, unravel
 
 
 def emit_matmul(
@@ -76,14 +76,6 @@ def emit_matmul(
     n_batch_total = math.prod(out_batch) if out_batch else 1
     batch_dims = list(out_batch)
 
-    def _batch_indices(flat_idx: int) -> tuple[int, ...]:
-        indices = []
-        remaining = flat_idx
-        for d in reversed(batch_dims):
-            indices.append(remaining % d)
-            remaining //= d
-        return tuple(reversed(indices))
-
     def _a_batch_slices(batch_idx: tuple[int, ...]) -> list[DimSlice]:
         """Build batch slices for A, respecting broadcast (size-1 dims)."""
         slices = []
@@ -116,7 +108,7 @@ def emit_matmul(
         a_k1_view = nb.view(a_hbm, (K, 1))
 
     for batch_flat in range(n_batch_total):
-        batch_idx = _batch_indices(batch_flat) if batch_dims else ()
+        batch_idx = unravel(batch_flat, batch_dims) if batch_dims else ()
         for m_i in range(n_m_tiles):
             m_off = m_i * tile_m
             m_size = min(tile_m, M - m_off)

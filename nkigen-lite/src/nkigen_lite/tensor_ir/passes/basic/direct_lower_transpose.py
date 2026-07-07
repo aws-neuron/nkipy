@@ -113,14 +113,7 @@ def _tile_iter(in_shape, perm, groups, c_out, c_rank, tile_p, tile_f):
 
     for batch_flat in range(n_batch):
         # Expand batch flat index to per-collapsed-batch-dim coords
-        batch_coords: tuple[int, ...] = ()
-        if c_batch_dims:
-            remaining = batch_flat
-            coords = []
-            for d in reversed(c_batch_dims):
-                coords.append(remaining % d)
-                remaining //= d
-            batch_coords = tuple(reversed(coords))
+        batch_coords = unravel(batch_flat, c_batch_dims) if c_batch_dims else ()
 
         # Build batch portion of src and dst slices
         batch_src: dict[int, DimSlice] = {}

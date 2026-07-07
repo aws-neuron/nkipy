@@ -93,11 +93,19 @@ loads compose through (the view-reshape rebind is the existing prototype).
   expansion `(1,8,1,64)→(1,8,8,64)`) are *not* collapse-safe and stay
   materialized. qwen3 MoE: broadcast_to 105 calls/1438 ops → 7 calls/700 ops;
   total 42805 → 41633 nki ops (−2.7%). All 7 remaining are legit GQA middles.
-- [ ] **Shared "materialize a tile from a viewed value" load helper.**
-  All emitters load through one helper that composes the access descriptor
-  into the `DimSlice`s. This is also the 2D-(P,F)-normalization consolidation
-  from the review — collapse-to-2D becomes the normal form, not a per-op
-  fast path.
+- [x] **Shared "materialize a tile from a viewed value" load helper.**
+  `load_input_tile` / `store_output_tile` (+ the shared `canonical_layout`)
+  in `direct_lower_utils.py` are now the single load/store path for
+  elementwise emission. `_emit_ew_tile` previously carried two near-identical
+  load branches (normal load vs. slice-view load-with-offset) inlined; both
+  now call `load_input_tile`, which composes an optional per-dim `offsets`
+  descriptor (the slice's `starts`) into the `DimSlice`s. The rep shape and
+  tile-sizes no longer thread through `_emit_ew_tile` — each value tiles in its
+  own canonical row-major layout mapped onto the rep loop, so the helper needs
+  only `(shape, dtype, seg_dtype, indices, rep_layout, offsets)`. Behavior-
+  neutral: qwen3 MoE stays at 39968 nki ops / 10601 dma_copy (same DMAs, one
+  code path). The access-descriptor seam this creates is what a future
+  transpose/reshape view composes through.
 - [x] **slice as view** (contiguous, static starts): done via JIT
   materialization rather than a global descriptor. A static-start, stride-1
   `slice` preserves rank, so an elementwise consumer just adds the slice's
@@ -189,3 +197,4 @@ Fusions, in order of expected payoff (re-profile after Phase 1 to confirm):
 | 2026-07-05 | Phase 1: fold broadcast_to into elementwise consumers | 41633 nki (9.0x), 11369 dma_copy | broadcast_to 105 calls/1438 ops → 7 calls/700 ops (only GQA middles remain); elementwise unchanged (native F/P broadcast). Fold runs pre-decompose, also fixing the div-denominator precision round-trip. |
 | 2026-07-06 | Phase 1: slice as view (offset fold + JIT materialize) | 40993 nki (8.8x), 11113 dma_copy | slice attribution 1149 ops/714 dmas → 0 (folded into EW consumers or materialized off the profiled wrapper); elementwise 3240→3264 (composed offset loads). Foldable slices: static-start, stride-1. All 695 tensor_ir tests + 11 new slice-view tests (7 interp, 4 HW) pass. |
 | 2026-07-06 | Phase 1: compose chained transposes | 39968 nki (8.6x), 10601 dma_copy | transpose 2864→2096 ops (1056 dmas); one of the two 4096-wide attention transposes folds away (`(0,2,1,3)`∘`(0,1,3,2)` → `(0,2,3,1)`). New `fold_transpose.py` peephole. 6 interp + 2 HW fold tests pass; transpose+lowering HW suites (35 tests) green on trn2. |
+| 2026-07-06 | Phase 1: shared load/store tile helper | 39968 nki (8.6x), 10601 dma_copy | Refactor only — `load_input_tile`/`store_output_tile`/`canonical_layout` in `direct_lower_utils.py` are the single elementwise load/store path (was two inlined branches in `_emit_ew_tile`); slice-view offset is now an optional `offsets` descriptor. Op count unchanged (behavior-neutral). All 702 tensor_ir tests pass (1 flaky HW-compile contention, green in isolation). |

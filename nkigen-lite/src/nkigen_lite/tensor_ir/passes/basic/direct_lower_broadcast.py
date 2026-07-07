@@ -36,6 +36,7 @@ from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
     ceildiv,
     collapse_view,
     iter_pf_tiles,
+    unravel,
 )
 
 
@@ -103,12 +104,7 @@ def _emit_broadcast_scalar(nb: Builder, x_hbm, y_hbm, out_shape, dtype) -> None:
     n_batch = math.prod(batch_dims) if batch_dims else 1
 
     for bf in range(n_batch):
-        batch_idx = []
-        remaining = bf
-        for d in reversed(batch_dims):
-            batch_idx.append(remaining % d)
-            remaining //= d
-        batch_idx = tuple(reversed(batch_idx))
+        batch_idx = unravel(bf, batch_dims) if batch_dims else ()
 
         for p_i in range(ceildiv(p_extent, tile_p)):
             p_off = p_i * tile_p
@@ -268,16 +264,8 @@ def emit_broadcast_to(nb: Builder, x_hbm, y_hbm, in_shape, out_shape, dtype) -> 
     batch_dims = list(out_shape[:-2]) if rank > 2 else []
     n_batch = math.prod(batch_dims) if batch_dims else 1
 
-    def _unravel_idx(flat_idx: int) -> tuple[int, ...]:
-        indices = []
-        remaining = flat_idx
-        for d in reversed(batch_dims):
-            indices.append(remaining % d)
-            remaining //= d
-        return tuple(reversed(indices))
-
     for bf in range(n_batch):
-        batch_idx = _unravel_idx(bf) if batch_dims else ()
+        batch_idx = unravel(bf, batch_dims) if batch_dims else ()
         for p_i in range(ceildiv(p_extent, tile_p)):
             p_off = p_i * tile_p
             p_size = min(tile_p, p_extent - p_off)
