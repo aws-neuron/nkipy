@@ -467,13 +467,10 @@ class TestLowerHW:
 
 
 class TestCollapsedElementwise:
-    """Rank>=3 elementwise segments collapse leading dims onto the partition.
+    """Rank>=3 elementwise segments lower correctly.
 
     These shapes mirror the multi-batch attention segments in the fused Qwen3
-    layer, where the old per-tile path used only out[-2] partition lanes and
-    unrolled prod(out[:-2]) iterations. Verified at the interpreter level and
-    (selectively) on hardware. See ``_try_emit_collapsed_ew`` in
-    ``direct_lower.py``.
+    layer. Verified at the interpreter level and (selectively) on hardware.
     """
 
     # -- interpreter --

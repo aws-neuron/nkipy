@@ -64,11 +64,10 @@ def _broadcast_shapes(*shapes: tuple[int, ...]) -> tuple[int, ...] | None:
 def _collapses_cleanly(src_shape: tuple[int, ...], rep_shape: tuple[int, ...]) -> bool:
     """True if ``src_shape`` collapses to the elementwise rep's ``(P, F)``.
 
-    Mirrors ``direct_lower._collapse_ew_shape``: for a rank>=3 rep the whole
-    segment loops ``(prod(rep[:-1]), rep[-1])``, and an operand can join that
-    loop only if its collapsed partition is ``rep_P`` or 1 and its collapsed
-    free is ``rep_F`` or 1. For rank<3 reps the generic 2D path handles any
-    broadcast, so folding is always collapse-safe.
+    For a rank>=3 rep the whole segment loops ``(prod(rep[:-1]), rep[-1])``,
+    and an operand can join that loop only if its collapsed partition is
+    ``rep_P`` or 1 and its collapsed free is ``rep_F`` or 1. For rank<3 reps the
+    generic 2D path handles any broadcast, so folding is always collapse-safe.
     """
     if len(rep_shape) < 3:
         return True

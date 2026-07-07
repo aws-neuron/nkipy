@@ -152,17 +152,11 @@ def test_perf1_mixed_collapse_elementwise_no_blowup():
         {"oq": (1, S, Hq, D), "ok": (1, S, Hk, D)},
     )
 
-    # Op-count guard on the precise symptom: before the fix the merged segment
-    # put the size-1-ish axis on the partition and unrolled S=64, emitting one
-    # compute op per (sequence, ...) element (128 tensor_tensor_arith). A clean
-    # collapse tiles each mul over the packed partition — a handful of ops.
-    b = Builder("t")
-    build(b)
-    nki_graph = lower_to_nki(b.graph)
-    n_compute = sum(1 for o in nki_graph.ops if o.opcode == "tensor_tensor_arith")
-    assert n_compute <= 8, (
-        f"mixed-collapse elementwise unrolled to {n_compute} compute ops"
-    )
+    # NOTE: the rank>=3 leading-dims-onto-partition collapse fast path was
+    # removed (to be reintroduced as the Phase-2 fusion-compatibility
+    # predicate), so each rank-4 mul currently unrolls the sequence axis. Only
+    # the correctness check above is asserted here; the op-count guard is
+    # dropped until the collapse path returns.
 
 
 # ---------------------------------------------------------------------------
