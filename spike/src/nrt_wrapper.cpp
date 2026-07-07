@@ -83,4 +83,28 @@ uint32_t NrtRuntime::get_total_nc_count() {
     return count;
 }
 
+uint32_t NrtRuntime::get_tensor_lnc(const nrt_tensor_t *tensor) {
+  int lnc_idx = 0;
+  NRT_STATUS status = nrt_tensor_get_lnc_index(tensor, &lnc_idx);
+  if (status != NRT_SUCCESS) {
+    throw NrtError(status, "Failed to get tensor LNC index");
+  }
+  return static_cast<uint32_t>(lnc_idx);
+}
+
+uint32_t NrtRuntime::get_model_lnc(const nrt_model_t *model) {
+  nrt_model_info_t info;
+  size_t info_size_out = 0;
+  NRT_STATUS status =
+      nrt_get_model_info(model, &info, sizeof(info), &info_size_out);
+  if (status != NRT_SUCCESS) {
+    throw NrtError(status, "Failed to get model info");
+  }
+  return info.vnc;
+}
+
+size_t NrtRuntime::get_tensor_size(const nrt_tensor_t *tensor) {
+  return nrt_tensor_get_size(tensor);
+}
+
 } // namespace spike
