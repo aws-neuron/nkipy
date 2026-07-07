@@ -39,7 +39,7 @@ from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
     max_free_elems,
     unravel,
 )
-from nkigen_lite.tensor_ir.passes.basic.direct_lower_fusion import (
+from nkigen_lite.tensor_ir.passes.basic.direct_lower_elementwise import (
     _emit_elementwise_segment,
 )
 
@@ -109,13 +109,6 @@ def lower_graph(graph: Graph) -> nki_ir.Graph:
         if key not in hbm_map:
             hbm_map[key] = nb.add_input(key, _nki_shape(out_val.type.shape), out_val.type.dtype)
 
-    # Splat values of constant-op results: concat inlines these (memset straight
-    # into the output window) instead of loading a buffer.
-    const_values: dict[str, float] = {
-        op.results[0].name: op.attrs["value"]
-        for op in graph.ops if op.opcode == "constant"
-    }
-
     # Allocate an HBM buffer for every op result.  Skip reshape results:
     # a reshape preserves row-major flat order, so its result is emitted as a
     # zero-copy view of the (row-major contiguous) input HBM buffer rather than
@@ -133,10 +126,10 @@ def lower_graph(graph: Graph) -> nki_ir.Graph:
                     _nki_shape(r.type.shape), r.type.dtype, MemorySpace.HBM
                 )
 
-    # Per-op emitters, all ``(nb, op, hbm_map) -> None``.  Two need closure over
-    # ``lower_graph`` state: ``concat`` splat-fills constant inputs, and a
-    # view-``slice`` emits nothing (its result is a zero-copy offset view the
-    # elementwise consumers compose through).
+    # Per-op emitters, all ``(nb, op, hbm_map) -> None``.  Only ``slice`` needs
+    # a closure over ``lower_graph`` state: a view-slice emits nothing (its
+    # result is a zero-copy offset view the elementwise consumers compose
+    # through).
     def _emit_slice_dispatch(nb, op, hbm_map):
         if op.results[0].name in slice_views:
             return  # zero-copy offset view; no emission
@@ -144,9 +137,6 @@ def lower_graph(graph: Graph) -> nki_ir.Graph:
 
     emitters = {
         **_OP_EMITTERS,
-        "concat": lambda nb, op, hbm_map: _emit_concat_op(
-            nb, op, hbm_map, const_values
-        ),
         "slice": _emit_slice_dispatch,
     }
 
@@ -352,30 +342,17 @@ def _emit_slice_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
     )
 
 
-def _emit_concat_op(
-    nb: Builder, op, hbm_map: dict[str, Value],
-    const_values: dict[str, float] | None = None,
-) -> None:
+def _emit_concat_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
     out_val = op.results[0]
     axis = op.attrs["axis"]
     rank = len(out_val.type.shape)
     if axis < 0:
         axis += rank
-    # Constant inputs are splat-filled straight into the output window (no HBM
-    # buffer, no load) — see emit_concat. Their hbm_map entry may not exist.
-    const_values = const_values or {}
-    splats = [const_values.get(v.name) for v in op.inputs]
-    input_hbms = [hbm_map.get(v.name) for v in op.inputs]
-    if any(h is None and s is None for h, s in zip(input_hbms, splats)):
-        raise KeyError(
-            f"concat input missing HBM buffer and not a constant: "
-            f"{[v.name for v in op.inputs]}"
-        )
+    input_hbms = [hbm_map[v.name] for v in op.inputs]
     input_shapes = [v.type.shape for v in op.inputs]
     emit_concat(
         nb, input_hbms, hbm_map[out_val.name],
         input_shapes, axis, op.inputs[0].type.dtype,
-        splats=splats if any(s is not None for s in splats) else None,
     )
 
 
@@ -389,8 +366,7 @@ def _emit_broadcast_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
 
 
 # Per-opcode emitters, all ``(nb, op, hbm_map) -> None``.  ``lower_graph`` wraps
-# two of these in closures over its own state: ``concat`` (splat-fills constant
-# inputs via ``const_values``) and ``slice`` (a view-slice emits nothing).
+# ``slice`` in a closure over its own state (a view-slice emits nothing).
 # Elementwise ops are not dispatched here — they run through the fused tile loop.
 _OP_EMITTERS: dict[str, object] = {
     "reduce": emit_reduce,
@@ -398,6 +374,7 @@ _OP_EMITTERS: dict[str, object] = {
     "transpose": _emit_transpose_op,
     "reshape": _emit_reshape_op,
     "slice": _emit_slice_op,
+    "concat": _emit_concat_op,
     "broadcast_to": _emit_broadcast_op,
     "iota": emit_iota,
     "topk": emit_topk,
