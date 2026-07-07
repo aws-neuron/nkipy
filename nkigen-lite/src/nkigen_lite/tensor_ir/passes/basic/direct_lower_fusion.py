@@ -1,20 +1,21 @@
-"""Elementwise fusion pass: segment + fused-tile emission for tensor IR.
+"""Elementwise fused-tile emission for tensor IR.
 
-Consecutive elementwise ops are grouped into a single segment and lowered
-together as one tiled loop, keeping intermediates on-chip (no HBM round-trip
-between them). This module owns the two halves of that:
+An elementwise segment is lowered as one tiled load→compute→store loop, keeping
+intermediates on-chip (no HBM round-trip between them):
 
-  - ``_segment_ops`` splits a graph's ops into elementwise groups (fused) and
-    individual non-elementwise ops (each its own segment), a purely
-    shape-driven decision (see the docstring for the grouping rule).
-  - ``_emit_elementwise_segment`` emits one fused, tiled load→compute→store
-    loop for a group, with a rank>=3 leading-dims-onto-partition collapse fast
-    path (``_try_emit_collapsed_ew``) and a generic per-tile fallback.
+  - ``_emit_elementwise_segment`` emits one fused, tiled loop for a segment,
+    with a rank>=3 leading-dims-onto-partition collapse fast path
+    (``_try_emit_collapsed_ew``) and a generic per-tile fallback.
+
+Segmentation (grouping consecutive elementwise ops into one segment) currently
+lives in ``direct_lower.lower_graph``, which passes one op per segment — the
+grouping heuristic is to be reintroduced as the Phase-2 fusion-compatibility
+predicate.
 
 Layouts are canonical row-major throughout: HBM boundaries are layout-agnostic,
 so every load/store addresses data by logical coordinate and no per-value
-layout has to be agreed on. ``direct_lower.lower_graph`` calls these two entry
-points; everything else here is a helper for them.
+layout has to be agreed on. ``direct_lower.lower_graph`` calls
+``_emit_elementwise_segment``; everything else here is a helper for it.
 """
 
 from __future__ import annotations
@@ -32,7 +33,6 @@ from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
     BINARY_OPS,
     BITWISE_OPS,
     COMPARE_OPS,
-    ELEMENTWISE_OPCODES,
     UNARY_OPS,
     canonical_layout,
     ceildiv,
@@ -48,82 +48,6 @@ from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
 # Canonical row-major layout lives in direct_lower_utils (shared with the tile
 # load/store helpers); kept as a module-local alias for the callers below.
 _canonical_layout = canonical_layout
-
-
-# ---------------------------------------------------------------------------
-# Graph segmentation
-# ---------------------------------------------------------------------------
-
-
-def _collapsed_pf(shape: tuple[int, ...]) -> tuple[int, int]:
-    """Collapse a shape to the ``(prod(shape[:-1]), shape[-1])`` 2D form the
-    elementwise lowering tiles over (all leading axes fold onto the partition).
-    """
-    if len(shape) == 0:
-        return (1, 1)
-    return (prod(shape[:-1]), shape[-1])
-
-
-def _segment_ops(graph) -> list[list]:
-    """Segment graph ops into elementwise groups and individual non-elementwise ops.
-
-    Elementwise ops are grouped only if they have a compatible collapsed
-    ``(P, F)`` shape — every op in a group must fold to the same
-    partition/free extents (size-1 broadcasts aside). A group that mixed,
-    say, ``(1,128,8,64)`` (collapsed P=1024) with ``(1,128,1,64)`` (collapsed
-    P=128) cannot share one collapsed tile loop: the fast collapse path would
-    reject it and the generic fallback would put the size-1 axis on the
-    partition and unroll the 128-wide axis one element at a time. Splitting
-    keeps each group collapsible.
-
-    This is a purely shape-driven decision: emission uses one canonical
-    row-major layout for the whole group (see ``_emit_elementwise_segment``),
-    so there is no per-value layout to agree on.
-
-    Returns a list of segments. Each segment is either:
-      - A list of consecutive elementwise ops (grouped)
-      - A list with a single non-elementwise op
-    """
-    segments = []
-    current_ew = []
-    # Distinct non-1 collapsed extents seen in the current group (None until set).
-    group_p = None
-    group_f = None
-
-    def _flush():
-        nonlocal current_ew, group_p, group_f
-        if current_ew:
-            segments.append(current_ew)
-            current_ew = []
-        group_p = None
-        group_f = None
-
-    for op in graph.ops:
-        if op.opcode in ELEMENTWISE_OPCODES:
-            cp, cf = _collapsed_pf(op.results[0].type.shape)
-            # A second distinct non-1 partition (or free) extent can't share the
-            # group's collapsed tile loop.
-            shape_conflict = (
-                (cp != 1 and group_p is not None and cp != group_p)
-                or (cf != 1 and group_f is not None and cf != group_f)
-            )
-
-            if current_ew and shape_conflict:
-                _flush()
-
-            current_ew.append(op)
-            if cp != 1:
-                group_p = cp
-            if cf != 1:
-                group_f = cf
-        else:
-            _flush()
-            segments.append([op])
-
-    if current_ew:
-        segments.append(current_ew)
-
-    return segments
 
 
 # ---------------------------------------------------------------------------

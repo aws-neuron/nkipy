@@ -41,7 +41,6 @@ from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
 )
 from nkigen_lite.tensor_ir.passes.basic.direct_lower_fusion import (
     _emit_elementwise_segment,
-    _segment_ops,
 )
 
 
@@ -110,84 +109,67 @@ def lower_graph(graph: Graph) -> nki_ir.Graph:
         if key not in hbm_map:
             hbm_map[key] = nb.add_input(key, _nki_shape(out_val.type.shape), out_val.type.dtype)
 
-    segments = _segment_ops(graph)
-
-    # Which elementwise segment produced each value (results of non-elementwise
-    # ops are absent: their emitters always store to HBM).
-    seg_of: dict[str, int] = {}
-    for si, seg in enumerate(segments):
-        if seg[0].opcode in ELEMENTWISE_OPCODES:
-            for op in seg:
-                for r in op.results:
-                    seg_of[r.name] = si
-
     # Splat values of constant-op results: concat inlines these (memset straight
-    # into the output window), so a constant consumed only by concats needs no
-    # HBM buffer, no store, and no emission at all.
+    # into the output window) instead of loading a buffer.
     const_values: dict[str, float] = {
         op.results[0].name: op.attrs["value"]
         for op in graph.ops if op.opcode == "constant"
     }
 
-    # A value produced inside an elementwise segment stays on-chip (tile_map)
-    # for consumers in the same segment; it needs an HBM buffer + store only
-    # when some *other* segment reads it, or it is a graph output. Everything
-    # else is a dead store: skipping the allocation makes the (already
-    # guarded) store loops skip it too.  A constant read by a concat does not
-    # escape: concat inlines the splat instead of loading the buffer.
-    escapes: set[str] = {out_val.name for out_val in graph.outputs.values()}
-    for si, seg in enumerate(segments):
-        for op in seg:
-            for inp in op.inputs:
-                if inp.name in seg_of and seg_of[inp.name] != si:
-                    if op.opcode == "concat" and inp.name in const_values:
-                        continue
-                    escapes.add(inp.name)
-
-    # Allocate HBM intermediates for op results.  Skip reshape results:
+    # Allocate an HBM buffer for every op result.  Skip reshape results:
     # a reshape preserves row-major flat order, so its result is emitted as a
     # zero-copy view of the (row-major contiguous) input HBM buffer rather than
     # a fresh allocation + copy.  Allocating here would leave a large dead HBM
     # buffer (an expert weight reshape is ~100 MB).  Scalar reshapes still need
-    # a real buffer (() promotion), so don't skip those.  Also skip elementwise
-    # results that never escape their segment (see above).
+    # a real buffer (() promotion), so don't skip those.
     for op in graph.ops:
         if op.opcode == "reshape" and _is_view_reshape(op):
             continue
         if op.results and op.results[0].name in slice_views:
             continue  # lowered lazily as an offset view (or materialized on use)
         for r in op.results:
-            if r.name in seg_of and r.name not in escapes:
-                continue
             if r.name not in hbm_map:
                 hbm_map[r.name] = nb.alloc(
                     _nki_shape(r.type.shape), r.type.dtype, MemorySpace.HBM
                 )
 
-    # Lower each segment.  Elementwise segments are fused (one tiled loop) and
-    # compose slice-view offsets into their loads themselves.  Every other op
-    # is its own segment, dispatched through ``_OP_EMITTERS``; those emitters
-    # read their inputs' HBM buffers directly, so materialize any pending
-    # slice-view an input chains through before the emitter runs.
-    for segment in segments:
-        op = segment[0]
+    # Per-op emitters, all ``(nb, op, hbm_map) -> None``.  Two need closure over
+    # ``lower_graph`` state: ``concat`` splat-fills constant inputs, and a
+    # view-``slice`` emits nothing (its result is a zero-copy offset view the
+    # elementwise consumers compose through).
+    def _emit_slice_dispatch(nb, op, hbm_map):
+        if op.results[0].name in slice_views:
+            return  # zero-copy offset view; no emission
+        _emit_slice_op(nb, op, hbm_map)
+
+    emitters = {
+        **_OP_EMITTERS,
+        "concat": lambda nb, op, hbm_map: _emit_concat_op(
+            nb, op, hbm_map, const_values
+        ),
+        "slice": _emit_slice_dispatch,
+    }
+
+    # Lower each op.  An elementwise op is emitted through the tiled
+    # load→compute→store loop, which composes slice-view offsets into its loads
+    # itself — the one emitter that reads a view without materializing it, so it
+    # must run before the resolve loop below (grouping consecutive elementwise
+    # ops into one fused loop is to be reintroduced as the Phase-2
+    # fusion-compatibility predicate).  Every other emitter reads its inputs'
+    # HBM buffers directly, so materialize any pending slice-view an input
+    # chains through first, then dispatch.
+    for op in graph.ops:
         opcode = op.opcode
 
         if opcode in ELEMENTWISE_OPCODES:
-            _emit_elementwise_segment(nb, segment, hbm_map, slice_views, _resolve)
+            _emit_elementwise_segment(nb, [op], hbm_map, slice_views, _resolve)
             continue
 
         for inp in op.inputs:
             if inp.name in slice_views:
                 _resolve(inp.name)
 
-        if opcode == "slice" and op.results[0].name in slice_views:
-            continue  # zero-copy offset view; no emission
-        if opcode == "concat":
-            _emit_concat_op(nb, op, hbm_map, const_values)
-            continue
-
-        emitter = _OP_EMITTERS.get(opcode)
+        emitter = emitters.get(opcode)
         if emitter is None:
             raise NotImplementedError(f"Op {opcode!r} not supported")
         emitter(nb, op, hbm_map)
@@ -406,9 +388,10 @@ def _emit_broadcast_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
     )
 
 
-# Per-opcode emitters, all ``(nb, op, hbm_map) -> None``.  ``concat`` is
-# dispatched separately in ``lower_graph`` (it also needs ``const_values``);
-# elementwise segments are fused, not dispatched here.
+# Per-opcode emitters, all ``(nb, op, hbm_map) -> None``.  ``lower_graph`` wraps
+# two of these in closures over its own state: ``concat`` (splat-fills constant
+# inputs via ``const_values``) and ``slice`` (a view-slice emits nothing).
+# Elementwise ops are not dispatched here — they run through the fused tile loop.
 _OP_EMITTERS: dict[str, object] = {
     "reduce": emit_reduce,
     "matmul": _emit_matmul_op,
