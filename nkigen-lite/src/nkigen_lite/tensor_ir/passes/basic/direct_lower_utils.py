@@ -18,7 +18,6 @@ from nkigen_lite.nki_ir.ir import (
     SBUF_PER_PARTITION_BYTES,
 )
 from nkigen_lite.nki_ir import ir as nki_ir
-from nkigen_lite.tensor_ir.passes.layout import Layout
 
 
 # ---------------------------------------------------------------------------
@@ -207,61 +206,6 @@ def prefix_row_segments(r0, p, free, in_shape, in_strides, out_shape, out_stride
 # ---------------------------------------------------------------------------
 
 
-def compute_tile_sizes(
-    shape: tuple[int, ...], layout: Layout, dtype: "DType | None" = None
-) -> dict[int, int]:
-    """Compute per-dimension tile sizes.
-
-    I-dims: 1, outer P-dims: 1, innermost P-dim: min(extent, 128). F-dims are
-    full except the innermost, which is capped so one tile row fits a single
-    SBUF partition (a vocab-wide row, e.g. [1, 37984], would otherwise need a
-    150 KB tile and overflow once a few are live).  The lowering loops already
-    iterate ceil(extent / tile) tiles, so a smaller innermost-F tile is just
-    more iterations.  ``dtype`` selects the byte budget; when omitted, the
-    conservative F32 budget is used.
-    """
-    tiles: dict[int, int] = {}
-    for d in layout.i_dims:
-        tiles[d] = 1
-    p_dims = layout.p_dims
-    for i, d in enumerate(p_dims):
-        tiles[d] = min(shape[d], PARTITION_MAX) if i == len(p_dims) - 1 else 1
-    f_dims = layout.f_dims
-    cap = max_free_elems(dtype) if dtype is not None else max_free_elems(DType.F32)
-    for i, d in enumerate(f_dims):
-        if i == len(f_dims) - 1:
-            # Innermost F: cap to the per-partition budget divided by the outer
-            # F extents already committed (so the full on-chip free size stays
-            # within budget).
-            outer_f = 1
-            for j, dd in enumerate(f_dims):
-                if j != i:
-                    outer_f *= shape[dd]
-            tiles[d] = max(1, min(shape[d], cap // max(1, outer_f)))
-        else:
-            tiles[d] = shape[d]
-    return tiles
-
-
-def on_chip_shape(
-    shape: tuple[int, ...],
-    layout: Layout,
-    tile_sizes: dict[int, int],
-    indices: dict[int, int],
-) -> tuple[int, int]:
-    """Compute the 2D on-chip tile shape (P, F) for the current iteration."""
-    def _extent(d: int) -> int:
-        ts = tile_sizes[d]
-        if ts >= shape[d]:
-            return shape[d]
-        idx = indices.get(d, 0)
-        return min(ts, shape[d] - idx * ts)
-
-    p = prod(_extent(d) for d in layout.p_dims) if layout.p_dims else 1
-    f = prod(_extent(d) for d in layout.f_dims) if layout.f_dims else 1
-    return (p, f)
-
-
 def clamped_extent(
     dims: tuple[int, ...],
     shape: tuple[int, ...],
@@ -297,115 +241,6 @@ def build_slices(
             size = min(ts, shape[d] - off)
             slices.append(DimSlice(off, size))
     return slices
-
-
-def map_indices(
-    val_layout: Layout, rep_layout: Layout, indices: dict[int, int],
-) -> dict[int, int]:
-    """Map loop indices from the rep's dim positions to a value's dim positions."""
-    mapped: dict[int, int] = {}
-    for val_group, rep_group in [
-        (val_layout.i_dims, rep_layout.i_dims),
-        (val_layout.p_dims, rep_layout.p_dims),
-        (val_layout.f_dims, rep_layout.f_dims),
-    ]:
-        for k, val_d in enumerate(val_group):
-            if k < len(rep_group) and rep_group[k] in indices:
-                mapped[val_d] = indices[rep_group[k]]
-    return mapped
-
-
-def hbm_slices(
-    shape: tuple[int, ...],
-    layout: Layout,
-    tile_sizes: dict[int, int],
-    indices: dict[int, int],
-    rep_layout: Layout,
-) -> list[DimSlice]:
-    """Build DimSlice list for a DMA copy, mapping rep loop indices to value dims."""
-    val_indices = map_indices(layout, rep_layout, indices)
-    slices = []
-    for d in range(len(shape)):
-        ts = tile_sizes[d]
-        idx = val_indices.get(d, 0)
-        if ts >= shape[d]:
-            slices.append(DimSlice(0, shape[d]))
-        else:
-            off = idx * ts
-            size = min(ts, shape[d] - off)
-            slices.append(DimSlice(off, size))
-    return slices
-
-
-# ---------------------------------------------------------------------------
-# Canonical row-major layout + the shared tile load/store helpers
-# ---------------------------------------------------------------------------
-
-
-def canonical_layout(rank: int) -> Layout:
-    """Canonical row-major layout: last dim = F, penultimate = P, rest = I.
-
-    HBM is layout-agnostic (row-major contiguous), so every elementwise
-    load/store addresses data by logical coordinates in this one layout — the
-    declared layout of individual values is irrelevant across a segment
-    boundary. This is the normal form the tile machinery loops over.
-    """
-    if rank == 0:
-        return Layout(i_dims=(), p_dims=(), f_dims=())
-    if rank == 1:
-        return Layout(i_dims=(), p_dims=(), f_dims=(0,))
-    f_dims = (rank - 1,)
-    p_dims = (rank - 2,)
-    i_dims = tuple(range(rank - 2))
-    return Layout(i_dims=i_dims, p_dims=p_dims, f_dims=f_dims)
-
-
-def load_input_tile(
-    nb: Builder,
-    src_hbm: Value,
-    val_shape: tuple[int, ...],
-    val_dtype: DType,
-    seg_dtype: DType,
-    indices: dict[int, int],
-    rep_layout: Layout,
-    offsets: tuple[int, ...] | None = None,
-) -> Value:
-    """Materialize one tile of a viewed value from HBM into SBUF.
-
-    The single load path for elementwise emission: it computes the value's own
-    canonical row-major layout, tiles it with the segment dtype, maps the rep
-    loop indices onto its dims, and DMAs the tile in. ``offsets`` composes an
-    access descriptor into the load — a slice-as-view input passes its per-dim
-    ``starts`` so the tile reads ``src_hbm`` shifted by the slice window with no
-    copy of its own (the slice preserves rank, so the tile layout still comes
-    from ``val_shape`` and only the base offset shifts).
-    """
-    val_layout = canonical_layout(len(val_shape))
-    val_tile_sizes = compute_tile_sizes(val_shape, val_layout, seg_dtype)
-    val_tile = on_chip_shape(val_shape, val_layout, val_tile_sizes, indices)
-    slices = hbm_slices(val_shape, val_layout, val_tile_sizes, indices, rep_layout)
-    if offsets is not None:
-        slices = [DimSlice(s.offset + off, s.size, s.stride)
-                  for s, off in zip(slices, offsets)]
-    dst = nb.alloc(val_tile, val_dtype, MemorySpace.SBUF)
-    return nb.dma_copy(dst, src_hbm, slices)
-
-
-def store_output_tile(
-    nb: Builder,
-    hbm_dst: Value,
-    tile: Value,
-    seg_dtype: DType,
-    indices: dict[int, int],
-    rep_layout: Layout,
-) -> None:
-    """Store one SBUF tile back to its HBM buffer — the store counterpart to
-    ``load_input_tile``, using the destination's own canonical layout."""
-    out_layout = canonical_layout(len(hbm_dst.type.shape))
-    out_tile_sizes = compute_tile_sizes(hbm_dst.type.shape, out_layout, seg_dtype)
-    slices = hbm_slices(hbm_dst.type.shape, out_layout, out_tile_sizes,
-                        indices, rep_layout)
-    nb.dma_copy(hbm_dst, tile, slices)
 
 
 # ---------------------------------------------------------------------------

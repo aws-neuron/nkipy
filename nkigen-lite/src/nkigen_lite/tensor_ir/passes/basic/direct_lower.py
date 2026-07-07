@@ -40,7 +40,7 @@ from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
     unravel,
 )
 from nkigen_lite.tensor_ir.passes.basic.direct_lower_elementwise import (
-    _emit_elementwise_segment,
+    _emit_elementwise_group,
 )
 
 
@@ -152,7 +152,7 @@ def lower_graph(graph: Graph) -> nki_ir.Graph:
         opcode = op.opcode
 
         if opcode in ELEMENTWISE_OPCODES:
-            _emit_elementwise_segment(nb, [op], hbm_map, slice_views, _resolve)
+            _emit_elementwise_group(nb, [op], hbm_map, slice_views, _resolve)
             continue
 
         for inp in op.inputs:

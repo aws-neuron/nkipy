@@ -1,175 +1,252 @@
-"""Elementwise tile emission for tensor IR.
+"""Elementwise tile emission for tensor IR — linearize-and-tile flow.
 
-An elementwise segment (a list of elementwise ops) is lowered as one tiled
-load→compute→store loop, keeping intermediates on-chip within the segment (no
-HBM round-trip between them):
+An elementwise group (a list of elementwise ops sharing a broadcast result
+shape) is lowered exactly the way an NKI kernel for elementwise ops is written:
 
-  - ``_emit_elementwise_segment`` emits one tiled loop for a segment: the last
-    axis is the free dim, the penultimate is the partition, and the leading
-    axes are unrolled one tile at a time.
+  1. **Linearize**: collapse every tensor to 2D ``(P, F)`` where ``F`` is the
+     last (contiguous) axis and ``P`` is the product of all leading axes. HBM
+     buffers are row-major contiguous, so this is a zero-copy ``view`` — no data
+     movement, no ND index bookkeeping.
+  2. **Tile**: iterate the 2D domain in ``(128, free_tile)`` blocks — the
+     partition axis at the 128-lane hardware max, the free axis at the largest
+     power-of-two ``<= 512``.
+  3. **Compute**: for each tile, load the operands, run the group's ops on
+     the SBUF tiles, and store the results.
 
-Segmentation (grouping consecutive elementwise ops into one segment) currently
-lives in ``direct_lower.lower_graph``, which passes one op per segment — the
-grouping heuristic is to be reintroduced as the Phase-2 fusion-compatibility
-predicate, at which point a segment carries more than one op again.
-
-Layouts are canonical row-major throughout: HBM boundaries are layout-agnostic,
-so every load/store addresses data by logical coordinate and no per-value
-layout has to be agreed on. ``direct_lower.lower_graph`` calls
-``_emit_elementwise_segment``; everything else here is a helper for it.
+Why a flat 2D collapse is sound
+-------------------------------
+``fold_broadcast`` (and the upstream ``broadcast_to`` materialization it leaves
+in place) guarantee that every operand reaching an elementwise op, when
+right-aligned to the group's result shape and collapsed to 2D, has
+``P in {1, rep_P}`` and ``F in {1, rep_F}``. A genuine *middle* broadcast (e.g.
+GQA head expansion) is not collapse-preserving and is materialized to its own
+HBM buffer before it ever reaches here. So each operand is one of: the full
+``(rep_P, rep_F)`` tensor, a per-row scalar ``(rep_P, 1)``, a partition-broadcast
+row ``(1, rep_F)``, or a scalar ``(1, 1)`` — exactly the four cases the shared
+``emit_binary_op`` already broadcasts on-chip. The contract is asserted per
+operand in ``_collapse_operand`` so a violation fails loudly rather than
+miscomputing.
 """
 
 from __future__ import annotations
 
-from nkigen_lite.core import DType, Value, _DTYPE_BYTES
+from math import prod
+
+from nkigen_lite.core import DType, Value
 from nkigen_lite.nki_ir.ir import (
     Builder,
+    DimSlice,
     MemorySpace,
+    PARTITION_MAX,
 )
-from nkigen_lite.tensor_ir.passes.layout import Layout
 
 from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
     BINARY_OPS,
     BITWISE_OPS,
     COMPARE_OPS,
     UNARY_OPS,
-    canonical_layout,
     ceildiv,
-    compute_tile_sizes,
+    collapse_view,
     emit_binary_op,
     emit_unary_op,
-    load_input_tile,
-    on_chip_shape,
-    store_output_tile,
+    _materialize_broadcast,
 )
 
 
+# Largest free-dim tile: a power of two, capped at 512 (the tensor/vector
+# engine's comfortable free width). Anything wider is just more iterations.
+_FREE_TILE_MAX = 512
+
+
 # ---------------------------------------------------------------------------
-# Elementwise segment emission
+# Heuristic linearization + tiling
 # ---------------------------------------------------------------------------
 
 
-def _segment_dtype(ops: list) -> DType:
-    """Widest dtype touched by a segment.
+def _pf(shape: tuple[int, ...]) -> tuple[int, int]:
+    """Collapse a logical shape to 2D ``(P, F)``: F = last axis, P = the rest.
 
-    Every value in a segment shares the rep's tile loop, so all
-    ``compute_tile_sizes`` calls must use one byte budget — offsets are
-    ``idx * tile_size`` and would misalign if values tiled differently. The
-    binding constraint is the largest element, so tile to that; an all-bf16
-    segment gets twice the F32-default tile width.
+    Rank 0 → (1, 1); rank 1 → (1, F). Matches the row-major flat order of the
+    HBM buffer, so materializing this shape is a zero-copy view.
     """
-    best = DType.F32
-    best_bytes = 0
-    for op in ops:
-        for v in list(op.inputs) + list(op.results):
-            b = _DTYPE_BYTES[v.type.dtype]
-            if b > best_bytes:
-                best, best_bytes = v.type.dtype, b
-    return best
+    if len(shape) == 0:
+        return 1, 1
+    if len(shape) == 1:
+        return 1, shape[0]
+    return prod(shape[:-1]), shape[-1]
 
 
-def _emit_elementwise_segment(
+def _free_tile(free: int) -> int:
+    """Largest power of two ``<= min(free, 512)`` (and ``>= 1``)."""
+    cap = min(free, _FREE_TILE_MAX)
+    t = 1
+    while t * 2 <= cap:
+        t *= 2
+    return t
+
+
+# ---------------------------------------------------------------------------
+# Slice-as-view offset mapping
+# ---------------------------------------------------------------------------
+
+
+def _slice_2d_offset(
+    src_shape: tuple[int, ...],
+    slice_shape: tuple[int, ...],
+    starts: tuple[int, ...],
+) -> tuple[int, int]:
+    """Map a stride-1 static slice to ``(row_off, col_off)`` in the source's
+    collapsed 2D ``(P, F)`` view.
+
+    ``col_off`` is the last-axis start. ``row_off`` is the flat row index of the
+    slice's leading origin within the source's leading axes. This is only a
+    valid 2D window when the slice's leading region is a contiguous run of
+    source rows — i.e. once a leading axis is partially sliced, every inner
+    leading axis is full. That is exactly the collapse-clean condition
+    ``fold_broadcast`` enforces for slices it lets reach the elementwise path;
+    anything else raises rather than silently miscomputing.
+    """
+    lead = src_shape[:-1]
+    col_off = starts[-1] if starts else 0
+    row_off = 0
+    partial_seen = False
+    for d in range(len(lead)):
+        full = slice_shape[d] == src_shape[d] and starts[d] == 0
+        if partial_seen and not full:
+            raise NotImplementedError(
+                f"slice-as-view into elementwise: non-contiguous leading slice "
+                f"src={src_shape} slice={slice_shape} starts={starts}"
+            )
+        row_off += starts[d] * prod(src_shape[d + 1:-1])
+        if not full:
+            partial_seen = True
+    return row_off, col_off
+
+
+# ---------------------------------------------------------------------------
+# Group emission
+# ---------------------------------------------------------------------------
+
+
+def _emit_elementwise_group(
     nb: Builder, ops: list, hbm_map: dict[str, Value],
     slice_views: dict | None = None, resolve=None,
 ) -> None:
-    """Emit a fused elementwise segment: one tiled loop for all ops.
+    """Emit a fused elementwise group as one linearized, tiled loop.
 
     ``slice_views``/``resolve`` support slice-as-view: a foldable slice input
-    (in ``slice_views``) is read from its source buffer with the slice's base
-    offset added into the load, so no copy or HBM buffer is emitted for it.
+    (in ``slice_views``) is read from its source buffer with the slice's window
+    composed into the load, so no copy or HBM buffer is emitted for it.
     """
     slice_views = slice_views or {}
 
-    # Use a canonical row-major layout for elementwise segments. HBM is
-    # layout-agnostic, so all loads/stores address data by logical dimension
-    # coordinates — the declared layout of individual values is irrelevant.
     rep_shape = ops[-1].results[0].type.shape
+    rep_P, rep_F = _pf(rep_shape)
 
-    seg_dtype = _segment_dtype(ops)
-    rep_layout = canonical_layout(len(rep_shape))
-    tile_sizes = compute_tile_sizes(rep_shape, rep_layout, seg_dtype)
+    group_results = {r.name for op in ops for r in op.results}
 
-    # Which values are produced within this segment (stay on-chip)
-    segment_results = {r.name for op in ops for r in op.results}
-
-    # Slice-view inputs read by this segment: map name -> (source HBM buffer,
-    # per-dim base offsets) so the tile load adds the offset instead of copying.
-    slice_srcs: dict[str, tuple[Value, tuple[int, ...]]] = {}
+    # Resolve every external input to a load plan once (the 2D ``view`` of its
+    # HBM buffer is emitted a single time, not per tile). Each plan is
+    # ``(src_2d, opP, opF, row_off, col_off)``; a size-1 collapsed axis is a
+    # broadcast the load fans out on-chip, and ``row_off``/``col_off`` carry a
+    # slice-as-view base window.
+    load_plan: dict[str, tuple[Value, int, int, int, int]] = {}
     for op in ops:
         for inp in op.inputs:
-            if inp.name in slice_views and inp.name not in segment_results:
+            if inp.name in load_plan or inp.name in group_results:
+                continue
+            if inp.name in slice_views:
                 sop = slice_views[inp.name]
-                src_hbm = resolve(sop.inputs[0].name) if resolve else hbm_map[sop.inputs[0].name]
-                slice_srcs[inp.name] = (src_hbm, tuple(sop.attrs["starts"]))
+                src_name = sop.inputs[0].name
+                src_hbm = resolve(src_name) if resolve else hbm_map[src_name]
+                src_shape = sop.inputs[0].type.shape
+                row_off, col_off = _slice_2d_offset(
+                    src_shape, inp.type.shape, tuple(sop.attrs["starts"]),
+                )
+                srcP, srcF = _pf(src_shape)
+                opP, opF = _pf(inp.type.shape)
+                load_plan[inp.name] = (
+                    collapse_view(nb, src_hbm, srcP, srcF), opP, opF,
+                    row_off, col_off,
+                )
+            else:
+                hbm_val = hbm_map[inp.name]
+                opP, opF = _collapse_operand(inp, rep_P, rep_F)
+                load_plan[inp.name] = (
+                    collapse_view(nb, hbm_val, *_pf(hbm_val.type.shape)),
+                    opP, opF, 0, 0,
+                )
 
-    # Loop dims
-    loop_dims = [(d, rep_shape[d], tile_sizes[d])
-                 for d in sorted(tile_sizes.keys())
-                 if tile_sizes[d] < rep_shape[d]]
+    # Resolve each result to its collapsed-2D store view once.
+    store_plan: dict[str, Value] = {}
+    for op in ops:
+        for r in op.results:
+            hbm_dst = hbm_map[r.name]
+            store_plan[r.name] = collapse_view(nb, hbm_dst, *_pf(hbm_dst.type.shape))
 
-    def _emit_nested(depth: int, indices: dict[int, int]):
-        if depth >= len(loop_dims):
-            _emit_ew_tile(nb, ops, hbm_map, rep_layout,
-                          indices, segment_results, seg_dtype,
-                          slice_srcs=slice_srcs)
-            return
-        d, extent, ts = loop_dims[depth]
-        for i in range(ceildiv(extent, ts)):
-            _emit_nested(depth + 1, {**indices, d: i})
+    p_tile = min(rep_P, PARTITION_MAX)
+    f_tile = _free_tile(rep_F)
 
-    _emit_nested(0, {})
+    for p_i in range(ceildiv(rep_P, p_tile)):
+        p_off = p_i * p_tile
+        p_size = min(p_tile, rep_P - p_off)
+        for f_i in range(ceildiv(rep_F, f_tile)):
+            f_off = f_i * f_tile
+            f_size = min(f_tile, rep_F - f_off)
+            _emit_ew_tile(
+                nb, ops, group_results, load_plan, store_plan,
+                p_off, p_size, f_off, f_size,
+            )
+
+
+def _collapse_operand(val: Value, rep_P: int, rep_F: int) -> tuple[int, int]:
+    """Collapsed ``(P, F)`` of an operand, with the collapse-clean contract
+    asserted (see module docstring)."""
+    P, F = _pf(val.type.shape)
+    assert P in (1, rep_P) and F in (1, rep_F), (
+        f"elementwise operand {val.name} shape {val.type.shape} collapses to "
+        f"({P}, {F}), not broadcast-compatible with rep ({rep_P}, {rep_F})"
+    )
+    return P, F
+
+
+def _load_tile(
+    nb: Builder, hbm_2d: Value, opP: int, opF: int,
+    p_off: int, p_size: int, f_off: int, f_size: int,
+    dtype: DType, row_off: int, col_off: int,
+) -> Value:
+    """Load one ``(P, F)`` tile from a collapsed-2D HBM view, honoring
+    broadcast (size-1) axes and an optional slice-view base offset."""
+    ps = 1 if opP == 1 else p_size
+    fs = 1 if opF == 1 else f_size
+    p = row_off + (0 if opP == 1 else p_off)
+    f = col_off + (0 if opF == 1 else f_off)
+    dst = nb.alloc((ps, fs), dtype, MemorySpace.SBUF)
+    return nb.dma_copy(dst, hbm_2d, (DimSlice(p, ps), DimSlice(f, fs)))
 
 
 def _emit_ew_tile(
-    nb: Builder, ops: list, hbm_map: dict[str, Value],
-    rep_layout: Layout, indices: dict[int, int],
-    segment_results: set[str],
-    seg_dtype: DType,
-    slice_srcs: dict[str, tuple[Value, tuple[int, ...]]] | None = None,
+    nb: Builder, ops: list,
+    group_results: set[str],
+    load_plan: dict[str, tuple[Value, int, int, int, int]],
+    store_plan: dict[str, Value],
+    p_off: int, p_size: int, f_off: int, f_size: int,
 ) -> None:
-    """Emit one tile of fused elementwise computation.
-
-    Each input/output value is loaded/stored via ``load_input_tile`` /
-    ``store_output_tile``, which tile the value in its own canonical row-major
-    layout mapped onto the rep loop (``indices`` / ``rep_layout``) — the rep's
-    shape and tile sizes never need to be threaded in.
-
-    ``seg_dtype`` is the segment-wide tiling dtype (see ``_segment_dtype``);
-    every ``compute_tile_sizes`` call in the segment must use it so the
-    per-value slices align with the rep's loop.
-
-    ``slice_srcs`` (slice-as-view) maps an input name to ``(source_buffer,
-    starts)``: the input is a static-start, stride-1 slice with no buffer of
-    its own, so its tile loads from the source with each per-dim start added
-    into the load offset. The slice preserves rank, so the tile layout is
-    computed from the *slice* shape (keeping the rep-loop alignment) and only
-    the offsets shift.
-    """
-    slice_srcs = slice_srcs or {}
+    """Emit one ``(p_size, f_size)`` tile of the fused group."""
     tile_map: dict[str, Value] = {}
 
-    # Load external inputs through the one shared helper (canonical row-major
-    # for the input's own rank; HBM is layout-agnostic). A slice-as-view input
-    # has no buffer of its own: it reads from the slice's source with the
-    # slice's per-dim starts composed into the load offset.
+    # Load external inputs (collapsed to 2D, broadcast axes honored).
     for op in ops:
         for inp in op.inputs:
-            if inp.name in tile_map or inp.name in segment_results:
+            if inp.name in tile_map or inp.name in group_results:
                 continue
-            if inp.name in slice_srcs:
-                src_hbm, starts = slice_srcs[inp.name]
-                tile_map[inp.name] = load_input_tile(
-                    nb, src_hbm, inp.type.shape, inp.type.dtype, seg_dtype,
-                    indices, rep_layout, offsets=starts,
-                )
-                continue
-            hbm_val = hbm_map[inp.name]
-            tile_map[inp.name] = load_input_tile(
-                nb, hbm_val, hbm_val.type.shape, hbm_val.type.dtype, seg_dtype,
-                indices, rep_layout,
+            src_2d, opP, opF, row_off, col_off = load_plan[inp.name]
+            tile_map[inp.name] = _load_tile(
+                nb, src_2d, opP, opF, p_off, p_size, f_off, f_size,
+                inp.type.dtype, row_off, col_off,
             )
 
-    # Compute
+    # Compute.
     for op in ops:
         out_name = op.results[0].name
         out_dtype = op.results[0].type.dtype
@@ -190,17 +267,17 @@ def _emit_ew_tile(
             cond = tile_map[op.inputs[0].name]
             x_true = tile_map[op.inputs[1].name]
             y_false = tile_map[op.inputs[2].name]
+            # copy_predicated needs exactly-matching operand shapes; broadcast
+            # any size-1 operand up to the tile shape first.
+            out_shape = (p_size, f_size)
+            cond = _materialize_broadcast(nb, cond, out_shape)
+            x_true = _materialize_broadcast(nb, x_true, out_shape)
+            y_false = _materialize_broadcast(nb, y_false, out_shape)
             # result = y (copy), then overwrite with x where cond > 0.
             # copy_predicated never evaluates arithmetic on the unselected
-            # branch, so where(mask, scores, -inf) stays -inf/scores — the
-            # old cond*x + (1-cond)*y form produced NaN whenever the
-            # unselected branch was inf (0 * inf), which is exactly the
-            # masked-attention pattern.
-            shape = x_true.type.shape
-            result = nb.alloc(shape, out_dtype, MemorySpace.SBUF)
+            # branch, so where(mask, scores, -inf) stays -inf/scores.
+            result = nb.alloc(out_shape, out_dtype, MemorySpace.SBUF)
             nb.tensor_copy(result, y_false)
-            # copy_predicated requires an integer pred_mask; cond is float
-            # (1.0/0.0) here, so cast it through a u8 scratch tile.
             if cond.type.dtype not in (DType.U8, DType.U16, DType.U32):
                 pred_u8 = nb.alloc(cond.type.shape, DType.U8, MemorySpace.SBUF)
                 nb.tensor_copy(pred_u8, cond)
@@ -209,18 +286,18 @@ def _emit_ew_tile(
                 nb.copy_predicated(result, cond, x_true)
             tile_map[out_name] = result
         elif op.opcode == "constant":
-            out_shape = op.results[0].type.shape
-            const_layout = canonical_layout(len(out_shape))
-            const_tile_sizes = compute_tile_sizes(out_shape, const_layout, seg_dtype)
-            const_tile = on_chip_shape(out_shape, const_layout, const_tile_sizes, indices)
+            cP, cF = _pf(op.results[0].type.shape)
+            shape = (1 if cP == 1 else p_size, 1 if cF == 1 else f_size)
             tile_map[out_name] = nb.constant(
-                op.attrs["value"], const_tile, out_dtype, MemorySpace.SBUF
+                op.attrs["value"], shape, out_dtype, MemorySpace.SBUF
             )
 
-    # Store each result through the shared helper (canonical layout of the
-    # output's own rank).
+    # Store each result to its collapsed-2D HBM buffer.
     for op in ops:
         out_name = op.results[0].name
-        if out_name in tile_map:
-            store_output_tile(nb, hbm_map[out_name], tile_map[out_name],
-                              seg_dtype, indices, rep_layout)
+        if out_name not in tile_map:
+            continue
+        nb.dma_copy(
+            store_plan[out_name], tile_map[out_name],
+            (DimSlice(p_off, p_size), DimSlice(f_off, f_size)),
+        )
