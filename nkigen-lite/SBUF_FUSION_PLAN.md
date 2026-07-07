@@ -93,6 +93,9 @@ loads compose through (the view-reshape rebind is the existing prototype).
   expansion `(1,8,1,64)→(1,8,8,64)`) are *not* collapse-safe and stay
   materialized. qwen3 MoE: broadcast_to 105 calls/1438 ops → 7 calls/700 ops;
   total 42805 → 41633 nki ops (−2.7%). All 7 remaining are legit GQA middles.
+  **Reverted for now** — `passes/fold_broadcast.py` and its test removed and
+  dropped from the pipeline; revisit alongside the SBUF-first rework. Every
+  `broadcast_to` is again materialized to HBM.
 - [x] **Shared "materialize a tile from a viewed value" load helper.**
   `load_input_tile` / `store_output_tile` (+ the shared `canonical_layout`)
   in `direct_lower_utils.py` are now the single load/store path for
@@ -130,6 +133,8 @@ loads compose through (the view-reshape rebind is the existing prototype).
   on a (1,8,4096,128) tensor to feed QK^T — one of the two ~16 MB attention
   transposes folds away. qwen3 MoE: transpose 2864 → 2096 nki ops; total
   40993 → 39968 (−1025, −2.5%); dma_copy 11113 → 10601.
+  **Reverted for now** — `passes/fold_transpose.py` and its test removed and
+  dropped from the pipeline; revisit alongside the SBUF-first transpose rework.
 - [ ] **batch-only transpose as view** (no P↔F swap): pure coordinate
   remapping on the consumer's slices, as `emit_transpose` already proves. (The
   two remaining qwen3 transposes both swap P↔F, so this needs a new benchmark

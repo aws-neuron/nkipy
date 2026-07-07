@@ -15,12 +15,11 @@ shape) is lowered exactly the way an NKI kernel for elementwise ops is written:
 
 Why a flat 2D collapse is sound
 -------------------------------
-``fold_broadcast`` (and the upstream ``broadcast_to`` materialization it leaves
-in place) guarantee that every operand reaching an elementwise op, when
-right-aligned to the group's result shape and collapsed to 2D, has
-``P in {1, rep_P}`` and ``F in {1, rep_F}``. A genuine *middle* broadcast (e.g.
-GQA head expansion) is not collapse-preserving and is materialized to its own
-HBM buffer before it ever reaches here. So each operand is one of: the full
+Every ``broadcast_to`` is materialized to its own HBM buffer before it reaches
+here, so each operand reaching an elementwise op, when right-aligned to the
+group's result shape and collapsed to 2D, has ``P in {1, rep_P}`` and
+``F in {1, rep_F}``. A genuine *middle* broadcast (e.g. GQA head expansion) is
+also materialized to its own HBM buffer. So each operand is one of: the full
 ``(rep_P, rep_F)`` tensor, a per-row scalar ``(rep_P, 1)``, a partition-broadcast
 row ``(1, rep_F)``, or a scalar ``(1, 1)`` — exactly the four cases the shared
 ``emit_binary_op`` already broadcasts on-chip. The contract is asserted per
@@ -102,9 +101,8 @@ def _slice_2d_offset(
     slice's leading origin within the source's leading axes. This is only a
     valid 2D window when the slice's leading region is a contiguous run of
     source rows — i.e. once a leading axis is partially sliced, every inner
-    leading axis is full. That is exactly the collapse-clean condition
-    ``fold_broadcast`` enforces for slices it lets reach the elementwise path;
-    anything else raises rather than silently miscomputing.
+    leading axis is full. Anything else raises rather than silently
+    miscomputing.
     """
     lead = src_shape[:-1]
     col_off = starts[-1] if starts else 0
