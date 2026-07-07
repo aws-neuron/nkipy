@@ -4,6 +4,7 @@
 #include "error.h"
 
 #include <nrt/nrt.h>
+#include <nrt/nrt_async.h>
 #include <nrt/nrt_experimental.h>
 #include <nrt/nrt_profile.h>
 

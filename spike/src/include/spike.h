@@ -6,8 +6,6 @@
 #include "tensor.h"
 #include "tensor_set.h"
 
-#include <nrt/nrt_async.h>
-
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 
