@@ -56,14 +56,12 @@ from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
 # ---------------------------------------------------------------------------
 
 
-def emit_reduce(
-    nb: Builder, op, hbm_map: dict[str, Value],
-    strategy: str = "gpsimd",
-) -> None:
+def emit_reduce(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
     """Emit a reduce op into an existing Builder with pre-allocated HBM buffers.
 
-    ``strategy`` selects the P-dim implementation: "gpsimd" (default,
-    supports all kinds) or "matmul" (tensor engine, sum/mean only).
+    Dispatches by axis class: F-only, P-only (gpsimd), or mixed. The
+    tensor-engine P-reduce (``_emit_p_reduce_matmul_inline``) is reached only
+    through the standalone ``lower_p_reduce_matmul`` entry point, not here.
     """
     inp_val = op.inputs[0]
     inp_layout = default_layout(inp_val.type.shape)
@@ -75,10 +73,7 @@ def emit_reduce(
     if f_axes and not p_axes:
         _emit_f_reduce_inline(nb, op, hbm_map)
     elif p_axes and not f_axes:
-        if strategy == "matmul":
-            _emit_p_reduce_matmul_inline(nb, op, hbm_map)
-        else:
-            _emit_p_reduce_inline(nb, op, hbm_map)
+        _emit_p_reduce_inline(nb, op, hbm_map)
     else:
         _emit_mixed_reduce_inline(nb, op, hbm_map)
 
@@ -613,8 +608,7 @@ def _find_reduce_op(graph: Graph):
 
 
 def _lower_via_emit(
-    graph: Graph, name: str,
-    strategy: str, force: str | None = None,
+    graph: Graph, name: str, force: str | None = None,
 ) -> nki_ir.Graph:
     """Shared wrapper: build a graph with HBM inputs and ``{out}_out`` buffers,
     then emit the reduce into it.
@@ -641,37 +635,31 @@ def _lower_via_emit(
     elif force == "p_matmul":
         _emit_p_reduce_matmul_inline(nb, reduce_op, hbm_map)
     else:
-        emit_reduce(nb, reduce_op, hbm_map, strategy=strategy)
+        emit_reduce(nb, reduce_op, hbm_map)
 
     nb.set_outputs({n: hbm_map[f"{n}_out"] for n in graph.outputs})
     insert_deallocs(nb.graph)
     return nb.graph
 
 
-def lower_reduce(
-    graph: Graph,
-    strategy: str = "gpsimd",
-) -> nki_ir.Graph:
+def lower_reduce(graph: Graph) -> nki_ir.Graph:
     """Lower a reduce op handling all legal axis combinations.
 
-    Thin wrapper over ``emit_reduce``. ``strategy`` selects the P-dim phase:
-    "gpsimd" (default, all kinds) or "matmul" (sum/mean only).
+    Thin wrapper over ``emit_reduce``; dispatches by axis class.
     """
-    return _lower_via_emit(graph, "direct_reduce", strategy)
+    return _lower_via_emit(graph, "direct_reduce")
 
 
 def lower_f_reduce(graph: Graph) -> nki_ir.Graph:
     """Lower a graph with a reduce op over F-dims to NKI IR."""
-    return _lower_via_emit(graph, "direct_f_reduce", "gpsimd", force="f")
+    return _lower_via_emit(graph, "direct_f_reduce", force="f")
 
 
 def lower_p_reduce_gpsimd(graph: Graph) -> nki_ir.Graph:
     """Lower P-dim reduction using GpSimd cross_lane_reduce_arith."""
-    return _lower_via_emit(
-        graph, "direct_p_reduce_gpsimd", "gpsimd", force="p_gpsimd")
+    return _lower_via_emit(graph, "direct_p_reduce_gpsimd", force="p_gpsimd")
 
 
 def lower_p_reduce_matmul(graph: Graph) -> nki_ir.Graph:
     """Lower P-dim reduction via the matmul trick: ones.T @ x (sum/mean only)."""
-    return _lower_via_emit(
-        graph, "direct_p_reduce_matmul", "matmul", force="p_matmul")
+    return _lower_via_emit(graph, "direct_p_reduce_matmul", force="p_matmul")

@@ -29,6 +29,7 @@ from nkigen_lite.nki_ir import ir as nki_ir
 
 from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
     ceildiv,
+    iter_pf_tiles,
     max_free_elems,
 )
 
@@ -94,19 +95,14 @@ def emit_scatter_rows(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
     w_tile = min(W, max_free_elems(vdtype))
 
     # Backdrop: copy base -> result, tiled over N rows and W columns.
-    for p_i in range(ceildiv(N, PARTITION_MAX)):
-        p_off = p_i * PARTITION_MAX
-        p_size = min(PARTITION_MAX, N - p_off)
-        for w_i in range(ceildiv(W, w_tile)):
-            w_off = w_i * w_tile
-            w_size = min(w_tile, W - w_off)
-            tile = nb.dma_copy(
-                nb.alloc((p_size, w_size), vdtype, MemorySpace.SBUF),
-                base_hbm, (DimSlice(p_off, p_size), DimSlice(w_off, w_size)),
-            )
-            nb.dma_copy(
-                out_hbm, tile, (DimSlice(p_off, p_size), DimSlice(w_off, w_size))
-            )
+    for p_off, p_size, w_off, w_size in iter_pf_tiles(N, W, vdtype):
+        tile = nb.dma_copy(
+            nb.alloc((p_size, w_size), vdtype, MemorySpace.SBUF),
+            base_hbm, (DimSlice(p_off, p_size), DimSlice(w_off, w_size)),
+        )
+        nb.dma_copy(
+            out_hbm, tile, (DimSlice(p_off, p_size), DimSlice(w_off, w_size))
+        )
 
     # Scatter the M update rows, tiled over M and W.  dma_copy_indirect
     # addresses whole rows of the result HBM tensor via the per-row index;

@@ -34,10 +34,10 @@ def max_free_elems(dtype: DType) -> int:
 
     Data-movement tiles span the full partition (up to 128 rows), so the
     free dim is what determines per-partition byte usage. Several such tiles
-    can be live at once (load + store, double-buffering, plus the segment's
-    working set), and the compiler's allocator must fit them all in one
-    partition's SBUF. Budget a conservative fraction of capacity so a handful
-    of concurrent tiles stay well under the limit. Returns at least 1.
+    can be live at once (load + store, double-buffering, plus the op's working
+    set), and the compiler's allocator must fit them all in one partition's
+    SBUF. Budget a conservative fraction of capacity so a handful of concurrent
+    tiles stay well under the limit. Returns at least 1.
     """
     elem_bytes = _DTYPE_BYTES[dtype]
     return max(1, (SBUF_PER_PARTITION_BYTES // 4) // elem_bytes)
@@ -240,30 +240,6 @@ def build_slices(
             off = idx * ts
             size = min(ts, shape[d] - off)
             slices.append(DimSlice(off, size))
-    return slices
-
-
-# ---------------------------------------------------------------------------
-# Output slice helper
-# ---------------------------------------------------------------------------
-
-
-def build_out_slices(
-    batch_idx: tuple[int, ...],
-    p_off: int,
-    p_size: int,
-    f_size: int,
-    out_rank: int,
-) -> list[DimSlice]:
-    """Build destination DimSlice for an output tile."""
-    slices = []
-    for bi in batch_idx:
-        slices.append(DimSlice(bi, 1))
-    if out_rank >= 2:
-        slices.append(DimSlice(p_off, p_size))
-        slices.append(DimSlice(0, f_size))
-    else:
-        slices.append(DimSlice(p_off, p_size))
     return slices
 
 

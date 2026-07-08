@@ -76,23 +76,15 @@ def emit_matmul(
     n_batch_total = math.prod(out_batch) if out_batch else 1
     batch_dims = list(out_batch)
 
-    def _a_batch_slices(batch_idx: tuple[int, ...]) -> list[DimSlice]:
-        """Build batch slices for A, respecting broadcast (size-1 dims)."""
-        slices = []
-        offset = len(out_batch) - len(a_batch)
-        for i, d in enumerate(a_batch):
-            bi = batch_idx[i + offset]
-            slices.append(DimSlice(0 if d == 1 else bi, 1))
-        return slices
-
-    def _b_batch_slices(batch_idx: tuple[int, ...]) -> list[DimSlice]:
-        """Build batch slices for B, respecting broadcast (size-1 dims)."""
-        slices = []
-        offset = len(out_batch) - len(b_batch)
-        for i, d in enumerate(b_batch):
-            bi = batch_idx[i + offset]
-            slices.append(DimSlice(0 if d == 1 else bi, 1))
-        return slices
+    def _batch_slices(
+        operand_batch: tuple[int, ...], batch_idx: tuple[int, ...],
+    ) -> list[DimSlice]:
+        """Build an operand's batch slices, respecting broadcast (size-1 dims)."""
+        offset = len(out_batch) - len(operand_batch)
+        return [
+            DimSlice(0 if d == 1 else batch_idx[i + offset], 1)
+            for i, d in enumerate(operand_batch)
+        ]
 
     # M==1 fast path: the stationary operand A is a single row (1, K), so its
     # transpose to (K, 1) is a pure layout reinterpret — the K elements are
@@ -129,7 +121,7 @@ def emit_matmul(
                         a_k1_view, (DimSlice(k_off, k_size), DimSlice(0, 1)),
                     ))
                     continue
-                a_slices = _a_batch_slices(batch_idx) + [DimSlice(m_off, m_size), DimSlice(k_off, k_size)]
+                a_slices = _batch_slices(a_batch, batch_idx) + [DimSlice(m_off, m_size), DimSlice(k_off, k_size)]
                 a_tile = nb.dma_copy(
                     nb.alloc((m_size, k_size), dtype, MemorySpace.SBUF),
                     a_hbm, tuple(a_slices),
@@ -147,7 +139,7 @@ def emit_matmul(
                     k_off = k_i * tile_k
                     k_size = min(tile_k, K - k_off)
 
-                    b_slices = _b_batch_slices(batch_idx) + [DimSlice(k_off, k_size), DimSlice(n_off, n_size)]
+                    b_slices = _batch_slices(b_batch, batch_idx) + [DimSlice(k_off, k_size), DimSlice(n_off, n_size)]
                     b_mov = nb.dma_copy(
                         nb.alloc((k_size, n_size), dtype, MemorySpace.SBUF),
                         b_hbm, tuple(b_slices),

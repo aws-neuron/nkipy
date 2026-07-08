@@ -128,10 +128,8 @@ def _emit_topk_rows(nb: Builder, src_hbm, val_hbm, idx_hbm, p_off: int,
     if F <= TOPK_FREE_MAX:
         data = _load_topk_data(nb, src_hbm, p_off, p_size, 0, F, vdtype)
         vals, idxs = _topk_scan(nb, data, p_size, k, vdtype, idtype)
-        v_store = vals if k == _aligned(k) else _first_cols(nb, vals, k)
-        i_store = idxs if k == _aligned(k) else _first_cols(nb, idxs, k)
-        nb.dma_copy(val_hbm, v_store, (out_rows, DimSlice(0, k)))
-        nb.dma_copy(idx_hbm, i_store, (out_rows, DimSlice(0, k)))
+        nb.dma_copy(val_hbm, _keep_k(nb, vals, k), (out_rows, DimSlice(0, k)))
+        nb.dma_copy(idx_hbm, _keep_k(nb, idxs, k), (out_rows, DimSlice(0, k)))
         return
 
     n_chunks = ceildiv(F, TOPK_FREE_MAX)
@@ -159,10 +157,8 @@ def _emit_topk_rows(nb: Builder, src_hbm, val_hbm, idx_hbm, p_off: int,
                 idxs, off_tile, nki_ir.NisaArithOp.ADD,
             )
         col = DimSlice(c * k, k)
-        v_store = vals if k == _aligned(k) else _first_cols(nb, vals, k)
-        i_store = idxs if k == _aligned(k) else _first_cols(nb, idxs, k)
-        nb.dma_copy(cand_vals_hbm, v_store, (DimSlice(0, p_size), col))
-        nb.dma_copy(cand_idx_hbm, i_store, (DimSlice(0, p_size), col))
+        nb.dma_copy(cand_vals_hbm, _keep_k(nb, vals, k), (DimSlice(0, p_size), col))
+        nb.dma_copy(cand_idx_hbm, _keep_k(nb, idxs, k), (DimSlice(0, p_size), col))
 
     # Merge: scan the candidate values for the global top-k, then gather the
     # corresponding global indices by the merged positions.
@@ -183,10 +179,17 @@ def _emit_topk_rows(nb: Builder, src_hbm, val_hbm, idx_hbm, p_off: int,
         nb.alloc(mpos.type.shape, idtype, MemorySpace.SBUF),
         cand_idx_sbuf, mpos,
     )
-    v_store = mvals if k == _aligned(k) else _first_cols(nb, mvals, k)
-    i_store = gidx if k == _aligned(k) else _first_cols(nb, gidx, k)
-    nb.dma_copy(val_hbm, v_store, (out_rows, DimSlice(0, k)))
-    nb.dma_copy(idx_hbm, i_store, (out_rows, DimSlice(0, k)))
+    nb.dma_copy(val_hbm, _keep_k(nb, mvals, k), (out_rows, DimSlice(0, k)))
+    nb.dma_copy(idx_hbm, _keep_k(nb, gidx, k), (out_rows, DimSlice(0, k)))
+
+
+def _keep_k(nb: Builder, tile: Value, k: int) -> Value:
+    """Trim a fold-aligned scan-result tile to its first ``k`` columns.
+
+    ``_topk_scan`` returns ``_aligned(k)``-wide tiles; when ``k`` is already
+    aligned the tile is returned as-is, else its first ``k`` columns are
+    extracted (``_first_cols``)."""
+    return tile if k == _aligned(k) else _first_cols(nb, tile, k)
 
 
 def _first_cols(nb: Builder, tile: Value, keep: int) -> Value:

@@ -195,7 +195,7 @@ def emit_transpose(
     """Emit transpose tiling into an existing Builder (DMA strategy)."""
     rank = len(in_shape)
 
-    c_in, c_perm, groups, src_order = _collapse_perm(in_shape, perm)
+    c_in, c_perm, groups, _src_order = _collapse_perm(in_shape, perm)
     c_out = tuple(c_in[p] for p in c_perm)
     c_rank = len(c_out)
 
@@ -291,7 +291,7 @@ def emit_transpose_te(
     """
     rank = len(in_shape)
 
-    c_in, c_perm, groups, src_order = _collapse_perm(in_shape, perm)
+    c_in, c_perm, groups, _src_order = _collapse_perm(in_shape, perm)
     c_out = tuple(c_in[p] for p in c_perm)
     c_rank = len(c_out)
 

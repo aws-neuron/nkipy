@@ -7,9 +7,9 @@ boundaries — elementwise through the linearize-and-tile loop, the rest through
 their per-opcode emitters. (Fusing consecutive elementwise ops so intermediates
 stay on-chip is the deferred Phase-2 work.)
 
-Layouts are decided per segment, not per value: every segment boundary
-round-trips through HBM, which is layout-agnostic (row-major), so each
-emitter picks the layout for its own tile loop (see passes/layout.py).
+Layouts are decided per op, not per value: every op boundary round-trips
+through HBM, which is layout-agnostic (row-major), so each emitter picks the
+layout for its own tile loop (see passes/layout.py).
 
 Usage:
     graph = build_some_pattern(...)

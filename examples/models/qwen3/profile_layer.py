@@ -70,9 +70,8 @@ def main():
 
     attribution = defaultdict(lambda: {"nki_ops": 0, "dmas": 0, "calls": 0})
 
-    def _wrap(fn_name, label):
-        orig = getattr(dl, fn_name)
-
+    def _instrument(orig, label):
+        """Wrap an emitter to attribute the nki ops/DMAs it appends to ``label``."""
         def wrapped(nb, *a, **kw):
             before = len(nb.graph.ops)
             r = orig(nb, *a, **kw)
@@ -83,36 +82,20 @@ def main():
             )
             attribution[label]["calls"] += 1
             return r
+        return wrapped
 
-        setattr(dl, fn_name, wrapped)
+    # Elementwise ops are dispatched by a direct module-global call in
+    # ``lower_graph`` (``_emit_elementwise_op(nb, op, hbm_map)``), so reassigning
+    # the module attribute intercepts them.
+    dl._emit_elementwise_op = _instrument(dl._emit_elementwise_op, "elementwise")
 
-    _orig_ew = dl._emit_elementwise_segment
-
-    def _wrapped_ew(nb, ops, *a, **kw):
-        before = len(nb.graph.ops)
-        r = _orig_ew(nb, ops, *a, **kw)
-        added = nb.graph.ops[before:]
-        attribution["elementwise"]["nki_ops"] += len(added)
-        attribution["elementwise"]["dmas"] += sum(
-            1 for o in added if o.opcode in ("dma_copy", "dma_copy_indirect")
-        )
-        attribution["elementwise"]["calls"] += 1
-        return r
-
-    dl._emit_elementwise_segment = _wrapped_ew
-    for fn, lbl in [
-        ("_emit_reduce_op", "reduce"), ("_emit_matmul_op", "matmul"),
-        ("_emit_transpose_op", "transpose"), ("_emit_reshape_op", "reshape"),
-        ("_emit_slice_op", "slice"), ("_emit_concat_op", "concat"),
-        ("_emit_broadcast_op", "broadcast_to"),
-    ]:
-        if hasattr(dl, fn):
-            _wrap(fn, lbl)
-    for fn, lbl in [
-        ("_emit_gather_rows_op", "gather_rows"), ("_emit_topk_op", "topk"),
-    ]:
-        if hasattr(dl, fn):
-            _wrap(fn, lbl)
+    # Every other op dispatches through the ``_OP_EMITTERS`` table keyed by
+    # opcode. The table holds direct function references captured at import, so
+    # patching module attributes would miss them — wrap the entries in place.
+    # Keying the label by opcode auto-covers reduce/matmul/transpose/reshape/
+    # slice/concat/broadcast_to/iota/topk/gather/scatter/collectives.
+    for opcode in list(dl._OP_EMITTERS):
+        dl._OP_EMITTERS[opcode] = _instrument(dl._OP_EMITTERS[opcode], opcode)
 
     nki = lower_to_nki(tensor_graph)
     n_nki = len(nki.ops)

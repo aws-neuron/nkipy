@@ -32,7 +32,6 @@ from nkigen_lite.nki_ir.ir import (
 )
 
 from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
-    build_out_slices,
     ceildiv,
     collapse_view,
     flat_range_to_src_chunks,
@@ -485,11 +484,6 @@ def _emit_reshape_diff_f(nb, x_hbm, y_hbm, in_shape, out_shape, dtype):
                     cur_col = 0
 
 
-def _collapse_to_2d(nb: Builder, hbm, shape, lead, last):
-    """Reinterpret a row-major HBM buffer as 2D (shared ``collapse_view``)."""
-    return collapse_view(nb, hbm, lead, last)
-
-
 def _emit_2d_window_copy(
     nb: Builder, src_2d, dst_2d, src_f_off: int, dst_f_off: int, f_width: int,
     dtype,
@@ -555,8 +549,8 @@ def _emit_axis_window_copy(
     T = prod(in_shape[axis + 1:]) if axis + 1 < len(in_shape) else 1
     A_in = in_shape[axis]
     A_out = out_shape[axis]
-    src_2d = _collapse_to_2d(nb, src_hbm, in_shape, L * A_in, T)
-    dst_2d = _collapse_to_2d(nb, dst_hbm, out_shape, L * A_out, T)
+    src_2d = collapse_view(nb, src_hbm, L * A_in, T)
+    dst_2d = collapse_view(nb, dst_hbm, L * A_out, T)
     for outer in range(L):
         _emit_2d_rows_copy(
             nb, src_2d, dst_2d,
@@ -584,8 +578,8 @@ def emit_slice(nb: Builder, x_hbm, y_hbm, in_shape, out_shape, starts, dtype,
     if (rank >= 3
             and all(starts[i] == 0 and out_shape[i] == in_shape[i] for i in range(rank - 1))):
         lead = prod(in_shape[:-1])
-        src_2d = _collapse_to_2d(nb, x_hbm, in_shape, lead, in_shape[-1])
-        dst_2d = _collapse_to_2d(nb, y_hbm, out_shape, lead, out_shape[-1])
+        src_2d = collapse_view(nb, x_hbm, lead, in_shape[-1])
+        dst_2d = collapse_view(nb, y_hbm, lead, out_shape[-1])
         _emit_2d_window_copy(
             nb, src_2d, dst_2d, starts[-1], 0, out_shape[-1], dtype)
         return
@@ -708,11 +702,11 @@ def emit_concat(nb: Builder, input_hbms: list, y_hbm, input_shapes: list, axis: 
     # instead of unrolling prod(shape[:-2]) one-row copies.
     if rank >= 3 and axis == rank - 1:
         lead = prod(out_shape[:-1])
-        dst_2d = _collapse_to_2d(nb, y_hbm, out_shape, lead, out_shape[-1])
+        dst_2d = collapse_view(nb, y_hbm, lead, out_shape[-1])
         dst_f_off = 0
         for inp_idx, inp_shape in enumerate(input_shapes):
             w = inp_shape[-1]
-            src_2d = _collapse_to_2d(nb, input_hbms[inp_idx], inp_shape, lead, w)
+            src_2d = collapse_view(nb, input_hbms[inp_idx], lead, w)
             _emit_2d_window_copy(nb, src_2d, dst_2d, 0, dst_f_off, w, dtype)
             dst_f_off += w
         return
