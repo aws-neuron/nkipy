@@ -1,10 +1,11 @@
 """Orchestrated direct lowering: tensor IR → NKI IR with HBM boundaries.
 
 Lowers a complete tensor IR graph (after canonicalize + decompose) to a single
-NKI IR graph. Consecutive elementwise ops are grouped and lowered together
-(intermediates stay on-chip); all other ops (reduce, matmul, transpose,
-reshape, slice, concat, broadcast_to) get their own load→compute→store
-sequence with HBM boundaries.
+NKI IR graph. Every op (elementwise, reduce, matmul, transpose, reshape, slice,
+concat, broadcast_to) gets its own load→compute→store sequence with HBM
+boundaries — elementwise through the linearize-and-tile loop, the rest through
+their per-opcode emitters. (Fusing consecutive elementwise ops so intermediates
+stay on-chip is the deferred Phase-2 work.)
 
 Layouts are decided per segment, not per value: every segment boundary
 round-trips through HBM, which is layout-agnostic (row-major), so each
@@ -40,26 +41,13 @@ from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
     unravel,
 )
 from nkigen_lite.tensor_ir.passes.basic.direct_lower_elementwise import (
-    _emit_elementwise_group,
+    _emit_elementwise_op,
 )
 
 
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
-
-
-def _is_view_slice(op) -> bool:
-    """True if a ``slice`` can be lowered as a zero-copy offset view.
-
-    A static-start, stride-1 slice is a contiguous per-dim window of its
-    (row-major) source: a consumer that loads via per-dim ``DimSlice``s reads
-    the same data by adding the slice's ``starts`` into its own offsets — no
-    copy, no HBM buffer. Non-unit strides can't compose this way (the DMA would
-    need the consumer to also carry the stride), so those keep the copy path.
-    """
-    strides = op.attrs.get("strides")
-    return strides is None or all(s == 1 for s in strides)
 
 
 def lower_graph(graph: Graph) -> nki_ir.Graph:
@@ -70,34 +58,6 @@ def lower_graph(graph: Graph) -> nki_ir.Graph:
     def _nki_shape(shape):
         """NKI requires at least rank-1 tensors."""
         return shape if len(shape) > 0 else (1,)
-
-    # View-eligible slices: name -> the slice op. Lowered lazily — an
-    # elementwise consumer composes the slice's base offset into its own loads
-    # (no buffer, no copy); any other consumer (or a graph output) triggers
-    # ``_resolve``, which materializes the buffer + copy once, on first use.
-    slice_views: dict[str, object] = {
-        op.results[0].name: op
-        for op in graph.ops
-        if op.opcode == "slice" and _is_view_slice(op)
-    }
-
-    def _resolve(name: str) -> Value:
-        """Return the HBM buffer for ``name``, materializing a pending
-        slice-view (and any slice-view source it chains through) on demand."""
-        if name in hbm_map:
-            return hbm_map[name]
-        op = slice_views[name]
-        src_hbm = _resolve(op.inputs[0].name)
-        out_val = op.results[0]
-        buf = nb.alloc(_nki_shape(out_val.type.shape), out_val.type.dtype,
-                       MemorySpace.HBM)
-        emit_slice(
-            nb, src_hbm, buf, op.inputs[0].type.shape, out_val.type.shape,
-            op.attrs["starts"], out_val.type.dtype,
-            strides=op.attrs.get("strides"),
-        )
-        hbm_map[name] = buf
-        return buf
 
     # Allocate HBM inputs
     for v in graph.inputs:
@@ -118,55 +78,32 @@ def lower_graph(graph: Graph) -> nki_ir.Graph:
     for op in graph.ops:
         if op.opcode == "reshape" and _is_view_reshape(op):
             continue
-        if op.results and op.results[0].name in slice_views:
-            continue  # lowered lazily as an offset view (or materialized on use)
         for r in op.results:
             if r.name not in hbm_map:
                 hbm_map[r.name] = nb.alloc(
                     _nki_shape(r.type.shape), r.type.dtype, MemorySpace.HBM
                 )
 
-    # Per-op emitters, all ``(nb, op, hbm_map) -> None``.  Only ``slice`` needs
-    # a closure over ``lower_graph`` state: a view-slice emits nothing (its
-    # result is a zero-copy offset view the elementwise consumers compose
-    # through).
-    def _emit_slice_dispatch(nb, op, hbm_map):
-        if op.results[0].name in slice_views:
-            return  # zero-copy offset view; no emission
-        _emit_slice_op(nb, op, hbm_map)
-
-    emitters = {
-        **_OP_EMITTERS,
-        "slice": _emit_slice_dispatch,
-    }
-
     # Lower each op.  An elementwise op is emitted through the tiled
-    # load→compute→store loop, which composes slice-view offsets into its loads
-    # itself — the one emitter that reads a view without materializing it, so it
-    # must run before the resolve loop below (grouping consecutive elementwise
+    # load→compute→store loop; every other op reads its inputs' HBM buffers
+    # directly through its per-opcode emitter (grouping consecutive elementwise
     # ops into one fused loop is to be reintroduced as the Phase-2
-    # fusion-compatibility predicate).  Every other emitter reads its inputs'
-    # HBM buffers directly, so materialize any pending slice-view an input
-    # chains through first, then dispatch.
+    # fusion-compatibility predicate).
     for op in graph.ops:
         opcode = op.opcode
 
         if opcode in ELEMENTWISE_OPCODES:
-            _emit_elementwise_group(nb, [op], hbm_map, slice_views, _resolve)
+            _emit_elementwise_op(nb, op, hbm_map)
             continue
 
-        for inp in op.inputs:
-            if inp.name in slice_views:
-                _resolve(inp.name)
-
-        emitter = emitters.get(opcode)
+        emitter = _OP_EMITTERS.get(opcode)
         if emitter is None:
             raise NotImplementedError(f"Op {opcode!r} not supported")
         emitter(nb, op, hbm_map)
 
     # Copy final results to output buffers
     for out_name, out_val in graph.outputs.items():
-        src = _resolve(out_val.name)
+        src = hbm_map[out_val.name]
         dst = hbm_map[f"{out_name}_out"]
         if src is not dst:
             _emit_hbm_copy(nb, src, dst, out_val.type.shape)
@@ -365,8 +302,7 @@ def _emit_broadcast_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
     )
 
 
-# Per-opcode emitters, all ``(nb, op, hbm_map) -> None``.  ``lower_graph`` wraps
-# ``slice`` in a closure over its own state (a view-slice emits nothing).
+# Per-opcode emitters, all ``(nb, op, hbm_map) -> None``.
 # Elementwise ops are not dispatched here — they run through the fused tile loop.
 _OP_EMITTERS: dict[str, object] = {
     "reduce": emit_reduce,

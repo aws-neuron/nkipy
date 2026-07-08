@@ -626,19 +626,18 @@ class TestCollapsedReduce:
 
 
 class TestSliceAsView:
-    """A static-start, stride-1 slice is lowered as a zero-copy offset view:
-    an elementwise consumer composes the slice's base offset into its own
-    loads (no buffer, no copy); any other consumer (reshape, graph output)
-    materializes the slice once, on demand. See ``_is_view_slice`` /
-    ``slice_views`` in ``direct_lower.py``.
+    """A static-start slice feeding an elementwise (or any other) consumer is
+    materialized to its own HBM buffer via ``emit_slice``; the consumer then
+    reads that buffer normally. These cases exercise slice shapes (row split,
+    partition-axis window, last-axis window, graph output) that must lower
+    correctly regardless of consumer.
     """
 
     # -- interpreter --
 
     def test_split_gate_up_mul(self):
         """Mirrors the MoE gate/up split: slice a (384,) row into two (192,)
-        halves that feed an elementwise mul — both slices fold into the mul's
-        loads with no intermediate buffer."""
+        halves that feed an elementwise mul."""
         rng = np.random.default_rng(0)
         x = rng.standard_normal((384,)).astype(np.float32)
 
@@ -651,8 +650,7 @@ class TestSliceAsView:
 
     def test_slice_2d_partition_axis_elementwise(self):
         """Slice on the partition axis (rows 8:200 of a (256,128) tensor),
-        result feeds an elementwise add — the offset composes into the tiled
-        2D load across both partition tiles."""
+        result feeds an elementwise add across both partition tiles."""
         rng = np.random.default_rng(1)
         x = rng.standard_normal((256, 128)).astype(np.float32)
         bias = rng.standard_normal((192, 128)).astype(np.float32)
@@ -667,7 +665,7 @@ class TestSliceAsView:
 
     def test_slice_last_axis_window_elementwise(self):
         """Slice a last-axis window (cols 1024:1152 of a (1,8,1280) tensor)
-        feeding a unary — a mid-tensor column offset folded into the load."""
+        feeding a unary."""
         rng = np.random.default_rng(2)
         x = rng.standard_normal((1, 8, 1280)).astype(np.float32)
 
@@ -679,8 +677,7 @@ class TestSliceAsView:
         _lower_and_check_interp(build, {"x": x}, (1, 8, 128), atol=1e-4)
 
     def test_slice_as_graph_output_materializes(self):
-        """A slice that IS a graph output has no elementwise consumer to fold
-        into, so it materializes via the copy path."""
+        """A slice that IS a graph output materializes via the copy path."""
         rng = np.random.default_rng(3)
         x = rng.standard_normal((16, 64)).astype(np.float32)
 

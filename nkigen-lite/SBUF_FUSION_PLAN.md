@@ -109,19 +109,15 @@ loads compose through (the view-reshape rebind is the existing prototype).
   neutral: qwen3 MoE stays at 39968 nki ops / 10601 dma_copy (same DMAs, one
   code path). The access-descriptor seam this creates is what a future
   transpose/reshape view composes through.
-- [x] **slice as view** (contiguous, static starts): done via JIT
-  materialization rather than a global descriptor. A static-start, stride-1
-  `slice` preserves rank, so an elementwise consumer just adds the slice's
-  per-dim `starts` into its own tile-load offsets (`slice_srcs` in
-  `_emit_ew_tile`) — no buffer, no copy. `lower_graph` records these in
-  `slice_views` and skips their allocation/emission; any *other* consumer
-  (reshape/matmul/reduce/transpose/concat, the rank≥3 collapse path, or a graph
-  output) calls `_resolve`, which materializes the buffer + copy once (KB
-  refuses `.view()` on a sliced tile, so only the generic EW path can compose —
-  HW-verified). Non-unit strides keep the copy path. qwen3 MoE: 41633 → 40993
-  nki ops (−640, −1.5%); dma_copy 11369 → 11113. The `slice` attribution
-  category disappears — the hot gate/up `(384,)→(192,)×128` split and top-k
-  index slices fold into their consumers.
+- [ ] **slice as view** (contiguous, static starts): implemented (d109c16) then
+  **reverted** — every `slice` now materializes to its own HBM buffer via
+  `emit_slice`, and elementwise consumers read that buffer normally. The
+  offset-fold version (`slice_views` + `_resolve` in `lower_graph`, a
+  `row_off`/`col_off` composed into `_emit_ew_tile`'s loads) carried a
+  correctness bug in the 2D-window contiguity check and added lazy-materialization
+  machinery whose only payoff was a −1.5% op count on qwen3 MoE (41633 → 40993
+  nki ops). Removed for simplicity; revisit as an access-descriptor composed
+  through the elementwise load path if the op/buffer savings prove to matter.
 - [x] **compose chained transposes** (done ahead of the "transpose as view"
   item; higher payoff on the qwen3 graph). `transpose(transpose(x, p1), p2)` is
   a single `transpose(x, compose)` with `compose[i] = p1[p2[i]]` — permuting
