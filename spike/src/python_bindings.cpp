@@ -97,7 +97,7 @@ NB_MODULE(_spike, m) {
                    "Is collective model")
       .def("__repr__", &NrtModel::to_string);
 
-  // Spike class - uses keep_alive for safe shared ownership with tensors/models
+  // Models and tensors share Spike's runtime-closed state in C++.
   nb::class_<Spike>(m, "Spike")
       .def(nb::init<int>(), "verbose_level"_a = 0,
            "Initialize Spike with verbose level")
@@ -110,10 +110,9 @@ NB_MODULE(_spike, m) {
       // Core runtime methods
       .def("close", &Spike::close, "Close the NRT runtime")
 
-      // Keep Spike alive for models that depend on it
       .def("load_model", &Spike::load_model, "neff_file"_a, "core_id"_a = 0,
            "cc_enabled"_a = false, "rank_id"_a = 0, "world_size"_a = 1,
-           nb::keep_alive<0, 1>(), "Load a model from NEFF file")
+           "Load a model from NEFF file")
 
       .def("unload_model", &Spike::unload_model, "model"_a, "Unload a model")
 
@@ -125,14 +124,13 @@ NB_MODULE(_spike, m) {
                                                      // to execute (enable CC)
            "Execute a model with given inputs and outputs")
 
-      // Keep Spike alive for tensors that depend on it
       .def("allocate_tensor", &Spike::allocate_tensor, "size"_a,
            "core_id"_a = 0, nb::arg("name") = nb::none(),
-           nb::keep_alive<0, 1>(), "Allocate a tensor on device")
+           "Allocate a tensor on device")
 
       .def("slice_from_tensor", &Spike::slice_from_tensor, "source"_a,
            "offset"_a = 0, "size"_a = 0, nb::arg("name") = nb::none(),
-           nb::keep_alive<0, 1>(), "Create a tensor slice from another tensor")
+           "Create a tensor slice from another tensor")
 
       .def("free_tensor", &Spike::free_tensor, "tensor"_a, "Free a tensor")
 

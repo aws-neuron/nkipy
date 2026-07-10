@@ -2,6 +2,8 @@
 #define SPIKE_SRC_INCLUDE_MODEL_H
 
 #include "tensor_set.h"
+#include <atomic>
+#include <memory>
 #include <optional>
 
 namespace spike {
@@ -33,7 +35,7 @@ public:
   uint32_t get_world_size() const { return world_size_; }
   bool get_is_collective() const { return is_collective_; }
   bool is_unloaded() const;
-  bool is_owner() const { return spike_ != nullptr; }
+  bool is_owner() const { return runtime_closed_ != nullptr; }
 
   // String representation
   std::string to_string() const;
@@ -51,7 +53,7 @@ private:
   uint32_t rank_id_;
   uint32_t world_size_;
   bool is_collective_;
-  const Spike *spike_;
+  std::shared_ptr<std::atomic_bool> runtime_closed_;
 };
 
 } // namespace spike

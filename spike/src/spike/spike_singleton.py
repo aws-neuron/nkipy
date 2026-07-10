@@ -150,10 +150,14 @@ def get_spike_singleton() -> _Spike:
 def _cleanup() -> None:
     """Cleanup function called at program exit."""
     global _runtime
-    # Note: Spike object from nanobind is RAII and Python GC managed, so no need
-    # to call `.close()` explicitly. However, we do want to set the global to
-    # None to make sure it does before nanobind ref leak check.
-    _runtime = None
+    with _lock:
+        runtime = _runtime
+        _runtime = None
+    if runtime is not None:
+        # Close NRT before Python starts tearing down nanobind module state.
+        # Models and tensors retain a shared closed-state token and skip NRT
+        # cleanup when their own destructors run later.
+        runtime.close()
 
 
 atexit.register(_cleanup)

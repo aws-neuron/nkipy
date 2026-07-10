@@ -4,6 +4,7 @@
 #include "model.h"
 #include "nrt_wrapper.h"
 #include "tensor.h"
+#include <atomic>
 #include <memory>
 #include <optional>
 #include <unordered_map>
@@ -42,6 +43,9 @@ public:
   // Runtime management
   int close();
   bool is_closed() const { return runtime_.get() == nullptr; }
+  std::shared_ptr<std::atomic_bool> get_runtime_closed_state() const {
+    return runtime_closed_;
+  }
 
   // Model operations
   NrtModel load_model(const std::string &neff_file, uint32_t core_id = 0,
@@ -78,6 +82,7 @@ public:
 private:
   int verbose_level_;
   std::unique_ptr<NrtRuntime> runtime_;
+  std::shared_ptr<std::atomic_bool> runtime_closed_;
 
   // Helper methods
   NrtTensorSet create_tensor_sets(
