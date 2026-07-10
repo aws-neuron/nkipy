@@ -50,6 +50,7 @@ class TestKnobDispatch:
 
 def _make_silu_kernel_builder(M, N, tile_p=128, tile_f=128):
     """Return a real NKI kernel_builder function that computes SiLU activation."""
+
     def silu_kernel(input_0, output_0):
         import nki.compiler.kernel_builder as nb
         import nki.language as nl
@@ -88,6 +89,7 @@ def _make_silu_kernel_builder(M, N, tile_p=128, tile_f=128):
                     ],
                     src=out_sbuf,
                 )
+
     return silu_kernel
 
 
@@ -147,7 +149,7 @@ class TestNkiGenTraceContext:
     @pytest.fixture(autouse=True)
     def _skip_if_no_nkigen(self):
         try:
-            import nkigen  # noqa: F401
+            import nkigen.builder  # noqa: F401
         except ImportError:
             pytest.skip("nkigen not installed")
 
@@ -171,13 +173,14 @@ class TestSpecializeNkigen:
     @pytest.fixture(autouse=True)
     def _skip_if_no_nkigen(self):
         try:
-            import nkigen  # noqa: F401
+            import nkigen.builder  # noqa: F401
         except ImportError:
             pytest.skip("nkigen not installed")
 
     @staticmethod
     def _run(func, *np_args):
         from utils import NEURON_AVAILABLE, on_device_test, trace_and_compile
+
         if NEURON_AVAILABLE:
             return on_device_test(func, "nkigen", *np_args)
         else:
@@ -231,7 +234,7 @@ class TestSpecializeNkigen:
 
     @pytest.mark.xfail(
         reason="custom_op kernel_builder tracing requires TracedArray, "
-               "not yet wired through NKIPyTensorRef path"
+        "not yet wired through NKIPyTensorRef path"
     )
     def test_custom_op_with_kernel_builder(self):
         """nki_custom_op with real kernel_builder traces through nkigen backend."""
@@ -263,7 +266,7 @@ class TestNkigenInplaceUpdate:
     @pytest.fixture(autouse=True)
     def _skip_if_no_nkigen(self):
         try:
-            import nkigen  # noqa: F401
+            import nkigen.builder  # noqa: F401
         except ImportError:
             pytest.skip("nkigen not installed")
 
@@ -420,5 +423,3 @@ class TestNkigenInplaceUpdate:
         ir, result = self._trace_and_run(kernel, a, b)
         if result is not None:
             baremetal_assert_allclose(result, expected)
-
-
