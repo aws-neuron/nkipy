@@ -267,6 +267,7 @@ class DrafterCPU:
         # slots (MTP). Indices into the n_new-wide window: [C-1, C, ..., C+K-2].
         x = self._rms(x, self.w["norm.weight"])
         logits = (x[0, C - 1 :] @ self.w["lm_head.weight"].T).float()  # (K, vocab)
+        self.last_logits = logits  # stashed for numerical cross-checks
         draft_local = logits.argmax(dim=-1)
 
         # Map draft vocab -> target vocab (identity when d2t is all-zero).

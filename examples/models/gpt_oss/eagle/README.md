@@ -54,6 +54,26 @@ Mean acceptance length: X.XX (K=7)
 Decode tokens/sec: XX.XX
 ```
 
+### Drafter placement (device by default)
+
+By default the drafter forward runs **on the Neuron device**
+(`kernels/drafter.py` + `drafter_model.py`). It keeps a full per-layer KV cache on
+device (prefill over the prompt, then each step commits the accepted tokens and
+drafts K positions attending to the whole context) — the same algorithm as the
+CPU reference, so acceptance matches. Pass `--cpu-drafter` to run the CPU drafter
+(`drafter_cpu.py`) instead: same math, but the layer forward runs in PyTorch on
+host with a host↔device round-trip per step — the slower debug/reference path.
+Measured on trn2 (TP=4, K=7, chat prompt):
+
+| Drafter | Mean acceptance | Decode tok/s |
+|---------|-----------------|--------------|
+| device (default) | ~4.2 | ~35 |
+| `--cpu-drafter`  | ~4.3 | ~4.8 |
+
+The device drafter matches the CPU drafter's acceptance and is ~7× faster in
+decode (no per-step host↔device sync). Note: the first `prefill()` lazily
+compiles a prompt-width kernel stack, which currently inflates time-to-first-token.
+
 ## How it works
 
 ### Speculation loop
@@ -199,8 +219,18 @@ midlayer concatenates embeds with hidden to 2H; later layers are standard.
 ### Status / remaining work
 
 The CPU drafter path (`DrafterCPU`) and the `speculate.py` loop bookkeeping are
-GPU-validated against vLLM. Not yet re-validated on Trainium hardware: the NKI
-target's `verify`/prefill numerics and end-to-end acceptance. The on-device
-`kernels/drafter.py` still lacks a KV cache and is currently unused by
-`speculate.py`; porting the validated KV-cached path to the device kernel is the
-remaining performance work.
+GPU-validated against vLLM. The **on-device drafter now keeps a KV cache**
+(`drafter_model.py` + `drafter_layer_cached`/`drafter_layer_kernel` in
+`kernels/drafter.py`): it prefills over the prompt and drafts K context-attending
+positions per step, matching `DrafterCPU` token-for-token on device (7/7 with
+real context) and reaching parity acceptance (~4.2) at ~35 decode tok/s on trn2
+(TP=4). It is the default; `--cpu-drafter` selects the reference path.
+
+Remaining work:
+
+- **Time-to-first-token.** `prefill()` lazily compiles a prompt-width kernel
+  stack on the first call (inside the timed region). Pre-compile a bucketed set of
+  prompt widths (like the base model's context buckets) to hide this.
+- **Commit-step batching.** Each step commits accepted tokens with one width-1
+  kernel call per token; batching them into a single multi-row commit would cut
+  per-step launches.

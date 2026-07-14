@@ -49,7 +49,9 @@ if _BASE not in sys.path:
     sys.path.insert(0, _BASE)
 
 from config import Config, get_config  # noqa: E402  (base config; _BASE wins)
+from eagle.config import get_eagle_config  # noqa: E402
 from eagle.drafter_cpu import DrafterCPU  # noqa: E402
+from eagle.drafter_model import DrafterModel  # noqa: E402
 from kernels.transformer_layer import transformer_layer  # noqa: E402  (base)
 from nkipy.runtime import DeviceKernel, DeviceTensor  # noqa: E402
 from safetensors.torch import load_file  # noqa: E402
@@ -193,6 +195,32 @@ def _stack_aux(aux_list):
     return torch.cat([a.to(torch.bfloat16) for a in aux_list], dim=-1)
 
 
+class _DeviceDrafterAdapter:
+    """Thin wrapper exposing the on-device `DrafterModel` under the loop's
+    interface (`prefill` / `draft(pending_tokens, pending_aux3, base_pos)`).
+
+    `DrafterModel` now keeps a full per-layer KV cache on device (mirroring
+    `DrafterCPU`), so the adapter just forwards the calls: it prefills the drafter
+    over the prompt and, each step, commits the accepted tokens and drafts K
+    positions attending to the full context.
+    """
+
+    def __init__(self, draft_model, draft_checkpoint, target_hidden_size, K):
+        cfg = get_eagle_config(draft_model, target_hidden_size, num_draft_tokens=K)
+        weights = load_file(
+            os.path.join(draft_checkpoint, "drafter.safetensors"), device="cpu"
+        )
+        build_dir = os.path.abspath(os.path.join(draft_checkpoint, "build_device"))
+        os.makedirs(build_dir, exist_ok=True)
+        self._model = DrafterModel(weights, cfg, build_dir)
+
+    def prefill(self, token_ids, aux_hidden_states):
+        self._model.prefill(token_ids, aux_hidden_states)
+
+    def draft(self, commit_token_ids, commit_aux3, base_pos):
+        return self._model.draft(commit_token_ids, commit_aux3, base_pos)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-n", "--max-new-tokens", type=int, default=128)
@@ -212,6 +240,15 @@ def main():
     parser.add_argument("--model", default="/home/ubuntu/models/gpt-oss-20b")
     parser.add_argument(
         "--draft-model", default="/home/ubuntu/models/GPT-OSS-20B-P-EAGLE"
+    )
+    parser.add_argument(
+        "--cpu-drafter",
+        action="store_true",
+        help="Run the drafter forward on CPU (drafter_cpu.py) instead of the "
+        "Neuron device. Same full-context KV-cache algorithm as the device "
+        "drafter, but runs in PyTorch on host with a host<->device round-trip per "
+        "step — the slower reference/debug path. By default the drafter runs "
+        "on-device (drafter_model.py), which matches CPU acceptance and is faster.",
     )
     args = parser.parse_args()
 
@@ -235,7 +272,8 @@ def main():
             [{"role": "user", "content": args.prompt}],
             add_generation_prompt=True,
             return_tensors="np",
-        )
+            return_dict=True,
+        )["input_ids"]
     prompt_len = input_ids.shape[1]
     eos_ids = _resolve_eos_ids(args.model, tokenizer)
 
@@ -251,10 +289,16 @@ def main():
 
     # Drafter (replicated on every rank). The drafter keeps its own KV cache over
     # the full context and proposes K tokens in one parallel forward pass per step
-    # (validated against vLLM's eagle3 parallel-drafting path). It runs on CPU; it
-    # is tiny (4 layers, ~3.6 GB) and its correctness is independent of placement.
+    # (validated against vLLM's eagle3 parallel-drafting path). Defaults to the
+    # on-device path (drafter_model.py); --cpu-drafter selects the PyTorch
+    # reference. Either way it is tiny (4 layers, ~3.6 GB).
     print_log("Loading drafter weights")
-    drafter = DrafterCPU(args.draft_model, config.hidden_size, num_draft_tokens=K)
+    if args.cpu_drafter:
+        drafter = DrafterCPU(args.draft_model, config.hidden_size, num_draft_tokens=K)
+    else:
+        drafter = _DeviceDrafterAdapter(
+            args.draft_model, args.draft_checkpoint, config.hidden_size, K
+        )
 
     # ── Prefill the target on the prompt ──
     dist.barrier()

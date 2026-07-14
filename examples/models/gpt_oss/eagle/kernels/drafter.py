@@ -19,7 +19,7 @@ import neuronxcc.nki.language as nl
 import numpy as np
 from nkipy.core import tensor_apis
 
-from .drafter_layer import drafter_layer
+from .drafter_layer import drafter_layer, drafter_layer_cached
 from .rmsnorm import rmsnorm_kernel
 from .rope import compute_cos_sin_cache
 
@@ -92,6 +92,68 @@ def drafter_forward(
     x = rmsnorm_kernel(x, norm_weight, cfg.norm_eps)
     logits = np.matmul(x, lm_head_weight)  # (B, K, draft_vocab_local)
     return logits
+
+
+def drafter_layer_kernel(
+    x,  # (B, S, 2H) for fusion, (B, S, H) for plain
+    start_pos,  # (1,) int32 runtime offset, or None for prefill
+    q_proj,
+    k_proj,
+    v_proj,
+    o_proj,
+    input_weight,
+    hidden_norm_weight,  # only used when is_fusion; pass a dummy otherwise
+    post_attention_weight,
+    gate_proj,
+    up_proj,
+    down_proj,
+    cache_k,
+    cache_v,
+    cfg,
+    is_fusion=False,
+):
+    """One KV-cached drafter layer (fusion midlayer or plain), device entry point.
+
+    Aliases ``cache_k``/``cache_v`` (in + out): the S new positions are scattered
+    into the cache at absolute positions ``start_pos + [0..S-1]`` (or ``0..S-1`` in
+    prefill) and attend causally to the full cache. Same host-driven per-layer loop
+    as the base model (``GptOssModel._run_layer``).
+    """
+    weights = {
+        "q_proj": q_proj,
+        "k_proj": k_proj,
+        "v_proj": v_proj,
+        "o_proj": o_proj,
+        "input_layernorm": input_weight,
+        "post_attention_layernorm": post_attention_weight,
+        "gate_proj": gate_proj,
+        "up_proj": up_proj,
+        "down_proj": down_proj,
+    }
+    if is_fusion:
+        weights["hidden_norm"] = hidden_norm_weight
+
+    out = drafter_layer_cached(
+        x,
+        weights,
+        cfg.norm_eps,
+        cfg.num_heads,
+        cfg.num_kv_heads,
+        cfg.head_dim,
+        cfg.rope_inv_freq,
+        cfg.rope_attention_scaling,
+        cache_k,
+        cache_v,
+        start_pos,
+        is_fusion,
+    )
+    return out, cache_k, cache_v
+
+
+def drafter_head_kernel(h, norm_weight, lm_head_weight, cfg):
+    """Final norm + draft lm_head over S positions -> logits (B, S, draft_vocab)."""
+    h = rmsnorm_kernel(h, norm_weight, cfg.norm_eps)
+    return np.matmul(h, lm_head_weight)
 
 
 # Per-layer weight key suffixes, in the order the prep step emits them.
