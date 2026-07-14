@@ -345,17 +345,25 @@ def main():
         sys.stdout.flush()
 
     t_decode = time.time()
+    prof = {"draft": 0.0, "verify": 0.0}
+    profile = os.environ.get("SPEC_PROFILE") == "1"
     while len(generated) < args.max_new_tokens:
         # 1) Draft K tokens. Commit the pending (newly accepted) tokens into the
         #    drafter's KV cache; the NTP prediction comes from the last committed
         #    slot and K-1 MTP (ptd) slots follow. base_pos is the absolute position
         #    of the first pending token.
         base_pos = cur_pos - len(pending_tokens)
+        if profile:
+            dist.barrier(); _t = time.time()
         drafts = drafter.draft(pending_tokens, pending_aux3, base_pos)
+        if profile:
+            dist.barrier(); prof["draft"] += time.time() - _t; _t = time.time()
 
         # 2) Verify: feed [last_token, drafts...] at absolute cur_pos.
         cand = [generated[-1]] + drafts  # length K+1
         target_ids, aux = target.verify(cand, cur_pos)
+        if profile:
+            dist.barrier(); prof["verify"] += time.time() - _t
 
         # 3) Accept the longest matching prefix (greedy).
         accepted = []
@@ -410,6 +418,23 @@ def main():
         print(f"Generated {n_new} tokens in {n_steps} verify steps")
         print(f"Mean acceptance length: {accept_len:.2f} (K={K})")
         print(f"Decode tokens/sec: {n_new / max(decode_time, 1e-6):.2f}")
+        if profile:
+            other = decode_time - prof["draft"] - prof["verify"]
+            print(
+                f"\n[profile] per-step avg over {n_steps} steps:"
+                f"\n  draft : {1000 * prof['draft'] / n_steps:7.1f} ms/step "
+                f"({100 * prof['draft'] / decode_time:.0f}%)"
+                f"\n  verify: {1000 * prof['verify'] / n_steps:7.1f} ms/step "
+                f"({100 * prof['verify'] / decode_time:.0f}%)"
+                f"\n  other : {1000 * other / n_steps:7.1f} ms/step "
+                f"({100 * other / decode_time:.0f}%)"
+            )
+            m = getattr(drafter, "_model", None)
+            if m is not None and hasattr(m, "_t_forward"):
+                print(
+                    f"  drafter forward: {1000 * m._t_forward / n_steps:6.1f} ms/step "
+                    f"(1 combined commit+draft call/step)"
+                )
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ rows are re-written at their absolute positions and the causal mask prevents any
 query from attending past its own position (same trick as the target's verify).
 """
 
+import os
 import time
 
 import numpy as np
@@ -135,52 +136,17 @@ class DrafterModel:
         B = cfg.max_batch_size
         t = time.time()
 
-        start_pos_sample = DeviceTensor.from_numpy(
-            np.empty((1,), dtype=np.int32), "d_start_pos"
-        )
-
-        # The draft step feeds K positions (1 NTP + K-1 MTP) at a runtime offset.
-        # Fusion layer sees 2H; plain layers see H.
-        def x2h(S, name):
-            return DeviceTensor.from_numpy(
-                np.empty((B, S, 2 * H), dtype=cfg.dtype), name
-            )
-
-        def x1h(S, name):
-            return DeviceTensor.from_numpy(np.empty((B, S, H), dtype=cfg.dtype), name)
-
-        # draft-width (K) kernels.
-        self.kernel_draft = [None] * self.n_layers
-        for i in range(self.n_layers):
-            xin = x2h(self.K, f"d_x_draft_{i}") if i == 0 else x1h(self.K, f"d_x_draft_{i}")
-            self.kernel_draft[i] = self._compile_layer(
-                f"drafter_draft_L{i}", i, xin, start_pos_sample
-            )
-
-        # commit-width (1 row) kernels: extend the cache by one accepted token.
-        self.kernel_commit = [None] * self.n_layers
-        for i in range(self.n_layers):
-            xin = x2h(1, f"d_x_commit_{i}") if i == 0 else x1h(1, f"d_x_commit_{i}")
-            self.kernel_commit[i] = self._compile_layer(
-                f"drafter_commit_L{i}", i, xin, start_pos_sample
-            )
-
-        # Head kernel over K positions.
-        h_sample = x1h(self.K, "d_h_head")
-        self.kernel_head = DeviceKernel.compile_and_load(
-            drafter_head_kernel,
-            name="drafter_head",
-            h=h_sample,
-            norm_weight=self.norm_weight,
-            lm_head_weight=self.lm_head_weight,
-            cfg=cfg,
-            build_dir=self.build_dir,
-            additional_compiler_args=cfg.additional_compiler_args_nkipy,
-        )
-        self._draft_logits = DeviceTensor.from_numpy(
-            np.empty((B, self.K, self.lm_head_weight.shape[1]), dtype=cfg.dtype),
-            "d_draft_logits",
-        )
+        # A draft step runs a single combined pass of width W = C + K - 1 over
+        #   [commit_0 .. commit_{C-1} | ptd_0 .. ptd_{K-2}]
+        # C (# accepted tokens) is 1..K+1, so W ranges K..2K. Compile one layer +
+        # head kernel set per width, keyed by W. Pre-compile all widths upfront:
+        # compiling inside the decode loop would stall the first step at each new
+        # width by tens of seconds.
+        self._draft_kernels = {}  # W -> list[layer kernel]
+        self._head_kernels = {}  # W -> head kernel
+        self._logit_bufs = {}  # W -> (B, W, vocab) output buffer
+        for W in range(self.K, 2 * self.K + 1):
+            self._get_draft(W)
         self._compile_time = time.time() - t
 
     # ── helpers ────────────────────────────────────────────────────────────
@@ -275,67 +241,106 @@ class DrafterModel:
             )
         self._prefill_width = S
 
+    def _get_draft(self, W):
+        """Compile+cache the layer stack and head for a draft width W (idempotent)."""
+        if W in self._draft_kernels:
+            return
+        cfg = self.config
+        H = cfg.hidden_size
+        B = cfg.max_batch_size
+        start_pos_sample = DeviceTensor.from_numpy(
+            np.empty((1,), dtype=np.int32), f"d_sp_{W}"
+        )
+        kernels = [None] * self.n_layers
+        for i in range(self.n_layers):
+            width = 2 * H if i == 0 else H
+            xin = DeviceTensor.from_numpy(
+                np.empty((B, W, width), dtype=cfg.dtype), f"d_x_draft_{W}_{i}"
+            )
+            kernels[i] = self._compile_layer(
+                f"drafter_draft_L{i}_W{W}", i, xin, start_pos_sample
+            )
+        self._draft_kernels[W] = kernels
+
+        h_sample = DeviceTensor.from_numpy(
+            np.empty((B, W, H), dtype=cfg.dtype), f"d_h_head_{W}"
+        )
+        self._head_kernels[W] = DeviceKernel.compile_and_load(
+            drafter_head_kernel,
+            name=f"drafter_head_W{W}",
+            h=h_sample,
+            norm_weight=self.norm_weight,
+            lm_head_weight=self.lm_head_weight,
+            cfg=cfg,
+            build_dir=self.build_dir,
+            additional_compiler_args=cfg.additional_compiler_args_nkipy,
+        )
+        self._logit_bufs[W] = DeviceTensor.from_numpy(
+            np.empty((B, W, self.lm_head_weight.shape[1]), dtype=cfg.dtype),
+            f"d_draft_logits_{W}",
+        )
+
     @torch.no_grad()
     def draft(self, commit_token_ids, commit_aux3, base_pos):
         """Generate K draft tokens for one speculation step (see DrafterCPU.draft).
 
-        Commits the newly accepted tokens into the cache (one row each at their
-        absolute positions), then runs K positions (NTP + K-1 MTP) attending to
-        the full cache. Rejected speculative rows from the previous step are
-        overwritten in place, so no explicit rollback is needed.
+        Runs ONE combined forward of width W = C + K - 1 over
+        ``[commit_0 .. commit_{C-1} | ptd_0 .. ptd_{K-2}]`` at consecutive absolute
+        positions ``base_pos + [0..W-1]``, all attending to the full cache. The K
+        draft logits come from the last committed slot (NTP) + the K-1 ptd slots
+        (MTP): rows ``[C-1 .. W-1]``. Rejected speculative rows from the previous
+        step are overwritten in place, so no explicit rollback is needed.
         """
         H, K = self.H, self.K
         C = len(commit_token_ids)
         assert C >= 1, "draft() needs at least the NTP (last committed) token"
+        W = C + K - 1
 
-        # 1) Commit each accepted token into the cache at its absolute position.
+        _prof = os.environ.get("SPEC_PROFILE") == "1"
+        if _prof:
+            _td = time.time()
+
+        # Committed slots: real embeddings + fc-fused real target hiddens.
         commit_emb = self.embed_tokens[torch.as_tensor(commit_token_ids)].reshape(
             1, C, H
         ).to(torch.bfloat16)
         commit_hidden = self._fc_fuse(commit_aux3)  # (1, C, H)
-        for j in range(C):
-            self._run_stack(
-                self.kernel_commit,
-                commit_emb[:, j : j + 1, :],
-                commit_hidden[:, j : j + 1, :],
-                start_pos=base_pos + j,
-            )
-        self.cache_len = base_pos + C
-        ntp_pos = base_pos + C - 1  # abs position of the NTP (last committed) slot
 
-        # 2) Draft: K positions. depth 0 = NTP (re-run the last committed slot so
-        #    its logit is available); depths 1..K-1 = MTP (ptd embed + mask hidden).
-        #    All attend to the full cache under a block-causal mask.
-        ntp_emb = commit_emb[:, C - 1 : C, :]
-        ntp_hidden = commit_hidden[:, C - 1 : C, :]
+        # MTP slots: ptd-token embedding + fc(mask_hidden), shared across depths.
         if K > 1:
             mtp_emb = self.ptd_emb_host.reshape(1, 1, H).expand(1, K - 1, H).to(
                 torch.bfloat16
             )
             mtp_hidden = self.mask_hidden_fused.reshape(1, 1, H).expand(1, K - 1, H)
-            embs = torch.cat([ntp_emb, mtp_emb], dim=1)  # (1, K, H)
-            hiddens = torch.cat([ntp_hidden, mtp_hidden], dim=1)
+            embs = torch.cat([commit_emb, mtp_emb], dim=1)  # (1, W, H)
+            hiddens = torch.cat([commit_hidden, mtp_hidden], dim=1)
         else:
-            embs, hiddens = ntp_emb, ntp_hidden
+            embs, hiddens = commit_emb, commit_hidden
 
-        x_final = self._run_stack(self.kernel_draft, embs, hiddens, start_pos=ntp_pos)
+        self._get_draft(W)
+        x_final = self._run_stack(
+            self._draft_kernels[W], embs, hiddens, start_pos=base_pos
+        )
 
-        # Restore cache_len to the committed length: the K draft rows (written at
-        # ntp_pos..ntp_pos+K-1) are speculative and will be overwritten when the
-        # next step commits the accepted tokens at those same absolute positions.
+        # The committed rows [0..C-1] land in the cache at their true absolute
+        # positions; the K-1 ptd rows are speculative and get overwritten when the
+        # next step commits accepted tokens at those same positions.
         self.cache_len = base_pos + C
 
-        # 3) Head: K logit rows -> K draft tokens.
-        self.kernel_head(
+        # Head over W positions; the K draft logits are rows [C-1 .. W-1].
+        logits_buf = self._logit_bufs[W]
+        self._head_kernels[W](
             inputs={
                 "h": x_final,
                 "norm_weight": self.norm_weight,
                 "lm_head_weight": self.lm_head_weight,
             },
-            outputs={"output0": self._draft_logits},
+            outputs={"output0": logits_buf},
         )
-        logits = self._draft_logits.torch().float()[0]  # (K, vocab_local)
+        logits = logits_buf.torch().float()[0, C - 1 :]  # (K, vocab_local)
         self.last_logits = logits  # stashed for numerical cross-checks
         draft_local = logits.argmax(dim=-1)  # (K,)
         draft_global = draft_local + self.d2t[draft_local]
+        if _prof:
+            self._t_forward = getattr(self, "_t_forward", 0.0) + time.time() - _td
         return draft_global.tolist()

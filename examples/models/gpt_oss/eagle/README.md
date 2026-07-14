@@ -67,12 +67,13 @@ Measured on trn2 (TP=4, K=7, chat prompt):
 
 | Drafter | Mean acceptance | Decode tok/s |
 |---------|-----------------|--------------|
-| device (default) | ~4.2 | ~35 |
+| device (default) | ~4.3 | ~41 |
 | `--cpu-drafter`  | ~4.3 | ~4.8 |
 
-The device drafter matches the CPU drafter's acceptance and is ~7× faster in
-decode (no per-step host↔device sync). Note: the first `prefill()` lazily
-compiles a prompt-width kernel stack, which currently inflates time-to-first-token.
+The device drafter matches the CPU drafter's acceptance and is ~8× faster in
+decode (no per-step host↔device sync). Set `SPEC_PROFILE=1` to print a per-step
+draft/verify time breakdown. Note: the first `prefill()` lazily compiles a
+prompt-width kernel stack, which currently inflates time-to-first-token.
 
 ## How it works
 
@@ -223,14 +224,22 @@ GPU-validated against vLLM. The **on-device drafter now keeps a KV cache**
 (`drafter_model.py` + `drafter_layer_cached`/`drafter_layer_kernel` in
 `kernels/drafter.py`): it prefills over the prompt and drafts K context-attending
 positions per step, matching `DrafterCPU` token-for-token on device (7/7 with
-real context) and reaching parity acceptance (~4.2) at ~35 decode tok/s on trn2
+real context) and reaching parity acceptance (~4.3) at ~41 decode tok/s on trn2
 (TP=4). It is the default; `--cpu-drafter` selects the reference path.
 
-Remaining work:
+Each draft step runs a **single combined forward** of width `W = C + K - 1` over
+`[commit_0 .. commit_{C-1} | ptd_0 .. ptd_{K-2}]` (accepted tokens + MTP slots), so
+committing accepted tokens and drafting the next K happen in one pass — no
+separate per-token commit launches. Kernels are compiled once per width (`W`
+ranges `K..2K`) at load time.
 
+Remaining work (profile with `SPEC_PROFILE=1`):
+
+- **Verify dominates (~64%, ~67 ms/step).** The target runs K+1 tokens through 24
+  MoE layers, and the MoE `feedforward` loops per-token per-expert on host
+  (`kernels/transformer_layer.py`). This is the next-highest-value target.
+- **Drafter forward (~33 ms/step).** Each layer allocates a fresh output
+  `DeviceTensor` per call; persistent per-layer buffers would trim this.
 - **Time-to-first-token.** `prefill()` lazily compiles a prompt-width kernel
   stack on the first call (inside the timed region). Pre-compile a bucketed set of
   prompt widths (like the base model's context buckets) to hide this.
-- **Commit-step batching.** Each step commits accepted tokens with one width-1
-  kernel call per token; batching them into a single multi-row commit would cut
-  per-step launches.
