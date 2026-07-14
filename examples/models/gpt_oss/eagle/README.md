@@ -67,13 +67,14 @@ Measured on trn2 (TP=4, K=7, chat prompt):
 
 | Drafter | Mean acceptance | Decode tok/s |
 |---------|-----------------|--------------|
-| device (default) | ~4.3 | ~41 |
+| device (default) | ~4.3 | ~50 |
 | `--cpu-drafter`  | ~4.3 | ~4.8 |
 
-The device drafter matches the CPU drafter's acceptance and is ~8× faster in
-decode (no per-step host↔device sync). Set `SPEC_PROFILE=1` to print a per-step
-draft/verify time breakdown. Note: the first `prefill()` lazily compiles a
-prompt-width kernel stack, which currently inflates time-to-first-token.
+The device drafter matches the CPU drafter's acceptance and is ~10× faster in
+decode (fused single kernel, no per-step host↔device sync). Set `SPEC_PROFILE=1`
+to print a per-step draft/verify time breakdown. Note: the first `prefill()`
+compiles a full-prompt-width fused kernel, which inflates time-to-first-token on
+a cold build cache.
 
 ## How it works
 
@@ -220,26 +221,28 @@ midlayer concatenates embeds with hidden to 2H; later layers are standard.
 ### Status / remaining work
 
 The CPU drafter path (`DrafterCPU`) and the `speculate.py` loop bookkeeping are
-GPU-validated against vLLM. The **on-device drafter now keeps a KV cache**
-(`drafter_model.py` + `drafter_layer_cached`/`drafter_layer_kernel` in
-`kernels/drafter.py`): it prefills over the prompt and drafts K context-attending
-positions per step, matching `DrafterCPU` token-for-token on device (7/7 with
-real context) and reaching parity acceptance (~4.3) at ~41 decode tok/s on trn2
+GPU-validated against vLLM. The **on-device drafter keeps a KV cache and runs as
+a single fused kernel** (`drafter_model.py` + `drafter_fused_kernel` in
+`kernels/drafter.py`): fc-fusion + (embed, hidden) assembly + all 4 layers +
+final norm + lm_head in one device call, each layer aliasing its own cache. It
+prefills over the prompt and drafts K context-attending positions per step,
+matching `DrafterCPU` token-for-token on device (parity is sub-noise bf16 ties,
+logit cosine 0.9999) and reaching acceptance ~4.3 at ~50 decode tok/s on trn2
 (TP=4). It is the default; `--cpu-drafter` selects the reference path.
 
-Each draft step runs a **single combined forward** of width `W = C + K - 1` over
+Each draft step runs a **single fused forward** of width `W = C + K - 1` over
 `[commit_0 .. commit_{C-1} | ptd_0 .. ptd_{K-2}]` (accepted tokens + MTP slots), so
-committing accepted tokens and drafting the next K happen in one pass — no
-separate per-token commit launches. Kernels are compiled once per width (`W`
-ranges `K..2K`) at load time.
+committing accepted tokens and drafting the next K happen in one kernel — no
+separate per-token commit or per-layer launches. One kernel is compiled per width
+(`W` ranges `K..2K`) at load time.
 
 Remaining work (profile with `SPEC_PROFILE=1`):
 
-- **Verify dominates (~64%, ~67 ms/step).** The target runs K+1 tokens through 24
-  MoE layers, and the MoE `feedforward` loops per-token per-expert on host
-  (`kernels/transformer_layer.py`). This is the next-highest-value target.
-- **Drafter forward (~33 ms/step).** Each layer allocates a fresh output
-  `DeviceTensor` per call; persistent per-layer buffers would trim this.
-- **Time-to-first-token.** `prefill()` lazily compiles a prompt-width kernel
-  stack on the first call (inside the timed region). Pre-compile a bucketed set of
-  prompt widths (like the base model's context buckets) to hide this.
+- **Verify dominates (~78%, ~66 ms/step).** The target runs K+1 tokens through 24
+  MoE layers; profiling shows this is genuine device compute in the layer kernels
+  (the argmax/head and aux copies are <3 ms/step combined), not host overhead.
+  Speeding it up means optimizing the shared target MoE `feedforward` kernel.
+- **Time-to-first-token.** `prefill()` compiles a full-prompt-width fused kernel
+  on the first call (inside the timed region), which dominates TTFT on a cold
+  build cache; a warm cache amortizes it. Pre-compiling a bucketed set of prompt
+  widths (like the base model's context buckets) would hide it.

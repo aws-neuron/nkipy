@@ -1,18 +1,18 @@
-"""Device-side P-EAGLE drafter with a KV cache.
+"""Device-side P-EAGLE drafter with a KV cache, fused into one kernel per step.
 
-Mirrors ``DrafterCPU`` (drafter_cpu.py) but runs the layer forward on the Neuron
-device. The drafter keeps a per-layer KV cache over the full context (prompt +
-accepted tokens); each draft step appends K positions (1 NTP + K-1 MTP) that
-attend causally to the whole cache, exactly like the CPU reference. Only the fc
-fusion and the (embed, hidden) input assembly happen on host (tiny); every
-attention/MLP layer runs on device via ``drafter_layer_kernel``.
+Mirrors ``DrafterCPU`` (drafter_cpu.py) but runs the whole drafter forward as a
+single Neuron kernel: fc-fusion + (embed, hidden) assembly + all 4 layers +
+final norm + lm_head, with each layer aliasing its own persistent KV cache. The
+drafter keeps a per-layer KV cache over the full context (prompt + accepted
+tokens); each draft step runs W = C + K - 1 positions that attend causally to
+the whole cache, exactly like the CPU reference.
 
-The host-driven per-layer loop matches the base model (``GptOssModel``): each
-layer is a compiled kernel that aliases its own ``cache_k``/``cache_v``. Kernels
-are compiled once per sequence width (prefill = prompt_len-1, commit = 1 row,
-draft = K rows). Rollback of rejected speculative rows is implicit: committed
-rows are re-written at their absolute positions and the causal mask prevents any
-query from attending past its own position (same trick as the target's verify).
+Only the token-embedding gather stays on host (dynamic ids); everything else is
+on device. Kernels are compiled once per sequence width (prefill = prompt_len-1,
+draft W = K..2K) at load time. Rollback of rejected speculative rows is implicit:
+committed rows are re-written at their absolute positions and the causal mask
+prevents any query from attending past its own position (same trick as the
+target's verify).
 """
 
 import os
@@ -23,7 +23,7 @@ import torch
 from nkipy.runtime import DeviceKernel, DeviceTensor
 
 from .config import EagleConfig
-from .kernels.drafter import drafter_head_kernel, drafter_layer_kernel
+from .kernels.drafter import drafter_fused_kernel
 
 BUILD_DIR = None  # set by the caller (absolute path)
 
@@ -35,6 +35,7 @@ class DrafterModel:
         self.H = config.hidden_size
         self.K = config.num_draft_tokens
         self.n_layers = config.num_layers
+        assert self.n_layers == 4, "fused kernel is wired for 4 layers (1 fusion + 3)"
         self.cache_len = 0
         self._prepare_tensors(weights)
         self._prepare_kernels()
@@ -46,250 +47,205 @@ class DrafterModel:
         cfg = self.config
         H = cfg.hidden_size
 
-        # Host tensors used to build the (embed, hidden) input stream.
+        # Host: token embeddings (dynamic gather each step) + d2t remap.
         self.embed_tokens = w["embed_tokens"]  # (vocab, H) host
-        self.fc_weight_host = w["fc_weight"].to(torch.float32)  # (3*target_H, H)
-        self.mask_hidden_host = w["mask_hidden"].to(torch.float32)  # (1, 3*target_H)
+        self.ptd_emb_host = self.embed_tokens[cfg.ptd_token_id].reshape(1, H)
         self.d2t = w["d2t"].to(torch.int64)
-        self.ptd_token_id = cfg.ptd_token_id
 
-        # fc-fused shared MTP hidden (host): fc(mask_hidden) -> (1, H).
-        self.mask_hidden_fused = (self.mask_hidden_host @ self.fc_weight_host).to(
-            torch.bfloat16
-        )
-        self.ptd_emb_host = self.embed_tokens[self.ptd_token_id].reshape(1, H)
-
+        # Device: fc weight + mask hidden (fc-fuse now runs on device).
+        self.fc_weight = self._dt(w["fc_weight"], "d_fc_weight")  # (3*tH, H)
+        self.mask_hidden = self._dt(
+            w["mask_hidden"].reshape(1, -1), "d_mask_hidden"
+        )  # (1, 3*tH)
         self.norm_weight = self._dt(w["norm_weight"], "d_norm_weight")
         self.lm_head_weight = self._dt(w["lm_head_weight"], "d_lm_head_weight")
 
-        # Per-layer weight dicts (device) + KV caches. Layer 0 is the fusion
-        # midlayer; layers 1..N-1 are plain. Caches are (B, max_seq, n_kv, hd).
-        cache_shape = (
-            cfg.max_batch_size,
-            cfg.max_seq_len,
-            cfg.num_kv_heads,
-            cfg.head_dim,
-        )
-        self.layers = []
-        for i in range(self.n_layers):
-            prefix = "midlayer" if i == 0 else f"layers.{i}"
-            lt = {
-                "q_proj": self._dt(w[f"{prefix}.q_proj"], f"d_{prefix}_q"),
-                "k_proj": self._dt(w[f"{prefix}.k_proj"], f"d_{prefix}_k"),
-                "v_proj": self._dt(w[f"{prefix}.v_proj"], f"d_{prefix}_v"),
-                "o_proj": self._dt(w[f"{prefix}.o_proj"], f"d_{prefix}_o"),
-                "input_weight": self._dt(
-                    w[f"{prefix}.input_weight"], f"d_{prefix}_in"
-                ),
-                "post_attention_weight": self._dt(
-                    w[f"{prefix}.post_attention_weight"], f"d_{prefix}_post"
-                ),
-                "gate_proj": self._dt(w[f"{prefix}.gate_proj"], f"d_{prefix}_gate"),
-                "up_proj": self._dt(w[f"{prefix}.up_proj"], f"d_{prefix}_up"),
-                "down_proj": self._dt(w[f"{prefix}.down_proj"], f"d_{prefix}_down"),
-                "cache_k": DeviceTensor.from_numpy(
-                    np.zeros(cache_shape, dtype=cfg.dtype), f"d_cache_k_{i}"
-                ),
-                "cache_v": DeviceTensor.from_numpy(
-                    np.zeros(cache_shape, dtype=cfg.dtype), f"d_cache_v_{i}"
-                ),
-            }
-            if i == 0:
-                lt["hidden_norm_weight"] = self._dt(
-                    w["midlayer.hidden_norm_weight"], "d_midlayer_hn"
-                )
-            else:
-                # Plain layers have no hidden_norm; reuse input_weight as a dummy
-                # so the kernel signature is uniform (unused when is_fusion=False).
-                lt["hidden_norm_weight"] = lt["input_weight"]
-            self.layers.append(lt)
+        # Fusion midlayer weights (layer 0).
+        self.m = {
+            k: self._dt(w[f"midlayer.{k}"], f"d_m_{k}")
+            for k in [
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "input_weight", "hidden_norm_weight", "post_attention_weight",
+                "gate_proj", "up_proj", "down_proj",
+            ]
+        }
 
-    def _compile_layer(self, name, i, x_sample, start_pos_sample):
-        lt = self.layers[i]
-        is_fusion = i == 0
+        # Plain layers 1..N-1, stacked on a leading axis.
+        plain_keys = [
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "input_weight", "post_attention_weight",
+            "gate_proj", "up_proj", "down_proj",
+        ]
+        self.p = {}
+        for k in plain_keys:
+            stacked = torch.stack(
+                [w[f"layers.{i}.{k}"] for i in range(1, cfg.num_layers)]
+            )
+            self.p[k] = self._dt(stacked, f"d_p_{k}")
+
+        # Per-layer KV caches (separate named device tensors, aliased in+out).
+        cache_shape = (
+            cfg.max_batch_size, cfg.max_seq_len, cfg.num_kv_heads, cfg.head_dim
+        )
+        self.cache_k = [
+            DeviceTensor.from_numpy(np.zeros(cache_shape, dtype=cfg.dtype), f"d_ck_{i}")
+            for i in range(self.n_layers)
+        ]
+        self.cache_v = [
+            DeviceTensor.from_numpy(np.zeros(cache_shape, dtype=cfg.dtype), f"d_cv_{i}")
+            for i in range(self.n_layers)
+        ]
+
+    def _weight_inputs(self):
+        """The (static) weight + cache inputs common to every fused kernel call."""
+        d = {
+            "fc_weight": self.fc_weight,
+            "mask_hidden": self.mask_hidden,
+            "norm_weight": self.norm_weight,
+            "lm_head_weight": self.lm_head_weight,
+            "m_q_proj": self.m["q_proj"],
+            "m_k_proj": self.m["k_proj"],
+            "m_v_proj": self.m["v_proj"],
+            "m_o_proj": self.m["o_proj"],
+            "m_input_weight": self.m["input_weight"],
+            "m_hidden_norm_weight": self.m["hidden_norm_weight"],
+            "m_post_attention_weight": self.m["post_attention_weight"],
+            "m_gate_proj": self.m["gate_proj"],
+            "m_up_proj": self.m["up_proj"],
+            "m_down_proj": self.m["down_proj"],
+            "p_q_proj": self.p["q_proj"],
+            "p_k_proj": self.p["k_proj"],
+            "p_v_proj": self.p["v_proj"],
+            "p_o_proj": self.p["o_proj"],
+            "p_input_weight": self.p["input_weight"],
+            "p_post_attention_weight": self.p["post_attention_weight"],
+            "p_gate_proj": self.p["gate_proj"],
+            "p_up_proj": self.p["up_proj"],
+            "p_down_proj": self.p["down_proj"],
+        }
+        for i in range(self.n_layers):
+            d[f"cache_k{i}.must_alias_input"] = self.cache_k[i]
+            d[f"cache_v{i}.must_alias_input"] = self.cache_v[i]
+        return d
+
+    def _cache_outputs(self):
+        out = {}
+        for i in range(self.n_layers):
+            out[f"cache_k{i}"] = self.cache_k[i]
+            out[f"cache_v{i}"] = self.cache_v[i]
+        return out
+
+    def _compile_fused(self, W, C, name):
+        """Compile the fused kernel specialized to width W and committed-count C."""
+        cfg = self.config
+        H, B = cfg.hidden_size, cfg.max_batch_size
+        embeds = DeviceTensor.from_numpy(
+            np.empty((B, W, H), dtype=cfg.dtype), f"d_embeds_{name}"
+        )
+        th3 = DeviceTensor.from_numpy(
+            np.empty((B, C, 3 * cfg.target_hidden_size), dtype=cfg.dtype),
+            f"d_th3_{name}",
+        )
+        start_pos = DeviceTensor.from_numpy(np.empty((1,), dtype=np.int32), f"d_sp_{name}")
+        kw = {
+            "embeds": embeds,
+            "target_hidden3": th3,
+            "start_pos": start_pos,
+        }
+        kw.update(self._weight_inputs())
+        # compile_and_load takes DeviceTensors positionally-by-kwarg; drop the
+        # ".must_alias_input" suffix used only at call time.
+        compile_kw = {k.split(".")[0]: v for k, v in kw.items()}
         return DeviceKernel.compile_and_load(
-            drafter_layer_kernel,
+            drafter_fused_kernel,
             name=name,
-            x=x_sample,
-            start_pos=start_pos_sample,
-            q_proj=lt["q_proj"],
-            k_proj=lt["k_proj"],
-            v_proj=lt["v_proj"],
-            o_proj=lt["o_proj"],
-            input_weight=lt["input_weight"],
-            hidden_norm_weight=lt["hidden_norm_weight"],
-            post_attention_weight=lt["post_attention_weight"],
-            gate_proj=lt["gate_proj"],
-            up_proj=lt["up_proj"],
-            down_proj=lt["down_proj"],
-            cache_k=lt["cache_k"],
-            cache_v=lt["cache_v"],
-            cfg=self.config,
-            is_fusion=is_fusion,
+            cfg=cfg,
             build_dir=self.build_dir,
-            additional_compiler_args=self.config.additional_compiler_args_nkipy,
+            additional_compiler_args=cfg.additional_compiler_args_nkipy,
+            **compile_kw,
         )
 
     def _prepare_kernels(self):
-        cfg = self.config
-        H = cfg.hidden_size
-        B = cfg.max_batch_size
         t = time.time()
-
-        # A draft step runs a single combined pass of width W = C + K - 1 over
-        #   [commit_0 .. commit_{C-1} | ptd_0 .. ptd_{K-2}]
-        # C (# accepted tokens) is 1..K+1, so W ranges K..2K. Compile one layer +
-        # head kernel set per width, keyed by W. Pre-compile all widths upfront:
-        # compiling inside the decode loop would stall the first step at each new
-        # width by tens of seconds.
-        self._draft_kernels = {}  # W -> list[layer kernel]
-        self._head_kernels = {}  # W -> head kernel
-        self._logit_bufs = {}  # W -> (B, W, vocab) output buffer
+        # Draft step: width W = C + K - 1, C in 1..K+1, so W in K..2K. For each W
+        # the committed count is C = W - K + 1. Compile all upfront (a lazy compile
+        # inside the decode loop would stall a step by tens of seconds).
+        self.kernel_draft = {}  # W -> kernel
+        self.draft_logits = {}  # W -> (B, W, vocab) buffer
         for W in range(self.K, 2 * self.K + 1):
-            self._get_draft(W)
+            C = W - self.K + 1
+            self.kernel_draft[W] = self._compile_fused(W, C, f"drafter_fused_W{W}")
+            self.draft_logits[W] = DeviceTensor.from_numpy(
+                np.empty(
+                    (self.config.max_batch_size, W, self.lm_head_weight.shape[1]),
+                    dtype=self.config.dtype,
+                ),
+                f"d_logits_W{W}",
+            )
+        self._prefill_kernel = None
+        self._prefill_width = None
         self._compile_time = time.time() - t
 
-    # ── helpers ────────────────────────────────────────────────────────────
+    # ── helpers ──────────────────────────────────────────────────────────────
 
-    def _fc_fuse(self, hidden3):
-        """(., 3*target_H) host float -> (., H) bf16 via fc weight."""
-        return (hidden3.to(torch.float32) @ self.fc_weight_host).to(torch.bfloat16)
+    def _embed(self, token_ids):
+        ids = torch.as_tensor(token_ids)
+        return self.embed_tokens[ids].reshape(1, len(ids), self.H).to(torch.bfloat16)
 
-    def _run_layer(self, kernels, i, x_dev, start_pos_dev):
-        lt = self.layers[i]
+    def _run_fused(self, kernel, logits_buf, embeds, target_hidden3, start_pos):
+        """Invoke the fused kernel: upload inputs, run, return host logits (W,vocab)."""
         inputs = {
-            "x": x_dev,
-            "q_proj": lt["q_proj"],
-            "k_proj": lt["k_proj"],
-            "v_proj": lt["v_proj"],
-            "o_proj": lt["o_proj"],
-            "input_weight": lt["input_weight"],
-            "hidden_norm_weight": lt["hidden_norm_weight"],
-            "post_attention_weight": lt["post_attention_weight"],
-            "gate_proj": lt["gate_proj"],
-            "up_proj": lt["up_proj"],
-            "down_proj": lt["down_proj"],
-            "cache_k.must_alias_input": lt["cache_k"],
-            "cache_v.must_alias_input": lt["cache_v"],
+            "embeds": self._dt(embeds, "embeds_in"),
+            "target_hidden3": self._dt(target_hidden3.to(torch.bfloat16), "th3_in"),
+            "start_pos": DeviceTensor.from_numpy(
+                np.array([start_pos], dtype=np.int32), "sp_in"
+            ),
         }
-        if start_pos_dev is not None:
-            inputs["start_pos"] = start_pos_dev
-        out = DeviceTensor.from_numpy(
-            np.empty((x_dev.shape[0], x_dev.shape[1], self.H), dtype=self.config.dtype),
-            f"d_layer_out_{i}",
-        )
-        kernels[i](
-            inputs=inputs,
-            outputs={"output0": out, "cache_k": lt["cache_k"], "cache_v": lt["cache_v"]},
-        )
-        return out
+        inputs.update(self._weight_inputs())
+        outputs = {"output0": logits_buf}
+        outputs.update(self._cache_outputs())
+        kernel(inputs=inputs, outputs=outputs)
+        return logits_buf.torch().float()[0]  # (W, vocab_local)
 
-    def _run_stack(self, kernels, embeds, hiddens, start_pos):
-        """Run fusion (2H) + plain (H) layers over S positions at abs start_pos.
-
-        embeds/hiddens: host bf16 (B, S, H). Returns final host hidden (B, S, H).
-        """
-        cfg = self.config
-        x_2h = torch.cat([embeds, hiddens], dim=-1)  # (B, S, 2H)
-        sp = (
-            None
-            if start_pos is None
-            else DeviceTensor.from_numpy(np.array([start_pos], dtype=np.int32), "sp")
-        )
-        x_dev = DeviceTensor.from_torch(x_2h, "d_stack_in")
-        x_dev = self._run_layer(kernels, 0, x_dev, sp)  # fusion 2H -> H
-        for i in range(1, self.n_layers):
-            x_dev = self._run_layer(kernels, i, x_dev, sp)
-        return x_dev
-
-    # ── public API (matches DrafterCPU) ──────────────────────────────────────
+    # ── public API (matches DrafterCPU) ────────────────────────────────────────
 
     def reset(self):
         self.cache_len = 0
 
     @torch.no_grad()
     def prefill(self, token_ids, aux_hidden_states):
-        """Fill the drafter KV cache with prompt context.
+        """Fill the drafter KV cache with prompt context (single fused pass).
 
         token_ids: (S,) prompt tokens (EAGLE-shifted by the caller).
         aux_hidden_states: (1, S, 3*target_H) target tap hiddens.
         """
         self.reset()
         S = len(token_ids)
-        emb = self.embed_tokens[torch.as_tensor(token_ids)].reshape(1, S, self.H)
-        emb = emb.to(torch.bfloat16)
-        hidden = self._fc_fuse(aux_hidden_states)  # (1, S, H)
+        embeds = self._embed(token_ids)  # (1, S, H)
+        th3 = aux_hidden_states  # all S rows are "committed" (C == S, no MTP slots)
 
-        # Compile a prefill-width stack lazily (width depends on the prompt).
-        if getattr(self, "_prefill_width", None) != S:
-            self._compile_prefill(S)
-        self._run_stack(self.kernel_prefill, emb, hidden, start_pos=None)
+        if self._prefill_width != S:
+            self._prefill_kernel = self._compile_fused(S, S, f"drafter_prefill_{S}")
+            self._prefill_logits = DeviceTensor.from_numpy(
+                np.empty(
+                    (self.config.max_batch_size, S, self.lm_head_weight.shape[1]),
+                    dtype=self.config.dtype,
+                ),
+                f"d_plogits_{S}",
+            )
+            self._prefill_width = S
+        self._run_fused(self._prefill_kernel, self._prefill_logits, embeds, th3, 0)
         self.cache_len = S
-
-    def _compile_prefill(self, S):
-        cfg = self.config
-        H = cfg.hidden_size
-        B = cfg.max_batch_size
-        self.kernel_prefill = [None] * self.n_layers
-        for i in range(self.n_layers):
-            width = 2 * H if i == 0 else H
-            xin = DeviceTensor.from_numpy(
-                np.empty((B, S, width), dtype=cfg.dtype), f"d_x_prefill_{i}"
-            )
-            self.kernel_prefill[i] = self._compile_layer(
-                f"drafter_prefill_L{i}_{S}", i, xin, None
-            )
-        self._prefill_width = S
-
-    def _get_draft(self, W):
-        """Compile+cache the layer stack and head for a draft width W (idempotent)."""
-        if W in self._draft_kernels:
-            return
-        cfg = self.config
-        H = cfg.hidden_size
-        B = cfg.max_batch_size
-        start_pos_sample = DeviceTensor.from_numpy(
-            np.empty((1,), dtype=np.int32), f"d_sp_{W}"
-        )
-        kernels = [None] * self.n_layers
-        for i in range(self.n_layers):
-            width = 2 * H if i == 0 else H
-            xin = DeviceTensor.from_numpy(
-                np.empty((B, W, width), dtype=cfg.dtype), f"d_x_draft_{W}_{i}"
-            )
-            kernels[i] = self._compile_layer(
-                f"drafter_draft_L{i}_W{W}", i, xin, start_pos_sample
-            )
-        self._draft_kernels[W] = kernels
-
-        h_sample = DeviceTensor.from_numpy(
-            np.empty((B, W, H), dtype=cfg.dtype), f"d_h_head_{W}"
-        )
-        self._head_kernels[W] = DeviceKernel.compile_and_load(
-            drafter_head_kernel,
-            name=f"drafter_head_W{W}",
-            h=h_sample,
-            norm_weight=self.norm_weight,
-            lm_head_weight=self.lm_head_weight,
-            cfg=cfg,
-            build_dir=self.build_dir,
-            additional_compiler_args=cfg.additional_compiler_args_nkipy,
-        )
-        self._logit_bufs[W] = DeviceTensor.from_numpy(
-            np.empty((B, W, self.lm_head_weight.shape[1]), dtype=cfg.dtype),
-            f"d_draft_logits_{W}",
-        )
 
     @torch.no_grad()
     def draft(self, commit_token_ids, commit_aux3, base_pos):
         """Generate K draft tokens for one speculation step (see DrafterCPU.draft).
 
-        Runs ONE combined forward of width W = C + K - 1 over
+        Runs ONE fused forward of width W = C + K - 1 over
         ``[commit_0 .. commit_{C-1} | ptd_0 .. ptd_{K-2}]`` at consecutive absolute
         positions ``base_pos + [0..W-1]``, all attending to the full cache. The K
-        draft logits come from the last committed slot (NTP) + the K-1 ptd slots
-        (MTP): rows ``[C-1 .. W-1]``. Rejected speculative rows from the previous
-        step are overwritten in place, so no explicit rollback is needed.
+        draft logits are rows ``[C-1 .. W-1]`` (last committed slot + K-1 MTP).
+        Rejected speculative rows from the previous step are overwritten in place.
         """
         H, K = self.H, self.K
         C = len(commit_token_ids)
@@ -300,44 +256,25 @@ class DrafterModel:
         if _prof:
             _td = time.time()
 
-        # Committed slots: real embeddings + fc-fused real target hiddens.
-        commit_emb = self.embed_tokens[torch.as_tensor(commit_token_ids)].reshape(
-            1, C, H
-        ).to(torch.bfloat16)
-        commit_hidden = self._fc_fuse(commit_aux3)  # (1, C, H)
-
-        # MTP slots: ptd-token embedding + fc(mask_hidden), shared across depths.
+        # Embedding half: committed token embeds + K-1 ptd embeds. The hidden half
+        # (fc-fuse of target_hidden3 / mask_hidden) is built inside the kernel.
+        commit_emb = self._embed(commit_token_ids)  # (1, C, H)
         if K > 1:
             mtp_emb = self.ptd_emb_host.reshape(1, 1, H).expand(1, K - 1, H).to(
                 torch.bfloat16
             )
-            mtp_hidden = self.mask_hidden_fused.reshape(1, 1, H).expand(1, K - 1, H)
-            embs = torch.cat([commit_emb, mtp_emb], dim=1)  # (1, W, H)
-            hiddens = torch.cat([commit_hidden, mtp_hidden], dim=1)
+            embeds = torch.cat([commit_emb, mtp_emb], dim=1)  # (1, W, H)
         else:
-            embs, hiddens = commit_emb, commit_hidden
+            embeds = commit_emb
 
-        self._get_draft(W)
-        x_final = self._run_stack(
-            self._draft_kernels[W], embs, hiddens, start_pos=base_pos
+        logits = self._run_fused(
+            self.kernel_draft[W], self.draft_logits[W], embeds, commit_aux3, base_pos
         )
-
-        # The committed rows [0..C-1] land in the cache at their true absolute
-        # positions; the K-1 ptd rows are speculative and get overwritten when the
-        # next step commits accepted tokens at those same positions.
+        # Committed rows land at their true absolute positions; the K-1 ptd rows are
+        # speculative and get overwritten when the next step commits accepted tokens.
         self.cache_len = base_pos + C
 
-        # Head over W positions; the K draft logits are rows [C-1 .. W-1].
-        logits_buf = self._logit_bufs[W]
-        self._head_kernels[W](
-            inputs={
-                "h": x_final,
-                "norm_weight": self.norm_weight,
-                "lm_head_weight": self.lm_head_weight,
-            },
-            outputs={"output0": logits_buf},
-        )
-        logits = logits_buf.torch().float()[0, C - 1 :]  # (K, vocab_local)
+        logits = logits[C - 1 :]  # (K, vocab_local)
         self.last_logits = logits  # stashed for numerical cross-checks
         draft_local = logits.argmax(dim=-1)  # (K,)
         draft_global = draft_local + self.d2t[draft_local]

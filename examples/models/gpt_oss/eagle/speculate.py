@@ -156,6 +156,9 @@ class SpeculativeGptOss(base.GptOssModel):
             np.array([start_pos], dtype=np.int32), "verify_pos"
         )
 
+        _prof = os.environ.get("SPEC_PROFILE") == "1"
+        if _prof:
+            _t = time.time()
         aux = []
         for i in range(cfg.num_layers):
             lt = self.layer_tensors[i]
@@ -174,7 +177,14 @@ class SpeculativeGptOss(base.GptOssModel):
                 },
             )
             if cfg.aux_layers is not None and i in cfg.aux_layers:
+                if _prof:
+                    _ta = time.time()
                 aux.append(h.torch().clone())
+                if _prof:
+                    self._t_aux = getattr(self, "_t_aux", 0.0) + time.time() - _ta
+        if _prof:
+            self._t_layers = getattr(self, "_t_layers", 0.0) + (time.time() - _t)
+            _t = time.time()
 
         target_ids = DeviceTensor.from_numpy(
             np.empty((1, S), dtype=np.int32), "tgt_ids"
@@ -187,7 +197,10 @@ class SpeculativeGptOss(base.GptOssModel):
             },
             outputs={"output0": target_ids},
         )
-        return target_ids.torch().reshape(S).tolist(), aux
+        out = target_ids.torch().reshape(S).tolist()
+        if _prof:
+            self._t_argmax = getattr(self, "_t_argmax", 0.0) + time.time() - _t
+        return out, aux
 
 
 def _stack_aux(aux_list):
@@ -433,7 +446,15 @@ def main():
             if m is not None and hasattr(m, "_t_forward"):
                 print(
                     f"  drafter forward: {1000 * m._t_forward / n_steps:6.1f} ms/step "
-                    f"(1 combined commit+draft call/step)"
+                    f"(1 fused kernel/step)"
+                )
+            if hasattr(target, "_t_layers"):
+                print(
+                    f"  verify breakdown:"
+                    f"\n    layers: {1000 * target._t_layers / n_steps:6.1f} ms/step "
+                    f"(incl. aux copies {1000 * target._t_aux / n_steps:.1f})"
+                    f"\n    argmax: {1000 * target._t_argmax / n_steps:6.1f} ms/step "
+                    f"(head + argmax + host transfer)"
                 )
 
 
