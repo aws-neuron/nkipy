@@ -237,7 +237,10 @@ class _DeviceDrafterAdapter:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-n", "--max-new-tokens", type=int, default=128)
-    parser.add_argument("-k", "--num-draft-tokens", type=int, default=7)
+    # K=3 is the measured throughput optimum on trn2: verify cost grows ~6.3
+    # ms/token but acceptance plateaus around 3.3 for this drafter, so larger K
+    # pays more verify time for no extra accepted tokens. See README.
+    parser.add_argument("-k", "--num-draft-tokens", type=int, default=3)
     parser.add_argument("prompt", nargs="?", default="The capital of France is")
     parser.add_argument(
         "--raw-prompt",

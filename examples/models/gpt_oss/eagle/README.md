@@ -41,7 +41,7 @@ torchrun --nproc-per-node $TP eagle/speculate.py \
     --draft-checkpoint ./eagle/tmp_p-eagle \
     --model /path/to/gpt-oss-20b \
     --draft-model /path/to/GPT-OSS-20B-P-EAGLE \
-    -n 256 -k 7 \
+    -n 256 -k 3 \
     "Write a Python function that implements binary search."
 ```
 
@@ -75,6 +75,28 @@ decode (fused single kernel, no per-step host↔device sync). Set `SPEC_PROFILE=
 to print a per-step draft/verify time breakdown. Note: the first `prefill()`
 compiles a full-prompt-width fused kernel, which inflates time-to-first-token on
 a cold build cache.
+
+### Choosing K (draft tokens per step)
+
+Verify runs `K+1` candidate tokens through the target in one pass. Profiling on
+trn2 (TP=4) shows its cost is **~19 ms fixed + ~6.3 ms per candidate token** — the
+fixed part (a single-token forward, ~19 ms, dominated by loading the 24 layers'
+weights from HBM) is amortized across all `K+1` tokens, so verify is efficient
+*per token*. But acceptance saturates: this drafter plateaus around ~3.3 accepted
+tokens/step, so beyond K≈3 each extra draft slot adds verify time for no extra
+accepted tokens. Sweep (n=96, chat prompt):
+
+| K | Mean acceptance | Decode tok/s |
+|---|-----------------|--------------|
+| 1 | 1.94 | 50.0 |
+| 2 | 2.67 | 52.6 |
+| **3 (default)** | **3.31** | **~60** |
+| 4 | 3.31 | 49.5 |
+| 7 | 4.33 | 50.4 |
+
+**K=3 is the throughput optimum (~60–62 tok/s), beating both the base model
+(~52 tok/s) and larger K.** Higher K only helps if a stronger drafter raises the
+acceptance plateau. Set `-k` to override.
 
 ## How it works
 
@@ -238,10 +260,15 @@ separate per-token commit or per-layer launches. One kernel is compiled per widt
 
 Remaining work (profile with `SPEC_PROFILE=1`):
 
-- **Verify dominates (~78%, ~66 ms/step).** The target runs K+1 tokens through 24
-  MoE layers; profiling shows this is genuine device compute in the layer kernels
-  (the argmax/head and aux copies are <3 ms/step combined), not host overhead.
-  Speeding it up means optimizing the shared target MoE `feedforward` kernel.
+- **Verify is the dominant per-step cost** (~70–78% depending on K). Profiling
+  shows it scales as **~19 ms fixed + ~6.3 ms/candidate token**, and it is genuine
+  device layer compute (argmax/head and aux copies are <3 ms/step combined), not
+  host overhead. The fixed ~19 ms is a single-token forward — dominated by
+  streaming the 24 layers' weights from HBM — so it is amortized across the batch.
+  Tuning **K to the acceptance plateau** (K=3 here) is the highest-leverage lever;
+  a stronger drafter (higher plateau) would let larger K pay off. Further gains
+  would come from the shared target MoE `feedforward` kernel (e.g. gathering each
+  routed expert's weights once per step instead of per token).
 - **Time-to-first-token.** `prefill()` compiles a full-prompt-width fused kernel
   on the first call (inside the timed region), which dominates TTFT on a cold
   build cache; a warm cache amortizes it. Pre-compiling a bucketed set of prompt
