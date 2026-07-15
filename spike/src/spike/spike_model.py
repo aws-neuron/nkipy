@@ -196,7 +196,27 @@ class SpikeModel:
             )
 
     def _validate_io(self, inputs, outputs):
+        """Validate that caller-supplied I/O dicts match the compiled NEFF.
+
+        Checks tensor names, shapes, dtypes, and core placement.  Raises
+        ``ValueError`` with the expected NEFF names on any name mismatch,
+        so callers get actionable diagnostics instead of a bare ``KeyError``.
+        """
         model_core_id = self.model_ref.core_id
+
+        unknown_inputs = set(inputs) - set(self.input_tensors_info)
+        if unknown_inputs:
+            raise ValueError(
+                f"Unknown input(s) {unknown_inputs} for model '{self.name}'. "
+                f"Expected inputs: {list(self.input_tensors_info.keys())}"
+            )
+        unknown_outputs = set(outputs) - set(self.output_tensors_info)
+        if unknown_outputs:
+            raise ValueError(
+                f"Unknown output(s) {unknown_outputs} for model '{self.name}'. "
+                f"Expected outputs: {list(self.output_tensors_info.keys())}"
+            )
+
         for k, v in inputs.items():
             tensor_core_id = v.tensor_ref.core_id
             assert tensor_core_id == model_core_id, (
