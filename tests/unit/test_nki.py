@@ -412,15 +412,13 @@ def test_nki_direct_jit_beta3():
 
     @nki_beta3.jit
     def nki_add_kernel(a_input, b_input):
-        ix = nl_beta3.affine_range(128)
-        iy = nl_beta3.affine_range(512)
-        a_tile = nl_beta3.load(a_input[ix, iy])
-        b_tile = nl_beta3.load(b_input[ix, iy])
+        a_tile = nl_beta3.load(a_input[:, :])
+        b_tile = nl_beta3.load(b_input[:, :])
         c_tile = nl_beta3.add(a_tile, b_tile)
         output = nl_beta3.ndarray(
             a_input.shape, dtype=a_input.dtype, buffer=nl_beta3.shared_hbm
         )
-        nl_beta3.store(output[ix, iy], value=c_tile)
+        nl_beta3.store(output[:, :], value=c_tile)
         return output
 
     a = np.random.rand(128, 512).astype(np.float32)
@@ -441,15 +439,13 @@ def test_nki_direct_jit_beta3_called_twice_different_shapes():
 
     @nki_beta3.jit
     def nki_add_kernel(a_input, b_input):
-        ix = nl_beta3.affine_range(128)
-        iy = nl_beta3.affine_range(512)
-        a_tile = nl_beta3.load(a_input[ix, iy])
-        b_tile = nl_beta3.load(b_input[ix, iy])
+        a_tile = nl_beta3.load(a_input[:, :])
+        b_tile = nl_beta3.load(b_input[:, :])
         c_tile = nl_beta3.add(a_tile, b_tile)
         output = nl_beta3.ndarray(
             a_input.shape, dtype=a_input.dtype, buffer=nl_beta3.shared_hbm
         )
-        nl_beta3.store(output[ix, iy], value=c_tile)
+        nl_beta3.store(output[:, :], value=c_tile)
         return output
 
     a1 = np.random.rand(128, 512).astype(np.float32)
@@ -474,15 +470,13 @@ def test_nki_direct_jit_beta3_kwargs_operand_order():
 
     @nki_beta3.jit
     def nki_add_kernel(a_input, b_input):
-        ix = nl_beta3.affine_range(128)
-        iy = nl_beta3.affine_range(512)
-        a_tile = nl_beta3.load(a_input[ix, iy])
-        b_tile = nl_beta3.load(b_input[ix, iy])
+        a_tile = nl_beta3.load(a_input[:, :])
+        b_tile = nl_beta3.load(b_input[:, :])
         c_tile = nl_beta3.add(a_tile, b_tile)
         output = nl_beta3.ndarray(
             a_input.shape, dtype=a_input.dtype, buffer=nl_beta3.shared_hbm
         )
-        nl_beta3.store(output[ix, iy], value=c_tile)
+        nl_beta3.store(output[:, :], value=c_tile)
         return output
 
     a = np.random.rand(128, 512).astype(np.float32)
@@ -503,15 +497,13 @@ def test_nki_wrap_kernel_beta3():
 
     @nki_beta3.jit
     def nki_add_kernel(a_input, b_input):
-        ix = nl_beta3.affine_range(128)
-        iy = nl_beta3.affine_range(512)
-        a_tile = nl_beta3.load(a_input[ix, iy])
-        b_tile = nl_beta3.load(b_input[ix, iy])
+        a_tile = nl_beta3.load(a_input[:, :])
+        b_tile = nl_beta3.load(b_input[:, :])
         c_tile = nl_beta3.add(a_tile, b_tile)
         output = nl_beta3.ndarray(
             a_input.shape, dtype=a_input.dtype, buffer=nl_beta3.shared_hbm
         )
-        nl_beta3.store(output[ix, iy], value=c_tile)
+        nl_beta3.store(output[:, :], value=c_tile)
         return output
 
     a = np.random.rand(128, 512).astype(np.float32)
@@ -539,12 +531,10 @@ def test_nki_mutable_tensor_beta3():
 
     @nki_beta3.jit
     def nki_inplace_add_kernel(a_input, b_input):
-        ix = nl_beta3.affine_range(128)
-        iy = nl_beta3.affine_range(512)
-        a_tile = nl_beta3.load(a_input[ix, iy])
-        b_tile = nl_beta3.load(b_input[ix, iy])
+        a_tile = nl_beta3.load(a_input[:, :])
+        b_tile = nl_beta3.load(b_input[:, :])
         c_tile = nl_beta3.add(a_tile, b_tile)
-        nl_beta3.store(a_input[ix, iy], value=c_tile)
+        nl_beta3.store(a_input[:, :], value=c_tile)
         return a_input
 
     a = np.random.rand(128, 512).astype(np.float32)
@@ -577,12 +567,10 @@ def test_nki_mutable_tensor_beta3_hardware():
 
     @nki_beta3.jit
     def nki_inplace_add_kernel(a_input, b_input):
-        ix = nl_beta3.affine_range(128)
-        iy = nl_beta3.affine_range(512)
-        a_tile = nl_beta3.load(a_input[ix, iy])
-        b_tile = nl_beta3.load(b_input[ix, iy])
+        a_tile = nl_beta3.load(a_input[:, :])
+        b_tile = nl_beta3.load(b_input[:, :])
         c_tile = nl_beta3.add(a_tile, b_tile)
-        nl_beta3.store(a_input[ix, iy], value=c_tile)
+        nl_beta3.store(a_input[:, :], value=c_tile)
         return a_input
 
     a = np.random.rand(128, 512).astype(np.float32)
@@ -621,15 +609,13 @@ def test_nki_simple_beta3_hardware():
 
     @nki_beta3.jit
     def nki_add_kernel(a_input, b_input):
-        ix = nl_beta3.affine_range(128)
-        iy = nl_beta3.affine_range(512)
-        a_tile = nl_beta3.load(a_input[ix, iy])
-        b_tile = nl_beta3.load(b_input[ix, iy])
+        a_tile = nl_beta3.load(a_input[:, :])
+        b_tile = nl_beta3.load(b_input[:, :])
         c_tile = nl_beta3.add(a_tile, b_tile)
         output = nl_beta3.ndarray(
             a_input.shape, dtype=a_input.dtype, buffer=nl_beta3.shared_hbm
         )
-        nl_beta3.store(output[ix, iy], value=c_tile)
+        nl_beta3.store(output[:, :], value=c_tile)
         return output
 
     a = np.random.rand(128, 512).astype(np.float32)
