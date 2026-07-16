@@ -37,7 +37,6 @@ from nkigen_lite.nki_ir.ir import (
     Builder,
     DimSlice,
     MemorySpace,
-    PARTITION_MAX,
 )
 
 from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
@@ -45,13 +44,13 @@ from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
     BITWISE_OPS,
     COMPARE_OPS,
     UNARY_OPS,
-    ceildiv,
     collapse_view,
     emit_binary_op,
     emit_unary_op,
     _materialize_broadcast,
 )
 from nkigen_lite.tensor_ir.passes.basic.direct_lower_alloc import Scratch
+from nkigen_lite.tensor_ir.passes.basic.direct_lower_schedule import TileSchedule
 
 
 # Largest free-dim tile: a power of two, capped at 512 (the tensor/vector
@@ -75,15 +74,6 @@ def _pf(shape: tuple[int, ...]) -> tuple[int, int]:
     if len(shape) == 1:
         return 1, shape[0]
     return prod(shape[:-1]), shape[-1]
-
-
-def _free_tile(free: int) -> int:
-    """Largest power of two ``<= min(free, 512)`` (and ``>= 1``)."""
-    cap = min(free, _FREE_TILE_MAX)
-    t = 1
-    while t * 2 <= cap:
-        t *= 2
-    return t
 
 
 # ---------------------------------------------------------------------------
@@ -123,19 +113,13 @@ def _emit_elementwise_op(nb: Builder, op, hbm_map: dict[str, Value], scratch: Sc
     hbm_dst = hbm_map[op.results[0].name]
     store_2d = collapse_view(nb, hbm_dst, *_pf(hbm_dst.type.shape))
 
-    p_tile = min(rep_P, PARTITION_MAX)
-    f_tile = _free_tile(rep_F)
-
-    for p_i in range(ceildiv(rep_P, p_tile)):
-        p_off = p_i * p_tile
-        p_size = min(p_tile, rep_P - p_off)
-        for f_i in range(ceildiv(rep_F, f_tile)):
-            f_off = f_i * f_tile
-            f_size = min(f_tile, rep_F - f_off)
-            _emit_ew_tile(
-                nb, op, load_plan, store_2d,
-                p_off, p_size, f_off, f_size, scratch,
-            )
+    for p_off, p_size, f_off, f_size in TileSchedule.free_pow2(
+        rep_P, rep_F, _FREE_TILE_MAX
+    ).pf_tiles():
+        _emit_ew_tile(
+            nb, op, load_plan, store_2d,
+            p_off, p_size, f_off, f_size, scratch,
+        )
 
 
 def _collapse_operand(val: Value, rep_P: int, rep_F: int) -> tuple[int, int]:

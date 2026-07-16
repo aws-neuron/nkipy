@@ -120,6 +120,21 @@ class TileSchedule:
         chosen (formerly the free function ``iter_pf_tiles``)."""
         return cls((P, F), {0: PARTITION_MAX, 1: max_free_elems(dtype)})
 
+    @classmethod
+    def free_pow2(cls, P: int, F: int, free_max: int = 512) -> "TileSchedule":
+        """The elementwise 2D ``(P, F)`` schedule: partition at 128 lanes, free
+        dim at the largest power of two ``<= min(F, free_max)``.
+
+        Distinct from ``pf``: elementwise compute wants a power-of-two free
+        width capped at the tensor/vector engine's comfortable 512, not the
+        dtype-derived data-movement budget ``max_free_elems``. This is the
+        single place that policy lives (formerly ``_free_tile``)."""
+        cap = min(F, free_max)
+        t = 1
+        while t * 2 <= cap:
+            t *= 2
+        return cls((P, F), {0: PARTITION_MAX, 1: t})
+
     def pf_tiles(self) -> Iterator[tuple[int, int, int, int]]:
         """Yield ``(p_off, p_size, f_off, f_size)`` for a 2D schedule.
 

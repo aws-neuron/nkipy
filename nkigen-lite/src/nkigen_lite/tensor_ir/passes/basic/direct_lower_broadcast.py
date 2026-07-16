@@ -197,13 +197,12 @@ def _emit_collapsed_broadcast(nb: Builder, x_hbm, y_hbm, L, B, T, dtype, scratch
         src_tiles: dict[int, object] = {}  # per-partition-row scalar, keyed by p_off
         for p_off, p_size, f_off, f_size in TileSchedule.pf(L, B, dtype).pf_tiles():
             if p_off not in src_tiles:
-                src_tiles[p_off] = nb.dma_copy(
-                    nb.alloc((p_size, 1), dtype, MemorySpace.SBUF),
-                    src, (DimSlice(p_off, p_size), DimSlice(0, 1)),
+                src_tiles[p_off] = scratch.load(
+                    src, (DimSlice(p_off, p_size), DimSlice(0, 1)), (p_size, 1), dtype,
                 )
             ones = nb.constant(1.0, (p_size, f_size), dtype, MemorySpace.SBUF)
             rep = nb.tensor_scalar_arith(
-                nb.alloc((p_size, f_size), dtype, MemorySpace.SBUF),
+                scratch.sbuf((p_size, f_size), dtype),
                 ones, src_tiles[p_off], NisaArithOp.MULTIPLY,
             )
             nb.dma_copy(dst, rep, (DimSlice(p_off, p_size), DimSlice(f_off, f_size)))
@@ -215,9 +214,9 @@ def _emit_collapsed_broadcast(nb: Builder, x_hbm, y_hbm, L, B, T, dtype, scratch
         dst = collapse_view(nb, y_hbm, B, T)
         for p_off, p_size, f_off, f_size in TileSchedule.pf(B, T, dtype).pf_tiles():
             # Stride-0 partition load fans the one source row across p_size rows.
-            rep = nb.dma_copy(
-                nb.alloc((p_size, f_size), dtype, MemorySpace.SBUF),
+            rep = scratch.load(
                 src, (DimSlice(0, p_size, stride=0), DimSlice(f_off, f_size)),
+                (p_size, f_size), dtype,
             )
             nb.dma_copy(dst, rep, (DimSlice(p_off, p_size), DimSlice(f_off, f_size)))
         return
@@ -227,9 +226,9 @@ def _emit_collapsed_broadcast(nb: Builder, x_hbm, y_hbm, L, B, T, dtype, scratch
     src = nb.view(x_hbm, (L, 1, T))
     dst = nb.view(y_hbm, (L, B, T))
     for p_off, p_size, f_off, f_size in TileSchedule.pf(L, T, dtype).pf_tiles():
-        tile = nb.dma_copy(
-            nb.alloc((p_size, f_size), dtype, MemorySpace.SBUF),
+        tile = scratch.load(
             src, (DimSlice(p_off, p_size), DimSlice(0, 1), DimSlice(f_off, f_size)),
+            (p_size, f_size), dtype,
         )
         for b in range(B):
             nb.dma_copy(

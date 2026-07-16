@@ -32,6 +32,14 @@ def iter_pf_tiles(P, F, dtype):
             yield p_off, p_size, f_off, f_size
 
 
+def _free_tile(free, free_max=512):
+    cap = min(free, free_max)
+    t = 1
+    while t * 2 <= cap:
+        t *= 2
+    return t
+
+
 def build_slices(shape, tile_sizes, indices):
     slices = []
     for d in range(len(shape)):
@@ -78,6 +86,23 @@ def test_pf_schedule_slices_match(P, F, dtype):
     for idx, tup in zip(sched, iter_pf_tiles(P, F, dtype)):
         ps, fs = idx.slices(sched.shape, sched.tile_sizes)
         assert (ps.offset, ps.size, fs.offset, fs.size) == tup
+
+
+@pytest.mark.parametrize("P,F", PF_SHAPES)
+def test_free_pow2_matches_old_elementwise_loop(P, F):
+    """free_pow2 reproduces the old _free_tile + hand-rolled loop exactly."""
+    p_tile = min(P, PARTITION_MAX)
+    f_tile = _free_tile(F)
+    expected = []
+    for p_i in range((P + p_tile - 1) // p_tile):
+        p_off = p_i * p_tile
+        p_size = min(p_tile, P - p_off)
+        for f_i in range((F + f_tile - 1) // f_tile):
+            f_off = f_i * f_tile
+            f_size = min(f_tile, F - f_off)
+            expected.append((p_off, p_size, f_off, f_size))
+    got = list(TileSchedule.free_pow2(P, F, 512).pf_tiles())
+    assert got == expected
 
 
 # N-D nested schedule (reduce-style): compare against build_slices / clamped_extent

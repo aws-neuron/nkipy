@@ -93,10 +93,32 @@ Bare non-load SBUF allocs (accumulators, `ones`, scale constants, PSUM) were
 intentionally left as `nb.alloc`/`nb.constant`: they are compute outputs, not
 scratch, so they don't belong to the allocation-audit surface.
 
-## Step 3 — Body-split emitters (opportunistic)
+## Step 3 — Body-split emitters (opportunistic)  ✅ DONE
 
-- [ ] Reshape each regular emitter into plan-once + `for tile in sched: body(...)`.
-- [ ] Lowest urgency; do while touching each emitter.
+- [x] Added `TileSchedule.free_pow2(P, F, free_max)` — the elementwise tile
+  policy (partition at 128, free = largest power-of-two ≤ min(F, 512)). Now the
+  single home of that policy (formerly `_free_tile`).
+- [x] Folded the elementwise emitter's hand-rolled 2D loop onto
+  `free_pow2(...).pf_tiles()`; deleted `_free_tile` and the dead
+  `ceildiv`/`PARTITION_MAX` imports. The emitter was already plan-once
+  (`load_plan`/`store_2d`) + `for tile: _emit_ew_tile`, so this completes its
+  body-split shape.
+- [x] Collapsed the 3 straggler `nb.dma_copy(nb.alloc(...))` loads in
+  broadcast's `_emit_collapsed_broadcast` to `scratch.load` (incl. the stride-0
+  fan-out and the 3D middle-broadcast slice) + the ones-multiply dst to
+  `scratch.sbuf`.
+- [x] Equivalence test `test_free_pow2_matches_old_elementwise_loop` (pins
+  `free_pow2` against the old `_free_tile` + loop).
+- [x] `uv run pytest tests/ -n auto`: **869 passed, 1 xfailed**. No new F401s.
+
+Intentionally NOT migrated (matches the Step-3 fit assessment): the remaining
+`range(ceildiv(...))` loops in gather (indirect-DMA, data-dependent), iota
+(produce, not load), memory's flat-range chunking, and the generic
+batch-unrolled broadcast/hbm-copy paths. These build per-dim slices via batch
+`unravel` + start-offsets that the flat `tile_sizes` model doesn't express
+without changing generated IR — bespoke iteration is correct there. Reduce and
+elementwise (the regular tile-loop emitters) are the ones that belong on
+`TileSchedule`, and both now are.
 
 ---
 
@@ -109,4 +131,9 @@ scratch, so they don't belong to the allocation-audit surface.
   passed).
 - 2026-07-15: Step 2 complete. `Scratch` added and threaded per-graph through
   every emitter; all HBM scratch + 57 load idioms routed through it; unit test
-  added. Full suite green (856 passed). Next: Step 3 (body-split, opportunistic).
+  added. Full suite green (856 passed).
+- 2026-07-15: Step 3 complete. `free_pow2` constructor added; elementwise folded
+  onto it; straggler broadcast loads collapsed; equivalence test added. Full
+  suite green (869 passed). **All three steps done** — tiling, allocation, and
+  codegen are now separated in the regular tile-loop emitters (reduce,
+  elementwise), with `Scratch` the allocation seam across all emitters.
