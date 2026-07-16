@@ -153,3 +153,15 @@ elementwise (the regular tile-loop emitters) are the ones that belong on
   `Allocator`. Only PSUM accumulators (×3) and the `Allocator` method bodies use
   `nb.alloc` now. Removed 2 dead `MemorySpace` imports. Suite green (869 passed);
   ruff F401 5 (below prior baseline).
+- 2026-07-15: Unified elementwise into the emitter dispatch table (it already
+  shared the `(nb, op, hbm_map, alloc)` contract) — one uniform lookup, no
+  special-case branch.
+- 2026-07-15: Producer-owns-output allocation. Deleted the separate
+  result-buffer pre-pass (which had to know `_is_view_reshape`, coupling
+  allocation to reshape lowering). Emitters now dispatch through
+  `_with_result_buffers`, which allocates each result's HBM just-in-time before
+  the emitter runs; reshape is registered raw (in `_SELF_ALLOCATING`) so its
+  view case installs a zero-copy view with no dead buffer. `lower_graph` now has
+  no per-opcode special cases. Verified byte-for-byte equivalent generated IR
+  (identical opcode multiset; only alloc *ordering* differs — interleaved vs.
+  up-front). Full monorepo suite green (1446 passed).

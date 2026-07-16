@@ -50,15 +50,16 @@ from nkigen_lite.tensor_ir.passes.basic.direct_lower_alloc import Allocator
 # ---------------------------------------------------------------------------
 
 
+def _nki_shape(shape):
+    """NKI requires at least rank-1 tensors."""
+    return shape if len(shape) > 0 else (1,)
+
+
 def lower_graph(graph: Graph) -> nki_ir.Graph:
     """Lower a full tensor IR graph to NKI IR with HBM boundaries."""
     nb = Builder("direct_lower")
     alloc = Allocator(nb)
     hbm_map: dict[str, Value] = {}
-
-    def _nki_shape(shape):
-        """NKI requires at least rank-1 tensors."""
-        return shape if len(shape) > 0 else (1,)
 
     # Allocate HBM inputs
     for v in graph.inputs:
@@ -70,24 +71,12 @@ def lower_graph(graph: Graph) -> nki_ir.Graph:
         if key not in hbm_map:
             hbm_map[key] = nb.add_input(key, _nki_shape(out_val.type.shape), out_val.type.dtype)
 
-    # Allocate an HBM buffer for every op result.  Skip reshape results:
-    # a reshape preserves row-major flat order, so its result is emitted as a
-    # zero-copy view of the (row-major contiguous) input HBM buffer rather than
-    # a fresh allocation + copy.  Allocating here would leave a large dead HBM
-    # buffer (an expert weight reshape is ~100 MB).  Scalar reshapes still need
-    # a real buffer (() promotion), so don't skip those.
-    for op in graph.ops:
-        if op.opcode == "reshape" and _is_view_reshape(op):
-            continue
-        for r in op.results:
-            if r.name not in hbm_map:
-                hbm_map[r.name] = alloc.hbm(
-                    _nki_shape(r.type.shape), r.type.dtype
-                )
-
-    # Lower each op through its per-opcode emitter. Elementwise ops dispatch to
-    # the tiled load→compute→store loop (``_emit_elementwise_op``); every other
-    # op reads its inputs' HBM buffers directly. All emitters share the
+    # Lower each op through its per-opcode emitter. Every emitter's result HBM
+    # buffers are allocated just-in-time by ``_with_result_buffers`` (below)
+    # before it runs, so the producer owns its own output allocation — no
+    # separate pre-pass. The one exception is reshape, registered raw because it
+    # decides per-op whether its result is a zero-copy view of the input buffer
+    # (no allocation) or a real copy. All emitters share the
     # ``(nb, op, hbm_map, alloc) -> None`` contract, so a single table drives
     # them. (Grouping consecutive elementwise ops into one fused loop is the
     # deferred Phase-2 fusion-compatibility work.)
@@ -247,16 +236,21 @@ def _is_view_reshape(op) -> bool:
 
 
 def _emit_reshape_op(nb: Builder, op, hbm_map: dict[str, Value], alloc: Allocator) -> None:
+    # Registered raw (not via ``_with_result_buffers``) so the view case can
+    # avoid allocating a dead result buffer — an expert-weight reshape result is
+    # ~100 MB. This emitter owns the reshape result's allocation.
     inp_val = op.inputs[0]
     out_val = op.results[0]
     if _is_view_reshape(op):
         # Zero-copy: reinterpret the input HBM buffer to the output shape.
-        # The result was deliberately not pre-allocated (see lower_graph), so
-        # downstream consumers read this view directly.
+        # Downstream consumers read this view directly; no buffer allocated.
         hbm_map[out_val.name] = nb.view(hbm_map[inp_val.name], out_val.type.shape)
         return
+    # Real copy (scalar () -> (1,) promotion): allocate the result buffer here.
+    out_hbm = alloc.hbm(_nki_shape(out_val.type.shape), out_val.type.dtype)
+    hbm_map[out_val.name] = out_hbm
     emit_reshape(
-        nb, hbm_map[inp_val.name], hbm_map[out_val.name],
+        nb, hbm_map[inp_val.name], out_hbm,
         inp_val.type.shape, out_val.type.shape, inp_val.type.dtype, alloc,
     )
 
@@ -295,10 +289,27 @@ def _emit_broadcast_op(nb: Builder, op, hbm_map: dict[str, Value], alloc: Alloca
     )
 
 
-# Per-opcode emitters, all ``(nb, op, hbm_map, alloc) -> None``. Every elementwise
-# opcode maps to the shared tiled load→compute→store loop; structural ops have
-# their own emitter.
-_OP_EMITTERS: dict[str, object] = {
+def _with_result_buffers(emitter):
+    """Allocate an HBM buffer for each of the op's results before emitting.
+
+    Every emitter writes its output into a pre-existing ``hbm_map`` entry, so
+    the producer's result buffers are allocated just-in-time here rather than in
+    a separate pre-pass. Ops that install their own result value (reshape, which
+    may alias the input buffer as a zero-copy view) are registered raw, bypassing
+    this wrapper so they never get a dead buffer allocated.
+    """
+    def wrapped(nb, op, hbm_map, alloc):
+        for r in op.results:
+            if r.name not in hbm_map:
+                hbm_map[r.name] = alloc.hbm(_nki_shape(r.type.shape), r.type.dtype)
+        emitter(nb, op, hbm_map, alloc)
+    return wrapped
+
+
+# Raw per-opcode emitters, all ``(nb, op, hbm_map, alloc) -> None``. Every
+# elementwise opcode maps to the shared tiled load→compute→store loop; structural
+# ops have their own emitter.
+_RAW_EMITTERS: dict[str, object] = {
     "reduce": emit_reduce,
     "matmul": _emit_matmul_op,
     "transpose": _emit_transpose_op,
@@ -313,6 +324,16 @@ _OP_EMITTERS: dict[str, object] = {
     "gather_rows": emit_gather_rows,
     **{opcode: _emit_collective_op for opcode in COLLECTIVE_OPCODES},
     **{opcode: _emit_elementwise_op for opcode in ELEMENTWISE_OPCODES},
+}
+
+# Opcodes whose emitter installs its own result value (a zero-copy view that must
+# NOT get a fresh buffer). These dispatch raw; all others go through
+# ``_with_result_buffers``, which allocates their result HBM just-in-time.
+_SELF_ALLOCATING = frozenset({"reshape"})
+
+_OP_EMITTERS: dict[str, object] = {
+    opcode: (emitter if opcode in _SELF_ALLOCATING else _with_result_buffers(emitter))
+    for opcode, emitter in _RAW_EMITTERS.items()
 }
 
 
