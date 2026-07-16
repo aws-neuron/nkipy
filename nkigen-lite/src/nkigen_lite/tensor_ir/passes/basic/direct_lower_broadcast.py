@@ -116,7 +116,7 @@ def _emit_broadcast_scalar(nb: Builder, x_hbm, y_hbm, out_shape, dtype, alloc) -
             else:
                 scalar_operand = scalar_tile
             ones = nb.constant(1.0, (p_size, tile_f), dtype, MemorySpace.SBUF)
-            dst = nb.alloc((p_size, tile_f), dtype, MemorySpace.SBUF)
+            dst = alloc.sbuf((p_size, tile_f), dtype)
             dst = nb.tensor_scalar_arith(dst, ones, scalar_operand, NisaArithOp.MULTIPLY)
 
             dst_slices = [DimSlice(bi, 1) for bi in batch_idx]
@@ -291,7 +291,7 @@ def emit_broadcast_to(nb: Builder, x_hbm, y_hbm, in_shape, out_shape, dtype, all
 
             if src_f == 1 and tile_f > 1:
                 ones = nb.constant(1.0, (tile.type.shape[0], tile_f), dtype, MemorySpace.SBUF)
-                dst = nb.alloc((tile.type.shape[0], tile_f), dtype, MemorySpace.SBUF)
+                dst = alloc.sbuf((tile.type.shape[0], tile_f), dtype)
                 tile = nb.tensor_scalar_arith(dst, ones, tile, NisaArithOp.MULTIPLY)
 
             dst_slices = [DimSlice(bi, 1) for bi in batch_idx]

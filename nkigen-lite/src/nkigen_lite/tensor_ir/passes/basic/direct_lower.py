@@ -26,7 +26,6 @@ from nkigen_lite.core import Graph, Value
 from nkigen_lite.nki_ir.ir import (
     Builder,
     DimSlice,
-    MemorySpace,
     PARTITION_MAX,
 )
 from nkigen_lite.nki_ir import ir as nki_ir
@@ -82,8 +81,8 @@ def lower_graph(graph: Graph) -> nki_ir.Graph:
             continue
         for r in op.results:
             if r.name not in hbm_map:
-                hbm_map[r.name] = nb.alloc(
-                    _nki_shape(r.type.shape), r.type.dtype, MemorySpace.HBM
+                hbm_map[r.name] = alloc.hbm(
+                    _nki_shape(r.type.shape), r.type.dtype
                 )
 
     # Lower each op.  An elementwise op is emitted through the tiled

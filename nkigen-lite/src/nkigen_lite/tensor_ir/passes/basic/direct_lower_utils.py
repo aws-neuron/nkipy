@@ -18,6 +18,7 @@ from nkigen_lite.nki_ir.ir import (
     SBUF_PER_PARTITION_BYTES,
 )
 from nkigen_lite.nki_ir import ir as nki_ir
+from nkigen_lite.tensor_ir.passes.basic.direct_lower_alloc import Allocator
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +201,6 @@ def broadcast_partition(nb: Builder, src: Value, target_shape: tuple[int, int]) 
     instance is threaded or built here — and threading it through the whole
     ``emit_binary_op`` compute chain would be churn for no behavioural gain.
     """
-    from nkigen_lite.tensor_ir.passes.basic.direct_lower_alloc import Allocator
     alloc = Allocator(nb)
     p, f = target_shape
     staging = alloc.hbm((1, f), src.type.dtype)
@@ -310,6 +310,7 @@ def _materialize_broadcast(nb: Builder, x: Value, out_shape: tuple[int, int]) ->
     compare/bitwise paths, whose tensor_tensor ops require exactly matching
     shapes — unlike arith, which has a native tensor_scalar form.
     """
+    alloc = Allocator(nb)
     p, f = x.type.shape
     out_p, out_f = out_shape
     if p == 1 and out_p > 1:
@@ -317,13 +318,14 @@ def _materialize_broadcast(nb: Builder, x: Value, out_shape: tuple[int, int]) ->
         p = out_p
     if f == 1 and out_f > 1:
         ones = nb.constant(1.0, (p, out_f), x.type.dtype, MemorySpace.SBUF)
-        rep = nb.alloc((p, out_f), x.type.dtype, MemorySpace.SBUF)
+        rep = alloc.sbuf((p, out_f), x.type.dtype)
         x = nb.tensor_scalar_arith(rep, ones, x, nki_ir.NisaArithOp.MULTIPLY)
     return x
 
 
 def emit_binary_op(nb: Builder, out_dtype: DType, a: Value, b: Value, opcode: str) -> Value:
     """Emit a binary elementwise op with broadcast alignment."""
+    alloc = Allocator(nb)
     if opcode in COMPARE_OPS or opcode in BITWISE_OPS:
         # tensor_tensor_compare / _bitvec require exactly matching shapes, so
         # materialize size-1 operands on both axes (the arith path below can
@@ -336,13 +338,13 @@ def emit_binary_op(nb: Builder, out_dtype: DType, a: Value, b: Value, opcode: st
             b = _materialize_broadcast(nb, b, out_shape)
         if opcode in COMPARE_OPS:
             # Comparison ops produce same dtype as input (1.0/0.0 float)
-            dst = nb.alloc(a.type.shape, a.type.dtype, MemorySpace.SBUF)
+            dst = alloc.sbuf(a.type.shape, a.type.dtype)
             return nb.tensor_tensor_compare(dst, a, b, COMPARE_OPS[opcode])
-        dst = nb.alloc(a.type.shape, out_dtype, MemorySpace.SBUF)
+        dst = alloc.sbuf(a.type.shape, out_dtype)
         return nb.tensor_tensor_bitvec(dst, a, b, BITWISE_OPS[opcode])
     arith_op = BINARY_OPS[opcode]
     if a.type.shape == b.type.shape:
-        dst = nb.alloc(a.type.shape, out_dtype, MemorySpace.SBUF)
+        dst = alloc.sbuf(a.type.shape, out_dtype)
         return nb.tensor_tensor_arith(dst, a, b, arith_op)
 
     ap, af = a.type.shape
@@ -352,20 +354,20 @@ def emit_binary_op(nb: Builder, out_dtype: DType, a: Value, b: Value, opcode: st
     if bf == 1 and (bp == ap or bp == 1):
         if bp == 1 and out_shape[0] > 1:
             b = broadcast_partition(nb, b, (out_shape[0], bf))
-        dst = nb.alloc(out_shape, out_dtype, MemorySpace.SBUF)
+        dst = alloc.sbuf(out_shape, out_dtype)
         return nb.tensor_scalar_arith(dst, a, b, arith_op)
 
     if af == 1 and (ap == bp or ap == 1):
         if arith_op in COMMUTATIVE_OPS:
             if ap == 1 and out_shape[0] > 1:
                 a = broadcast_partition(nb, a, (out_shape[0], af))
-            dst = nb.alloc(out_shape, out_dtype, MemorySpace.SBUF)
+            dst = alloc.sbuf(out_shape, out_dtype)
             return nb.tensor_scalar_arith(dst, b, a, arith_op)
         if ap == 1 and out_shape[0] > 1:
             a = broadcast_partition(nb, a, out_shape)
         else:
             a = nb.broadcast(a, out_shape)
-        dst = nb.alloc(out_shape, out_dtype, MemorySpace.SBUF)
+        dst = alloc.sbuf(out_shape, out_dtype)
         return nb.tensor_tensor_arith(dst, a, b, arith_op)
 
     if ap == 1 and bp > 1 and af == bf:
@@ -376,21 +378,22 @@ def emit_binary_op(nb: Builder, out_dtype: DType, a: Value, b: Value, opcode: st
         raise NotImplementedError(
             f"binary shapes {a.type.shape} / {b.type.shape} not alignable"
         )
-    dst = nb.alloc(out_shape, out_dtype, MemorySpace.SBUF)
+    dst = alloc.sbuf(out_shape, out_dtype)
     return nb.tensor_tensor_arith(dst, a, b, arith_op)
 
 
 def emit_unary_op(nb: Builder, out_dtype: DType, src: Value, opcode: str) -> Value:
     """Emit a unary elementwise op."""
+    alloc = Allocator(nb)
     if opcode == "floor":
         return _emit_floor(nb, out_dtype, src)
     if opcode == "neg":
-        dst = nb.alloc(src.type.shape, out_dtype, MemorySpace.SBUF)
+        dst = alloc.sbuf(src.type.shape, out_dtype)
         p = src.type.shape[0]
         neg_one = nb.constant(-1.0, (p, 1), src.type.dtype, MemorySpace.SBUF)
         return nb.tensor_scalar_arith(dst, src, neg_one, nki_ir.NisaArithOp.MULTIPLY)
     act_op = UNARY_OPS[opcode]
-    dst = nb.alloc(src.type.shape, out_dtype, MemorySpace.SBUF)
+    dst = alloc.sbuf(src.type.shape, out_dtype)
     return nb.activation(dst, src, act_op)
 
 
@@ -410,40 +413,41 @@ def _emit_floor(nb: Builder, out_dtype: DType, src: Value) -> Value:
     Uses integer arithmetic for the conditional select to avoid float
     precision issues in the correction step.
     """
+    alloc = Allocator(nb)
     shape = src.type.shape
     p = shape[0]
 
     # trunc(x) via int32 cast (rounds toward zero)
-    casted = nb.alloc(shape, DType.I32, MemorySpace.SBUF)
+    casted = alloc.sbuf(shape, DType.I32)
     nb.tensor_copy(casted, src)
 
     # cast back to float for comparison
-    casted_back = nb.alloc(shape, out_dtype, MemorySpace.SBUF)
+    casted_back = alloc.sbuf(shape, out_dtype)
     nb.tensor_copy(casted_back, casted)
 
     # condition = (casted_back > x): uint8 predicate, 1 when trunc overshot
-    condition = nb.alloc(shape, DType.U8, MemorySpace.SBUF)
+    condition = alloc.sbuf(shape, DType.U8)
     nb.tensor_tensor_compare(condition, casted_back, src, nki_ir.NisaArithOp.IS_GT)
 
     # cond_not = condition XOR 1 (logical NOT)
     one_u8 = nb.constant(1.0, (p, 1), DType.U8, MemorySpace.SBUF)
-    cond_not = nb.alloc(shape, DType.U8, MemorySpace.SBUF)
+    cond_not = alloc.sbuf(shape, DType.U8)
     nb.tensor_scalar_bitvec(cond_not, condition, one_u8, nki_ir.NisaBitvecOp.XOR)
 
     # casted_m1 = casted - 1 (integer subtraction)
     one_i32 = nb.constant(1.0, (p, 1), DType.I32, MemorySpace.SBUF)
-    casted_m1 = nb.alloc(shape, DType.I32, MemorySpace.SBUF)
+    casted_m1 = alloc.sbuf(shape, DType.I32)
     nb.tensor_scalar_arith(casted_m1, casted, one_i32, nki_ir.NisaArithOp.SUBTRACT)
 
     # larger = condition * casted_m1 (mixed-dtype: u8 × i32 → out_dtype)
-    larger = nb.alloc(shape, out_dtype, MemorySpace.SBUF)
+    larger = alloc.sbuf(shape, out_dtype)
     nb.tensor_tensor_compare(larger, condition, casted_m1, nki_ir.NisaArithOp.MULTIPLY)
 
     # smaller = cond_not * casted (mixed-dtype: u8 × i32 → out_dtype)
-    smaller = nb.alloc(shape, out_dtype, MemorySpace.SBUF)
+    smaller = alloc.sbuf(shape, out_dtype)
     nb.tensor_tensor_compare(smaller, cond_not, casted, nki_ir.NisaArithOp.MULTIPLY)
 
     # result = larger + smaller
-    result = nb.alloc(shape, out_dtype, MemorySpace.SBUF)
+    result = alloc.sbuf(shape, out_dtype)
     nb.tensor_tensor_arith(result, larger, smaller, nki_ir.NisaArithOp.ADD)
     return result

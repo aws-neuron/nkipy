@@ -85,13 +85,19 @@ Step 3 (body-split), not this equivalence-preserving step.
 - [x] `uv run pytest tests/ -n auto`: **856 passed, 1 xfailed**. No new ruff
   F401s (removed the `MemorySpace`/`ceildiv` imports that went dead).
 
-Deferred (not blocking): a handful of multi-line `nb.dma_copy(nb.alloc(...))`
-loads in broadcast's `_emit_collapsed_broadcast` and topk's `_topk_scan` were
-left un-collapsed — they still route SBUF through the builder directly rather
-than `scratch.sbuf`. Equivalence-preserving; fold in during Step 3 body-split.
-Bare non-load SBUF allocs (accumulators, `ones`, scale constants, PSUM) were
-intentionally left as `nb.alloc`/`nb.constant`: they are compute outputs, not
-scratch, so they don't belong to the allocation-audit surface.
+Follow-up (done): every SBUF allocation now routes through `Allocator.sbuf`,
+including compute-output dst tiles (`dst = alloc.sbuf(...); nb.tensor_reduce_arith(dst, ...)`)
+in reduce/elementwise/broadcast and the arith helpers in `direct_lower_utils.py`
+(which build a local `Allocator(nb)`, like `broadcast_partition`). The per-op
+HBM result-buffer pre-pass in `lower_graph` routes through `Allocator.hbm`. So
+`Allocator` now owns 100% of SBUF + HBM-scratch allocation.
+
+Remaining `nb.alloc` calls — by design, outside `Allocator`:
+- **PSUM accumulators** (matmul, transpose, reduce, ×3): the systolic-array
+  output space, a distinct resource that isn't poolable like scratch.
+- The `Allocator.sbuf`/`.hbm` method bodies themselves (the single wrappers).
+`nb.constant(...)` (alloc + memset fused) also stays on the builder — it's a
+compute-init, not a bare allocation.
 
 ## Step 3 — Body-split emitters (opportunistic)  ✅ DONE
 
@@ -142,3 +148,8 @@ elementwise (the regular tile-loop emitters) are the ones that belong on
   too, not only HBM scratch, so the broader name reads truer. Concept prose
   ("HBM scratch") and pre-existing `scratch_*` locals unchanged. Suite green
   (807 tensor_ir passed).
+- 2026-07-15: Completed the allocation invariant — routed all ~37 SBUF
+  compute-output dst tiles + the `lower_graph` HBM result pre-pass through
+  `Allocator`. Only PSUM accumulators (×3) and the `Allocator` method bodies use
+  `nb.alloc` now. Removed 2 dead `MemorySpace` imports. Suite green (869 passed);
+  ruff F401 5 (below prior baseline).

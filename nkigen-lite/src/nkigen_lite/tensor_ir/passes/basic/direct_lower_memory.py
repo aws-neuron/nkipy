@@ -27,7 +27,6 @@ from nkigen_lite.core import DType, Graph
 from nkigen_lite.nki_ir.ir import (
     Builder,
     DimSlice,
-    MemorySpace,
     PARTITION_MAX,
 )
 

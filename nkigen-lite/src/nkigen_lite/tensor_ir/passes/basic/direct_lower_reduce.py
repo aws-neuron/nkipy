@@ -212,12 +212,12 @@ def _emit_f_reduce_inline(
         slices = idx.slices(inp_shape, inp_tile_sizes)
         src = alloc.load(hbm_map[inp_val.name], slices, (p_ext, f_ext), dtype)
 
-        dst = nb.alloc((p_ext, 1), dtype, MemorySpace.SBUF)
+        dst = alloc.sbuf((p_ext, 1), dtype)
         dst = nb.tensor_reduce_arith(dst, src, reduce_nki_op, num_r_dim=1, keepdims=True)
 
         if kind == "mean":
             scale = nb.constant(1.0 / float(f_ext), (p_ext, 1), dtype, MemorySpace.SBUF)
-            result = nb.alloc((p_ext, 1), dtype, MemorySpace.SBUF)
+            result = alloc.sbuf((p_ext, 1), dtype)
             dst = nb.tensor_tensor_arith(result, dst, scale, nki_ir.NisaArithOp.MULTIPLY)
 
         out_slices = idx.slices(out_shape, out_tile_sizes)
@@ -294,7 +294,7 @@ def _emit_p_reduce_inline(
     for outer_idx in TileSchedule(inp_shape, outer_ts):
         outer_indices = outer_idx.indices
         f_ext = outer_idx.extent(inp_layout.f_dims, inp_shape, inp_tile_sizes)
-        accum = nb.alloc((1, f_ext), dtype, MemorySpace.SBUF)
+        accum = alloc.sbuf((1, f_ext), dtype)
         accum = nb.memset(accum, COMBINE_INIT[kind])
 
         if accum_has_loops:
@@ -303,9 +303,9 @@ def _emit_p_reduce_inline(
                 p_ext = idx.extent(reduced_p_dims, inp_shape, inp_tile_sizes)
                 slices = idx.slices(inp_shape, inp_tile_sizes)
                 src = alloc.load(hbm_map[inp_val.name], slices, (p_ext, f_ext), dtype)
-                partial = nb.alloc((1, f_ext), dtype, MemorySpace.SBUF)
+                partial = alloc.sbuf((1, f_ext), dtype)
                 partial = nb.cross_lane_reduce_arith(partial, src, reduce_nki_op)
-                new_accum = nb.alloc((1, f_ext), dtype, MemorySpace.SBUF)
+                new_accum = alloc.sbuf((1, f_ext), dtype)
                 accum = nb.tensor_tensor_arith(new_accum, accum, partial, combine_op)
         else:
             p_ext = outer_idx.extent(reduced_p_dims, inp_shape, inp_tile_sizes)
@@ -315,7 +315,7 @@ def _emit_p_reduce_inline(
 
         if kind == "mean":
             scale = nb.constant(1.0 / float(total_p), (1, f_ext), dtype, MemorySpace.SBUF)
-            result = nb.alloc((1, f_ext), dtype, MemorySpace.SBUF)
+            result = alloc.sbuf((1, f_ext), dtype)
             accum = nb.tensor_tensor_arith(result, accum, scale, nki_ir.NisaArithOp.MULTIPLY)
 
         out_slices = outer_idx.slices(out_shape, out_tile_sizes)
@@ -396,7 +396,7 @@ def _emit_p_reduce_matmul_inline(
         p_ext = idx.extent(reduced_p_dims, inp_shape, inp_tile_sizes)
         slices = idx.slices(inp_shape, inp_tile_sizes)
         src_tile = alloc.load(hbm_map[inp_val.name], slices, (p_ext, f_ext), dtype)
-        ones = nb.alloc((p_ext, 1), dtype, MemorySpace.SBUF)
+        ones = alloc.sbuf((p_ext, 1), dtype)
         ones = nb.memset(ones, 1.0)
         # matmul: ones[K,M=1].T @ src[K,N=F] -> psum[M=1,N=F]
         nb.matmul(psum, ones, src_tile, accumulate=True)
@@ -416,17 +416,17 @@ def _emit_p_reduce_matmul_inline(
             _load_and_matmul(outer_idx, f_ext, psum)
 
         # Copy PSUM -> SBUF
-        sbuf_out = nb.alloc((1, f_ext), DType.F32, MemorySpace.SBUF)
+        sbuf_out = alloc.sbuf((1, f_ext), DType.F32)
         sbuf_out = nb.tensor_copy(sbuf_out, psum)
 
         if kind == "mean":
             scale = nb.constant(1.0 / float(total_p), (1, f_ext), DType.F32, MemorySpace.SBUF)
-            mean_dst = nb.alloc((1, f_ext), DType.F32, MemorySpace.SBUF)
+            mean_dst = alloc.sbuf((1, f_ext), DType.F32)
             sbuf_out = nb.tensor_tensor_arith(mean_dst, sbuf_out, scale, nki_ir.NisaArithOp.MULTIPLY)
 
         out_dtype = out_val.type.dtype
         if out_dtype != DType.F32:
-            cast_dst = nb.alloc((1, f_ext), out_dtype, MemorySpace.SBUF)
+            cast_dst = alloc.sbuf((1, f_ext), out_dtype)
             sbuf_out = nb.cast(cast_dst, sbuf_out)
 
         out_slices = outer_idx.slices(out_shape, out_tile_sizes)
@@ -496,7 +496,7 @@ def _emit_mixed_reduce_inline(
 
     for outer_idx in TileSchedule(inp_shape, outer_ts):
         outer_indices = outer_idx.indices
-        accum = nb.alloc((1, 1), dtype, MemorySpace.SBUF)
+        accum = alloc.sbuf((1, 1), dtype)
         accum = nb.memset(accum, COMBINE_INIT[p_kind])
 
         if p_has_loops:
@@ -505,23 +505,23 @@ def _emit_mixed_reduce_inline(
                 p_ext = idx.extent(reduced_p_dims, inp_shape, inp_tile_sizes)
                 slices = idx.slices(inp_shape, inp_tile_sizes)
                 src = alloc.load(hbm_map[inp_val.name], slices, (p_ext, f_reduced_ext), dtype)
-                f_red = nb.alloc((p_ext, 1), dtype, MemorySpace.SBUF)
+                f_red = alloc.sbuf((p_ext, 1), dtype)
                 f_red = nb.tensor_reduce_arith(f_red, src, reduce_nki_op, num_r_dim=1, keepdims=True)
-                p_red = nb.alloc((1, 1), dtype, MemorySpace.SBUF)
+                p_red = alloc.sbuf((1, 1), dtype)
                 p_red = nb.cross_lane_reduce_arith(p_red, f_red, REDUCE_OPS[p_kind])
-                new_accum = nb.alloc((1, 1), dtype, MemorySpace.SBUF)
+                new_accum = alloc.sbuf((1, 1), dtype)
                 accum = nb.tensor_tensor_arith(new_accum, accum, p_red, combine_op)
         else:
             p_ext = outer_idx.extent(reduced_p_dims, inp_shape, inp_tile_sizes)
             slices = outer_idx.slices(inp_shape, inp_tile_sizes)
             src = alloc.load(hbm_map[inp_val.name], slices, (p_ext, f_reduced_ext), dtype)
-            f_red = nb.alloc((p_ext, 1), dtype, MemorySpace.SBUF)
+            f_red = alloc.sbuf((p_ext, 1), dtype)
             f_red = nb.tensor_reduce_arith(f_red, src, reduce_nki_op, num_r_dim=1, keepdims=True)
             accum = nb.cross_lane_reduce_arith(accum, f_red, REDUCE_OPS[p_kind])
 
         if kind == "mean":
             scale = nb.constant(1.0 / float(total_reduced), (1, 1), dtype, MemorySpace.SBUF)
-            result = nb.alloc((1, 1), dtype, MemorySpace.SBUF)
+            result = alloc.sbuf((1, 1), dtype)
             accum = nb.tensor_tensor_arith(result, accum, scale, nki_ir.NisaArithOp.MULTIPLY)
 
         out_slices = outer_idx.slices(out_shape, out_tile_sizes)

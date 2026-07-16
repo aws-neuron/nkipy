@@ -178,7 +178,7 @@ def _emit_ew_tile(
         result = emit_unary_op(nb, out_dtype, src, op.opcode)
     elif op.opcode == "cast":
         src = tile_map[op.inputs[0].name]
-        result = nb.alloc(src.type.shape, out_dtype, MemorySpace.SBUF)
+        result = alloc.sbuf(src.type.shape, out_dtype)
         nb.tensor_copy(result, src)
     elif op.opcode == "where":
         cond = tile_map[op.inputs[0].name]
@@ -193,10 +193,10 @@ def _emit_ew_tile(
         # result = y (copy), then overwrite with x where cond > 0.
         # copy_predicated never evaluates arithmetic on the unselected
         # branch, so where(mask, scores, -inf) stays -inf/scores.
-        result = nb.alloc(out_shape, out_dtype, MemorySpace.SBUF)
+        result = alloc.sbuf(out_shape, out_dtype)
         nb.tensor_copy(result, y_false)
         if cond.type.dtype not in (DType.U8, DType.U16, DType.U32):
-            pred_u8 = nb.alloc(cond.type.shape, DType.U8, MemorySpace.SBUF)
+            pred_u8 = alloc.sbuf(cond.type.shape, DType.U8)
             nb.tensor_copy(pred_u8, cond)
             nb.copy_predicated(result, pred_u8, x_true)
         else:
