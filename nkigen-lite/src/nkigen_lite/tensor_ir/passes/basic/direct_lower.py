@@ -85,21 +85,16 @@ def lower_graph(graph: Graph) -> nki_ir.Graph:
                     _nki_shape(r.type.shape), r.type.dtype
                 )
 
-    # Lower each op.  An elementwise op is emitted through the tiled
-    # load→compute→store loop; every other op reads its inputs' HBM buffers
-    # directly through its per-opcode emitter (grouping consecutive elementwise
-    # ops into one fused loop is to be reintroduced as the Phase-2
-    # fusion-compatibility predicate).
+    # Lower each op through its per-opcode emitter. Elementwise ops dispatch to
+    # the tiled load→compute→store loop (``_emit_elementwise_op``); every other
+    # op reads its inputs' HBM buffers directly. All emitters share the
+    # ``(nb, op, hbm_map, alloc) -> None`` contract, so a single table drives
+    # them. (Grouping consecutive elementwise ops into one fused loop is the
+    # deferred Phase-2 fusion-compatibility work.)
     for op in graph.ops:
-        opcode = op.opcode
-
-        if opcode in ELEMENTWISE_OPCODES:
-            _emit_elementwise_op(nb, op, hbm_map, alloc)
-            continue
-
-        emitter = _OP_EMITTERS.get(opcode)
+        emitter = _OP_EMITTERS.get(op.opcode)
         if emitter is None:
-            raise NotImplementedError(f"Op {opcode!r} not supported")
+            raise NotImplementedError(f"Op {op.opcode!r} not supported")
         emitter(nb, op, hbm_map, alloc)
 
     # Copy final results to output buffers
@@ -300,8 +295,9 @@ def _emit_broadcast_op(nb: Builder, op, hbm_map: dict[str, Value], alloc: Alloca
     )
 
 
-# Per-opcode emitters, all ``(nb, op, hbm_map) -> None``.
-# Elementwise ops are not dispatched here — they run through the fused tile loop.
+# Per-opcode emitters, all ``(nb, op, hbm_map, alloc) -> None``. Every elementwise
+# opcode maps to the shared tiled load→compute→store loop; structural ops have
+# their own emitter.
 _OP_EMITTERS: dict[str, object] = {
     "reduce": emit_reduce,
     "matmul": _emit_matmul_op,
@@ -316,6 +312,7 @@ _OP_EMITTERS: dict[str, object] = {
     "scatter_rows": emit_scatter_rows,
     "gather_rows": emit_gather_rows,
     **{opcode: _emit_collective_op for opcode in COLLECTIVE_OPCODES},
+    **{opcode: _emit_elementwise_op for opcode in ELEMENTWISE_OPCODES},
 }
 
 
