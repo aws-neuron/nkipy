@@ -43,6 +43,7 @@ from nkigen_lite.tensor_ir.passes.basic.direct_lower_schedule import TileSchedul
 from nkigen_lite.tensor_ir.passes.basic.direct_lower_elementwise import (
     _emit_elementwise_op,
 )
+from nkigen_lite.tensor_ir.passes.basic.direct_lower_alloc import Scratch
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +54,7 @@ from nkigen_lite.tensor_ir.passes.basic.direct_lower_elementwise import (
 def lower_graph(graph: Graph) -> nki_ir.Graph:
     """Lower a full tensor IR graph to NKI IR with HBM boundaries."""
     nb = Builder("direct_lower")
+    scratch = Scratch(nb)
     hbm_map: dict[str, Value] = {}
 
     def _nki_shape(shape):
@@ -93,33 +95,33 @@ def lower_graph(graph: Graph) -> nki_ir.Graph:
         opcode = op.opcode
 
         if opcode in ELEMENTWISE_OPCODES:
-            _emit_elementwise_op(nb, op, hbm_map)
+            _emit_elementwise_op(nb, op, hbm_map, scratch)
             continue
 
         emitter = _OP_EMITTERS.get(opcode)
         if emitter is None:
             raise NotImplementedError(f"Op {opcode!r} not supported")
-        emitter(nb, op, hbm_map)
+        emitter(nb, op, hbm_map, scratch)
 
     # Copy final results to output buffers
     for out_name, out_val in graph.outputs.items():
         src = hbm_map[out_val.name]
         dst = hbm_map[f"{out_name}_out"]
         if src is not dst:
-            _emit_hbm_copy(nb, src, dst, out_val.type.shape)
+            _emit_hbm_copy(nb, src, dst, out_val.type.shape, scratch)
 
     nb.set_outputs({name: hbm_map[f"{name}_out"] for name in graph.outputs})
     insert_deallocs(nb.graph)
     return nb.graph
 
 
-def _emit_hbm_copy(nb: Builder, src: Value, dst: Value, shape: tuple[int, ...]):
+def _emit_hbm_copy(nb: Builder, src: Value, dst: Value, shape: tuple[int, ...], scratch: Scratch):
     """Copy an entire HBM tensor to another HBM tensor, tiled."""
     if len(shape) == 0:
         # HBM buffers may be promoted from () to (1,)
         src_slices = [DimSlice(0, 1)] * len(src.type.shape)
         dst_slices = [DimSlice(0, 1)] * len(dst.type.shape)
-        tile = nb.dma_copy(nb.alloc((1, 1), src.type.dtype, MemorySpace.SBUF), src, src_slices)
+        tile = scratch.load(src, src_slices, (1, 1), src.type.dtype)
         nb.dma_copy(dst, tile, dst_slices)
         return
 
@@ -138,9 +140,9 @@ def _emit_hbm_copy(nb: Builder, src: Value, dst: Value, shape: tuple[int, ...]):
         for p_off, p_size, f_off, f_size in TileSchedule.pf(
             lead, shape[-1], src.type.dtype
         ).pf_tiles():
-            tile = nb.dma_copy(
-                nb.alloc((p_size, f_size), src.type.dtype, MemorySpace.SBUF),
+            tile = scratch.load(
                 src_2d, (DimSlice(p_off, p_size), DimSlice(f_off, f_size)),
+                (p_size, f_size), src.type.dtype,
             )
             nb.dma_copy(dst_2d, tile, (DimSlice(p_off, p_size), DimSlice(f_off, f_size)))
         return
@@ -168,10 +170,7 @@ def _emit_hbm_copy(nb: Builder, src: Value, dst: Value, shape: tuple[int, ...]):
                 if len(shape) >= 2:
                     slices.append(DimSlice(p_off, p_size))
                 slices.append(DimSlice(f_off, f_size))
-                tile = nb.dma_copy(
-                    nb.alloc((p_size, f_size), src.type.dtype, MemorySpace.SBUF),
-                    src, slices,
-                )
+                tile = scratch.load(src, slices, (p_size, f_size), src.type.dtype)
                 nb.dma_copy(dst, tile, slices)
 
 
@@ -195,13 +194,13 @@ from nkigen_lite.tensor_ir.passes.basic.direct_lower_gather import (
 
 
 def _emit_matmul_op(
-    nb: Builder, op, hbm_map: dict[str, Value],
+    nb: Builder, op, hbm_map: dict[str, Value], scratch: Scratch,
 ) -> None:
     a_val, b_val = op.inputs
     c_val = op.results[0]
     emit_matmul(
         nb, hbm_map[a_val.name], hbm_map[b_val.name], hbm_map[c_val.name],
-        a_val.type.shape, b_val.type.shape, a_val.type.dtype,
+        a_val.type.shape, b_val.type.shape, a_val.type.dtype, scratch,
     )
 
 
@@ -210,7 +209,7 @@ COLLECTIVE_OPCODES = frozenset(
 )
 
 
-def _emit_collective_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
+def _emit_collective_op(nb: Builder, op, hbm_map: dict[str, Value], scratch: Scratch) -> None:
     """Lower a collective op to an nki_ir collective node.
 
     The compiler forbids collectives from reading/writing kernel IO tensors
@@ -222,20 +221,20 @@ def _emit_collective_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
     src_hbm = hbm_map[inp_val.name]
     dst_hbm = hbm_map[out_val.name]
 
-    src_scratch = nb.alloc(src_hbm.type.shape, src_hbm.type.dtype, MemorySpace.HBM)
-    dst_scratch = nb.alloc(dst_hbm.type.shape, dst_hbm.type.dtype, MemorySpace.HBM)
+    src_scratch = scratch.hbm(src_hbm.type.shape, src_hbm.type.dtype)
+    dst_scratch = scratch.hbm(dst_hbm.type.shape, dst_hbm.type.dtype)
 
-    _emit_hbm_copy(nb, src_hbm, src_scratch, inp_val.type.shape)
+    _emit_hbm_copy(nb, src_hbm, src_scratch, inp_val.type.shape, scratch)
     nb.collective(op.opcode, dst_scratch, src_scratch, op.attrs)
-    _emit_hbm_copy(nb, dst_scratch, dst_hbm, out_val.type.shape)
+    _emit_hbm_copy(nb, dst_scratch, dst_hbm, out_val.type.shape, scratch)
 
 
-def _emit_transpose_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
+def _emit_transpose_op(nb: Builder, op, hbm_map: dict[str, Value], scratch: Scratch) -> None:
     inp_val = op.inputs[0]
     out_val = op.results[0]
     emit_transpose(
         nb, hbm_map[inp_val.name], hbm_map[out_val.name],
-        inp_val.type.shape, op.attrs["perm"], inp_val.type.dtype,
+        inp_val.type.shape, op.attrs["perm"], inp_val.type.dtype, scratch,
     )
 
 
@@ -253,7 +252,7 @@ def _is_view_reshape(op) -> bool:
     return len(inp_val.type.shape) > 0 and len(out_val.type.shape) > 0
 
 
-def _emit_reshape_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
+def _emit_reshape_op(nb: Builder, op, hbm_map: dict[str, Value], scratch: Scratch) -> None:
     inp_val = op.inputs[0]
     out_val = op.results[0]
     if _is_view_reshape(op):
@@ -264,22 +263,22 @@ def _emit_reshape_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
         return
     emit_reshape(
         nb, hbm_map[inp_val.name], hbm_map[out_val.name],
-        inp_val.type.shape, out_val.type.shape, inp_val.type.dtype,
+        inp_val.type.shape, out_val.type.shape, inp_val.type.dtype, scratch,
     )
 
 
-def _emit_slice_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
+def _emit_slice_op(nb: Builder, op, hbm_map: dict[str, Value], scratch: Scratch) -> None:
     inp_val = op.inputs[0]
     out_val = op.results[0]
     emit_slice(
         nb, hbm_map[inp_val.name], hbm_map[out_val.name],
         inp_val.type.shape, out_val.type.shape, op.attrs["starts"],
         inp_val.type.dtype,
-        strides=op.attrs.get("strides"),
+        strides=op.attrs.get("strides"), scratch=scratch,
     )
 
 
-def _emit_concat_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
+def _emit_concat_op(nb: Builder, op, hbm_map: dict[str, Value], scratch: Scratch) -> None:
     out_val = op.results[0]
     axis = op.attrs["axis"]
     rank = len(out_val.type.shape)
@@ -289,16 +288,16 @@ def _emit_concat_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
     input_shapes = [v.type.shape for v in op.inputs]
     emit_concat(
         nb, input_hbms, hbm_map[out_val.name],
-        input_shapes, axis, op.inputs[0].type.dtype,
+        input_shapes, axis, op.inputs[0].type.dtype, scratch,
     )
 
 
-def _emit_broadcast_op(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
+def _emit_broadcast_op(nb: Builder, op, hbm_map: dict[str, Value], scratch: Scratch) -> None:
     inp_val = op.inputs[0]
     out_val = op.results[0]
     emit_broadcast_to(
         nb, hbm_map[inp_val.name], hbm_map[out_val.name],
-        inp_val.type.shape, out_val.type.shape, inp_val.type.dtype,
+        inp_val.type.shape, out_val.type.shape, inp_val.type.dtype, scratch,
     )
 
 

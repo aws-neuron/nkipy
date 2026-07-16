@@ -62,14 +62,36 @@ policy than `pf` (`max_free_elems`). Left as-is: folding it onto TileSchedule
 needs a `.free_pow2` constructor and would change generated IR, so it belongs in
 Step 3 (body-split), not this equivalence-preserving step.
 
-## Step 2 — Introduce `Scratch`
+## Step 2 — Introduce `Scratch`  ✅ DONE
 
-- [ ] `Scratch` handle wrapping `nb`: `.sbuf(shape, dtype)`, `.hbm(shape, dtype)`,
-  `.load(hbm_2d, slices, dtype)` (fuses the ubiquitous
-  `nb.dma_copy(nb.alloc(...), src, slices)` idiom).
-- [ ] Migrate the 11 scattered `nb.alloc(..., HBM)` scratch sites (topk×6,
-  reduce, transpose, collective×2, memory, utils `broadcast_partition`).
-- [ ] Tests green.
+- [x] `Scratch` handle wrapping `nb` in `direct_lower_alloc.py`:
+  `.sbuf(shape, dtype)`, `.hbm(shape, dtype)`, and
+  `.load(src, slices, shape, dtype)` — the last fuses the ubiquitous
+  `nb.dma_copy(nb.alloc(...), src, slices)` idiom (57 sites).
+- [x] Threaded ONE `Scratch` per graph from `lower_graph` through the emitter
+  dispatch. Every dispatched emitter now takes a trailing `scratch`; standalone
+  `lower_*` wrappers construct a local one (public `emit_*` take `scratch=None`
+  and default-construct, so the wrappers didn't need touching).
+- [x] Migrated all HBM scratch sites through `Scratch.hbm` — the single audit
+  choke-point for scratch HBM (the OOM lever from the qwen3 notes): collective×2
+  (direct_lower), topk×2 (`_topk_scan`, `cand_*`), topk `_first_cols` /
+  `_overlay_columns`, reshape `_emit_reshape_diff_f`, `broadcast_partition`.
+- [x] `broadcast_partition` (buried in the `emit_binary_op` compute chain)
+  self-constructs a local `Scratch` rather than threading through every arith
+  path — equivalent, since `Scratch` is a stateless `nb` wrapper and the audit
+  point is `Scratch.hbm` regardless.
+- [x] Added `test_direct_lower_alloc.py` (4 cases: space correctness + load ==
+  alloc+dma equivalence).
+- [x] `uv run pytest tests/ -n auto`: **856 passed, 1 xfailed**. No new ruff
+  F401s (removed the `MemorySpace`/`ceildiv` imports that went dead).
+
+Deferred (not blocking): a handful of multi-line `nb.dma_copy(nb.alloc(...))`
+loads in broadcast's `_emit_collapsed_broadcast` and topk's `_topk_scan` were
+left un-collapsed — they still route SBUF through the builder directly rather
+than `scratch.sbuf`. Equivalence-preserving; fold in during Step 3 body-split.
+Bare non-load SBUF allocs (accumulators, `ones`, scale constants, PSUM) were
+intentionally left as `nb.alloc`/`nb.constant`: they are compute outputs, not
+scratch, so they don't belong to the allocation-audit surface.
 
 ## Step 3 — Body-split emitters (opportunistic)
 
@@ -84,4 +106,7 @@ Step 3 (body-split), not this equivalence-preserving step.
 - 2026-07-15: Step 1 complete. `TileSchedule`/`TileIndex` extracted; all
   `iter_pf_tiles` callers + all five reduce loop-nests migrated; three old free
   functions deleted; equivalence test added. Full tensor_ir suite green (794
-  passed). Next: Step 2 (`Scratch`).
+  passed).
+- 2026-07-15: Step 2 complete. `Scratch` added and threaded per-graph through
+  every emitter; all HBM scratch + 57 load idioms routed through it; unit test
+  added. Full suite green (856 passed). Next: Step 3 (body-split, opportunistic).

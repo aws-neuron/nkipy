@@ -43,7 +43,6 @@ from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
     COMBINE_INIT,
     COMBINE_OPS,
     REDUCE_OPS,
-    ceildiv,
     collapse_view,
     max_free_elems,
 )
@@ -51,6 +50,7 @@ from nkigen_lite.tensor_ir.passes.basic.direct_lower_schedule import (
     TileIndex,
     TileSchedule,
 )
+from nkigen_lite.tensor_ir.passes.basic.direct_lower_alloc import Scratch
 
 
 # ---------------------------------------------------------------------------
@@ -58,7 +58,7 @@ from nkigen_lite.tensor_ir.passes.basic.direct_lower_schedule import (
 # ---------------------------------------------------------------------------
 
 
-def emit_reduce(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
+def emit_reduce(nb: Builder, op, hbm_map: dict[str, Value], scratch: Scratch) -> None:
     """Emit a reduce op into an existing Builder with pre-allocated HBM buffers.
 
     Dispatches by axis class: F-only, P-only (gpsimd), or mixed. The
@@ -73,15 +73,15 @@ def emit_reduce(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
     p_axes = axis & set(inp_layout.p_dims)
 
     if f_axes and not p_axes:
-        _emit_f_reduce_inline(nb, op, hbm_map)
+        _emit_f_reduce_inline(nb, op, hbm_map, scratch)
     elif p_axes and not f_axes:
-        _emit_p_reduce_inline(nb, op, hbm_map)
+        _emit_p_reduce_inline(nb, op, hbm_map, scratch)
     else:
-        _emit_mixed_reduce_inline(nb, op, hbm_map)
+        _emit_mixed_reduce_inline(nb, op, hbm_map, scratch)
 
 
 def _try_emit_collapsed_f_reduce(
-    nb: Builder, op, hbm_map: dict[str, Value],
+    nb: Builder, op, hbm_map: dict[str, Value], scratch: Scratch,
 ) -> bool:
     """Reduce over a trailing-suffix free axis by collapsing all leading dims
     onto the partition. Returns False (emitting nothing) when not applicable.
@@ -137,12 +137,12 @@ def _try_emit_collapsed_f_reduce(
     for idx in TileSchedule((lead,), p_ts):
         (ps,) = idx.slices((lead,), p_ts)
         p_off, p_size = ps.offset, ps.size
-        src = nb.dma_copy(
-            nb.alloc((p_size, red), dtype, MemorySpace.SBUF),
+        src = scratch.load(
             src_2d, (DimSlice(p_off, p_size), DimSlice(0, red)),
+            (p_size, red), dtype,
         )
         dst = nb.tensor_reduce_arith(
-            nb.alloc((p_size, 1), dtype, MemorySpace.SBUF),
+            scratch.sbuf((p_size, 1), dtype),
             src, reduce_nki_op, num_r_dim=1, keepdims=True,
         )
         nb.dma_copy(dst_2d, dst, (DimSlice(p_off, p_size), DimSlice(0, 1)))
@@ -150,7 +150,7 @@ def _try_emit_collapsed_f_reduce(
 
 
 def _emit_f_reduce_inline(
-    nb: Builder, op, hbm_map: dict[str, Value],
+    nb: Builder, op, hbm_map: dict[str, Value], scratch: Scratch,
 ) -> None:
     """F-dim reduction via tensor_reduce_arith on the vector engine.
 
@@ -176,7 +176,7 @@ def _emit_f_reduce_inline(
     # Fast path: collapse leading dims onto the partition for a trailing-axis
     # reduce (packs all 128 lanes; mirrors HLO's reduce-then-reshape). Falls
     # back to the general per-tile path below when not applicable.
-    if _try_emit_collapsed_f_reduce(nb, op, hbm_map):
+    if _try_emit_collapsed_f_reduce(nb, op, hbm_map, scratch):
         return
 
     f_dims = inp_layout.f_dims
@@ -210,8 +210,7 @@ def _emit_f_reduce_inline(
         f_ext = prod(inp_shape[d] for d in reduced_f_dims)
 
         slices = idx.slices(inp_shape, inp_tile_sizes)
-        src = nb.alloc((p_ext, f_ext), dtype, MemorySpace.SBUF)
-        src = nb.dma_copy(src, hbm_map[inp_val.name], slices)
+        src = scratch.load(hbm_map[inp_val.name], slices, (p_ext, f_ext), dtype)
 
         dst = nb.alloc((p_ext, 1), dtype, MemorySpace.SBUF)
         dst = nb.tensor_reduce_arith(dst, src, reduce_nki_op, num_r_dim=1, keepdims=True)
@@ -226,7 +225,7 @@ def _emit_f_reduce_inline(
 
 
 def _emit_p_reduce_inline(
-    nb: Builder, op, hbm_map: dict[str, Value],
+    nb: Builder, op, hbm_map: dict[str, Value], scratch: Scratch,
 ) -> None:
     """P-dim reduction using GpSimd cross_lane_reduce_arith.
 
@@ -303,8 +302,7 @@ def _emit_p_reduce_inline(
                 idx = TileIndex({**outer_indices, **accum_idx.indices})
                 p_ext = idx.extent(reduced_p_dims, inp_shape, inp_tile_sizes)
                 slices = idx.slices(inp_shape, inp_tile_sizes)
-                src = nb.alloc((p_ext, f_ext), dtype, MemorySpace.SBUF)
-                src = nb.dma_copy(src, hbm_map[inp_val.name], slices)
+                src = scratch.load(hbm_map[inp_val.name], slices, (p_ext, f_ext), dtype)
                 partial = nb.alloc((1, f_ext), dtype, MemorySpace.SBUF)
                 partial = nb.cross_lane_reduce_arith(partial, src, reduce_nki_op)
                 new_accum = nb.alloc((1, f_ext), dtype, MemorySpace.SBUF)
@@ -312,8 +310,7 @@ def _emit_p_reduce_inline(
         else:
             p_ext = outer_idx.extent(reduced_p_dims, inp_shape, inp_tile_sizes)
             slices = outer_idx.slices(inp_shape, inp_tile_sizes)
-            src = nb.alloc((p_ext, f_ext), dtype, MemorySpace.SBUF)
-            src = nb.dma_copy(src, hbm_map[inp_val.name], slices)
+            src = scratch.load(hbm_map[inp_val.name], slices, (p_ext, f_ext), dtype)
             accum = nb.cross_lane_reduce_arith(accum, src, reduce_nki_op)
 
         if kind == "mean":
@@ -326,7 +323,7 @@ def _emit_p_reduce_inline(
 
 
 def _emit_p_reduce_matmul_inline(
-    nb: Builder, op, hbm_map: dict[str, Value],
+    nb: Builder, op, hbm_map: dict[str, Value], scratch: Scratch,
 ) -> None:
     """P-dim reduction using the matmul trick: ones.T @ x (sum/mean only).
 
@@ -398,8 +395,7 @@ def _emit_p_reduce_matmul_inline(
     def _load_and_matmul(idx: TileIndex, f_ext: int, psum):
         p_ext = idx.extent(reduced_p_dims, inp_shape, inp_tile_sizes)
         slices = idx.slices(inp_shape, inp_tile_sizes)
-        src_tile = nb.alloc((p_ext, f_ext), dtype, MemorySpace.SBUF)
-        src_tile = nb.dma_copy(src_tile, hbm_map[inp_val.name], slices)
+        src_tile = scratch.load(hbm_map[inp_val.name], slices, (p_ext, f_ext), dtype)
         ones = nb.alloc((p_ext, 1), dtype, MemorySpace.SBUF)
         ones = nb.memset(ones, 1.0)
         # matmul: ones[K,M=1].T @ src[K,N=F] -> psum[M=1,N=F]
@@ -438,7 +434,7 @@ def _emit_p_reduce_matmul_inline(
 
 
 def _emit_mixed_reduce_inline(
-    nb: Builder, op, hbm_map: dict[str, Value],
+    nb: Builder, op, hbm_map: dict[str, Value], scratch: Scratch,
 ) -> None:
     """Mixed P/F reduction: F-reduce each P-chunk, then combine across P.
 
@@ -508,8 +504,7 @@ def _emit_mixed_reduce_inline(
                 idx = TileIndex({**outer_indices, **p_idx.indices})
                 p_ext = idx.extent(reduced_p_dims, inp_shape, inp_tile_sizes)
                 slices = idx.slices(inp_shape, inp_tile_sizes)
-                src = nb.alloc((p_ext, f_reduced_ext), dtype, MemorySpace.SBUF)
-                src = nb.dma_copy(src, hbm_map[inp_val.name], slices)
+                src = scratch.load(hbm_map[inp_val.name], slices, (p_ext, f_reduced_ext), dtype)
                 f_red = nb.alloc((p_ext, 1), dtype, MemorySpace.SBUF)
                 f_red = nb.tensor_reduce_arith(f_red, src, reduce_nki_op, num_r_dim=1, keepdims=True)
                 p_red = nb.alloc((1, 1), dtype, MemorySpace.SBUF)
@@ -519,8 +514,7 @@ def _emit_mixed_reduce_inline(
         else:
             p_ext = outer_idx.extent(reduced_p_dims, inp_shape, inp_tile_sizes)
             slices = outer_idx.slices(inp_shape, inp_tile_sizes)
-            src = nb.alloc((p_ext, f_reduced_ext), dtype, MemorySpace.SBUF)
-            src = nb.dma_copy(src, hbm_map[inp_val.name], slices)
+            src = scratch.load(hbm_map[inp_val.name], slices, (p_ext, f_reduced_ext), dtype)
             f_red = nb.alloc((p_ext, 1), dtype, MemorySpace.SBUF)
             f_red = nb.tensor_reduce_arith(f_red, src, reduce_nki_op, num_r_dim=1, keepdims=True)
             accum = nb.cross_lane_reduce_arith(accum, f_red, REDUCE_OPS[p_kind])
@@ -561,6 +555,7 @@ def _lower_via_emit(
     """
     reduce_op = _find_reduce_op(graph)
     nb = Builder(name)
+    scratch = Scratch(nb)
     hbm_map: dict[str, Value] = {}
     for v in graph.inputs:
         hbm_map[v.name] = nb.add_input(v.name, v.type.shape, v.type.dtype)
@@ -571,13 +566,13 @@ def _lower_via_emit(
         hbm_map[oval.name] = buf
 
     if force == "f":
-        _emit_f_reduce_inline(nb, reduce_op, hbm_map)
+        _emit_f_reduce_inline(nb, reduce_op, hbm_map, scratch)
     elif force == "p_gpsimd":
-        _emit_p_reduce_inline(nb, reduce_op, hbm_map)
+        _emit_p_reduce_inline(nb, reduce_op, hbm_map, scratch)
     elif force == "p_matmul":
-        _emit_p_reduce_matmul_inline(nb, reduce_op, hbm_map)
+        _emit_p_reduce_matmul_inline(nb, reduce_op, hbm_map, scratch)
     else:
-        emit_reduce(nb, reduce_op, hbm_map)
+        emit_reduce(nb, reduce_op, hbm_map, scratch)
 
     nb.set_outputs({n: hbm_map[f"{n}_out"] for n in graph.outputs})
     insert_deallocs(nb.graph)

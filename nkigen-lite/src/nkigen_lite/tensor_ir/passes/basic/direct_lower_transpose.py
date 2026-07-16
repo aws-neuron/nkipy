@@ -45,6 +45,7 @@ from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
     row_major_strides,
     unravel,
 )
+from nkigen_lite.tensor_ir.passes.basic.direct_lower_alloc import Scratch
 
 
 def _needs_pf_swap(perm: tuple[int, ...]) -> bool:
@@ -191,8 +192,11 @@ def emit_transpose(
     in_shape: tuple[int, ...],
     perm: tuple[int, ...],
     dtype: DType = DType.F32,
+    scratch: "Scratch | None" = None,
 ) -> None:
     """Emit transpose tiling into an existing Builder (DMA strategy)."""
+    if scratch is None:
+        scratch = Scratch(nb)
     rank = len(in_shape)
 
     c_in, c_perm, groups, _src_order = _collapse_perm(in_shape, perm)
@@ -220,17 +224,14 @@ def emit_transpose(
             for rows, src_slices, dst_slices in prefix_row_segments(
                 p0, p_size, I * J, in_shape, in_strides, out_shape, out_strides,
             ):
-                tile = nb.dma_copy(
-                    nb.alloc((rows, I * J), dtype, MemorySpace.SBUF),
-                    x_hbm, src_slices,
-                )
+                tile = scratch.load(x_hbm, src_slices, (rows, I * J), dtype)
                 # Source tile row layout is I groups of J contiguous elements;
                 # the AP walks J at stride 1 then I at stride J, i.e.
                 # (J outer, I inner).
                 src_view = nb.access_pattern(
                     tile, [[I * J, rows], [1, J], [J, I]]
                 )
-                dst_tile = nb.alloc((rows, J, I), dtype, MemorySpace.SBUF)
+                dst_tile = scratch.sbuf((rows, J, I), dtype)
                 nb.tensor_copy(dst_tile, src_view)
                 nb.dma_copy(y_hbm, dst_tile, dst_slices)
         return
@@ -249,17 +250,11 @@ def emit_transpose(
         in_shape, perm, groups, c_out, c_rank, tile_p, tile_f
     ):
         if swap_pf:
-            tile = nb.dma_copy(
-                nb.alloc((f_cov, p_cov), dtype, MemorySpace.SBUF),
-                x_hbm, src_slices,
-            )
+            tile = scratch.load(x_hbm, src_slices, (f_cov, p_cov), dtype)
             transposed = nb.transpose(tile, (1, 0))
             nb.dma_copy(y_hbm, transposed, dst_slices)
         else:
-            tile = nb.dma_copy(
-                nb.alloc((p_cov, f_cov), dtype, MemorySpace.SBUF),
-                x_hbm, src_slices,
-            )
+            tile = scratch.load(x_hbm, src_slices, (p_cov, f_cov), dtype)
             nb.dma_copy(y_hbm, tile, dst_slices)
 
 
@@ -271,6 +266,7 @@ def emit_transpose_te(
     in_shape: tuple[int, ...],
     perm: tuple[int, ...],
     dtype: DType = DType.F32,
+    scratch: "Scratch | None" = None,
 ) -> None:
     """Emit transpose tiling into an existing Builder (tensor engine strategy).
 
@@ -289,6 +285,8 @@ def emit_transpose_te(
     permutation swaps P↔F; it is unused (may be None) otherwise, in which case
     this degenerates to a plain DMA copy.
     """
+    if scratch is None:
+        scratch = Scratch(nb)
     rank = len(in_shape)
 
     c_in, c_perm, groups, _src_order = _collapse_perm(in_shape, perm)
@@ -312,28 +310,18 @@ def emit_transpose_te(
         in_shape, perm, groups, c_out, c_rank, tile_p, tile_f
     ):
         if swap_pf:
-            stat = nb.dma_copy(
-                nb.alloc((f_cov, p_cov), dtype, MemorySpace.SBUF),
-                x_hbm, src_slices,
-            )
-            eye_tile = nb.dma_copy(
-                nb.alloc((f_cov, f_cov), dtype, MemorySpace.SBUF),
-                eye_hbm,
-                (DimSlice(0, f_cov), DimSlice(0, f_cov)),
-            )
+            stat = scratch.load(x_hbm, src_slices, (f_cov, p_cov), dtype)
+            eye_tile = scratch.load(eye_hbm, (DimSlice(0, f_cov), DimSlice(0, f_cov)), (f_cov, f_cov), dtype)
 
             psum = nb.alloc((p_cov, f_cov), DType.F32, MemorySpace.PSUM)
             nb.matmul(psum, stat, eye_tile, accumulate=False)
 
             out_sbuf = nb.tensor_copy(
-                nb.alloc((p_cov, f_cov), DType.F32, MemorySpace.SBUF), psum
+                scratch.sbuf((p_cov, f_cov), DType.F32), psum
             )
             nb.dma_copy(y_hbm, out_sbuf, dst_slices)
         else:
-            tile = nb.dma_copy(
-                nb.alloc((p_cov, f_cov), dtype, MemorySpace.SBUF),
-                x_hbm, src_slices,
-            )
+            tile = scratch.load(x_hbm, src_slices, (p_cov, f_cov), dtype)
             nb.dma_copy(y_hbm, tile, dst_slices)
 
 

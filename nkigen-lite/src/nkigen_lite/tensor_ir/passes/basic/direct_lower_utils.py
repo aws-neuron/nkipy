@@ -193,12 +193,21 @@ def prefix_row_segments(r0, p, free, in_shape, in_strides, out_shape, out_stride
 
 
 def broadcast_partition(nb: Builder, src: Value, target_shape: tuple[int, int]) -> Value:
-    """Replicate a (1, F) tile to (P, F) via HBM scratch round-trip."""
+    """Replicate a (1, F) tile to (P, F) via HBM scratch round-trip.
+
+    Uses a local ``Scratch`` for the staging buffer: it is a stateless wrapper
+    over ``nb``, so the ``Scratch.hbm`` audit choke-point is reached whether the
+    instance is threaded or built here — and threading it through the whole
+    ``emit_binary_op`` compute chain would be churn for no behavioural gain.
+    """
+    from nkigen_lite.tensor_ir.passes.basic.direct_lower_alloc import Scratch
+    scratch = Scratch(nb)
     p, f = target_shape
-    scratch = nb.alloc((1, f), src.type.dtype, MemorySpace.HBM)
-    nb.dma_copy(scratch, src, (DimSlice(0, 1), DimSlice(0, f)))
-    dst = nb.alloc((p, f), src.type.dtype, MemorySpace.SBUF)
-    return nb.dma_copy(dst, scratch, (DimSlice(0, p, stride=0), DimSlice(0, f)))
+    staging = scratch.hbm((1, f), src.type.dtype)
+    nb.dma_copy(staging, src, (DimSlice(0, 1), DimSlice(0, f)))
+    return scratch.load(
+        staging, (DimSlice(0, p, stride=0), DimSlice(0, f)), (p, f), src.type.dtype,
+    )
 
 
 # ---------------------------------------------------------------------------

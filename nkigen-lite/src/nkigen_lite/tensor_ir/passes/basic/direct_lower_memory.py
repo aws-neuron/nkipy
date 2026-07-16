@@ -41,6 +41,7 @@ from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
     unravel,
 )
 from nkigen_lite.tensor_ir.passes.basic.direct_lower_schedule import TileSchedule
+from nkigen_lite.tensor_ir.passes.basic.direct_lower_alloc import Scratch
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +183,7 @@ def _emit_concat_input(
     axis: int,
     concat_offset: int,
     dtype: DType,
+    scratch,
 ) -> None:
     """Emit tiled DMA copies for one concat input into the output (generic
     rank<=2 / non-collapsible fallback used by ``emit_concat``)."""
@@ -222,10 +224,7 @@ def _emit_concat_input(
                     offset = concat_offset if i == axis else 0
                     dst_slices.append(DimSlice(offset, tile_f))
 
-            tile = b.dma_copy(
-                b.alloc((p_size, tile_f), dtype, MemorySpace.SBUF),
-                x_hbm, src_slices,
-            )
+            tile = scratch.load(x_hbm, src_slices, (p_size, tile_f), dtype)
             b.dma_copy(y_hbm, tile, dst_slices)
 
 
@@ -234,10 +233,12 @@ def _emit_concat_input(
 # ---------------------------------------------------------------------------
 
 
-def emit_reshape(nb: Builder, x_hbm, y_hbm, in_shape, out_shape, dtype) -> None:
+def emit_reshape(nb: Builder, x_hbm, y_hbm, in_shape, out_shape, dtype, scratch=None) -> None:
     """Emit reshape tiling into an existing Builder."""
+    if scratch is None:
+        scratch = Scratch(nb)
     if len(out_shape) == 0 or len(in_shape) == 0:
-        _emit_reshape_scalar(nb, x_hbm, y_hbm, in_shape, out_shape, dtype)
+        _emit_reshape_scalar(nb, x_hbm, y_hbm, in_shape, out_shape, dtype, scratch)
         return
 
     # When a path's natural tile would be wider than one SBUF partition can
@@ -251,22 +252,22 @@ def emit_reshape(nb: Builder, x_hbm, y_hbm, in_shape, out_shape, dtype) -> None:
     p_common = _largest_common_prefix(in_shape, out_shape)
     if p_common > 1 or (p_common == 1 and in_shape[0] == 1 and out_shape[0] == 1):
         if prod(in_shape) // p_common > cap:
-            _emit_reshape_flat_copy(nb, x_hbm, y_hbm, in_shape, out_shape, dtype)
+            _emit_reshape_flat_copy(nb, x_hbm, y_hbm, in_shape, out_shape, dtype, scratch)
         else:
-            _emit_reshape_via_prefix(nb, x_hbm, y_hbm, in_shape, out_shape, p_common, dtype)
+            _emit_reshape_via_prefix(nb, x_hbm, y_hbm, in_shape, out_shape, p_common, dtype, scratch)
     elif in_shape[-1] == out_shape[-1]:
         if in_shape[-1] > cap:
-            _emit_reshape_flat_copy(nb, x_hbm, y_hbm, in_shape, out_shape, dtype)
+            _emit_reshape_flat_copy(nb, x_hbm, y_hbm, in_shape, out_shape, dtype, scratch)
         else:
-            _emit_reshape_same_f(nb, x_hbm, y_hbm, in_shape, out_shape, dtype)
+            _emit_reshape_same_f(nb, x_hbm, y_hbm, in_shape, out_shape, dtype, scratch)
     else:
         if in_shape[-1] > cap or out_shape[-1] > cap:
-            _emit_reshape_flat_copy(nb, x_hbm, y_hbm, in_shape, out_shape, dtype)
+            _emit_reshape_flat_copy(nb, x_hbm, y_hbm, in_shape, out_shape, dtype, scratch)
         else:
-            _emit_reshape_diff_f(nb, x_hbm, y_hbm, in_shape, out_shape, dtype)
+            _emit_reshape_diff_f(nb, x_hbm, y_hbm, in_shape, out_shape, dtype, scratch)
 
 
-def _emit_reshape_flat_copy(nb, x_hbm, y_hbm, in_shape, out_shape, dtype):
+def _emit_reshape_flat_copy(nb, x_hbm, y_hbm, in_shape, out_shape, dtype, scratch):
     """Reshape via a bounded flat copy, used when a row is too wide for SBUF.
 
     A reshape preserves row-major flat order, so element ``i`` of the source
@@ -293,13 +294,12 @@ def _emit_reshape_flat_copy(nb, x_hbm, y_hbm, in_shape, out_shape, dtype):
         seg = min(src_first[1], dst_first[1])
         (src_slices, _), = flat_range_to_src_chunks(pos, seg, in_shape, in_strides)
         (dst_slices, _), = flat_range_to_src_chunks(pos, seg, out_shape, out_strides)
-        tile = nb.dma_copy(
-            nb.alloc((1, seg), dtype, MemorySpace.SBUF), x_hbm, src_slices)
+        tile = scratch.load(x_hbm, src_slices, (1, seg), dtype)
         nb.dma_copy(y_hbm, tile, dst_slices)
         pos += seg
 
 
-def _emit_reshape_via_prefix(nb, x_hbm, y_hbm, in_shape, out_shape, p_common, dtype):
+def _emit_reshape_via_prefix(nb, x_hbm, y_hbm, in_shape, out_shape, p_common, dtype, scratch):
     """Emit prefix-path reshape: partition fixed, free-dim regrouped via view."""
     total = prod(in_shape)
     in_free = total // p_common
@@ -315,13 +315,12 @@ def _emit_reshape_via_prefix(nb, x_hbm, y_hbm, in_shape, out_shape, p_common, dt
         # that are one rectangle on both sides and emit a load+view+store each.
         for rows, src_slices, dst_slices in prefix_row_segments(
             r0, p, in_free, in_shape, in_strides, out_shape, out_strides):
-            tile = nb.dma_copy(
-                nb.alloc((rows, in_free), dtype, MemorySpace.SBUF), x_hbm, src_slices)
+            tile = scratch.load(x_hbm, src_slices, (rows, in_free), dtype)
             tile = nb.view(tile, (rows, out_free))
             nb.dma_copy(y_hbm, tile, dst_slices)
 
 
-def _emit_reshape_scalar(nb, x_hbm, y_hbm, in_shape, out_shape, dtype):
+def _emit_reshape_scalar(nb, x_hbm, y_hbm, in_shape, out_shape, dtype, scratch):
     """Handle reshape to/from scalar (rank-0) tensors.
 
     HBM buffers may have been promoted from () to (1,) by the lowering,
@@ -331,11 +330,11 @@ def _emit_reshape_scalar(nb, x_hbm, y_hbm, in_shape, out_shape, dtype):
     dst_rank = len(y_hbm.type.shape)
     src_slices = [DimSlice(0, 1)] * src_rank
     dst_slices = [DimSlice(0, 1)] * dst_rank
-    tile = nb.dma_copy(nb.alloc((1, 1), dtype, MemorySpace.SBUF), x_hbm, src_slices)
+    tile = scratch.load(x_hbm, src_slices, (1, 1), dtype)
     nb.dma_copy(y_hbm, tile, dst_slices)
 
 
-def _emit_reshape_same_f(nb, x_hbm, y_hbm, in_shape, out_shape, dtype):
+def _emit_reshape_same_f(nb, x_hbm, y_hbm, in_shape, out_shape, dtype, scratch):
     out_rank = len(out_shape)
     tile_f = out_shape[-1]
     p_extent = out_shape[-2] if out_rank >= 2 else 1
@@ -373,15 +372,12 @@ def _emit_reshape_same_f(nb, x_hbm, y_hbm, in_shape, out_shape, dtype):
                     dst_slices.append(DimSlice(p_off + row_cursor, chunk_rows))
                 dst_slices.append(DimSlice(0, tile_f))
 
-                tile = nb.dma_copy(
-                    nb.alloc((chunk_rows, tile_f), dtype, MemorySpace.SBUF),
-                    x_hbm, src_slices,
-                )
+                tile = scratch.load(x_hbm, src_slices, (chunk_rows, tile_f), dtype)
                 nb.dma_copy(y_hbm, tile, dst_slices)
                 row_cursor += chunk_rows
 
 
-def _emit_reshape_diff_f(nb, x_hbm, y_hbm, in_shape, out_shape, dtype):
+def _emit_reshape_diff_f(nb, x_hbm, y_hbm, in_shape, out_shape, dtype, scratch):
     """Reshape with different last dim via scratch buffer."""
     total = prod(in_shape)
     out_f = out_shape[-1]
@@ -406,7 +402,7 @@ def _emit_reshape_diff_f(nb, x_hbm, y_hbm, in_shape, out_shape, dtype):
         row_width = in_f
 
     scratch_shape = (total // row_width, row_width)
-    scratch_hbm = nb.alloc(scratch_shape, dtype, MemorySpace.HBM)
+    scratch_hbm = scratch.hbm(scratch_shape, dtype)
 
     # Phase 1: copy source into scratch
     eff_f = effective_in_shape[-1]
@@ -430,7 +426,7 @@ def _emit_reshape_diff_f(nb, x_hbm, y_hbm, in_shape, out_shape, dtype):
                 if len(in_shape) >= 2:
                     src_slices.append(DimSlice(p_off, p_size))
                 src_slices.append(DimSlice(0, eff_f))
-            tile = nb.dma_copy(nb.alloc((p_size, eff_f), dtype, MemorySpace.SBUF), x_hbm, src_slices)
+            tile = scratch.load(x_hbm, src_slices, (p_size, eff_f), dtype)
             nb.dma_copy(scratch_hbm, tile, [DimSlice(row_offset, p_size), DimSlice(0, eff_f)])
             row_offset += p_size
 
@@ -459,11 +455,11 @@ def _emit_reshape_diff_f(nb, x_hbm, y_hbm, in_shape, out_shape, dtype):
 
             if scratch_col == 0 and out_f <= scratch_f:
                 s_sl = [DimSlice(scratch_row, 1), DimSlice(0, out_f)]
-                tile = nb.dma_copy(nb.alloc((1, out_f), dtype, MemorySpace.SBUF), scratch_hbm, s_sl)
+                tile = scratch.load(scratch_hbm, s_sl, (1, out_f), dtype)
                 nb.dma_copy(y_hbm, tile, dst_slices)
             elif scratch_col + out_f <= scratch_f:
                 s_sl = [DimSlice(scratch_row, 1), DimSlice(scratch_col, out_f)]
-                tile = nb.dma_copy(nb.alloc((1, out_f), dtype, MemorySpace.SBUF), scratch_hbm, s_sl)
+                tile = scratch.load(scratch_hbm, s_sl, (1, out_f), dtype)
                 nb.dma_copy(y_hbm, tile, dst_slices)
             else:
                 remaining = out_f
@@ -472,7 +468,7 @@ def _emit_reshape_diff_f(nb, x_hbm, y_hbm, in_shape, out_shape, dtype):
                 while remaining > 0:
                     chunk = min(remaining, scratch_f - cur_col)
                     s_sl = [DimSlice(cur_row, 1), DimSlice(cur_col, chunk)]
-                    tile = nb.dma_copy(nb.alloc((1, chunk), dtype, MemorySpace.SBUF), scratch_hbm, s_sl)
+                    tile = scratch.load(scratch_hbm, s_sl, (1, chunk), dtype)
                     d_sl = [DimSlice(bi, 1) for bi in batch_idx]
                     if out_rank >= 2:
                         d_sl.append(DimSlice(p_i, 1))
@@ -486,7 +482,7 @@ def _emit_reshape_diff_f(nb, x_hbm, y_hbm, in_shape, out_shape, dtype):
 
 def _emit_2d_window_copy(
     nb: Builder, src_2d, dst_2d, src_f_off: int, dst_f_off: int, f_width: int,
-    dtype,
+    dtype, scratch,
 ) -> None:
     """Copy a full-height column window ``[f_off, f_off+f_width)`` from a 2D HBM
     source to a 2D HBM destination, tiling the partition at 128 and the free
@@ -497,9 +493,9 @@ def _emit_2d_window_copy(
     """
     P = src_2d.type.shape[0]
     for p_off, p_size, fo, fw in TileSchedule.pf(P, f_width, dtype).pf_tiles():
-        tile = nb.dma_copy(
-            nb.alloc((p_size, fw), dtype, MemorySpace.SBUF),
+        tile = scratch.load(
             src_2d, (DimSlice(p_off, p_size), DimSlice(src_f_off + fo, fw)),
+            (p_size, fw), dtype,
         )
         nb.dma_copy(
             dst_2d, tile, (DimSlice(p_off, p_size), DimSlice(dst_f_off + fo, fw))
@@ -508,7 +504,7 @@ def _emit_2d_window_copy(
 
 def _emit_2d_rows_copy(
     nb: Builder, src_2d, dst_2d, src_r_off: int, dst_r_off: int, n_rows: int,
-    width: int, dtype,
+    width: int, dtype, scratch,
 ) -> None:
     """Copy a full-width row window ``[r_off, r_off+n_rows)`` from a 2D HBM
     source to a 2D HBM destination, tiling the partition (row axis) at 128 and
@@ -521,9 +517,9 @@ def _emit_2d_rows_copy(
     time.
     """
     for p_off, p_size, fo, fw in TileSchedule.pf(n_rows, width, dtype).pf_tiles():
-        tile = nb.dma_copy(
-            nb.alloc((p_size, fw), dtype, MemorySpace.SBUF),
+        tile = scratch.load(
             src_2d, (DimSlice(src_r_off + p_off, p_size), DimSlice(fo, fw)),
+            (p_size, fw), dtype,
         )
         nb.dma_copy(
             dst_2d, tile, (DimSlice(dst_r_off + p_off, p_size), DimSlice(fo, fw))
@@ -532,7 +528,7 @@ def _emit_2d_rows_copy(
 
 def _emit_axis_window_copy(
     nb, src_hbm, dst_hbm, in_shape, out_shape, axis, src_axis_off, dst_axis_off,
-    axis_extent, dtype,
+    axis_extent, dtype, scratch,
 ) -> None:
     """Copy a window along a non-last ``axis``, all other axes kept full.
 
@@ -555,20 +551,22 @@ def _emit_axis_window_copy(
         _emit_2d_rows_copy(
             nb, src_2d, dst_2d,
             outer * A_in + src_axis_off, outer * A_out + dst_axis_off,
-            axis_extent, T, dtype,
+            axis_extent, T, dtype, scratch,
         )
 
 
 def emit_slice(nb: Builder, x_hbm, y_hbm, in_shape, out_shape, starts, dtype,
-               strides=None) -> None:
+               strides=None, scratch=None) -> None:
     """Emit slice tiling into an existing Builder."""
+    if scratch is None:
+        scratch = Scratch(nb)
     rank = len(in_shape)
     if strides is None:
         strides = (1,) * rank
 
     has_non_unit_stride = any(s != 1 for s in strides)
     if has_non_unit_stride:
-        _emit_strided_slice(nb, x_hbm, y_hbm, in_shape, out_shape, starts, strides, dtype)
+        _emit_strided_slice(nb, x_hbm, y_hbm, in_shape, out_shape, starts, strides, dtype, scratch)
         return
 
     # Fast path: a rank>=3 slice that touches only the last axis (all leading
@@ -581,7 +579,7 @@ def emit_slice(nb: Builder, x_hbm, y_hbm, in_shape, out_shape, starts, dtype,
         src_2d = collapse_view(nb, x_hbm, lead, in_shape[-1])
         dst_2d = collapse_view(nb, y_hbm, lead, out_shape[-1])
         _emit_2d_window_copy(
-            nb, src_2d, dst_2d, starts[-1], 0, out_shape[-1], dtype)
+            nb, src_2d, dst_2d, starts[-1], 0, out_shape[-1], dtype, scratch)
         return
 
     # Fast path: a rank>=3 slice that touches only ONE non-last axis (every
@@ -596,7 +594,7 @@ def emit_slice(nb: Builder, x_hbm, y_hbm, in_shape, out_shape, starts, dtype,
             a = cut[0]
             _emit_axis_window_copy(
                 nb, x_hbm, y_hbm, in_shape, out_shape, a,
-                starts[a], 0, out_shape[a], dtype)
+                starts[a], 0, out_shape[a], dtype, scratch)
             return
 
     tile_p = min(out_shape[-2], PARTITION_MAX) if rank >= 2 else 1
@@ -625,11 +623,11 @@ def emit_slice(nb: Builder, x_hbm, y_hbm, in_shape, out_shape, starts, dtype,
                 dst_slices.append(DimSlice(p_off, p_size))
             dst_slices.append(DimSlice(0, tile_f))
 
-            tile = nb.dma_copy(nb.alloc((p_size, tile_f), dtype, MemorySpace.SBUF), x_hbm, src_slices)
+            tile = scratch.load(x_hbm, src_slices, (p_size, tile_f), dtype)
             nb.dma_copy(y_hbm, tile, dst_slices)
 
 
-def _emit_strided_slice(nb, x_hbm, y_hbm, in_shape, out_shape, starts, strides, dtype):
+def _emit_strided_slice(nb, x_hbm, y_hbm, in_shape, out_shape, starts, strides, dtype, scratch):
     """Emit a strided slice as tiled strided-DMA descriptors.
 
     A strided slice reads every ``stride``-th element along each axis. The DMA
@@ -647,8 +645,7 @@ def _emit_strided_slice(nb, x_hbm, y_hbm, in_shape, out_shape, starts, strides, 
         out_f = out_shape[0]
         src_slices = [DimSlice(starts[0], out_f, stride=strides[0])]
         dst_slices = [DimSlice(0, out_f)]
-        tile = nb.dma_copy(
-            nb.alloc((1, out_f), dtype, MemorySpace.SBUF), x_hbm, src_slices)
+        tile = scratch.load(x_hbm, src_slices, (1, out_f), dtype)
         nb.dma_copy(y_hbm, tile, dst_slices)
         return
 
@@ -680,14 +677,15 @@ def _emit_strided_slice(nb, x_hbm, y_hbm, in_shape, out_shape, starts, strides, 
             dst_slices.append(DimSlice(p_off, p_size))
             dst_slices.append(DimSlice(0, out_f))
 
-            tile = nb.dma_copy(
-                nb.alloc((p_size, out_f), dtype, MemorySpace.SBUF), x_hbm, src_slices)
+            tile = scratch.load(x_hbm, src_slices, (p_size, out_f), dtype)
             nb.dma_copy(y_hbm, tile, dst_slices)
 
 
 def emit_concat(nb: Builder, input_hbms: list, y_hbm, input_shapes: list, axis: int,
-                dtype) -> None:
+                dtype, scratch=None) -> None:
     """Emit concat tiling into an existing Builder."""
+    if scratch is None:
+        scratch = Scratch(nb)
     rank = len(input_shapes[0])
     if axis < 0:
         axis += rank
@@ -707,7 +705,7 @@ def emit_concat(nb: Builder, input_hbms: list, y_hbm, input_shapes: list, axis: 
         for inp_idx, inp_shape in enumerate(input_shapes):
             w = inp_shape[-1]
             src_2d = collapse_view(nb, input_hbms[inp_idx], lead, w)
-            _emit_2d_window_copy(nb, src_2d, dst_2d, 0, dst_f_off, w, dtype)
+            _emit_2d_window_copy(nb, src_2d, dst_2d, 0, dst_f_off, w, dtype, scratch)
             dst_f_off += w
         return
 
@@ -721,12 +719,12 @@ def emit_concat(nb: Builder, input_hbms: list, y_hbm, input_shapes: list, axis: 
         for inp_idx, inp_shape in enumerate(input_shapes):
             _emit_axis_window_copy(
                 nb, input_hbms[inp_idx], y_hbm, inp_shape, out_shape, axis,
-                0, axis_offset, inp_shape[axis], dtype)
+                0, axis_offset, inp_shape[axis], dtype, scratch)
             axis_offset += inp_shape[axis]
         return
 
     concat_offset = 0
     for inp_idx, inp_shape in enumerate(input_shapes):
         _emit_concat_input(nb, input_hbms[inp_idx], y_hbm, inp_shape, out_shape,
-                           axis, concat_offset, dtype)
+                           axis, concat_offset, dtype, scratch)
         concat_offset += inp_shape[axis]
