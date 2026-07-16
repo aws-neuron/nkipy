@@ -29,9 +29,9 @@ from nkigen_lite.nki_ir import ir as nki_ir
 
 from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
     ceildiv,
-    iter_pf_tiles,
     max_free_elems,
 )
+from nkigen_lite.tensor_ir.passes.basic.direct_lower_schedule import TileSchedule
 
 
 def emit_gather_along_axis(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
@@ -95,7 +95,7 @@ def emit_scatter_rows(nb: Builder, op, hbm_map: dict[str, Value]) -> None:
     w_tile = min(W, max_free_elems(vdtype))
 
     # Backdrop: copy base -> result, tiled over N rows and W columns.
-    for p_off, p_size, w_off, w_size in iter_pf_tiles(N, W, vdtype):
+    for p_off, p_size, w_off, w_size in TileSchedule.pf(N, W, vdtype).pf_tiles():
         tile = nb.dma_copy(
             nb.alloc((p_size, w_size), vdtype, MemorySpace.SBUF),
             base_hbm, (DimSlice(p_off, p_size), DimSlice(w_off, w_size)),

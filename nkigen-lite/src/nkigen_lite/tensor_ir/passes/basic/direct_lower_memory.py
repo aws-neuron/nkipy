@@ -35,12 +35,12 @@ from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
     ceildiv,
     collapse_view,
     flat_range_to_src_chunks,
-    iter_pf_tiles,
     max_free_elems,
     prefix_row_segments,
     row_major_strides,
     unravel,
 )
+from nkigen_lite.tensor_ir.passes.basic.direct_lower_schedule import TileSchedule
 
 
 # ---------------------------------------------------------------------------
@@ -496,7 +496,7 @@ def _emit_2d_window_copy(
     contiguous last-axis window across all the (collapsed) leading rows".
     """
     P = src_2d.type.shape[0]
-    for p_off, p_size, fo, fw in iter_pf_tiles(P, f_width, dtype):
+    for p_off, p_size, fo, fw in TileSchedule.pf(P, f_width, dtype).pf_tiles():
         tile = nb.dma_copy(
             nb.alloc((p_size, fw), dtype, MemorySpace.SBUF),
             src_2d, (DimSlice(p_off, p_size), DimSlice(src_f_off + fo, fw)),
@@ -520,7 +520,7 @@ def _emit_2d_rows_copy(
     the copy packs all 128 lanes instead of unrolling the leading rows one at a
     time.
     """
-    for p_off, p_size, fo, fw in iter_pf_tiles(n_rows, width, dtype):
+    for p_off, p_size, fo, fw in TileSchedule.pf(n_rows, width, dtype).pf_tiles():
         tile = nb.dma_copy(
             nb.alloc((p_size, fw), dtype, MemorySpace.SBUF),
             src_2d, (DimSlice(src_r_off + p_off, p_size), DimSlice(fo, fw)),

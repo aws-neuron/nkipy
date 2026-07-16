@@ -43,11 +43,13 @@ from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
     COMBINE_INIT,
     COMBINE_OPS,
     REDUCE_OPS,
-    build_slices,
     ceildiv,
-    clamped_extent,
     collapse_view,
     max_free_elems,
+)
+from nkigen_lite.tensor_ir.passes.basic.direct_lower_schedule import (
+    TileIndex,
+    TileSchedule,
 )
 
 
@@ -129,9 +131,12 @@ def _try_emit_collapsed_f_reduce(
     dst_2d = collapse_view(nb, hbm_map[out_val.name], lead, 1)
     reduce_nki_op = REDUCE_OPS[kind]
 
-    for p_i in range(ceildiv(lead, PARTITION_MAX)):
-        p_off = p_i * PARTITION_MAX
-        p_size = min(PARTITION_MAX, lead - p_off)
+    # Partition tiled at 128; the reduced free width (red) fits one row, so it
+    # is untiled. dst mirrors src on the partition with a width-1 free dim.
+    p_ts = {0: PARTITION_MAX}
+    for idx in TileSchedule((lead,), p_ts):
+        (ps,) = idx.slices((lead,), p_ts)
+        p_off, p_size = ps.offset, ps.size
         src = nb.dma_copy(
             nb.alloc((p_size, red), dtype, MemorySpace.SBUF),
             src_2d, (DimSlice(p_off, p_size), DimSlice(0, red)),
@@ -199,36 +204,25 @@ def _emit_f_reduce_inline(
     for d in reduced_f_dims:
         out_tile_sizes[d] = 1
 
-    loop_dims = [(d, inp_shape[d], inp_tile_sizes[d])
-                 for d in sorted(inp_tile_sizes.keys())
-                 if inp_tile_sizes[d] < inp_shape[d]]
+    reduce_nki_op = REDUCE_OPS[kind]
+    for idx in TileSchedule(inp_shape, inp_tile_sizes):
+        p_ext = idx.extent(inp_layout.p_dims, inp_shape, inp_tile_sizes)
+        f_ext = prod(inp_shape[d] for d in reduced_f_dims)
 
-    def _nested(depth: int, indices: dict[int, int]):
-        if depth >= len(loop_dims):
-            p_ext = clamped_extent(inp_layout.p_dims, inp_shape, inp_tile_sizes, indices)
-            f_ext = prod(inp_shape[d] for d in reduced_f_dims)
+        slices = idx.slices(inp_shape, inp_tile_sizes)
+        src = nb.alloc((p_ext, f_ext), dtype, MemorySpace.SBUF)
+        src = nb.dma_copy(src, hbm_map[inp_val.name], slices)
 
-            slices = build_slices(inp_shape, inp_tile_sizes, indices)
-            src = nb.alloc((p_ext, f_ext), dtype, MemorySpace.SBUF)
-            src = nb.dma_copy(src, hbm_map[inp_val.name], slices)
+        dst = nb.alloc((p_ext, 1), dtype, MemorySpace.SBUF)
+        dst = nb.tensor_reduce_arith(dst, src, reduce_nki_op, num_r_dim=1, keepdims=True)
 
-            reduce_nki_op = REDUCE_OPS[kind]
-            dst = nb.alloc((p_ext, 1), dtype, MemorySpace.SBUF)
-            dst = nb.tensor_reduce_arith(dst, src, reduce_nki_op, num_r_dim=1, keepdims=True)
+        if kind == "mean":
+            scale = nb.constant(1.0 / float(f_ext), (p_ext, 1), dtype, MemorySpace.SBUF)
+            result = nb.alloc((p_ext, 1), dtype, MemorySpace.SBUF)
+            dst = nb.tensor_tensor_arith(result, dst, scale, nki_ir.NisaArithOp.MULTIPLY)
 
-            if kind == "mean":
-                scale = nb.constant(1.0 / float(f_ext), (p_ext, 1), dtype, MemorySpace.SBUF)
-                result = nb.alloc((p_ext, 1), dtype, MemorySpace.SBUF)
-                dst = nb.tensor_tensor_arith(result, dst, scale, nki_ir.NisaArithOp.MULTIPLY)
-
-            out_slices = build_slices(out_shape, out_tile_sizes, indices)
-            nb.dma_copy(hbm_map[out_val.name], dst, out_slices)
-            return
-        d, extent, ts = loop_dims[depth]
-        for i in range(ceildiv(extent, ts)):
-            _nested(depth + 1, {**indices, d: i})
-
-    _nested(0, {})
+        out_slices = idx.slices(out_shape, out_tile_sizes)
+        nb.dma_copy(hbm_map[out_val.name], dst, out_slices)
 
 
 def _emit_p_reduce_inline(
@@ -289,63 +283,46 @@ def _emit_p_reduce_inline(
     for d in f_dims:
         out_tile_sizes[d] = inp_tile_sizes[d]  # F unchanged by a P-reduce
 
-    outer_loop_dims = [(d, inp_shape[d], inp_tile_sizes[d])
-                       for d in sorted(set(inp_layout.i_dims) | set(kept_p_dims)
-                                       | set(f_dims))
-                       if inp_tile_sizes[d] < inp_shape[d]]
-    accum_loop_dims = [(d, inp_shape[d], inp_tile_sizes[d])
-                       for d in sorted(reduced_p_dims)
-                       if inp_tile_sizes[d] < inp_shape[d]]
+    outer_ts = {d: inp_tile_sizes[d]
+                for d in set(inp_layout.i_dims) | set(kept_p_dims) | set(f_dims)}
+    accum_ts = {d: inp_tile_sizes[d] for d in reduced_p_dims}
+    accum_has_loops = any(inp_tile_sizes[d] < inp_shape[d] for d in reduced_p_dims)
 
     total_p = prod(inp_shape[d] for d in reduced_p_dims)
     reduce_nki_op = REDUCE_OPS[kind]
     combine_op = COMBINE_OPS[kind]
 
-    def _outer_nested(depth: int, outer_indices: dict[int, int]):
-        if depth >= len(outer_loop_dims):
-            f_ext = clamped_extent(inp_layout.f_dims, inp_shape, inp_tile_sizes, outer_indices)
-            accum = nb.alloc((1, f_ext), dtype, MemorySpace.SBUF)
-            accum = nb.memset(accum, COMBINE_INIT[kind])
+    for outer_idx in TileSchedule(inp_shape, outer_ts):
+        outer_indices = outer_idx.indices
+        f_ext = outer_idx.extent(inp_layout.f_dims, inp_shape, inp_tile_sizes)
+        accum = nb.alloc((1, f_ext), dtype, MemorySpace.SBUF)
+        accum = nb.memset(accum, COMBINE_INIT[kind])
 
-            def _accum_nested(depth2: int, accum_indices: dict[int, int]):
-                nonlocal accum
-                if depth2 >= len(accum_loop_dims):
-                    indices = {**outer_indices, **accum_indices}
-                    p_ext = clamped_extent(reduced_p_dims, inp_shape, inp_tile_sizes, indices)
-                    slices = build_slices(inp_shape, inp_tile_sizes, indices)
-                    src = nb.alloc((p_ext, f_ext), dtype, MemorySpace.SBUF)
-                    src = nb.dma_copy(src, hbm_map[inp_val.name], slices)
-                    partial = nb.alloc((1, f_ext), dtype, MemorySpace.SBUF)
-                    partial = nb.cross_lane_reduce_arith(partial, src, reduce_nki_op)
-                    new_accum = nb.alloc((1, f_ext), dtype, MemorySpace.SBUF)
-                    accum = nb.tensor_tensor_arith(new_accum, accum, partial, combine_op)
-                    return
-                d, extent, ts = accum_loop_dims[depth2]
-                for i in range(ceildiv(extent, ts)):
-                    _accum_nested(depth2 + 1, {**accum_indices, d: i})
-
-            if accum_loop_dims:
-                _accum_nested(0, {})
-            else:
-                p_ext = clamped_extent(reduced_p_dims, inp_shape, inp_tile_sizes, outer_indices)
-                slices = build_slices(inp_shape, inp_tile_sizes, outer_indices)
+        if accum_has_loops:
+            for accum_idx in TileSchedule(inp_shape, accum_ts):
+                idx = TileIndex({**outer_indices, **accum_idx.indices})
+                p_ext = idx.extent(reduced_p_dims, inp_shape, inp_tile_sizes)
+                slices = idx.slices(inp_shape, inp_tile_sizes)
                 src = nb.alloc((p_ext, f_ext), dtype, MemorySpace.SBUF)
                 src = nb.dma_copy(src, hbm_map[inp_val.name], slices)
-                accum = nb.cross_lane_reduce_arith(accum, src, reduce_nki_op)
+                partial = nb.alloc((1, f_ext), dtype, MemorySpace.SBUF)
+                partial = nb.cross_lane_reduce_arith(partial, src, reduce_nki_op)
+                new_accum = nb.alloc((1, f_ext), dtype, MemorySpace.SBUF)
+                accum = nb.tensor_tensor_arith(new_accum, accum, partial, combine_op)
+        else:
+            p_ext = outer_idx.extent(reduced_p_dims, inp_shape, inp_tile_sizes)
+            slices = outer_idx.slices(inp_shape, inp_tile_sizes)
+            src = nb.alloc((p_ext, f_ext), dtype, MemorySpace.SBUF)
+            src = nb.dma_copy(src, hbm_map[inp_val.name], slices)
+            accum = nb.cross_lane_reduce_arith(accum, src, reduce_nki_op)
 
-            if kind == "mean":
-                scale = nb.constant(1.0 / float(total_p), (1, f_ext), dtype, MemorySpace.SBUF)
-                result = nb.alloc((1, f_ext), dtype, MemorySpace.SBUF)
-                accum = nb.tensor_tensor_arith(result, accum, scale, nki_ir.NisaArithOp.MULTIPLY)
+        if kind == "mean":
+            scale = nb.constant(1.0 / float(total_p), (1, f_ext), dtype, MemorySpace.SBUF)
+            result = nb.alloc((1, f_ext), dtype, MemorySpace.SBUF)
+            accum = nb.tensor_tensor_arith(result, accum, scale, nki_ir.NisaArithOp.MULTIPLY)
 
-            out_slices = build_slices(out_shape, out_tile_sizes, outer_indices)
-            nb.dma_copy(hbm_map[out_val.name], accum, out_slices)
-            return
-        d, extent, ts = outer_loop_dims[depth]
-        for i in range(ceildiv(extent, ts)):
-            _outer_nested(depth + 1, {**outer_indices, d: i})
-
-    _outer_nested(0, {})
+        out_slices = outer_idx.slices(out_shape, out_tile_sizes)
+        nb.dma_copy(hbm_map[out_val.name], accum, out_slices)
 
 
 def _emit_p_reduce_matmul_inline(
@@ -413,66 +390,51 @@ def _emit_p_reduce_matmul_inline(
     for d in f_dims:
         out_tile_sizes[d] = inp_tile_sizes[d]  # F unchanged by a P-reduce
 
-    outer_loop_dims = [(d, inp_shape[d], inp_tile_sizes[d])
-                       for d in sorted(set(inp_layout.i_dims) | set(kept_p_dims)
-                                       | set(f_dims))
-                       if inp_tile_sizes[d] < inp_shape[d]]
-    p_loop_dims = [(d, inp_shape[d], inp_tile_sizes[d])
-                   for d in sorted(reduced_p_dims)
-                   if inp_tile_sizes[d] < inp_shape[d]]
+    outer_ts = {d: inp_tile_sizes[d]
+                for d in set(inp_layout.i_dims) | set(kept_p_dims) | set(f_dims)}
+    p_ts = {d: inp_tile_sizes[d] for d in reduced_p_dims}
+    p_has_loops = any(inp_tile_sizes[d] < inp_shape[d] for d in reduced_p_dims)
 
-    def _outer_nested(depth: int, outer_indices: dict[int, int]):
-        if depth >= len(outer_loop_dims):
-            f_ext = clamped_extent(f_dims, inp_shape, inp_tile_sizes, outer_indices)
-            # PSUM accumulator: (M=1, N=F_window)
-            psum = nb.alloc((1, f_ext), DType.F32, MemorySpace.PSUM)
-            psum = nb.memset(psum, 0.0)
+    def _load_and_matmul(idx: TileIndex, f_ext: int, psum):
+        p_ext = idx.extent(reduced_p_dims, inp_shape, inp_tile_sizes)
+        slices = idx.slices(inp_shape, inp_tile_sizes)
+        src_tile = nb.alloc((p_ext, f_ext), dtype, MemorySpace.SBUF)
+        src_tile = nb.dma_copy(src_tile, hbm_map[inp_val.name], slices)
+        ones = nb.alloc((p_ext, 1), dtype, MemorySpace.SBUF)
+        ones = nb.memset(ones, 1.0)
+        # matmul: ones[K,M=1].T @ src[K,N=F] -> psum[M=1,N=F]
+        nb.matmul(psum, ones, src_tile, accumulate=True)
 
-            def _load_and_matmul(indices: dict[int, int]):
-                p_ext = clamped_extent(reduced_p_dims, inp_shape, inp_tile_sizes, indices)
-                slices = build_slices(inp_shape, inp_tile_sizes, indices)
-                src_tile = nb.alloc((p_ext, f_ext), dtype, MemorySpace.SBUF)
-                src_tile = nb.dma_copy(src_tile, hbm_map[inp_val.name], slices)
-                ones = nb.alloc((p_ext, 1), dtype, MemorySpace.SBUF)
-                ones = nb.memset(ones, 1.0)
-                # matmul: ones[K,M=1].T @ src[K,N=F] -> psum[M=1,N=F]
-                nb.matmul(psum, ones, src_tile, accumulate=True)
+    for outer_idx in TileSchedule(inp_shape, outer_ts):
+        outer_indices = outer_idx.indices
+        f_ext = outer_idx.extent(f_dims, inp_shape, inp_tile_sizes)
+        # PSUM accumulator: (M=1, N=F_window)
+        psum = nb.alloc((1, f_ext), DType.F32, MemorySpace.PSUM)
+        psum = nb.memset(psum, 0.0)
 
-            def _p_nested(depth2: int, p_indices: dict[int, int]):
-                if depth2 >= len(p_loop_dims):
-                    _load_and_matmul({**outer_indices, **p_indices})
-                    return
-                d, extent, ts = p_loop_dims[depth2]
-                for i in range(ceildiv(extent, ts)):
-                    _p_nested(depth2 + 1, {**p_indices, d: i})
+        if p_has_loops:
+            for p_idx in TileSchedule(inp_shape, p_ts):
+                _load_and_matmul(
+                    TileIndex({**outer_indices, **p_idx.indices}), f_ext, psum)
+        else:
+            _load_and_matmul(outer_idx, f_ext, psum)
 
-            if p_loop_dims:
-                _p_nested(0, {})
-            else:
-                _load_and_matmul(outer_indices)
+        # Copy PSUM -> SBUF
+        sbuf_out = nb.alloc((1, f_ext), DType.F32, MemorySpace.SBUF)
+        sbuf_out = nb.tensor_copy(sbuf_out, psum)
 
-            # Copy PSUM -> SBUF
-            sbuf_out = nb.alloc((1, f_ext), DType.F32, MemorySpace.SBUF)
-            sbuf_out = nb.tensor_copy(sbuf_out, psum)
+        if kind == "mean":
+            scale = nb.constant(1.0 / float(total_p), (1, f_ext), DType.F32, MemorySpace.SBUF)
+            mean_dst = nb.alloc((1, f_ext), DType.F32, MemorySpace.SBUF)
+            sbuf_out = nb.tensor_tensor_arith(mean_dst, sbuf_out, scale, nki_ir.NisaArithOp.MULTIPLY)
 
-            if kind == "mean":
-                scale = nb.constant(1.0 / float(total_p), (1, f_ext), DType.F32, MemorySpace.SBUF)
-                mean_dst = nb.alloc((1, f_ext), DType.F32, MemorySpace.SBUF)
-                sbuf_out = nb.tensor_tensor_arith(mean_dst, sbuf_out, scale, nki_ir.NisaArithOp.MULTIPLY)
+        out_dtype = out_val.type.dtype
+        if out_dtype != DType.F32:
+            cast_dst = nb.alloc((1, f_ext), out_dtype, MemorySpace.SBUF)
+            sbuf_out = nb.cast(cast_dst, sbuf_out)
 
-            out_dtype = out_val.type.dtype
-            if out_dtype != DType.F32:
-                cast_dst = nb.alloc((1, f_ext), out_dtype, MemorySpace.SBUF)
-                sbuf_out = nb.cast(cast_dst, sbuf_out)
-
-            out_slices = build_slices(out_shape, out_tile_sizes, outer_indices)
-            nb.dma_copy(hbm_map[out_val.name], sbuf_out, out_slices)
-            return
-        d, extent, ts = outer_loop_dims[depth]
-        for i in range(ceildiv(extent, ts)):
-            _outer_nested(depth + 1, {**outer_indices, d: i})
-
-    _outer_nested(0, {})
+        out_slices = outer_idx.slices(out_shape, out_tile_sizes)
+        nb.dma_copy(hbm_map[out_val.name], sbuf_out, out_slices)
 
 
 def _emit_mixed_reduce_inline(
@@ -528,68 +490,48 @@ def _emit_mixed_reduce_inline(
     for d in reduced_f_dims:
         out_tile_sizes[d] = out_shape[d]
 
-    outer_loop_dims = [
-        (d, inp_shape[d], inp_tile_sizes[d])
-        for d in sorted(set(inp_layout.i_dims) | set(kept_p_dims) | set(kept_f_dims))
-        if inp_tile_sizes[d] < inp_shape[d]
-    ]
-    p_accum_dims = [
-        (d, inp_shape[d], inp_tile_sizes[d])
-        for d in sorted(reduced_p_dims)
-        if inp_tile_sizes[d] < inp_shape[d]
-    ]
+    outer_ts = {d: inp_tile_sizes[d]
+                for d in set(inp_layout.i_dims) | set(kept_p_dims) | set(kept_f_dims)}
+    p_accum_ts = {d: inp_tile_sizes[d] for d in reduced_p_dims}
+    p_has_loops = any(inp_tile_sizes[d] < inp_shape[d] for d in reduced_p_dims)
 
     reduce_nki_op = REDUCE_OPS[f_kind]
     combine_op = COMBINE_OPS[p_kind]
 
-    def _outer_nested(depth: int, outer_indices: dict[int, int]):
-        if depth >= len(outer_loop_dims):
-            accum = nb.alloc((1, 1), dtype, MemorySpace.SBUF)
-            accum = nb.memset(accum, COMBINE_INIT[p_kind])
+    for outer_idx in TileSchedule(inp_shape, outer_ts):
+        outer_indices = outer_idx.indices
+        accum = nb.alloc((1, 1), dtype, MemorySpace.SBUF)
+        accum = nb.memset(accum, COMBINE_INIT[p_kind])
 
-            def _p_nested(depth2: int, p_indices: dict[int, int]):
-                nonlocal accum
-                if depth2 >= len(p_accum_dims):
-                    indices = {**outer_indices, **p_indices}
-                    p_ext = clamped_extent(reduced_p_dims, inp_shape, inp_tile_sizes, indices)
-                    slices = build_slices(inp_shape, inp_tile_sizes, indices)
-                    src = nb.alloc((p_ext, f_reduced_ext), dtype, MemorySpace.SBUF)
-                    src = nb.dma_copy(src, hbm_map[inp_val.name], slices)
-                    f_red = nb.alloc((p_ext, 1), dtype, MemorySpace.SBUF)
-                    f_red = nb.tensor_reduce_arith(f_red, src, reduce_nki_op, num_r_dim=1, keepdims=True)
-                    p_red = nb.alloc((1, 1), dtype, MemorySpace.SBUF)
-                    p_red = nb.cross_lane_reduce_arith(p_red, f_red, REDUCE_OPS[p_kind])
-                    new_accum = nb.alloc((1, 1), dtype, MemorySpace.SBUF)
-                    accum = nb.tensor_tensor_arith(new_accum, accum, p_red, combine_op)
-                    return
-                d, extent, ts = p_accum_dims[depth2]
-                for i in range(ceildiv(extent, ts)):
-                    _p_nested(depth2 + 1, {**p_indices, d: i})
-
-            if p_accum_dims:
-                _p_nested(0, {})
-            else:
-                p_ext = clamped_extent(reduced_p_dims, inp_shape, inp_tile_sizes, outer_indices)
-                slices = build_slices(inp_shape, inp_tile_sizes, outer_indices)
+        if p_has_loops:
+            for p_idx in TileSchedule(inp_shape, p_accum_ts):
+                idx = TileIndex({**outer_indices, **p_idx.indices})
+                p_ext = idx.extent(reduced_p_dims, inp_shape, inp_tile_sizes)
+                slices = idx.slices(inp_shape, inp_tile_sizes)
                 src = nb.alloc((p_ext, f_reduced_ext), dtype, MemorySpace.SBUF)
                 src = nb.dma_copy(src, hbm_map[inp_val.name], slices)
                 f_red = nb.alloc((p_ext, 1), dtype, MemorySpace.SBUF)
                 f_red = nb.tensor_reduce_arith(f_red, src, reduce_nki_op, num_r_dim=1, keepdims=True)
-                accum = nb.cross_lane_reduce_arith(accum, f_red, REDUCE_OPS[p_kind])
+                p_red = nb.alloc((1, 1), dtype, MemorySpace.SBUF)
+                p_red = nb.cross_lane_reduce_arith(p_red, f_red, REDUCE_OPS[p_kind])
+                new_accum = nb.alloc((1, 1), dtype, MemorySpace.SBUF)
+                accum = nb.tensor_tensor_arith(new_accum, accum, p_red, combine_op)
+        else:
+            p_ext = outer_idx.extent(reduced_p_dims, inp_shape, inp_tile_sizes)
+            slices = outer_idx.slices(inp_shape, inp_tile_sizes)
+            src = nb.alloc((p_ext, f_reduced_ext), dtype, MemorySpace.SBUF)
+            src = nb.dma_copy(src, hbm_map[inp_val.name], slices)
+            f_red = nb.alloc((p_ext, 1), dtype, MemorySpace.SBUF)
+            f_red = nb.tensor_reduce_arith(f_red, src, reduce_nki_op, num_r_dim=1, keepdims=True)
+            accum = nb.cross_lane_reduce_arith(accum, f_red, REDUCE_OPS[p_kind])
 
-            if kind == "mean":
-                scale = nb.constant(1.0 / float(total_reduced), (1, 1), dtype, MemorySpace.SBUF)
-                result = nb.alloc((1, 1), dtype, MemorySpace.SBUF)
-                accum = nb.tensor_tensor_arith(result, accum, scale, nki_ir.NisaArithOp.MULTIPLY)
+        if kind == "mean":
+            scale = nb.constant(1.0 / float(total_reduced), (1, 1), dtype, MemorySpace.SBUF)
+            result = nb.alloc((1, 1), dtype, MemorySpace.SBUF)
+            accum = nb.tensor_tensor_arith(result, accum, scale, nki_ir.NisaArithOp.MULTIPLY)
 
-            out_slices = build_slices(out_shape, out_tile_sizes, outer_indices)
-            nb.dma_copy(hbm_map[out_val.name], accum, out_slices)
-            return
-        d, extent, ts = outer_loop_dims[depth]
-        for i in range(ceildiv(extent, ts)):
-            _outer_nested(depth + 1, {**outer_indices, d: i})
-
-    _outer_nested(0, {})
+        out_slices = outer_idx.slices(out_shape, out_tile_sizes)
+        nb.dma_copy(hbm_map[out_val.name], accum, out_slices)
 
 
 # ---------------------------------------------------------------------------

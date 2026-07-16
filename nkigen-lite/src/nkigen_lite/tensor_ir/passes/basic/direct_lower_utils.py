@@ -56,25 +56,6 @@ def collapse_view(nb: Builder, hbm: Value, lead: int, last: int) -> Value:
     return nb.view(hbm, (lead, last))
 
 
-def iter_pf_tiles(P: int, F: int, dtype: DType):
-    """Yield ``(p_off, p_size, f_off, f_size)`` over a 2D ``(P, F)`` extent.
-
-    The single place that encodes the data-movement tile budget: partition
-    tiled at PARTITION_MAX (128 lanes), free dim tiled at
-    ``max_free_elems(dtype)`` so each tile fits the per-partition SBUF
-    budget. Every collapse-onto-partition fast path should loop with this
-    rather than hand-rolling its own bounds.
-    """
-    cap = max_free_elems(dtype)
-    for p_i in range(ceildiv(P, PARTITION_MAX)):
-        p_off = p_i * PARTITION_MAX
-        p_size = min(PARTITION_MAX, P - p_off)
-        for f_i in range(ceildiv(F, cap)):
-            f_off = f_i * cap
-            f_size = min(cap, F - f_off)
-            yield p_off, p_size, f_off, f_size
-
-
 # ---------------------------------------------------------------------------
 # Index utilities
 # ---------------------------------------------------------------------------
@@ -204,43 +185,6 @@ def prefix_row_segments(r0, p, free, in_shape, in_strides, out_shape, out_stride
 # ---------------------------------------------------------------------------
 # Tiling utilities
 # ---------------------------------------------------------------------------
-
-
-def clamped_extent(
-    dims: tuple[int, ...],
-    shape: tuple[int, ...],
-    tile_sizes: dict[int, int],
-    indices: dict[int, int],
-) -> int:
-    """Product of per-dim extents, clamped on boundaries."""
-    result = 1
-    for d in dims:
-        ts = tile_sizes[d]
-        if ts >= shape[d]:
-            result *= shape[d]
-        else:
-            idx = indices.get(d, 0)
-            result *= min(ts, shape[d] - idx * ts)
-    return result
-
-
-def build_slices(
-    shape: tuple[int, ...],
-    tile_sizes: dict[int, int],
-    indices: dict[int, int],
-) -> list[DimSlice]:
-    """Build DimSlice list for DMA, one per dimension."""
-    slices = []
-    for d in range(len(shape)):
-        ts = tile_sizes.get(d, shape[d])
-        if ts >= shape[d]:
-            slices.append(DimSlice(0, shape[d]))
-        else:
-            idx = indices.get(d, 0)
-            off = idx * ts
-            size = min(ts, shape[d] - off)
-            slices.append(DimSlice(off, size))
-    return slices
 
 
 # ---------------------------------------------------------------------------

@@ -35,9 +35,9 @@ from nkigen_lite.nki_ir.ir import (
 from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
     ceildiv,
     collapse_view,
-    iter_pf_tiles,
     unravel,
 )
+from nkigen_lite.tensor_ir.passes.basic.direct_lower_schedule import TileSchedule
 
 
 def lower_broadcast(
@@ -196,7 +196,7 @@ def _emit_collapsed_broadcast(nb: Builder, x_hbm, y_hbm, L, B, T, dtype) -> None
         src = collapse_view(nb, x_hbm, L, 1)
         dst = collapse_view(nb, y_hbm, L, B)
         src_tiles: dict[int, object] = {}  # per-partition-row scalar, keyed by p_off
-        for p_off, p_size, f_off, f_size in iter_pf_tiles(L, B, dtype):
+        for p_off, p_size, f_off, f_size in TileSchedule.pf(L, B, dtype).pf_tiles():
             if p_off not in src_tiles:
                 src_tiles[p_off] = nb.dma_copy(
                     nb.alloc((p_size, 1), dtype, MemorySpace.SBUF),
@@ -214,7 +214,7 @@ def _emit_collapsed_broadcast(nb: Builder, x_hbm, y_hbm, L, B, T, dtype) -> None
         # P-broadcast on (B, T): every output row equals the single source row.
         src = collapse_view(nb, x_hbm, 1, T)
         dst = collapse_view(nb, y_hbm, B, T)
-        for p_off, p_size, f_off, f_size in iter_pf_tiles(B, T, dtype):
+        for p_off, p_size, f_off, f_size in TileSchedule.pf(B, T, dtype).pf_tiles():
             # Stride-0 partition load fans the one source row across p_size rows.
             rep = nb.dma_copy(
                 nb.alloc((p_size, f_size), dtype, MemorySpace.SBUF),
@@ -227,7 +227,7 @@ def _emit_collapsed_broadcast(nb: Builder, x_hbm, y_hbm, L, B, T, dtype) -> None
     # all B output slices. Load once per block, store B times.
     src = nb.view(x_hbm, (L, 1, T))
     dst = nb.view(y_hbm, (L, B, T))
-    for p_off, p_size, f_off, f_size in iter_pf_tiles(L, T, dtype):
+    for p_off, p_size, f_off, f_size in TileSchedule.pf(L, T, dtype).pf_tiles():
         tile = nb.dma_copy(
             nb.alloc((p_size, f_size), dtype, MemorySpace.SBUF),
             src, (DimSlice(p_off, p_size), DimSlice(0, 1), DimSlice(f_off, f_size)),

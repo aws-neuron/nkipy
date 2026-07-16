@@ -36,10 +36,10 @@ from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
     ELEMENTWISE_OPCODES,
     ceildiv,
     collapse_view,
-    iter_pf_tiles,
     max_free_elems,
     unravel,
 )
+from nkigen_lite.tensor_ir.passes.basic.direct_lower_schedule import TileSchedule
 from nkigen_lite.tensor_ir.passes.basic.direct_lower_elementwise import (
     _emit_elementwise_op,
 )
@@ -135,9 +135,9 @@ def _emit_hbm_copy(nb: Builder, src: Value, dst: Value, shape: tuple[int, ...]):
         lead = prod(shape[:-1])
         src_2d = collapse_view(nb, src, lead, shape[-1])
         dst_2d = collapse_view(nb, dst, lead, shape[-1])
-        for p_off, p_size, f_off, f_size in iter_pf_tiles(
+        for p_off, p_size, f_off, f_size in TileSchedule.pf(
             lead, shape[-1], src.type.dtype
-        ):
+        ).pf_tiles():
             tile = nb.dma_copy(
                 nb.alloc((p_size, f_size), src.type.dtype, MemorySpace.SBUF),
                 src_2d, (DimSlice(p_off, p_size), DimSlice(f_off, f_size)),
