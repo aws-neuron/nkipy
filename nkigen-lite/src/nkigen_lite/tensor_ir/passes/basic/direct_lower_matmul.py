@@ -26,7 +26,7 @@ from nkigen_lite.nki_ir.ir import (
 )
 
 from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import ceildiv, unravel
-from nkigen_lite.tensor_ir.passes.basic.direct_lower_alloc import Scratch
+from nkigen_lite.tensor_ir.passes.basic.direct_lower_alloc import Allocator
 
 
 def emit_matmul(
@@ -37,7 +37,7 @@ def emit_matmul(
     a_shape: tuple[int, ...],
     b_shape: tuple[int, ...],
     dtype: DType = DType.F32,
-    scratch: "Scratch | None" = None,
+    alloc: "Allocator | None" = None,
     tile_m: int | None = None,
     tile_n: int | None = None,
     tile_k: int | None = None,
@@ -57,8 +57,8 @@ def emit_matmul(
     ``tile_m``/``tile_n``/``tile_k`` default to the hardware maxima; smaller
     explicit values are honored (capped at the maxima).
     """
-    if scratch is None:
-        scratch = Scratch(nb)
+    if alloc is None:
+        alloc = Allocator(nb)
 
     M, K = a_shape[-2], a_shape[-1]
     N = b_shape[-1]
@@ -121,13 +121,13 @@ def emit_matmul(
                 k_size = min(tile_k, K - k_off)
                 if a_k1_view is not None:
                     # (K,1) view: load k-tile directly with K on the partition.
-                    a_stats.append(scratch.load(
+                    a_stats.append(alloc.load(
                         a_k1_view, (DimSlice(k_off, k_size), DimSlice(0, 1)),
                         (k_size, 1), dtype,
                     ))
                     continue
                 a_slices = _batch_slices(a_batch, batch_idx) + [DimSlice(m_off, m_size), DimSlice(k_off, k_size)]
-                a_tile = scratch.load(
+                a_tile = alloc.load(
                     a_hbm, tuple(a_slices), (m_size, k_size), dtype,
                 )
                 a_stats.append(nb.transpose(a_tile, (1, 0)))
@@ -144,14 +144,14 @@ def emit_matmul(
                     k_size = min(tile_k, K - k_off)
 
                     b_slices = _batch_slices(b_batch, batch_idx) + [DimSlice(k_off, k_size), DimSlice(n_off, n_size)]
-                    b_mov = scratch.load(
+                    b_mov = alloc.load(
                         b_hbm, tuple(b_slices), (k_size, n_size), dtype,
                     )
 
                     nb.matmul(psum, a_stats[k_i], b_mov, accumulate=(k_i > 0))
 
                 c_sbuf = nb.tensor_copy(
-                    scratch.sbuf((m_size, n_size), out_dtype), psum
+                    alloc.sbuf((m_size, n_size), out_dtype), psum
                 )
                 c_slices = [DimSlice(bi, 1) for bi in batch_idx] + [DimSlice(m_off, m_size), DimSlice(n_off, n_size)]
                 nb.dma_copy(c_hbm, c_sbuf, tuple(c_slices))

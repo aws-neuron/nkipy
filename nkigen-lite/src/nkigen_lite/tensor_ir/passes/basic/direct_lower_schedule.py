@@ -8,7 +8,7 @@ hand-rolling ``ceildiv``/``range``/``min``.
 
 Design boundary: a ``TileSchedule`` knows about *shapes, tile sizes, and
 indices* only. It never touches the Builder, an op, or a dtype-as-buffer — that
-keeps it cleanly separable from allocation (``Scratch``) and codegen (the
+keeps it cleanly separable from allocation (``Allocator``) and codegen (the
 emitter body). Tile shape is a scheduling output, so alloc stays fused to the
 schedule via the ``TileIndex`` handed to the body; only the artificial
 alloc<->codegen coupling is removed.

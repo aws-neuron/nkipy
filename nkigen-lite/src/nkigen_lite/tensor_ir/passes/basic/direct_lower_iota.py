@@ -21,10 +21,10 @@ from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
     max_free_elems,
     unravel,
 )
-from nkigen_lite.tensor_ir.passes.basic.direct_lower_alloc import Scratch
+from nkigen_lite.tensor_ir.passes.basic.direct_lower_alloc import Allocator
 
 
-def emit_iota(nb: Builder, op, hbm_map: dict[str, Value], scratch: Scratch) -> None:
+def emit_iota(nb: Builder, op, hbm_map: dict[str, Value], alloc: Allocator) -> None:
     """Lower iota: an index ramp along ``dim``, broadcast over other axes.
 
     Tiled with a canonical row-major layout (last dim = free, penultimate =
@@ -72,7 +72,7 @@ def emit_iota(nb: Builder, op, hbm_map: dict[str, Value], scratch: Scratch) -> N
                     # batch axis: every element in this tile shares the index
                     pattern, ch_mul, offset = [[0, f_size]], 0, int(batch_idx[dim])
 
-                tile = scratch.sbuf((p_size, f_size), dtype)
+                tile = alloc.sbuf((p_size, f_size), dtype)
                 tile = nb.iota(tile, pattern=pattern, offset=offset, channel_multiplier=ch_mul)
 
                 dst_slices = [DimSlice(bi, 1) for bi in batch_idx]

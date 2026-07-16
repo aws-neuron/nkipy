@@ -28,7 +28,7 @@ from nkigen_lite.nki_ir.ir import (
 from nkigen_lite.nki_ir import ir as nki_ir
 
 from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import ceildiv
-from nkigen_lite.tensor_ir.passes.basic.direct_lower_alloc import Scratch
+from nkigen_lite.tensor_ir.passes.basic.direct_lower_alloc import Allocator
 
 
 # max8 / match_replace8 read at most this many free elements per call (a real
@@ -41,7 +41,7 @@ def _aligned(k: int) -> int:
     return ((k + 7) // 8) * 8
 
 
-def _topk_scan(nb: Builder, data: Value, P: int, k: int, vdtype, idtype, scratch):
+def _topk_scan(nb: Builder, data: Value, P: int, k: int, vdtype, idtype, alloc):
     """Run the max8 + match_replace8 scan over a resident (P, W>=8) SBUF tile.
 
     Returns ``(vals_sbuf (P, kp), idx_sbuf (P, kp))`` where ``kp = ceil(k/8)*8``
@@ -53,42 +53,42 @@ def _topk_scan(nb: Builder, data: Value, P: int, k: int, vdtype, idtype, scratch
     n_fold = (k + 7) // 8
     kp = n_fold * 8
     if n_fold == 1:
-        val8 = nb.max8(scratch.sbuf((P, 8), vdtype), data)
-        idx8 = scratch.sbuf((P, 8), idtype)
+        val8 = nb.max8(alloc.sbuf((P, 8), vdtype), data)
+        idx8 = alloc.sbuf((P, 8), idtype)
         _, idx8 = nb.match_replace8(data, idx8, data, val8, float("-inf"))
         return val8, idx8
-    val_scratch = scratch.hbm((P, kp), vdtype)
-    idx_scratch = scratch.hbm((P, kp), idtype)
+    val_scratch = alloc.hbm((P, kp), vdtype)
+    idx_scratch = alloc.hbm((P, kp), idtype)
     for fold in range(n_fold):
-        val8 = nb.max8(scratch.sbuf((P, 8), vdtype), data)
-        idx8 = scratch.sbuf((P, 8), idtype)
+        val8 = nb.max8(alloc.sbuf((P, 8), vdtype), data)
+        idx8 = alloc.sbuf((P, 8), idtype)
         data, idx8 = nb.match_replace8(data, idx8, data, val8, float("-inf"))
         col = DimSlice(fold * 8, 8)
         nb.dma_copy(val_scratch, val8, (DimSlice(0, P), col))
         nb.dma_copy(idx_scratch, idx8, (DimSlice(0, P), col))
-    vals = nb.dma_copy(scratch.sbuf((P, kp), vdtype),
+    vals = nb.dma_copy(alloc.sbuf((P, kp), vdtype),
                        val_scratch, (DimSlice(0, P), DimSlice(0, kp)))
-    idxs = nb.dma_copy(scratch.sbuf((P, kp), idtype),
+    idxs = nb.dma_copy(alloc.sbuf((P, kp), idtype),
                        idx_scratch, (DimSlice(0, P), DimSlice(0, kp)))
     return vals, idxs
 
 
 def _load_topk_data(nb: Builder, src_hbm, p_off: int, p_size: int,
-                    off: int, f: int, vdtype, scratch):
+                    off: int, f: int, vdtype, alloc):
     """Load src_hbm[p_off:p_off+p_size, off:off+f] into a (p_size, max(f,8))
     SBUF tile, padding the tail with -inf so max8's >=8 free-dim requirement
     always holds."""
     width = max(f, 8)
     if width == f:
-        return nb.dma_copy(scratch.sbuf((p_size, width), vdtype),
+        return nb.dma_copy(alloc.sbuf((p_size, width), vdtype),
                            src_hbm, (DimSlice(p_off, p_size), DimSlice(off, f)))
-    padded = nb.memset(scratch.sbuf((p_size, width), vdtype), float("-inf"))
-    loaded = nb.dma_copy(scratch.sbuf((p_size, f), vdtype),
+    padded = nb.memset(alloc.sbuf((p_size, width), vdtype), float("-inf"))
+    loaded = nb.dma_copy(alloc.sbuf((p_size, f), vdtype),
                          src_hbm, (DimSlice(p_off, p_size), DimSlice(off, f)))
-    return _overlay_columns(nb, padded, loaded, f, scratch)
+    return _overlay_columns(nb, padded, loaded, f, alloc)
 
 
-def emit_topk(nb: Builder, op, hbm_map: dict[str, Value], scratch: Scratch) -> None:
+def emit_topk(nb: Builder, op, hbm_map: dict[str, Value], alloc: Allocator) -> None:
     """Lower topk via the canonical hardware scan (max8 + match_replace8).
 
     Rows are independent, so the partition is tiled at PARTITION_MAX and each
@@ -118,19 +118,19 @@ def emit_topk(nb: Builder, op, hbm_map: dict[str, Value], scratch: Scratch) -> N
         p_off = p_i * PARTITION_MAX
         p_size = min(PARTITION_MAX, P - p_off)
         _emit_topk_rows(nb, src_hbm, val_hbm, idx_hbm, p_off, p_size, F, k,
-                        vdtype, idtype, scratch)
+                        vdtype, idtype, alloc)
 
 
 def _emit_topk_rows(nb: Builder, src_hbm, val_hbm, idx_hbm, p_off: int,
-                    p_size: int, F: int, k: int, vdtype, idtype, scratch) -> None:
+                    p_size: int, F: int, k: int, vdtype, idtype, alloc) -> None:
     """Emit the topk scan for one partition chunk of <=128 rows."""
     out_rows = DimSlice(p_off, p_size)
 
     if F <= TOPK_FREE_MAX:
-        data = _load_topk_data(nb, src_hbm, p_off, p_size, 0, F, vdtype, scratch)
-        vals, idxs = _topk_scan(nb, data, p_size, k, vdtype, idtype, scratch)
-        nb.dma_copy(val_hbm, _keep_k(nb, vals, k, scratch), (out_rows, DimSlice(0, k)))
-        nb.dma_copy(idx_hbm, _keep_k(nb, idxs, k, scratch), (out_rows, DimSlice(0, k)))
+        data = _load_topk_data(nb, src_hbm, p_off, p_size, 0, F, vdtype, alloc)
+        vals, idxs = _topk_scan(nb, data, p_size, k, vdtype, idtype, alloc)
+        nb.dma_copy(val_hbm, _keep_k(nb, vals, k, alloc), (out_rows, DimSlice(0, k)))
+        nb.dma_copy(idx_hbm, _keep_k(nb, idxs, k, alloc), (out_rows, DimSlice(0, k)))
         return
 
     n_chunks = ceildiv(F, TOPK_FREE_MAX)
@@ -143,81 +143,81 @@ def _emit_topk_rows(nb: Builder, src_hbm, val_hbm, idx_hbm, p_off: int,
 
     # Per-chunk local top-k, with indices rebased to global, gathered into
     # candidate buffers (p_size, cand).
-    cand_vals_hbm = scratch.hbm((p_size, cand), vdtype)
-    cand_idx_hbm = scratch.hbm((p_size, cand), idtype)
+    cand_vals_hbm = alloc.hbm((p_size, cand), vdtype)
+    cand_idx_hbm = alloc.hbm((p_size, cand), idtype)
     for c in range(n_chunks):
         off = c * TOPK_FREE_MAX
         fc = min(TOPK_FREE_MAX, F - off)
-        data = _load_topk_data(nb, src_hbm, p_off, p_size, off, fc, vdtype, scratch)
-        vals, idxs = _topk_scan(nb, data, p_size, k, vdtype, idtype, scratch)
+        data = _load_topk_data(nb, src_hbm, p_off, p_size, off, fc, vdtype, alloc)
+        vals, idxs = _topk_scan(nb, data, p_size, k, vdtype, idtype, alloc)
         if off != 0:
             # Rebase local indices to global: idx += off.
             off_tile = nb.constant(float(off), (p_size, 1), idtype, MemorySpace.SBUF)
             idxs = nb.tensor_scalar_arith(
-                scratch.sbuf(idxs.type.shape, idtype),
+                alloc.sbuf(idxs.type.shape, idtype),
                 idxs, off_tile, nki_ir.NisaArithOp.ADD,
             )
         col = DimSlice(c * k, k)
-        nb.dma_copy(cand_vals_hbm, _keep_k(nb, vals, k, scratch), (DimSlice(0, p_size), col))
-        nb.dma_copy(cand_idx_hbm, _keep_k(nb, idxs, k, scratch), (DimSlice(0, p_size), col))
+        nb.dma_copy(cand_vals_hbm, _keep_k(nb, vals, k, alloc), (DimSlice(0, p_size), col))
+        nb.dma_copy(cand_idx_hbm, _keep_k(nb, idxs, k, alloc), (DimSlice(0, p_size), col))
 
     # Merge: scan the candidate values for the global top-k, then gather the
     # corresponding global indices by the merged positions.
-    cand_data = _load_topk_data(nb, cand_vals_hbm, 0, p_size, 0, cand, vdtype, scratch)
+    cand_data = _load_topk_data(nb, cand_vals_hbm, 0, p_size, 0, cand, vdtype, alloc)
     width = max(cand, 8)
     cand_idx_sbuf = nb.memset(
-        scratch.sbuf((p_size, width), idtype), 0.0)
+        alloc.sbuf((p_size, width), idtype), 0.0)
     cand_idx_sbuf = _overlay_columns(
         nb,
         cand_idx_sbuf,
-        nb.dma_copy(scratch.sbuf((p_size, cand), idtype),
+        nb.dma_copy(alloc.sbuf((p_size, cand), idtype),
                     cand_idx_hbm, (DimSlice(0, p_size), DimSlice(0, cand))),
         cand,
-        scratch,
+        alloc,
     )
-    mvals, mpos = _topk_scan(nb, cand_data, p_size, k, vdtype, idtype, scratch)
+    mvals, mpos = _topk_scan(nb, cand_data, p_size, k, vdtype, idtype, alloc)
     # gather: global_idx[p, i] = cand_idx_sbuf[p, mpos[p, i]]
     gidx = nb.gather(
-        scratch.sbuf(mpos.type.shape, idtype),
+        alloc.sbuf(mpos.type.shape, idtype),
         cand_idx_sbuf, mpos,
     )
-    nb.dma_copy(val_hbm, _keep_k(nb, mvals, k, scratch), (out_rows, DimSlice(0, k)))
-    nb.dma_copy(idx_hbm, _keep_k(nb, gidx, k, scratch), (out_rows, DimSlice(0, k)))
+    nb.dma_copy(val_hbm, _keep_k(nb, mvals, k, alloc), (out_rows, DimSlice(0, k)))
+    nb.dma_copy(idx_hbm, _keep_k(nb, gidx, k, alloc), (out_rows, DimSlice(0, k)))
 
 
-def _keep_k(nb: Builder, tile: Value, k: int, scratch) -> Value:
+def _keep_k(nb: Builder, tile: Value, k: int, alloc) -> Value:
     """Trim a fold-aligned scan-result tile to its first ``k`` columns.
 
     ``_topk_scan`` returns ``_aligned(k)``-wide tiles; when ``k`` is already
     aligned the tile is returned as-is, else its first ``k`` columns are
     extracted (``_first_cols``)."""
-    return tile if k == _aligned(k) else _first_cols(nb, tile, k, scratch)
+    return tile if k == _aligned(k) else _first_cols(nb, tile, k, alloc)
 
 
-def _first_cols(nb: Builder, tile: Value, keep: int, scratch) -> Value:
+def _first_cols(nb: Builder, tile: Value, keep: int, alloc) -> Value:
     """Return a (P, keep) SBUF tile holding the first ``keep`` columns of
     ``tile``, via an HBM scratch round-trip (nki_ir has no SBUF sub-view).
 
     The scratch is sized to the tile's full width: callers pass fold-aligned
     ``kp = ceil(k/8)*8``-wide tiles, so ``keep`` can exceed 8 (e.g. k=12 on a
-    16-wide tile) — a hard-coded 8-wide scratch would leave columns 8..keep-1
+    16-wide tile) — a hard-coded 8-wide alloc would leave columns 8..keep-1
     reading past the buffer.
     """
     P, W = tile.type.shape
-    staging = scratch.hbm((P, W), tile.type.dtype)
+    staging = alloc.hbm((P, W), tile.type.dtype)
     nb.dma_copy(staging, tile, (DimSlice(0, P), DimSlice(0, W)))
-    return scratch.load(
+    return alloc.load(
         staging, (DimSlice(0, P), DimSlice(0, keep)), (P, keep), tile.type.dtype,
     )
 
 
-def _overlay_columns(nb: Builder, base: Value, cols: Value, n: int, scratch) -> Value:
+def _overlay_columns(nb: Builder, base: Value, cols: Value, n: int, alloc) -> Value:
     """Write the first ``n`` columns of ``cols`` over ``base`` (P, W>=n) via an
     HBM scratch round-trip, returning the merged SBUF tile."""
     P, W = base.type.shape
-    staging = scratch.hbm((P, W), base.type.dtype)
+    staging = alloc.hbm((P, W), base.type.dtype)
     nb.dma_copy(staging, base, (DimSlice(0, P), DimSlice(0, W)))
     nb.dma_copy(staging, cols, (DimSlice(0, P), DimSlice(0, n)))
-    return scratch.load(
+    return alloc.load(
         staging, (DimSlice(0, P), DimSlice(0, W)), (P, W), base.type.dtype,
     )

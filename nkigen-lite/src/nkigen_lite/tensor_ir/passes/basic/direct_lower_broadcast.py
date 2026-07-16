@@ -38,7 +38,7 @@ from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
     unravel,
 )
 from nkigen_lite.tensor_ir.passes.basic.direct_lower_schedule import TileSchedule
-from nkigen_lite.tensor_ir.passes.basic.direct_lower_alloc import Scratch
+from nkigen_lite.tensor_ir.passes.basic.direct_lower_alloc import Allocator
 
 
 def lower_broadcast(
@@ -87,14 +87,14 @@ def lower_broadcast(
     return b.graph
 
 
-def _emit_broadcast_scalar(nb: Builder, x_hbm, y_hbm, out_shape, dtype, scratch) -> None:
+def _emit_broadcast_scalar(nb: Builder, x_hbm, y_hbm, out_shape, dtype, alloc) -> None:
     """Broadcast a scalar (rank-0) HBM tensor to an arbitrary output shape."""
     from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import broadcast_partition
 
     rank = len(out_shape)
     # Load scalar as (1, 1) tile
     src_slices = [DimSlice(0, 1)] * len(x_hbm.type.shape)
-    scalar_tile = scratch.load(x_hbm, src_slices, (1, 1), dtype)
+    scalar_tile = alloc.load(x_hbm, src_slices, (1, 1), dtype)
 
     tile_p = min(out_shape[-2], PARTITION_MAX) if rank >= 2 else 1
     tile_f = out_shape[-1] if rank >= 1 else 1
@@ -171,7 +171,7 @@ def _collapse_broadcast(in_shape, out_shape):
     return L, B, T
 
 
-def _emit_collapsed_broadcast(nb: Builder, x_hbm, y_hbm, L, B, T, dtype, scratch) -> None:
+def _emit_collapsed_broadcast(nb: Builder, x_hbm, y_hbm, L, B, T, dtype, alloc) -> None:
     """Emit a single-run broadcast lowered through the canonical ``(L, B, T)``.
 
     Both HBM tensors are reshaped to the collapsed form via zero-copy views,
@@ -197,12 +197,12 @@ def _emit_collapsed_broadcast(nb: Builder, x_hbm, y_hbm, L, B, T, dtype, scratch
         src_tiles: dict[int, object] = {}  # per-partition-row scalar, keyed by p_off
         for p_off, p_size, f_off, f_size in TileSchedule.pf(L, B, dtype).pf_tiles():
             if p_off not in src_tiles:
-                src_tiles[p_off] = scratch.load(
+                src_tiles[p_off] = alloc.load(
                     src, (DimSlice(p_off, p_size), DimSlice(0, 1)), (p_size, 1), dtype,
                 )
             ones = nb.constant(1.0, (p_size, f_size), dtype, MemorySpace.SBUF)
             rep = nb.tensor_scalar_arith(
-                scratch.sbuf((p_size, f_size), dtype),
+                alloc.sbuf((p_size, f_size), dtype),
                 ones, src_tiles[p_off], NisaArithOp.MULTIPLY,
             )
             nb.dma_copy(dst, rep, (DimSlice(p_off, p_size), DimSlice(f_off, f_size)))
@@ -214,7 +214,7 @@ def _emit_collapsed_broadcast(nb: Builder, x_hbm, y_hbm, L, B, T, dtype, scratch
         dst = collapse_view(nb, y_hbm, B, T)
         for p_off, p_size, f_off, f_size in TileSchedule.pf(B, T, dtype).pf_tiles():
             # Stride-0 partition load fans the one source row across p_size rows.
-            rep = scratch.load(
+            rep = alloc.load(
                 src, (DimSlice(0, p_size, stride=0), DimSlice(f_off, f_size)),
                 (p_size, f_size), dtype,
             )
@@ -226,7 +226,7 @@ def _emit_collapsed_broadcast(nb: Builder, x_hbm, y_hbm, L, B, T, dtype, scratch
     src = nb.view(x_hbm, (L, 1, T))
     dst = nb.view(y_hbm, (L, B, T))
     for p_off, p_size, f_off, f_size in TileSchedule.pf(L, T, dtype).pf_tiles():
-        tile = scratch.load(
+        tile = alloc.load(
             src, (DimSlice(p_off, p_size), DimSlice(0, 1), DimSlice(f_off, f_size)),
             (p_size, f_size), dtype,
         )
@@ -237,15 +237,15 @@ def _emit_collapsed_broadcast(nb: Builder, x_hbm, y_hbm, L, B, T, dtype, scratch
             )
 
 
-def emit_broadcast_to(nb: Builder, x_hbm, y_hbm, in_shape, out_shape, dtype, scratch=None) -> None:
+def emit_broadcast_to(nb: Builder, x_hbm, y_hbm, in_shape, out_shape, dtype, alloc=None) -> None:
     """Emit broadcast_to tiling into an existing Builder."""
     from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import broadcast_partition
-    if scratch is None:
-        scratch = Scratch(nb)
+    if alloc is None:
+        alloc = Allocator(nb)
 
     # Scalar input: load the single element and broadcast to all output tiles
     if len(in_shape) == 0:
-        _emit_broadcast_scalar(nb, x_hbm, y_hbm, out_shape, dtype, scratch)
+        _emit_broadcast_scalar(nb, x_hbm, y_hbm, out_shape, dtype, alloc)
         return
 
     # Fast path: collapse a single contiguous broadcast run into (L, B, T) and
@@ -253,7 +253,7 @@ def emit_broadcast_to(nb: Builder, x_hbm, y_hbm, in_shape, out_shape, dtype, scr
     # per-tile loop below for multi-run broadcasts (rare).
     collapsed = _collapse_broadcast(in_shape, out_shape)
     if collapsed is not None:
-        _emit_collapsed_broadcast(nb, x_hbm, y_hbm, *collapsed, dtype, scratch)
+        _emit_collapsed_broadcast(nb, x_hbm, y_hbm, *collapsed, dtype, alloc)
         return
 
     rank = len(out_shape)
@@ -284,7 +284,7 @@ def emit_broadcast_to(nb: Builder, x_hbm, y_hbm, in_shape, out_shape, dtype, scr
 
             src_p = p_size if (len(in_shape) >= 2 and in_shape[-2] > 1) else 1
             src_f = tile_f if in_shape[-1] > 1 else 1
-            tile = scratch.load(x_hbm, src_slices, (src_p, src_f), dtype)
+            tile = alloc.load(x_hbm, src_slices, (src_p, src_f), dtype)
 
             if src_p == 1 and p_size > 1:
                 tile = broadcast_partition(nb, tile, (p_size, src_f))

@@ -49,7 +49,7 @@ from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
     emit_unary_op,
     _materialize_broadcast,
 )
-from nkigen_lite.tensor_ir.passes.basic.direct_lower_alloc import Scratch
+from nkigen_lite.tensor_ir.passes.basic.direct_lower_alloc import Allocator
 from nkigen_lite.tensor_ir.passes.basic.direct_lower_schedule import TileSchedule
 
 
@@ -93,7 +93,7 @@ class LoadPlan(NamedTuple):
     opF: int
 
 
-def _emit_elementwise_op(nb: Builder, op, hbm_map: dict[str, Value], scratch: Scratch) -> None:
+def _emit_elementwise_op(nb: Builder, op, hbm_map: dict[str, Value], alloc: Allocator) -> None:
     """Emit one elementwise op as a linearized, tiled load→compute→store loop."""
     rep_P, rep_F = _pf(op.results[0].type.shape)
 
@@ -118,7 +118,7 @@ def _emit_elementwise_op(nb: Builder, op, hbm_map: dict[str, Value], scratch: Sc
     ).pf_tiles():
         _emit_ew_tile(
             nb, op, load_plan, store_2d,
-            p_off, p_size, f_off, f_size, scratch,
+            p_off, p_size, f_off, f_size, alloc,
         )
 
 
@@ -134,7 +134,7 @@ def _collapse_operand(val: Value, rep_P: int, rep_F: int) -> tuple[int, int]:
 
 
 def _load_tile(
-    scratch: Scratch, hbm_2d: Value, opP: int, opF: int,
+    alloc: Allocator, hbm_2d: Value, opP: int, opF: int,
     p_off: int, p_size: int, f_off: int, f_size: int,
     dtype: DType,
 ) -> Value:
@@ -144,7 +144,7 @@ def _load_tile(
     fs = 1 if opF == 1 else f_size
     p = 0 if opP == 1 else p_off
     f = 0 if opF == 1 else f_off
-    return scratch.load(hbm_2d, (DimSlice(p, ps), DimSlice(f, fs)), (ps, fs), dtype)
+    return alloc.load(hbm_2d, (DimSlice(p, ps), DimSlice(f, fs)), (ps, fs), dtype)
 
 
 def _emit_ew_tile(
@@ -152,7 +152,7 @@ def _emit_ew_tile(
     load_plan: dict[str, LoadPlan],
     store_2d: Value,
     p_off: int, p_size: int, f_off: int, f_size: int,
-    scratch: Scratch,
+    alloc: Allocator,
 ) -> None:
     """Emit one ``(p_size, f_size)`` tile: load inputs, compute, store."""
     out_dtype = op.results[0].type.dtype
@@ -164,7 +164,7 @@ def _emit_ew_tile(
             continue
         plan = load_plan[inp.name]
         tile_map[inp.name] = _load_tile(
-            scratch, plan.src_2d, plan.opP, plan.opF, p_off, p_size, f_off, f_size,
+            alloc, plan.src_2d, plan.opP, plan.opF, p_off, p_size, f_off, f_size,
             inp.type.dtype,
         )
 

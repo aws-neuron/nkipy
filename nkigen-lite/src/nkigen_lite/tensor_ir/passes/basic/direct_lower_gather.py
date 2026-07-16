@@ -32,10 +32,10 @@ from nkigen_lite.tensor_ir.passes.basic.direct_lower_utils import (
     max_free_elems,
 )
 from nkigen_lite.tensor_ir.passes.basic.direct_lower_schedule import TileSchedule
-from nkigen_lite.tensor_ir.passes.basic.direct_lower_alloc import Scratch
+from nkigen_lite.tensor_ir.passes.basic.direct_lower_alloc import Allocator
 
 
-def emit_gather_along_axis(nb: Builder, op, hbm_map: dict[str, Value], scratch: Scratch) -> None:
+def emit_gather_along_axis(nb: Builder, op, hbm_map: dict[str, Value], alloc: Allocator) -> None:
     """Lower gather_along_axis via the hardware per-partition gather.
 
     ``out[p, i] = data[p, idx[p, i]]``.  Each partition chunk (up to
@@ -58,16 +58,16 @@ def emit_gather_along_axis(nb: Builder, op, hbm_map: dict[str, Value], scratch: 
         p_off = p_i * PARTITION_MAX
         p_size = min(PARTITION_MAX, P - p_off)
 
-        data_tile = scratch.load(data_hbm, (DimSlice(p_off, p_size), DimSlice(0, F_data)), (p_size, F_data), vdtype)
-        idx_tile = scratch.load(idx_hbm, (DimSlice(p_off, p_size), DimSlice(0, F_idx)), (p_size, F_idx), idtype)
+        data_tile = alloc.load(data_hbm, (DimSlice(p_off, p_size), DimSlice(0, F_data)), (p_size, F_data), vdtype)
+        idx_tile = alloc.load(idx_hbm, (DimSlice(p_off, p_size), DimSlice(0, F_idx)), (p_size, F_idx), idtype)
         out_tile = nb.gather(
-            scratch.sbuf((p_size, F_idx), vdtype),
+            alloc.sbuf((p_size, F_idx), vdtype),
             data_tile, idx_tile,
         )
         nb.dma_copy(out_hbm, out_tile, (DimSlice(p_off, p_size), DimSlice(0, F_idx)))
 
 
-def emit_scatter_rows(nb: Builder, op, hbm_map: dict[str, Value], scratch: Scratch) -> None:
+def emit_scatter_rows(nb: Builder, op, hbm_map: dict[str, Value], alloc: Allocator) -> None:
     """Lower scatter_rows: ``out = base.copy(); out[idx[r], :] = updates[r, :]``.
 
     First copy ``base`` HBM -> result HBM (tiled by N rows, the unchanged
@@ -91,7 +91,7 @@ def emit_scatter_rows(nb: Builder, op, hbm_map: dict[str, Value], scratch: Scrat
 
     # Backdrop: copy base -> result, tiled over N rows and W columns.
     for p_off, p_size, w_off, w_size in TileSchedule.pf(N, W, vdtype).pf_tiles():
-        tile = scratch.load(base_hbm, (DimSlice(p_off, p_size), DimSlice(w_off, w_size)), (p_size, w_size), vdtype)
+        tile = alloc.load(base_hbm, (DimSlice(p_off, p_size), DimSlice(w_off, w_size)), (p_size, w_size), vdtype)
         nb.dma_copy(
             out_hbm, tile, (DimSlice(p_off, p_size), DimSlice(w_off, w_size))
         )
@@ -102,11 +102,11 @@ def emit_scatter_rows(nb: Builder, op, hbm_map: dict[str, Value], scratch: Scrat
     for m_i in range(ceildiv(M, PARTITION_MAX)):
         m_off = m_i * PARTITION_MAX
         m_size = min(PARTITION_MAX, M - m_off)
-        idx_tile = scratch.load(idx_hbm, (DimSlice(m_off, m_size), DimSlice(0, 1)), (m_size, 1), idtype)
+        idx_tile = alloc.load(idx_hbm, (DimSlice(m_off, m_size), DimSlice(0, 1)), (m_size, 1), idtype)
         for w_i in range(ceildiv(W, w_tile)):
             w_off = w_i * w_tile
             w_size = min(w_tile, W - w_off)
-            upd_tile = scratch.load(upd_hbm, (DimSlice(m_off, m_size), DimSlice(w_off, w_size)), (m_size, w_size), vdtype)
+            upd_tile = alloc.load(upd_hbm, (DimSlice(m_off, m_size), DimSlice(w_off, w_size)), (m_size, w_size), vdtype)
             nb.dma_copy_indirect(
                 out_hbm, upd_tile, idx_tile, row_width=W, free_offset=w_off,
             )
@@ -114,7 +114,7 @@ def emit_scatter_rows(nb: Builder, op, hbm_map: dict[str, Value], scratch: Scrat
 
 def _emit_gather_rows_packed(
     nb: Builder, src_hbm, idx_hbm, out_hbm, N: int, W: int, M: int,
-    vdtype, idtype, scratch: Scratch,
+    vdtype, idtype, alloc: Allocator,
 ) -> None:
     """Gather wide rows with the partition packed.
 
@@ -131,7 +131,7 @@ def _emit_gather_rows_packed(
 
     # Per-lane offset (p) and the scale constant, hoisted across rows.
     lane = nb.iota(
-        scratch.sbuf((PARTITION_MAX, 1), idtype),
+        alloc.sbuf((PARTITION_MAX, 1), idtype),
         pattern=[[0, 1]], offset=0, channel_multiplier=1,
     )
     scale = nb.constant(
@@ -139,17 +139,17 @@ def _emit_gather_rows_packed(
 
     for r in range(M):
         # idx[r] fanned across all 128 lanes, then sub_idx = idx*128 + lane.
-        idx_rep = scratch.load(idx_hbm, (DimSlice(r, PARTITION_MAX, stride=0), DimSlice(0, 1)), (PARTITION_MAX, 1), idtype)
+        idx_rep = alloc.load(idx_hbm, (DimSlice(r, PARTITION_MAX, stride=0), DimSlice(0, 1)), (PARTITION_MAX, 1), idtype)
         scaled = nb.tensor_scalar_arith(
-            scratch.sbuf((PARTITION_MAX, 1), idtype),
+            alloc.sbuf((PARTITION_MAX, 1), idtype),
             idx_rep, scale, nki_ir.NisaArithOp.MULTIPLY,
         )
         sub_idx = nb.tensor_tensor_arith(
-            scratch.sbuf((PARTITION_MAX, 1), idtype),
+            alloc.sbuf((PARTITION_MAX, 1), idtype),
             scaled, lane, nki_ir.NisaArithOp.ADD,
         )
         row_tile = nb.dma_copy_indirect(
-            scratch.sbuf((PARTITION_MAX, sub_w), vdtype),
+            alloc.sbuf((PARTITION_MAX, sub_w), vdtype),
             src_sub, sub_idx,
         )
         nb.dma_copy(
@@ -158,7 +158,7 @@ def _emit_gather_rows_packed(
         )
 
 
-def emit_gather_rows(nb: Builder, op, hbm_map: dict[str, Value], scratch: Scratch) -> None:
+def emit_gather_rows(nb: Builder, op, hbm_map: dict[str, Value], alloc: Allocator) -> None:
     """Lower gather_rows: ``out[r, :] = src[idx[r], :]`` via the indirect DMA
     load (``dma_copy_indirect``), gathering whole rows from the (N, W) src HBM
     tensor into the (M, W) result.  Tiled over M gathered rows.  The index tile
@@ -193,7 +193,7 @@ def emit_gather_rows(nb: Builder, op, hbm_map: dict[str, Value], scratch: Scratc
         and packed_cost < generic_cost
     ):
         _emit_gather_rows_packed(
-            nb, src_hbm, idx_hbm, out_hbm, N, W, M, vdtype, idtype, scratch)
+            nb, src_hbm, idx_hbm, out_hbm, N, W, M, vdtype, idtype, alloc)
         return
 
     # Tile the row width: a single (m_size, W) tile would overflow SBUF for
@@ -203,13 +203,13 @@ def emit_gather_rows(nb: Builder, op, hbm_map: dict[str, Value], scratch: Scratc
     for m_i in range(ceildiv(M, PARTITION_MAX)):
         m_off = m_i * PARTITION_MAX
         m_size = min(PARTITION_MAX, M - m_off)
-        idx_tile = scratch.load(idx_hbm, (DimSlice(m_off, m_size), DimSlice(0, 1)), (m_size, 1), idtype)
+        idx_tile = alloc.load(idx_hbm, (DimSlice(m_off, m_size), DimSlice(0, 1)), (m_size, 1), idtype)
         for w_i in range(ceildiv(W, w_tile)):
             w_off = w_i * w_tile
             w_size = min(w_tile, W - w_off)
             # Indirect load: gather a column window of m_size rows of src.
             out_tile = nb.dma_copy_indirect(
-                scratch.sbuf((m_size, w_size), vdtype),
+                alloc.sbuf((m_size, w_size), vdtype),
                 src_hbm, idx_tile, row_width=W, free_offset=w_off,
             )
             nb.dma_copy(

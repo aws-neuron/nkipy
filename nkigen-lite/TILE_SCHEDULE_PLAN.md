@@ -1,4 +1,4 @@
-# Tile Schedule / Scratch / Body-Split Plan
+# Tile Schedule / Allocator / Body-Split Plan
 
 Goal: separate the three concerns currently braided in every direct-lowering
 loop body — **tiling**, **allocation**, and **codegen** — without fighting the
@@ -17,19 +17,19 @@ This plan promotes that to a shared type and re-points the other emitters at it.
 | Layer | Knows about | Never touches |
 |---|---|---|
 | `TileSchedule` | shapes, tile sizes, indices | `nb`, ops, dtypes-as-buffers |
-| `Scratch` | `nb.alloc`, memory spaces | tiling policy, op semantics |
+| `Allocator` | `nb.alloc`, memory spaces | tiling policy, op semantics |
 | emitter body | `nb.<compute>`, op semantics | `ceildiv`/`range`/`min`, raw `nb.alloc` |
 
 Tiling→alloc and tiling→codegen stay coupled through the `TileIndex` passed into
 the body — the honest, intrinsic coupling. Deallocs remain the existing
-post-pass (`insert_deallocs.py`); `Scratch` governs allocation only.
+post-pass (`insert_deallocs.py`); `Allocator` governs allocation only.
 
 ## Fit assessment (done during design)
 
 - **General reduce `_nested`** — recursive N-D nest; *defines* the abstraction.
 - **elementwise / hbm-copy / broadcast** — regular 2D `(P,F)`; `TileSchedule.pf`.
 - **topk / gather / scatter** — outer row tiling fits a schedule; inner body is
-  data-dependent, stays hand-written. Adopt `Scratch` + body-split, not
+  data-dependent, stays hand-written. Adopt `Allocator` + body-split, not
   schedule-driven iteration.
 - **reshape rectangle-splitting** (`flat_range_to_src_chunks`,
   `prefix_row_segments`) — this is *layout remapping*, NOT tiling. Must stay its
@@ -62,24 +62,24 @@ policy than `pf` (`max_free_elems`). Left as-is: folding it onto TileSchedule
 needs a `.free_pow2` constructor and would change generated IR, so it belongs in
 Step 3 (body-split), not this equivalence-preserving step.
 
-## Step 2 — Introduce `Scratch`  ✅ DONE
+## Step 2 — Introduce `Allocator` (class name: was `Scratch`)  ✅ DONE
 
-- [x] `Scratch` handle wrapping `nb` in `direct_lower_alloc.py`:
+- [x] `Allocator` handle wrapping `nb` in `direct_lower_alloc.py`:
   `.sbuf(shape, dtype)`, `.hbm(shape, dtype)`, and
   `.load(src, slices, shape, dtype)` — the last fuses the ubiquitous
   `nb.dma_copy(nb.alloc(...), src, slices)` idiom (57 sites).
-- [x] Threaded ONE `Scratch` per graph from `lower_graph` through the emitter
+- [x] Threaded ONE `Allocator` per graph from `lower_graph` through the emitter
   dispatch. Every dispatched emitter now takes a trailing `scratch`; standalone
   `lower_*` wrappers construct a local one (public `emit_*` take `scratch=None`
   and default-construct, so the wrappers didn't need touching).
-- [x] Migrated all HBM scratch sites through `Scratch.hbm` — the single audit
+- [x] Migrated all HBM scratch sites through `Allocator.hbm` — the single audit
   choke-point for scratch HBM (the OOM lever from the qwen3 notes): collective×2
   (direct_lower), topk×2 (`_topk_scan`, `cand_*`), topk `_first_cols` /
   `_overlay_columns`, reshape `_emit_reshape_diff_f`, `broadcast_partition`.
 - [x] `broadcast_partition` (buried in the `emit_binary_op` compute chain)
-  self-constructs a local `Scratch` rather than threading through every arith
-  path — equivalent, since `Scratch` is a stateless `nb` wrapper and the audit
-  point is `Scratch.hbm` regardless.
+  self-constructs a local `Allocator` rather than threading through every arith
+  path — equivalent, since `Allocator` is a stateless `nb` wrapper and the audit
+  point is `Allocator.hbm` regardless.
 - [x] Added `test_direct_lower_alloc.py` (4 cases: space correctness + load ==
   alloc+dma equivalence).
 - [x] `uv run pytest tests/ -n auto`: **856 passed, 1 xfailed**. No new ruff
@@ -129,11 +129,16 @@ elementwise (the regular tile-loop emitters) are the ones that belong on
   `iter_pf_tiles` callers + all five reduce loop-nests migrated; three old free
   functions deleted; equivalence test added. Full tensor_ir suite green (794
   passed).
-- 2026-07-15: Step 2 complete. `Scratch` added and threaded per-graph through
+- 2026-07-15: Step 2 complete. `Allocator` added and threaded per-graph through
   every emitter; all HBM scratch + 57 load idioms routed through it; unit test
   added. Full suite green (856 passed).
 - 2026-07-15: Step 3 complete. `free_pow2` constructor added; elementwise folded
   onto it; straggler broadcast loads collapsed; equivalence test added. Full
   suite green (869 passed). **All three steps done** — tiling, allocation, and
   codegen are now separated in the regular tile-loop emitters (reduce,
-  elementwise), with `Scratch` the allocation seam across all emitters.
+  elementwise), with `Allocator` the allocation seam across all emitters.
+- 2026-07-15: Renamed the allocation class `Scratch` → `Allocator` (and the
+  threaded instance `scratch` → `alloc`); the class allocates SBUF tiles + loads
+  too, not only HBM scratch, so the broader name reads truer. Concept prose
+  ("HBM scratch") and pre-existing `scratch_*` locals unchanged. Suite green
+  (807 tensor_ir passed).
