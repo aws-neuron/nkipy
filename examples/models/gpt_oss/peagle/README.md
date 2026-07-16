@@ -27,18 +27,18 @@ python tensor_preparation.py \
     --world-size 4 --output-dir ./tmp_gpt-oss-20b
 
 # Drafter (P-EAGLE, replicated on every rank — small, ~3.6 GB)
-python eagle/tensor_preparation.py \
+python peagle/tensor_preparation.py \
     --model-name /path/to/GPT-OSS-20B-P-EAGLE \
-    --output-dir ./eagle/tmp_p-eagle
+    --output-dir ./peagle/tmp_p-eagle
 ```
 
 ### 2. Run speculative decoding
 
 ``` sh
 TP=4
-torchrun --nproc-per-node $TP eagle/speculate.py \
+torchrun --nproc-per-node $TP peagle/speculate.py \
     --target-checkpoint ./tmp_gpt-oss-20b \
-    --draft-checkpoint ./eagle/tmp_p-eagle \
+    --draft-checkpoint ./peagle/tmp_p-eagle \
     --model /path/to/gpt-oss-20b \
     --draft-model /path/to/GPT-OSS-20B-P-EAGLE \
     -n 256 -k 3 \

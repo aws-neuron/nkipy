@@ -3,7 +3,7 @@
 These exercise the KV-cache bookkeeping that drives parallel-drafting acceptance.
 They need the P-EAGLE checkpoint locally and are skipped otherwise:
 
-    pytest examples/models/gpt_oss/eagle/test_drafter_cpu.py \
+    pytest examples/models/gpt_oss/peagle/test_drafter_cpu.py \
         --draft-model /path/to/GPT-OSS-20B-P-EAGLE
 
 The key invariant (verified on GPU against vLLM's eagle3 parallel-drafting path,

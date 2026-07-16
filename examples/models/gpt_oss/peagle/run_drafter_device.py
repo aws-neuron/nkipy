@@ -4,7 +4,7 @@ Loads the prepared (replicated) drafter weights, compiles the parallel-draft
 NKI kernel, and runs a single draft() call. This exercises the device path
 (`DrafterModel` + `kernels/drafter.py`), which speculate.py does not currently
 use. Run with: NEURON_PLATFORM_TARGET_OVERRIDE=trn2 torchrun --nproc-per-node 1 \
-    eagle/run_drafter_device.py --draft-checkpoint ./eagle/tmp_p-eagle \
+    peagle/run_drafter_device.py --draft-checkpoint ./peagle/tmp_p-eagle \
     --draft-model /home/ubuntu/models/GPT-OSS-20B-P-EAGLE
 """
 
@@ -13,7 +13,7 @@ import os
 import sys
 
 # Same sys.path dance as speculate.py: the base gpt_oss/ dir must win over the
-# eagle/ dir for the flat `config.py`, and eagle code is reached via `eagle.*`.
+# peagle/ dir for the flat `config.py`, and peagle code is reached via `peagle.*`.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _BASE = os.path.dirname(_HERE)
 sys.path[:] = [p for p in sys.path if os.path.abspath(p or ".") != _HERE]
@@ -26,13 +26,13 @@ import torch.distributed as dist  # noqa: E402
 from safetensors.torch import load_file  # noqa: E402
 
 from config import get_config  # noqa: E402  (base target config for hidden size)
-from eagle.config import get_eagle_config  # noqa: E402
-from eagle import drafter_model as dm  # noqa: E402
+from peagle.config import get_eagle_config  # noqa: E402
+from peagle import drafter_model as dm  # noqa: E402
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--draft-checkpoint", default="./eagle/tmp_p-eagle")
+    ap.add_argument("--draft-checkpoint", default="./peagle/tmp_p-eagle")
     ap.add_argument("--draft-model", default="/home/ubuntu/models/GPT-OSS-20B-P-EAGLE")
     ap.add_argument("--model", default="/home/ubuntu/models/gpt-oss-20b")
     ap.add_argument("-k", "--num-draft-tokens", type=int, default=7)
@@ -65,7 +65,7 @@ def main():
     drafter = dm.DrafterModel(weights, cfg, build_dir)
     print(f"[rank {dist.get_rank()}] Compiled in {drafter._compile_time:.1f}s")
 
-    from eagle.drafter_cpu import DrafterCPU
+    from peagle.drafter_cpu import DrafterCPU
 
     cpu = DrafterCPU(
         args.draft_model, target_hidden, num_draft_tokens=cfg.num_draft_tokens

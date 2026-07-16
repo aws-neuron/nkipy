@@ -9,7 +9,7 @@ logits; the caller argmaxes rows ``[C-1 .. W-1]`` (NTP + K-1 MTP) and applies th
 
 Weights are passed as a flat, static signature (fusion-midlayer weights prefixed
 ``m_``, plain-layer weights stacked on a leading axis and prefixed ``p_``), keyed
-exactly as produced by ``eagle/tensor_preparation.py``.
+exactly as produced by ``peagle/tensor_preparation.py``.
 """
 
 import numpy as np

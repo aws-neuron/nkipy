@@ -17,8 +17,8 @@ Greedy verification makes KV rollback implicit: rejected speculative KV entries
 are simply overwritten by the next verify pass (which re-reads from the accepted
 position), and the causal mask never lets a query attend past its own position.
 
-Run (from the gpt_oss/ directory, with eagle/ on PYTHONPATH):
-    torchrun --nproc-per-node $TP eagle/speculate.py \
+Run (from the gpt_oss/ directory, with peagle/ on PYTHONPATH):
+    torchrun --nproc-per-node $TP peagle/speculate.py \
         --target-checkpoint ./tmp_gpt-oss-20b \
         --draft-checkpoint ./tmp_p-eagle \
         --model /home/ubuntu/models/gpt-oss-20b \
@@ -35,23 +35,23 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-# Both the base gpt_oss package and the eagle subpackage have flat `config.py` /
+# Both the base gpt_oss package and the peagle subpackage have flat `config.py` /
 # `kernels/` modules. We put the base dir (gpt_oss/) FIRST on sys.path so the base
-# flat modules win, and import everything eagle-specific as the `eagle.*` package
-# (which can't collide). Works when run as `eagle/speculate.py` from gpt_oss/.
+# flat modules win, and import everything peagle-specific as the `peagle.*` package
+# (which can't collide). Works when run as `peagle/speculate.py` from gpt_oss/.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _BASE = os.path.dirname(_HERE)
-# torchrun puts the script's own dir (eagle/) on sys.path[0], which would shadow
-# the base flat modules (config.py, kernels/) with eagle's. Drop it and put the
-# base dir first; eagle code is reached via the `eagle.*` package from _BASE.
+# torchrun puts the script's own dir (peagle/) on sys.path[0], which would shadow
+# the base flat modules (config.py, kernels/) with peagle's. Drop it and put the
+# base dir first; peagle code is reached via the `peagle.*` package from _BASE.
 sys.path[:] = [p for p in sys.path if os.path.abspath(p or ".") != _HERE]
 if _BASE not in sys.path:
     sys.path.insert(0, _BASE)
 
 from config import Config, get_config  # noqa: E402  (base config; _BASE wins)
-from eagle.config import get_eagle_config  # noqa: E402
-from eagle.drafter_cpu import DrafterCPU  # noqa: E402
-from eagle.drafter_model import DrafterModel  # noqa: E402
+from peagle.config import get_eagle_config  # noqa: E402
+from peagle.drafter_cpu import DrafterCPU  # noqa: E402
+from peagle.drafter_model import DrafterModel  # noqa: E402
 from kernels.transformer_layer import transformer_layer  # noqa: E402  (base)
 from nkipy.runtime import DeviceKernel, DeviceTensor  # noqa: E402
 from safetensors.torch import load_file  # noqa: E402
@@ -84,7 +84,7 @@ class SpeculativeGptOss(base.GptOssModel):
     def _prepare_verify_kernels(self):
         """Compile a seq_len=(K+1) layer kernel per attention type, and a
         per-position verify-argmax kernel."""
-        from eagle.kernels.verify import verify_argmax
+        from peagle.kernels.verify import verify_argmax
 
         S = self.num_draft_tokens + 1
         cfg = self.config

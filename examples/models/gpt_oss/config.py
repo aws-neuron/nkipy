@@ -53,7 +53,7 @@ class Config:
         running layer ``i``, so to tap the same values we shift down by one:
         the input of layer ``L`` is the output of layer ``L-1``. Verified on GPU
         against vLLM for gpt-oss-20b: the drafter's 3 fc chunks equal the outputs
-        of target layers (1, 11, 20) at cosine 1.0 (see eagle README).
+        of target layers (1, 11, 20) at cosine 1.0 (see peagle README).
         """
         return (2 - 1, num_layers // 2 - 1, num_layers - 3 - 1)
 
