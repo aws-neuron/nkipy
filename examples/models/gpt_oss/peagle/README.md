@@ -147,8 +147,8 @@ All are numerically equivalent. End-to-end P-EAGLE tok/s (TP=4, n=160):
 | 7 | 33.1 | 35.3 | **40.0** |
 
 `batched` wins at the default K=3 (verify processes N=K+1 tokens); `dense` is
-weight-load-bound (~flat in N) and overtakes at K≥5. See `_moe_bench.py` for the
-isolated MoE microbenchmark and `_sweep.py` for the end-to-end sweep. (This table
+weight-load-bound (~flat in N) and overtakes at K≥5. See `_sweep.py` for the
+end-to-end sweep. (This table
 uses a harder prompt than the K-sweep above, so absolute tok/s is lower; the
 per-K kernel ranking is what's robust.)
 

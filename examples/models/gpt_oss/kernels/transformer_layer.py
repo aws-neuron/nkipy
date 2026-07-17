@@ -20,8 +20,8 @@ from .rmsnorm import rmsnorm_kernel
 from .softmax import softmax_kernel
 
 # Which MoE implementation the layer uses. "loop" is the original per-token/
-# per-expert Python loop; the others are batched formulations (see feedforward.py
-# and _moe_bench.py). Selectable via env so P-EAGLE can be swept without edits.
+# per-expert Python loop; the others are batched formulations (see feedforward.py).
+# Selectable via env so P-EAGLE can be swept without edits.
 #   loop     - reference, one gather+GEMV chain per (token, expert)
 #   batched  - gather top_k experts, batched GEMV      (best for small N)
 #   dense    - all experts as one dense GEMM, masked   (best for N >= ~6)
