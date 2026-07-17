@@ -1,11 +1,16 @@
-"""Microbenchmark: baseline (per-token/expert loop) MoE vs batched MoE.
+"""Microbenchmark: sweep MoE implementations across batch regimes.
 
 Compiles each MoE variant as an isolated device kernel over N = B*L tokens,
-verifies the two produce the same output on identical random weights, then times
-both. No real checkpoint needed -- random weights exercise the same op graph.
+verifies every variant matches the baseline on identical random weights, then
+reports device exec time (from .ntff traces) for each. No real checkpoint needed
+-- random weights exercise the same op graph.
+
+Regimes of interest:
+    L=1     decode (batch=1)
+    L=4/8   speculative-decode verify (K+1 tokens)
 
 Run (from examples/models/gpt_oss/):
-    NEURON_RT_VISIBLE_CORES=0 python _moe_bench.py --L 4
+    NEURON_RT_VISIBLE_CORES=0 python _moe_bench.py --dtype bf16 --L 1 4 8
 """
 
 import argparse
@@ -16,7 +21,12 @@ import numpy as np
 from nkipy.core import tensor_apis
 from nkipy.runtime import DeviceKernel, DeviceTensor
 
-from kernels.feedforward import clamped_swiglu, moe_batched
+from kernels.feedforward import (
+    clamped_swiglu,
+    moe_batched,
+    moe_concat,
+    moe_dense_masked,
+)
 from kernels.softmax import softmax_kernel
 
 # gpt-oss-20b MoE dims, per TP4 rank (intermediate 2880 -> 720).
@@ -74,19 +84,43 @@ def _make_kernel(fn, x, w):
     )
 
 
-def main():
-    global DT
-    p = argparse.ArgumentParser()
-    p.add_argument("--L", type=int, default=4, help="tokens (K+1 for verify)")
-    p.add_argument("--iters", type=int, default=100)
-    p.add_argument("--dtype", choices=["fp32", "bf16"], default="fp32")
-    args = p.parse_args()
-    os.environ.setdefault("NEURON_RT_VISIBLE_CORES", "0")
-    if args.dtype == "bf16":
-        import ml_dtypes
-        DT = np.dtype(ml_dtypes.bfloat16)
+# Variants under test. moe_baseline is the reference for correctness.
+VARIANTS = {
+    "baseline": moe_baseline,
+    "batched": moe_batched,
+    "concat": moe_concat,
+    "dense": moe_dense_masked,
+}
 
-    B, L = 1, args.L
+
+def _device_us(ntff, fn_name):
+    """Device wall-clock (us) + matmul count from a trace, auto-matching NEFF."""
+    import glob
+    import json
+    import subprocess
+
+    for neff in sorted(glob.glob(f"build/{fn_name}_*/*.neff"),
+                       key=os.path.getmtime, reverse=True):
+        r = subprocess.run(
+            ["neuron-profile", "view", "-n", neff, "-s", ntff,
+             "--output-format", "json", "--output-file", "/tmp/_moe.json"],
+            capture_output=True, text=True)
+        if os.path.exists("/tmp/_moe.json") and os.path.getsize("/tmp/_moe.json") > 1000 \
+           and "Unable to process" not in (r.stderr + r.stdout):
+            d = json.load(open("/tmp/_moe.json"))
+            os.remove("/tmp/_moe.json")
+            ins = [i for i in d["instruction"] if i.get("duration", 0)]
+            t0 = min(i["timestamp"] for i in ins)
+            t1 = max(i["timestamp"] + i["duration"] for i in ins)
+            mm = sum(1 for i in d["instruction"] if i.get("opcode") == "MATMUL")
+            return (t1 - t0) / 1000.0, mm
+        if os.path.exists("/tmp/_moe.json"):
+            os.remove("/tmp/_moe.json")
+    return None, None
+
+
+def run_L(L, args):
+    B = 1
     rng = np.random.default_rng(0)
 
     def r(shape, scale):
@@ -94,75 +128,70 @@ def main():
         # to float32, so the cast must come last or the kernel compiles as fp32.
         return (rng.standard_normal(shape) * scale).astype(DT)
 
-    x_np = r((B, L, D), 0.1)
-    w_np = {
-        "router_weight": r((D, E), 0.05),
-        "router_bias": r((E,), 0.05),
-        "gate_up_weight": r((E, D, 2 * I), 0.02),
-        "gate_up_bias": r((E, 2 * I), 0.02),
-        "down_weight": r((E, I, D), 0.02),
-        "down_bias": r((E, D), 0.02),
+    x = DeviceTensor.from_numpy(r((B, L, D), 0.1), "x")
+    w = {
+        "router_weight": DeviceTensor.from_numpy(r((D, E), 0.05), "router_weight"),
+        "router_bias": DeviceTensor.from_numpy(r((E,), 0.05), "router_bias"),
+        "gate_up_weight": DeviceTensor.from_numpy(r((E, D, 2 * I), 0.02), "gate_up_weight"),
+        "gate_up_bias": DeviceTensor.from_numpy(r((E, 2 * I), 0.02), "gate_up_bias"),
+        "down_weight": DeviceTensor.from_numpy(r((E, I, D), 0.02), "down_weight"),
+        "down_bias": DeviceTensor.from_numpy(r((E, D), 0.02), "down_bias"),
     }
-    x = DeviceTensor.from_numpy(x_np, "x")
-    w = {k: DeviceTensor.from_numpy(v, k) for k, v in w_np.items()}
-    assert x.numpy().dtype == DT, f"input dtype {x.numpy().dtype} != requested {DT}"
-
-    print(f"compiling kernels (B={B}, L={L}, E={E}, top_k={TOP_K}, "
-          f"dtype={np.dtype(DT).name}) ...")
-    k_base = _make_kernel(moe_baseline, x, w)
-    k_batch = _make_kernel(moe_batched, x, w)
-
-    # Kernel output dtype follows the input dtype (the matmuls preserve it).
-    out_base = DeviceTensor.from_numpy(np.zeros((B, L, D), dtype=DT), "ob")
-    out_batch = DeviceTensor.from_numpy(np.zeros((B, L, D), dtype=DT), "obt")
+    assert x.numpy().dtype == DT
 
     def run(kernel, out):
         kernel(inputs={"norm_z": x, **w}, outputs={"output0": out})
 
-    # correctness
-    run(k_base, out_base)
-    run(k_batch, out_batch)
-    a = out_base.torch().float().numpy()
-    b = out_batch.torch().float().numpy()
-    max_abs = np.max(np.abs(a - b))
-    rel = max_abs / (np.max(np.abs(a)) + 1e-9)
     tol = 2e-2 if args.dtype == "bf16" else 1e-4
-    print(f"\nequivalence: max|Δ|={max_abs:.3e}  rel={rel:.3e}  (tol={tol})")
-    ok = rel < tol
-    print("  -> MATCH" if ok else "  -> MISMATCH")
-
-    def timeit(kernel, out):
-        for _ in range(5):
-            run(kernel, out)
+    ref = None
+    rows = []
+    all_ok = True
+    for tag, fn in VARIANTS.items():
+        k = _make_kernel(fn, x, w)
+        out = DeviceTensor.from_numpy(np.zeros((B, L, D), dtype=DT), f"o_{tag}")
+        run(k, out)
+        val = out.torch().float().numpy()
+        if ref is None:
+            ref, rel = val, 0.0
+        else:
+            rel = np.max(np.abs(val - ref)) / (np.max(np.abs(ref)) + 1e-9)
+        ok = rel < tol
+        all_ok = all_ok and ok
+        ntff = os.path.abspath(f"moe_{tag}.ntff")
+        run(k, out)  # warm
+        k(inputs={"norm_z": x, **w}, outputs={"output0": out},
+          save_trace=True, ntff_name=ntff)
         out.torch()
-        t0 = time.time()
-        for _ in range(args.iters):
-            run(kernel, out)
-        out.torch()
-        return (time.time() - t0) / args.iters
+        dev_us, mm = _device_us(ntff, fn.__name__)
+        os.remove(ntff)
+        rows.append((tag, dev_us, mm, rel, ok))
 
-    tb = timeit(k_base, out_base)
-    tt = timeit(k_batch, out_batch)
+    base_us = rows[0][1]
+    print(f"\n===== L={L} (N={L}), dtype={np.dtype(DT).name}, top_k={TOP_K} =====")
+    print(f"  {'variant':10s} {'device_us':>10s} {'matmuls':>8s} {'speedup':>8s} "
+          f"{'rel_err':>9s}  ok")
+    for tag, dev_us, mm, rel, ok in rows:
+        sp = base_us / dev_us if dev_us else float("nan")
+        print(f"  {tag:10s} {dev_us:10.1f} {mm:8d} {sp:7.2f}x {rel:9.2e}  "
+              f"{'Y' if ok else 'N'}")
+    return all_ok
 
-    # Device-time ground truth via .ntff trace (host wall-clock is dispatch-bound).
-    def trace(kernel, out, name):
-        ntff = os.path.abspath(f"{name}.ntff")
-        kernel(inputs={"norm_z": x, **w}, outputs={"output0": out},
-               save_trace=True, ntff_name=ntff)
-        out.torch()
-        return ntff
 
-    nb = trace(k_base, out_base, "moe_base")
-    nt = trace(k_batch, out_batch, "moe_batch")
+def main():
+    global DT
+    p = argparse.ArgumentParser()
+    p.add_argument("--L", type=int, nargs="+", default=[1, 4, 8],
+                   help="token counts to sweep (1=decode, K+1=verify)")
+    p.add_argument("--dtype", choices=["fp32", "bf16"], default="bf16")
+    args = p.parse_args()
+    os.environ.setdefault("NEURON_RT_VISIBLE_CORES", "0")
+    if args.dtype == "bf16":
+        import ml_dtypes
+        DT = np.dtype(ml_dtypes.bfloat16)
 
-    print(f"\n=========== MoE timing (L={L}, {args.iters} iters) ===========")
-    print(f"  [host wall-clock, dispatch-bound]")
-    print(f"    baseline (loop) : {tb*1e6:8.1f} us/call")
-    print(f"    batched         : {tt*1e6:8.1f} us/call   ({tb/tt:.2f}x)")
-    print(f"  [device exec time -- see extract below]")
-    print(f"    baseline ntff   : {nb}")
-    print(f"    batched  ntff   : {nt}")
-    print("==============================================")
+    ok = True
+    for L in args.L:
+        ok = run_L(L, args) and ok
     return ok
 
 
