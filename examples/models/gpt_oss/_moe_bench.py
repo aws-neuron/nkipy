@@ -88,25 +88,33 @@ def main():
 
     B, L = 1, args.L
     rng = np.random.default_rng(0)
-    x_np = rng.standard_normal((B, L, D)).astype(DT) * 0.1
+
+    def r(shape, scale):
+        # Scale BEFORE the final astype: bf16_array * python_float promotes back
+        # to float32, so the cast must come last or the kernel compiles as fp32.
+        return (rng.standard_normal(shape) * scale).astype(DT)
+
+    x_np = r((B, L, D), 0.1)
     w_np = {
-        "router_weight": rng.standard_normal((D, E)).astype(DT) * 0.05,
-        "router_bias": rng.standard_normal((E,)).astype(DT) * 0.05,
-        "gate_up_weight": rng.standard_normal((E, D, 2 * I)).astype(DT) * 0.02,
-        "gate_up_bias": rng.standard_normal((E, 2 * I)).astype(DT) * 0.02,
-        "down_weight": rng.standard_normal((E, I, D)).astype(DT) * 0.02,
-        "down_bias": rng.standard_normal((E, D)).astype(DT) * 0.02,
+        "router_weight": r((D, E), 0.05),
+        "router_bias": r((E,), 0.05),
+        "gate_up_weight": r((E, D, 2 * I), 0.02),
+        "gate_up_bias": r((E, 2 * I), 0.02),
+        "down_weight": r((E, I, D), 0.02),
+        "down_bias": r((E, D), 0.02),
     }
     x = DeviceTensor.from_numpy(x_np, "x")
     w = {k: DeviceTensor.from_numpy(v, k) for k, v in w_np.items()}
+    assert x.numpy().dtype == DT, f"input dtype {x.numpy().dtype} != requested {DT}"
 
-    print(f"compiling kernels (B={B}, L={L}, E={E}, top_k={TOP_K}) ...")
+    print(f"compiling kernels (B={B}, L={L}, E={E}, top_k={TOP_K}, "
+          f"dtype={np.dtype(DT).name}) ...")
     k_base = _make_kernel(moe_baseline, x, w)
     k_batch = _make_kernel(moe_batched, x, w)
 
-    # Compute upcasts through np.exp in swiglu, so kernel output is fp32.
-    out_base = DeviceTensor.from_numpy(np.zeros((B, L, D), dtype=np.float32), "ob")
-    out_batch = DeviceTensor.from_numpy(np.zeros((B, L, D), dtype=np.float32), "obt")
+    # Kernel output dtype follows the input dtype (the matmuls preserve it).
+    out_base = DeviceTensor.from_numpy(np.zeros((B, L, D), dtype=DT), "ob")
+    out_batch = DeviceTensor.from_numpy(np.zeros((B, L, D), dtype=DT), "obt")
 
     def run(kernel, out):
         kernel(inputs={"norm_z": x, **w}, outputs={"output0": out})
