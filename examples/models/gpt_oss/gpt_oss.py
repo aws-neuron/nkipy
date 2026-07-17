@@ -7,7 +7,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from config import Config, get_config
-from kernels.sampling import greedy_sampling, greedy_sampling_with_embedding
+from kernels.sampling import greedy_sampling
 from kernels.transformer_layer import transformer_layer
 from nkipy.runtime import DeviceKernel, DeviceTensor
 from safetensors.torch import load_file
@@ -46,13 +46,10 @@ class GptOssModel:
         # kernels keyed by (phase, sliding) -> compiled DeviceKernel
         self.kernel_layer = {}
         self.kernel_cte_greedy_sampling = None
-        self.kernel_cte_greedy_sampling_embed = None
         self.kernel_tkg_greedy_sampling = None
-        self.kernel_tkg_greedy_sampling_embed = None
 
         self.norm_weight = None
         self.lm_head_weight = None
-        self.tok_embedding_device = None
 
         self._prepare_tensors(model_weights)
         self._prepare_kernels()
@@ -88,9 +85,6 @@ class GptOssModel:
         )
         self.lm_head_weight = DeviceTensor.from_torch(
             weights.get("lm_head_weight"), "lm_head_weight"
-        )
-        self.tok_embedding_device = DeviceTensor.from_torch(
-            self.tok_embedding, "tok_embedding"
         )
 
         print_log(f"--> Finished Preparing Tensors in {time.time() - t:.2f}s")
@@ -172,20 +166,6 @@ class GptOssModel:
         self.kernel_tkg_greedy_sampling = DeviceKernel.compile_and_load(
             greedy_sampling, name="tkg_greedy_sampling", h=x_token, **common
         )
-        self.kernel_cte_greedy_sampling_embed = DeviceKernel.compile_and_load(
-            greedy_sampling_with_embedding,
-            name="cte_greedy_sampling_embed",
-            h=x_context,
-            tok_embedding=self.tok_embedding_device,
-            **common,
-        )
-        self.kernel_tkg_greedy_sampling_embed = DeviceKernel.compile_and_load(
-            greedy_sampling_with_embedding,
-            name="tkg_greedy_sampling_embed",
-            h=x_token,
-            tok_embedding=self.tok_embedding_device,
-            **common,
-        )
 
         print_log(
             f"--> Finished Kernel Compilation and Loading in {time.time() - t:.2f}s"
@@ -237,73 +217,14 @@ class GptOssModel:
 
         return hidden_states, aux
 
-    def generate(self, input_ids, double_buffering=True):
-        """Run inference and generate tokens."""
-        hidden_states, _ = self.run_prefill(input_ids, capture_aux=False)
-
-        if double_buffering:
-            yield from self._generate_double_buffered(hidden_states)
-        else:
-            yield from self._generate_baseline(hidden_states)
-
     def _run_tkg_layers(self, hidden_states, start_pos):
         for i in range(self.config.num_layers):
             self._run_layer("tkg", i, hidden_states, start_pos)
 
-    # ── Double-buffered decode (fused sampling + on-device embedding) ──────
+    def generate(self, input_ids):
+        """Run inference and generate tokens."""
+        hidden_states, _ = self.run_prefill(input_ids, capture_aux=False)
 
-    def _generate_double_buffered(self, hidden_states):
-        context_len = self.config.context_len
-        B = self.config.max_batch_size
-
-        next_id_bufs = [
-            DeviceTensor.from_numpy(np.array([[0]], dtype=np.uint32), "next_id_0"),
-            DeviceTensor.from_numpy(np.array([[0]], dtype=np.uint32), "next_id_1"),
-        ]
-        decode_hidden = DeviceTensor.from_numpy(
-            np.empty((B, 1, self.config.hidden_size), dtype=self.config.dtype),
-            "decode_hidden",
-        )
-
-        cur_buf = 0
-        self.kernel_cte_greedy_sampling_embed(
-            inputs={
-                "h": hidden_states,
-                "norm_weight": self.norm_weight,
-                "lm_head_weight": self.lm_head_weight,
-                "tok_embedding": self.tok_embedding_device,
-            },
-            outputs={"output0": next_id_bufs[cur_buf], "output1": decode_hidden},
-        )
-
-        for pos in range(context_len, context_len + self.config.max_new_tokens):
-            prev_buf = cur_buf
-            cur_buf = 1 - cur_buf
-
-            t_start_pos = DeviceTensor.from_numpy(np.array([pos], dtype=np.int32))
-            self._run_tkg_layers(decode_hidden, t_start_pos)
-
-            self.kernel_tkg_greedy_sampling_embed(
-                inputs={
-                    "h": decode_hidden,
-                    "norm_weight": self.norm_weight,
-                    "lm_head_weight": self.lm_head_weight,
-                    "tok_embedding": self.tok_embedding_device,
-                },
-                outputs={"output0": next_id_bufs[cur_buf], "output1": decode_hidden},
-            )
-
-            next_id_torch = (
-                next_id_bufs[prev_buf].torch().reshape(B, 1).to(dtype=torch.int)
-            )
-            yield next_id_torch
-
-        next_id_torch = next_id_bufs[cur_buf].torch().reshape(B, 1).to(dtype=torch.int)
-        yield next_id_torch
-
-    # ── Baseline decode (host embedding lookup, no double buffering) ──────
-
-    def _generate_baseline(self, hidden_states):
         context_len = self.config.context_len
         B = self.config.max_batch_size
 
@@ -381,13 +302,12 @@ def load_model(args):
     shard_path = os.path.join(args.checkpoint, f"shard_{dist.get_rank()}.safetensors")
     weights = load_file(shard_path, device="cpu")
 
-    double_buffering = getattr(args, "double_buffering", True)
     model = GptOssModel(weights, config)
 
     start = time.time()
     print_log("Warming model")
     t = 0
-    for _ in model.generate(input_ids, double_buffering=double_buffering):
+    for _ in model.generate(input_ids):
         if t == 1:
             break
         t += 1
@@ -402,13 +322,7 @@ def main():
     parser.add_argument("prompt", nargs="?", default="The capital of France is")
     parser.add_argument("--checkpoint", default="./tmp_gpt-oss-20b")
     parser.add_argument("--model", default="openai/gpt-oss-20b")
-    parser.add_argument(
-        "--no-double-buffering",
-        action="store_true",
-        help="Disable fused embedding + double-buffered decoding (for perf comparison)",
-    )
     args = parser.parse_args()
-    args.double_buffering = not args.no_double_buffering
 
     model, input_ids, tokenizer = load_model(args)
 
@@ -419,7 +333,7 @@ def main():
     if dist.get_rank() == 0:
         print(f"\n{args.prompt}", end="")
     eos_ids = getattr(args, "eos_ids", set())
-    for id in model.generate(input_ids, double_buffering=args.double_buffering):
+    for id in model.generate(input_ids):
         if t == 0:
             first_token_time = time.time()
         t += 1
