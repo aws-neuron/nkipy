@@ -1,5 +1,7 @@
 import numpy as np
 
+from nkipy.core import tensor_apis
+
 
 def clamped_swiglu(gate, up, alpha, limit):
     """gpt-oss clamped SwiGLU gating.
@@ -32,3 +34,68 @@ def feedforward_kernel(
     gated = clamped_swiglu(xg, x_up, alpha, limit)
 
     return np.matmul(gated, down_weight) + down_bias
+
+
+def moe_batched(
+    norm_z,
+    router_weight,
+    router_bias,
+    gate_up_weight,
+    gate_up_bias,
+    down_weight,
+    down_bias,
+    top_k,
+    alpha,
+    limit,
+):
+    """Batched MoE over all (B*L) tokens with a single gather + batched matmul.
+
+    Replaces the per-(token, expert) Python loop. For N = B*L tokens and top_k
+    selected experts, all N*top_k expert feed-forwards are expressed as batched
+    ops so they trace into a handful of large HLO ops instead of N*top_k tiny
+    GEMV chains.
+
+    Shapes (E = num_experts, D = hidden, I = intermediate per rank):
+        norm_z:         (B, L, D)
+        gate_up_weight: (E, D, 2I)   gate_up_bias: (E, 2I)
+        down_weight:    (E, I, D)    down_bias:    (E, D)
+    Returns (B, L, D) expert output (pre-residual, pre-all-reduce).
+    """
+    B, L, D = norm_z.shape
+    N = B * L
+    flat = norm_z.reshape(N, D)  # (N, D)
+
+    # Router: top_k on raw logits (+bias), then softmax over the selected logits.
+    router_logits = np.matmul(flat, router_weight) + router_bias  # (N, E)
+    top_vals, top_idx = tensor_apis.topk(router_logits, k=top_k, axis=-1)  # (N, k)
+    top_w = _softmax_lastdim(top_vals)  # (N, k)
+
+    # Gather the selected experts' weights. Flatten (N, k) selection to (N*k,)
+    # so a single take() pulls all expert matrices at once.
+    sel = top_idx.reshape(N * top_k)  # (N*k,)
+    gu_w = np.take(gate_up_weight, sel, axis=0)  # (N*k, D, 2I)
+    gu_b = np.take(gate_up_bias, sel, axis=0)  # (N*k, 2I)
+    dn_w = np.take(down_weight, sel, axis=0)  # (N*k, I, D)
+    dn_b = np.take(down_bias, sel, axis=0)  # (N*k, D)
+
+    # Repeat each token's input for its top_k experts: (N, D) -> (N*k, 1, D).
+    x = flat.reshape(N, 1, D)
+    x = np.broadcast_to(x, (N, top_k, D)).reshape(N * top_k, 1, D)
+
+    # Batched gate/up projection: (N*k,1,D) @ (N*k,D,2I) -> (N*k,1,2I)
+    gup = np.matmul(x, gu_w) + gu_b.reshape(N * top_k, 1, -1)
+    xg, x_up = np.split(gup, 2, axis=-1)
+    gated = clamped_swiglu(xg, x_up, alpha, limit)  # (N*k,1,I)
+
+    # Batched down projection: (N*k,1,I) @ (N*k,I,D) -> (N*k,1,D)
+    expert_out = np.matmul(gated, dn_w) + dn_b.reshape(N * top_k, 1, -1)
+    expert_out = expert_out.reshape(N, top_k, D)
+
+    # Weighted combine over the top_k experts.
+    combined = np.sum(top_w.reshape(N, top_k, 1) * expert_out, axis=1)  # (N, D)
+    return combined.reshape(B, L, D)
+
+
+def _softmax_lastdim(x):
+    exp_x = np.exp(x - np.max(x, axis=-1, keepdims=True))
+    return exp_x / np.sum(exp_x, axis=-1, keepdims=True)
