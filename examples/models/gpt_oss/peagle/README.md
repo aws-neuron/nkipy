@@ -146,10 +146,9 @@ All are numerically equivalent. End-to-end P-EAGLE tok/s (TP=4, n=160):
 | 7 | 33.1 | 35.3 | **40.0** |
 
 `batched` wins at the default K=3 (verify processes N=K+1 tokens); `dense` is
-weight-load-bound (~flat in N) and overtakes at K≥5. See `_sweep.py` for the
-end-to-end sweep. (This table
-uses a harder prompt than the K-sweep above, so absolute tok/s is lower; the
-per-K kernel ranking is what's robust.)
+weight-load-bound (~flat in N) and overtakes at K≥5. (This table uses a harder
+prompt than the K-sweep above, so absolute tok/s is lower; the per-K kernel
+ranking is what's robust.)
 
 ## How it works
 
@@ -222,7 +221,6 @@ attending past its own position.
 | `drafter_cpu.py` | Reference CPU drafter (`--cpu-drafter`): same KV-cache algorithm in PyTorch |
 | `run_drafter_device.py` | Standalone harness to exercise the device drafter in isolation |
 | `test_drafter_cpu.py` | Regression tests for the CPU drafter's KV-cache bookkeeping (needs a local checkpoint) |
-| `_sweep.py` | Dev tool: sweep (K, MoE kernel) and tabulate end-to-end tok/s |
 | `kernels/drafter.py` | Parallel-drafting forward kernel (K tokens in one pass) |
 | `kernels/drafter_layer.py` | EAGLE-3 fusion midlayer + plain Llama layers |
 | `kernels/verify.py` | Multi-position greedy argmax for verification |
