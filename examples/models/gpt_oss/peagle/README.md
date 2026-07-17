@@ -135,7 +135,6 @@ The target's MoE feed-forward has several implementations, selected via the
 | `loop` (default) | per-(token, expert) Python loop | reference |
 | `batched` | gather top-k experts, batched GEMV | decode / verify with K ≤ 4 |
 | `dense` | all experts as one dense GEMM, router-masked | verify with K ≥ 5 |
-| `concat` | fuse a token's top-k experts into 2 matmuls | (≈ `batched`, no gain) |
 
 All are numerically equivalent. End-to-end P-EAGLE tok/s (TP=4, n=160):
 
@@ -219,7 +218,11 @@ attending past its own position.
 | `speculate.py` | Main entry: speculation loop orchestrating target + drafter |
 | `config.py` | `EagleConfig` for the P-EAGLE drafter (llama3 RoPE, fc, mask_hidden, K) |
 | `tensor_preparation.py` | Convert P-EAGLE checkpoint to x@W form (replicated, no TP) |
-| `drafter_model.py` | Device-side drafter: loads weights, compiles kernel, runs draft |
+| `drafter_model.py` | Device-side drafter (default): loads weights, compiles kernel, runs draft |
+| `drafter_cpu.py` | Reference CPU drafter (`--cpu-drafter`): same KV-cache algorithm in PyTorch |
+| `run_drafter_device.py` | Standalone harness to exercise the device drafter in isolation |
+| `test_drafter_cpu.py` | Regression tests for the CPU drafter's KV-cache bookkeeping (needs a local checkpoint) |
+| `_sweep.py` | Dev tool: sweep (K, MoE kernel) and tabulate end-to-end tok/s |
 | `kernels/drafter.py` | Parallel-drafting forward kernel (K tokens in one pass) |
 | `kernels/drafter_layer.py` | EAGLE-3 fusion midlayer + plain Llama layers |
 | `kernels/verify.py` | Multi-position greedy argmax for verification |

@@ -5,7 +5,7 @@ NKI kernel, and runs a single draft() call. This exercises the device path
 (`DrafterModel` + `kernels/drafter.py`), which speculate.py does not currently
 use. Run with: NEURON_PLATFORM_TARGET_OVERRIDE=trn2 torchrun --nproc-per-node 1 \
     peagle/run_drafter_device.py --draft-checkpoint ./peagle/tmp_p-eagle \
-    --draft-model /home/ubuntu/models/GPT-OSS-20B-P-EAGLE
+    --draft-model amazon/GPT-OSS-20B-P-EAGLE
 """
 
 import argparse
@@ -33,8 +33,8 @@ from peagle import drafter_model as dm  # noqa: E402
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--draft-checkpoint", default="./peagle/tmp_p-eagle")
-    ap.add_argument("--draft-model", default="/home/ubuntu/models/GPT-OSS-20B-P-EAGLE")
-    ap.add_argument("--model", default="/home/ubuntu/models/gpt-oss-20b")
+    ap.add_argument("--draft-model", default="amazon/GPT-OSS-20B-P-EAGLE")
+    ap.add_argument("--model", default="openai/gpt-oss-20b")
     ap.add_argument("-k", "--num-draft-tokens", type=int, default=7)
     args = ap.parse_args()
 

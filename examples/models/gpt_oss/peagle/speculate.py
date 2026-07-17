@@ -21,8 +21,8 @@ Run (from the gpt_oss/ directory, with peagle/ on PYTHONPATH):
     torchrun --nproc-per-node $TP peagle/speculate.py \
         --target-checkpoint ./tmp_gpt-oss-20b \
         --draft-checkpoint ./tmp_p-eagle \
-        --model /home/ubuntu/models/gpt-oss-20b \
-        --draft-model /home/ubuntu/models/GPT-OSS-20B-P-EAGLE \
+        --model openai/gpt-oss-20b \
+        --draft-model amazon/GPT-OSS-20B-P-EAGLE \
         -n 200 -k 7 "The capital of France is"
 """
 
@@ -253,9 +253,9 @@ def main():
     # Unused: the KV-cached DrafterCPU loads weights directly from --draft-model.
     # Kept for backward compatibility with existing invocations.
     parser.add_argument("--draft-checkpoint", default="./tmp_p-eagle")
-    parser.add_argument("--model", default="/home/ubuntu/models/gpt-oss-20b")
+    parser.add_argument("--model", default="openai/gpt-oss-20b")
     parser.add_argument(
-        "--draft-model", default="/home/ubuntu/models/GPT-OSS-20B-P-EAGLE"
+        "--draft-model", default="amazon/GPT-OSS-20B-P-EAGLE"
     )
     parser.add_argument(
         "--cpu-drafter",

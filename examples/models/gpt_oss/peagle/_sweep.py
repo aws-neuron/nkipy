@@ -63,8 +63,8 @@ def main():
     p.add_argument("--prompt", default="Write a Python function for binary search.")
     p.add_argument("--target-checkpoint", default="./tmp_gpt-oss-20b")
     p.add_argument("--draft-checkpoint", default="./peagle/tmp_p-eagle")
-    p.add_argument("--model", default="/home/ubuntu/models/gpt-oss-20b")
-    p.add_argument("--draft-model", default="/home/ubuntu/models/GPT-OSS-20B-P-EAGLE")
+    p.add_argument("--model", default="openai/gpt-oss-20b")
+    p.add_argument("--draft-model", default="amazon/GPT-OSS-20B-P-EAGLE")
     p.add_argument("--results", default="/tmp/peagle_sweep_results.jsonl",
                    help="append each combo's metrics here; completed combos are "
                    "skipped on re-run so a killed sweep resumes cheaply")

@@ -20,7 +20,7 @@ import torch
 import torch.nn.functional as F
 
 DRAFT_MODEL = os.environ.get(
-    "PEAGLE_DRAFT_MODEL", "/home/ubuntu/models/GPT-OSS-20B-P-EAGLE"
+    "PEAGLE_DRAFT_MODEL", "amazon/GPT-OSS-20B-P-EAGLE"
 )
 TARGET_HIDDEN = 2880  # gpt-oss-20b hidden size
 

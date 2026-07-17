@@ -13,7 +13,6 @@ from .attention import attention_kernel
 from .feedforward import (
     feedforward_kernel,
     moe_batched,
-    moe_concat,
     moe_dense_masked,
 )
 from .rmsnorm import rmsnorm_kernel
@@ -25,7 +24,7 @@ from .softmax import softmax_kernel
 #   loop     - reference, one gather+GEMV chain per (token, expert)
 #   batched  - gather top_k experts, batched GEMV      (best for small N)
 #   dense    - all experts as one dense GEMM, masked   (best for N >= ~6)
-_MOE_KERNELS = {"batched": moe_batched, "concat": moe_concat, "dense": moe_dense_masked}
+_MOE_KERNELS = {"batched": moe_batched, "dense": moe_dense_masked}
 MOE_KERNEL = os.environ.get("GPT_OSS_MOE_KERNEL", "loop")
 
 
