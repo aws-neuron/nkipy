@@ -240,14 +240,24 @@ class DrafterModel:
     def draft(self, commit_token_ids, commit_aux3, base_pos):
         """Generate K draft tokens for one speculation step.
 
+        ``C = len(commit_token_ids)`` is the number of tokens the target ACCEPTED
+        in the previous verify (the acceptance length, 1..K+1; averaged over a run
+        this is the "mean acceptance length"). These accepted tokens have not been
+        seen by the drafter yet, so this step first commits them into the KV cache
+        -- carrying their real target hidden states (``commit_aux3``, which only
+        exist after verify) -- and then drafts the next K tokens, all in one pass.
+
         Runs ONE fused forward of width W = C + K - 1 over
         ``[commit_0 .. commit_{C-1} | ptd_0 .. ptd_{K-2}]`` at consecutive absolute
-        positions ``base_pos + [0..W-1]``, all attending to the full cache. The K
-        draft logits are rows ``[C-1 .. W-1]`` (last committed slot + K-1 MTP).
-        Rejected speculative rows from the previous step are overwritten in place.
+        positions ``base_pos + [0..W-1]``, all attending to the full cache. The
+        width is C + K - 1 (not C + K) because the NTP draft is read from the last
+        committed row itself, so only K-1 extra placeholder (ptd/MTP) slots are
+        appended. The K draft logits are rows ``[C-1 .. W-1]`` (last committed slot
+        + K-1 MTP). Rejected speculative rows from the previous step are
+        overwritten in place.
         """
         H, K = self.H, self.K
-        C = len(commit_token_ids)
+        C = len(commit_token_ids)  # tokens accepted by the target last step
         assert C >= 1, "draft() needs at least the NTP (last committed) token"
         W = C + K - 1
 
