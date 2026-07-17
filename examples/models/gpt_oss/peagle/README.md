@@ -54,27 +54,16 @@ Mean acceptance length: X.XX (K=7)
 Decode tokens/sec: XX.XX
 ```
 
-### Drafter placement (device by default)
+### Drafter (on device)
 
-By default the drafter forward runs **on the Neuron device**
-(`kernels/drafter.py` + `drafter_model.py`). It keeps a full per-layer KV cache on
-device (prefill over the prompt, then each step commits the accepted tokens and
-drafts K positions attending to the whole context) — the same algorithm as the
-CPU reference, so acceptance matches. Pass `--cpu-drafter` to run the CPU drafter
-(`drafter_cpu.py`) instead: same math, but the layer forward runs in PyTorch on
-host with a host↔device round-trip per step — the slower debug/reference path.
-Measured on trn2 (TP=4, K=7, chat prompt):
-
-| Drafter | Mean acceptance | Decode tok/s |
-|---------|-----------------|--------------|
-| device (default) | ~4.3 | ~50 |
-| `--cpu-drafter`  | ~4.3 | ~4.8 |
-
-The device drafter matches the CPU drafter's acceptance and is ~10× faster in
-decode (fused single kernel, no per-step host↔device sync). Set `SPEC_PROFILE=1`
-to print a per-step draft/verify time breakdown. Note: the first `prefill()`
-compiles a full-prompt-width fused kernel, which inflates time-to-first-token on
-a cold build cache.
+The drafter forward runs **on the Neuron device** (`kernels/drafter.py` +
+`drafter_model.py`). It keeps a full per-layer KV cache on device — prefill over
+the prompt, then each step commits the accepted tokens and drafts K positions
+attending to the whole context — as a single fused kernel with no per-step
+host↔device sync (~4.3 acceptance, ~50 decode tok/s on trn2 at TP=4, K=7, chat
+prompt). Set `SPEC_PROFILE=1` to print a per-step draft/verify time breakdown.
+Note: the first `prefill()` compiles a full-prompt-width fused kernel, which
+inflates time-to-first-token on a cold build cache.
 
 ### Choosing K (draft tokens per step)
 
@@ -217,10 +206,7 @@ attending past its own position.
 | `speculate.py` | Main entry: speculation loop orchestrating target + drafter |
 | `config.py` | `EagleConfig` for the P-EAGLE drafter (llama3 RoPE, fc, mask_hidden, K) |
 | `tensor_preparation.py` | Convert P-EAGLE checkpoint to x@W form (replicated, no TP) |
-| `drafter_model.py` | Device-side drafter (default): loads weights, compiles kernel, runs draft |
-| `drafter_cpu.py` | Reference CPU drafter (`--cpu-drafter`): same KV-cache algorithm in PyTorch |
-| `run_drafter_device.py` | Standalone harness to exercise the device drafter in isolation |
-| `test_drafter_cpu.py` | Regression tests for the CPU drafter's KV-cache bookkeeping (needs a local checkpoint) |
+| `drafter_model.py` | Device-side drafter: loads weights, compiles kernel, runs draft |
 | `kernels/drafter.py` | Parallel-drafting forward kernel (K tokens in one pass) |
 | `kernels/drafter_layer.py` | EAGLE-3 fusion midlayer + plain Llama layers |
 | `kernels/verify.py` | Multi-position greedy argmax for verification |
@@ -231,11 +217,11 @@ attending past its own position.
 
 | What | Result |
 |------|--------|
-| Drafter layer math (`DrafterCPU`) | ✅ cos 0.9999 vs vLLM on prefill (85/86 tokens) |
+| Drafter layer math | ✅ cos 0.9999 vs vLLM on prefill (85/86 tokens) |
 | KV-cached decode steps | ✅ cos 0.9999, 100% draft-token match vs vLLM |
 | `draft()` public API | ✅ 7/7 draft tokens match vLLM on multiple decode steps |
 | Aux tap layers (1, 11, 20) | ✅ fc chunks equal target layer outputs at cos 1.0 |
-| Rollback / context-attention | ✅ guarded by `test_drafter_cpu.py` |
+| Rollback / context-attention | ✅ device drafter attends the full context KV cache |
 
 ## Acceptance length: root cause & fix
 
@@ -250,15 +236,14 @@ draft-token match). Three issues were found and fixed:
    cross-depth mask with **no prefill and no KV cache** — the MTP slots never saw
    the prompt, so they produced generic tokens. The drafter must keep a KV cache
    over the whole context and have every new position attend to it (plain causal
-   over absolute positions). `speculate.py` now uses the KV-cached `DrafterCPU`:
-   it prefills the drafter on the prompt and, each step, rolls the cache back to
-   the last accepted position and runs `[newly-accepted tokens | K-1 ptd slots]`.
+   over absolute positions). The drafter now keeps a KV cache: it prefills on the
+   prompt and, each step, rolls the cache back to the last accepted position and
+   runs `[newly-accepted tokens | K-1 ptd slots]`.
 
 2. **`rollback()` truncated the wrong axis.** The cache tensors are
    `(B, n_kv, seq, head_dim)`; `rollback()` sliced dim 1 (`n_kv`) instead of dim 2
    (`seq`), so rejected speculative KV entries were never discarded and corrupted
-   every later step. Fixed to slice the sequence axis. Guarded by
-   `test_drafter_cpu.py::test_rollback_restores_clean_cache`.
+   every later step. Fixed to slice the sequence axis.
 
 3. **Aux tap off-by-one.** vLLM's EAGLE-3 default `(2, n//2, n-3)` captures the
    residual stream *entering* those layers (`layer_idx=i+1` after layer `i`), i.e.
@@ -297,15 +282,14 @@ midlayer concatenates embeds with hidden to 2H; later layers are standard.
 
 ### Status / remaining work
 
-The CPU drafter path (`DrafterCPU`) and the `speculate.py` loop bookkeeping are
-GPU-validated against vLLM. The **on-device drafter keeps a KV cache and runs as
-a single fused kernel** (`drafter_model.py` + `drafter_fused_kernel` in
-`kernels/drafter.py`): fc-fusion + (embed, hidden) assembly + all 4 layers +
-final norm + lm_head in one device call, each layer aliasing its own cache. It
-prefills over the prompt and drafts K context-attending positions per step,
-matching `DrafterCPU` token-for-token on device (parity is sub-noise bf16 ties,
-logit cosine 0.9999) and reaching acceptance ~4.3 at ~50 decode tok/s on trn2
-(TP=4). It is the default; `--cpu-drafter` selects the reference path.
+The drafter math and the `speculate.py` loop bookkeeping are GPU-validated
+against vLLM (a PyTorch reference reproduced vLLM's drafter I/O at logit cosine
+0.9999). The **on-device drafter keeps a KV cache and runs as a single fused
+kernel** (`drafter_model.py` + `drafter_fused_kernel` in `kernels/drafter.py`):
+fc-fusion + (embed, hidden) assembly + all 4 layers + final norm + lm_head in one
+device call, each layer aliasing its own cache. It prefills over the prompt and
+drafts K context-attending positions per step, reaching acceptance ~4.3 at ~50
+decode tok/s on trn2 (TP=4).
 
 Each draft step runs a **single fused forward** of width `W = C + K - 1` over
 `[commit_0 .. commit_{C-1} | ptd_0 .. ptd_{K-2}]` (accepted tokens + MTP slots), so

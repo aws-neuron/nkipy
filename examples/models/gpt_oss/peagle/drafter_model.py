@@ -1,11 +1,10 @@
 """Device-side P-EAGLE drafter with a KV cache, fused into one kernel per step.
 
-Mirrors ``DrafterCPU`` (drafter_cpu.py) but runs the whole drafter forward as a
-single Neuron kernel: fc-fusion + (embed, hidden) assembly + all 4 layers +
-final norm + lm_head, with each layer aliasing its own persistent KV cache. The
-drafter keeps a per-layer KV cache over the full context (prompt + accepted
-tokens); each draft step runs W = C + K - 1 positions that attend causally to
-the whole cache, exactly like the CPU reference.
+Runs the whole drafter forward as a single Neuron kernel: fc-fusion +
+(embed, hidden) assembly + all 4 layers + final norm + lm_head, with each layer
+aliasing its own persistent KV cache. The drafter keeps a per-layer KV cache
+over the full context (prompt + accepted tokens); each draft step runs
+W = C + K - 1 positions that attend causally to the whole cache.
 
 Only the token-embedding gather stays on host (dynamic ids); everything else is
 on device. Kernels are compiled once per sequence width (prefill = prompt_len-1,
@@ -207,7 +206,7 @@ class DrafterModel:
         kernel(inputs=inputs, outputs=outputs)
         return logits_buf.torch().float()[0]  # (W, vocab_local)
 
-    # ── public API (matches DrafterCPU) ────────────────────────────────────────
+    # ── public API ─────────────────────────────────────────────────────────────
 
     def reset(self):
         self.cache_len = 0
@@ -239,7 +238,7 @@ class DrafterModel:
 
     @torch.no_grad()
     def draft(self, commit_token_ids, commit_aux3, base_pos):
-        """Generate K draft tokens for one speculation step (see DrafterCPU.draft).
+        """Generate K draft tokens for one speculation step.
 
         Runs ONE fused forward of width W = C + K - 1 over
         ``[commit_0 .. commit_{C-1} | ptd_0 .. ptd_{K-2}]`` at consecutive absolute
