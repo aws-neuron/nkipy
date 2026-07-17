@@ -98,6 +98,56 @@ accepted tokens. Sweep (n=96, chat prompt):
 (~52 tok/s) and larger K.** Higher K only helps if a stronger drafter raises the
 acceptance plateau. Set `-k` to override.
 
+### Speedup over the base model
+
+Speedup = speculative tok/s ÷ base (non-speculative) tok/s of the same target.
+Measured on trn2 (TP=4, K=3, binary-search chat prompt, acceptance ~3.2):
+
+| Configuration | Decode tok/s | Speedup |
+|---|---|---|
+| Base gpt-oss-20b (no speculation) | ~52 | 1.00× |
+| P-EAGLE K=3, `loop` MoE (default) | 61.6 | **1.18×** |
+| P-EAGLE K=3, `batched` MoE | 66.2 | **1.27×** |
+
+The speedup is well below the ~3.2 acceptance length because verify is not free:
+each step runs `K+1` tokens through the full target (~36–39 ms) plus ~13 ms of
+drafting. Decode is dispatch/overhead-bound, so verifying 4 tokens costs roughly
+2× a single-token step while producing ~3.2 tokens of output — hence ~1.2–1.3×.
+
+**Speedup scales ~linearly with acceptance length, which is prompt-dependent.**
+Chat-formatted, in-distribution prompts accept ~3.2 (→ ~1.2–1.3×); an
+out-of-distribution / hard prompt can accept ~2.3 (→ ~1.0×, i.e. no win).
+Always benchmark tok/s with a fixed, representative prompt. The biggest lever on
+speedup is a stronger drafter (raises the acceptance plateau); a cheaper verify
+(LNC2, or the `batched`/`dense` MoE kernels below) is the secondary lever.
+
+### MoE kernel selection
+
+The target's MoE feed-forward has several implementations, selected via the
+`GPT_OSS_MOE_KERNEL` env var (read in `kernels/transformer_layer.py`):
+
+| value | description | best regime |
+|---|---|---|
+| `loop` (default) | per-(token, expert) Python loop | reference |
+| `batched` | gather top-k experts, batched GEMV | decode / verify with K ≤ 4 |
+| `dense` | all experts as one dense GEMM, router-masked | verify with K ≥ 5 |
+| `concat` | fuse a token's top-k experts into 2 matmuls | (≈ `batched`, no gain) |
+
+All are numerically equivalent. End-to-end P-EAGLE tok/s (TP=4, n=160):
+
+| K | `loop` | `batched` | `dense` |
+|---|--------|-----------|---------|
+| 1 | 45.4 | **49.5** | 32.7 |
+| 3 | 44.9 | **47.8** | 42.1 |
+| 5 | 36.9 | 39.2 | **42.3** |
+| 7 | 33.1 | 35.3 | **40.0** |
+
+`batched` wins at the default K=3 (verify processes N=K+1 tokens); `dense` is
+weight-load-bound (~flat in N) and overtakes at K≥5. See `_moe_bench.py` for the
+isolated MoE microbenchmark and `_sweep.py` for the end-to-end sweep. (This table
+uses a harder prompt than the K-sweep above, so absolute tok/s is lower; the
+per-K kernel ranking is what's robust.)
+
 ## How it works
 
 ### Speculation loop
