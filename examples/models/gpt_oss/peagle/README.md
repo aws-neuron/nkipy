@@ -102,13 +102,13 @@ acceptance plateau. Set `-k` to override.
 
 Speedup = speculative tok/s ÷ base (non-speculative) tok/s of the same target,
 **with the same MoE kernel on both sides** (the base model also honors
-`GPT_OSS_MOE_KERNEL`, so comparing spec-batched against base-loop would overstate
-the win). Measured on trn2 (TP=4, K=3, binary-search chat prompt, acceptance ~3.2,
-n=200 base / n=256 spec):
+`GPT_OSS_MOE_KERNEL`, so comparing spec-batched against base-reference would
+overstate the win). Measured on trn2 (TP=4, K=3, binary-search chat prompt,
+acceptance ~3.2, n=200 base / n=256 spec):
 
 | MoE kernel | Base tok/s | P-EAGLE K=3 tok/s | Speedup |
 |---|---|---|---|
-| `loop` (default) | 52.0 | 61.6 | **1.18×** |
+| `reference` (default) | 52.0 | 61.6 | **1.18×** |
 | `batched` | 54.9 | 66.2 | **1.21×** |
 
 The speedup is well below the ~3.2 acceptance length because verify is not free:
@@ -132,14 +132,14 @@ The target's MoE feed-forward has several implementations, selected via the
 
 | value | description | best regime |
 |---|---|---|
-| `loop` (default) | per-(token, expert) Python loop | reference |
+| `reference` (default) | per-(token, expert) Python loop | clearest baseline |
 | `batched` | gather top-k experts, batched GEMV | decode / verify with K ≤ 4 |
 | `dense` | all experts as one dense GEMM, router-masked | verify with K ≥ 5 |
 
 All are numerically equivalent. End-to-end P-EAGLE tok/s (TP=4, n=160):
 
-| K | `loop` | `batched` | `dense` |
-|---|--------|-----------|---------|
+| K | `reference` | `batched` | `dense` |
+|---|-----------|-----------|---------|
 | 1 | 45.4 | **49.5** | 32.7 |
 | 3 | 44.9 | **47.8** | 42.1 |
 | 5 | 36.9 | 39.2 | **42.3** |

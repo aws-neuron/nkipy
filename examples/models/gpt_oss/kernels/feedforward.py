@@ -36,6 +36,54 @@ def feedforward_kernel(
     return np.matmul(gated, down_weight) + down_bias
 
 
+def moe_reference(
+    norm_z,
+    router_weight,
+    router_bias,
+    gate_up_weight,
+    gate_up_bias,
+    down_weight,
+    down_bias,
+    top_k,
+    alpha,
+    limit,
+):
+    """Reference MoE: an explicit Python loop over (batch, token, expert).
+
+    The clearest, slowest formulation -- one gather + GEMV chain per selected
+    expert per token. The batched variants (moe_batched, moe_dense_masked) are
+    numerically equivalent and faster; this stays as the readable reference and
+    correctness baseline. Shapes as in moe_batched.
+    """
+    B, L, D = norm_z.shape
+    router_logits = np.matmul(norm_z, router_weight) + router_bias
+    output = np.empty_like(norm_z)
+    for b in range(B):
+        for t in range(L):
+            token_input = norm_z[b, t, :]
+            token_logits = router_logits[b, t]
+            # gpt-oss routing: top-k on raw logits, then softmax over the
+            # selected logits (NOT softmax-then-topk).
+            top_k_logits, top_k_indices = tensor_apis.topk(token_logits, k=top_k)
+            top_k_weights = _softmax_lastdim(top_k_logits)
+            token_output = tensor_apis.zeros((D), dtype=output.dtype)
+            for e in range(top_k):
+                expert_idx = top_k_indices[e]
+                weight = top_k_weights[e]
+                expert_output = feedforward_kernel(
+                    token_input,
+                    gate_up_weight[expert_idx],
+                    gate_up_bias[expert_idx],
+                    down_weight[expert_idx],
+                    down_bias[expert_idx],
+                    alpha,
+                    limit,
+                )
+                token_output += weight * expert_output
+            output[b, t] = token_output
+    return output
+
+
 def moe_batched(
     norm_z,
     router_weight,

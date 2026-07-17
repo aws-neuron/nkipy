@@ -6,7 +6,7 @@ combination is obvious.
 
 Run (from examples/models/gpt_oss/):
     python peagle/_sweep.py -n 128 --prompt "..." \
-        --k 1 3 5 7 --kernels loop batched dense
+        --k 1 3 5 7 --kernels reference batched dense
 """
 
 import argparse
@@ -58,7 +58,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("-n", type=int, default=128)
     p.add_argument("--k", type=int, nargs="+", default=[1, 3, 5, 7])
-    p.add_argument("--kernels", nargs="+", default=["loop", "batched", "dense"])
+    p.add_argument("--kernels", nargs="+", default=["reference", "batched", "dense"])
     p.add_argument("--tp", type=int, default=4)
     p.add_argument("--prompt", default="Write a Python function for binary search.")
     p.add_argument("--target-checkpoint", default="./tmp_gpt-oss-20b")
