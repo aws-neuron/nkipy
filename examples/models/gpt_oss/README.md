@@ -74,3 +74,4 @@ gpt-oss differs from the Qwen3 MoE example in several ways, all handled here:
 | `tensor_preparation.py` | Dequantize, reshape, and shard HF weights for TP |
 | `test.sh` | Smoke test: prepares weights and runs generation |
 | `kernels/` | Attention, feed-forward, RoPE, RMSNorm, softmax, sampling kernels |
+| `kernels/nki/` | Hand-written NKI kernels (illustrative; e.g. `nki_rmsnorm_kernel`) |
