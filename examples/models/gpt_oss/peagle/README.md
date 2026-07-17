@@ -100,22 +100,26 @@ acceptance plateau. Set `-k` to override.
 
 ### Speedup over the base model
 
-Speedup = speculative tok/s ÷ base (non-speculative) tok/s of the same target.
-Measured on trn2 (TP=4, K=3, binary-search chat prompt, acceptance ~3.2):
+Speedup = speculative tok/s ÷ base (non-speculative) tok/s of the same target,
+**with the same MoE kernel on both sides** (the base model also honors
+`GPT_OSS_MOE_KERNEL`, so comparing spec-batched against base-loop would overstate
+the win). Measured on trn2 (TP=4, K=3, binary-search chat prompt, acceptance ~3.2,
+n=200 base / n=256 spec):
 
-| Configuration | Decode tok/s | Speedup |
-|---|---|---|
-| Base gpt-oss-20b (no speculation) | ~52 | 1.00× |
-| P-EAGLE K=3, `loop` MoE (default) | 61.6 | **1.18×** |
-| P-EAGLE K=3, `batched` MoE | 66.2 | **1.27×** |
+| MoE kernel | Base tok/s | P-EAGLE K=3 tok/s | Speedup |
+|---|---|---|---|
+| `loop` (default) | 52.0 | 61.6 | **1.18×** |
+| `batched` | 54.9 | 66.2 | **1.21×** |
 
 The speedup is well below the ~3.2 acceptance length because verify is not free:
 each step runs `K+1` tokens through the full target (~36–39 ms) plus ~13 ms of
 drafting. Decode is dispatch/overhead-bound, so verifying 4 tokens costs roughly
-2× a single-token step while producing ~3.2 tokens of output — hence ~1.2–1.3×.
+2× a single-token step while producing ~3.2 tokens of output — hence ~1.2×. The
+`batched` MoE speeds up base decode (52.0→54.9) and verify alike, so it lifts
+both columns and only slightly improves the *ratio* (1.18×→1.21×).
 
 **Speedup scales ~linearly with acceptance length, which is prompt-dependent.**
-Chat-formatted, in-distribution prompts accept ~3.2 (→ ~1.2–1.3×); an
+Chat-formatted, in-distribution prompts accept ~3.2 (→ ~1.2×); an
 out-of-distribution / hard prompt can accept ~2.3 (→ ~1.0×, i.e. no win).
 Always benchmark tok/s with a fixed, representative prompt. The biggest lever on
 speedup is a stronger drafter (raises the acceptance plateau); a cheaper verify
