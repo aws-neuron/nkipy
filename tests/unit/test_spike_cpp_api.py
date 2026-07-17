@@ -1,6 +1,8 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 import os
+import subprocess
+import sys
 import time
 
 import numpy as np
@@ -155,20 +157,43 @@ def test_tensor_lifecycle_on_delete():
     """Test tensor lifecycle when Spike instance and tensor are deleted.
 
     This test verifies that deleting a Spike instance and its allocated tensor
-    works correctly without errors. Uses keep_alive to ensure proper cleanup order.
+    works correctly without errors after the runtime has already closed.
 
     Runs before shared_spike_instance is created.
     """
     try:
         s = Spike()
         t = s.allocate_tensor(100)
-        del s  # Spike ref removed, but tensor keeps it alive via keep_alive
-        del t  # Now Spike can be destroyed
+        del s
+        del t
     except Exception as e:
         pytest.fail(f"tensor_lifecycle_on_delete failed: {e}")
 
 
 @pytest.mark.order(2)
+def test_interpreter_shutdown_with_live_tensors():
+    """Interpreter finalization must not traverse stale nanobind weakrefs."""
+    script = """
+from spike import get_spike_singleton
+
+runtime = get_spike_singleton()
+tensors = [runtime.allocate_tensor(4) for _ in range(128)]
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 0, (
+        f"child exited with {result.returncode}\n"
+        f"stdout:\n{result.stdout}\n"
+        f"stderr:\n{result.stderr}"
+    )
+
+
+@pytest.mark.order(3)
 def test_core_initialization():
     """Test core initialization and cleanup - runs BEFORE shared_spike fixture is created
 
@@ -196,7 +221,7 @@ def test_core_initialization():
 
 
 # This test will run third - it has order=3
-@pytest.mark.order(3)
+@pytest.mark.order(4)
 def test_static_methods():
     """Test static methods"""
     try:

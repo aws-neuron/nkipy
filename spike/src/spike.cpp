@@ -7,7 +7,8 @@ namespace spike {
 static bool g_alive_spike_instance_exists = false;
 
 Spike::Spike(int verbose_level)
-    : verbose_level_(verbose_level), runtime_(nullptr) {
+    : verbose_level_(verbose_level), runtime_(nullptr),
+      runtime_closed_(std::make_shared<std::atomic_bool>(false)) {
   if (g_alive_spike_instance_exists) {
     throw SpikeError(
         "Cannot create Spike instance: a previous instance still exists. "
@@ -35,6 +36,7 @@ uint32_t Spike::get_visible_neuron_core_count() {
 }
 
 int Spike::close() {
+  runtime_closed_->store(true);
   runtime_.reset();
   g_alive_spike_instance_exists = false;
   return 0;

@@ -9,7 +9,7 @@ namespace spike {
 NrtTensor::NrtTensor(nrt_tensor_placement_t placement, uint32_t core_id,
                      size_t size, const std::string &name, const Spike *spike)
     : ptr_(nullptr), core_id_(core_id), size_(size), name_(name),
-      spike_(spike) {
+      runtime_closed_(spike->get_runtime_closed_state()) {
 
   NRT_STATUS status =
       nrt_tensor_allocate(placement, core_id, size, name.c_str(), &ptr_);
@@ -22,7 +22,7 @@ NrtTensor::NrtTensor(nrt_tensor_placement_t placement, uint32_t core_id,
 NrtTensor::NrtTensor(const NrtTensor &source, size_t offset, size_t size,
                      const std::string &name)
     : ptr_(nullptr), core_id_(source.core_id_), size_(size), name_(name),
-      spike_(source.spike_) {
+      runtime_closed_(source.runtime_closed_) {
   if (source.is_freed()) {
     throw SpikeError(
         "Unable to allocate tensor slice from a source tensor that is freed. "
@@ -41,7 +41,8 @@ NrtTensor::~NrtTensor() { free(); }
 
 NrtTensor::NrtTensor(NrtTensor &&other) noexcept
     : ptr_(other.ptr_), core_id_(other.core_id_), size_(other.size_),
-      name_(std::move(other.name_)), spike_(other.spike_) {
+      name_(std::move(other.name_)),
+      runtime_closed_(std::move(other.runtime_closed_)) {
   other.ptr_ = nullptr;
 }
 
@@ -52,14 +53,14 @@ NrtTensor &NrtTensor::operator=(NrtTensor &&other) noexcept {
     core_id_ = other.core_id_;
     name_ = std::move(other.name_);
     size_ = other.size_;
-    spike_ = other.spike_;
+    runtime_closed_ = std::move(other.runtime_closed_);
     other.ptr_ = nullptr;
   }
   return *this;
 }
 
 bool NrtTensor::is_freed() const {
-  return ptr_ == nullptr || (is_owner() && spike_->is_closed());
+  return ptr_ == nullptr || (is_owner() && runtime_closed_->load());
 }
 
 void NrtTensor::write(const void *data, size_t size, size_t offset) {

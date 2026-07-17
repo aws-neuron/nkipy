@@ -12,7 +12,7 @@ NrtModel::NrtModel(const std::string &neff_path, uint32_t core_id,
                    const Spike *spike)
     : ptr_(nullptr), neff_path_(neff_path), core_id_(core_id),
       rank_id_(rank_id), world_size_(world_size), is_collective_(cc_enabled),
-      spike_(spike) {
+      runtime_closed_(spike->get_runtime_closed_state()) {
 
   // Read NEFF file
   std::ifstream file(neff_path, std::ios::binary | std::ios::ate);
@@ -56,7 +56,7 @@ NrtModel::NrtModel(const std::string &neff_path, uint32_t core_id,
 NrtModel::NrtModel(nrt_model_t *ptr, uint32_t core_id, bool cc_enabled,
                    uint32_t rank_id, uint32_t world_size)
     : ptr_(ptr), core_id_(core_id), rank_id_(rank_id), world_size_(world_size),
-      is_collective_(cc_enabled), spike_(nullptr) {}
+      is_collective_(cc_enabled), runtime_closed_(nullptr) {}
 
 NrtModel::~NrtModel() { unload(); }
 
@@ -64,7 +64,7 @@ NrtModel::NrtModel(NrtModel &&other) noexcept
     : ptr_(other.ptr_), neff_path_(std::move(other.neff_path_)),
       core_id_(other.core_id_), rank_id_(other.rank_id_),
       world_size_(other.world_size_), is_collective_(other.is_collective_),
-      spike_(other.spike_) {
+      runtime_closed_(std::move(other.runtime_closed_)) {
   other.ptr_ = nullptr;
 }
 
@@ -77,14 +77,14 @@ NrtModel &NrtModel::operator=(NrtModel &&other) noexcept {
     rank_id_ = other.rank_id_;
     world_size_ = other.world_size_;
     is_collective_ = other.is_collective_;
-    spike_ = other.spike_;
+    runtime_closed_ = std::move(other.runtime_closed_);
     other.ptr_ = nullptr;
   }
   return *this;
 }
 
 bool NrtModel::is_unloaded() const {
-  return ptr_ == nullptr || (is_owner() && spike_->is_closed());
+  return ptr_ == nullptr || (is_owner() && runtime_closed_->load());
 }
 
 void NrtModel::execute(const NrtTensorSet &inputs, NrtTensorSet &outputs,

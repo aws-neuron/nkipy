@@ -3,7 +3,9 @@
 
 #include "nrt_wrapper.h"
 
+#include <atomic>
 #include <cstdint>
+#include <memory>
 #include <string>
 
 namespace spike {
@@ -29,7 +31,7 @@ public:
     return ptr_ ? reinterpret_cast<uintptr_t>(nrt_tensor_get_va(ptr_)) : 0;
   }
   bool is_freed() const;
-  bool is_owner() const { return spike_ != nullptr; }
+  bool is_owner() const { return runtime_closed_ != nullptr; }
 
   // String representation
   std::string to_string() const;
@@ -49,7 +51,7 @@ private:
   uint32_t core_id_;
   uint64_t size_;
   std::string name_;
-  const Spike *spike_;
+  std::shared_ptr<std::atomic_bool> runtime_closed_;
 };
 
 } // namespace spike
