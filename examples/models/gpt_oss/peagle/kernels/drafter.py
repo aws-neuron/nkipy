@@ -12,10 +12,13 @@ Weights are passed as a flat, static signature (fusion-midlayer weights prefixed
 exactly as produced by ``peagle/tensor_preparation.py``.
 """
 
+import neuronxcc.nki.language as nl
 import numpy as np
+from nkipy.core import tensor_apis
 
 from .drafter_layer import drafter_layer_cached
 from .rmsnorm import rmsnorm_kernel
+from .rope import compute_cos_sin_cache
 
 
 def drafter_fused_kernel(
@@ -89,6 +92,16 @@ def drafter_fused_kernel(
     # Fusion midlayer consumes cat(embeds, hidden) of width 2H.
     x = np.concatenate([embeds, hiddens], axis=-1)  # (B, W, 2H)
 
+    # RoPE tables, gathered to the W query positions ONCE and shared across all
+    # layers (every layer uses identical rope params). start_pos=0 for prefill.
+    max_seq_len = cache_k[0].shape[1]
+    freqs_cos, freqs_sin = compute_cos_sin_cache(
+        cfg.rope_inv_freq, max_seq_len, cfg.rope_attention_scaling, dtype=nl.bfloat16
+    )
+    query_pos = start_pos + np.arange(W, dtype=np.int32)
+    freqs_cos = tensor_apis.constant(freqs_cos)[query_pos]
+    freqs_sin = tensor_apis.constant(freqs_sin)[query_pos]
+
     fusion_w = {
         "q_proj": m_q_proj,
         "k_proj": m_k_proj,
@@ -108,8 +121,8 @@ def drafter_fused_kernel(
         cfg.num_heads,
         cfg.num_kv_heads,
         cfg.head_dim,
-        cfg.rope_inv_freq,
-        cfg.rope_attention_scaling,
+        freqs_cos,
+        freqs_sin,
         cache_k[0],
         cache_v[0],
         start_pos,
@@ -136,8 +149,8 @@ def drafter_fused_kernel(
             cfg.num_heads,
             cfg.num_kv_heads,
             cfg.head_dim,
-            cfg.rope_inv_freq,
-            cfg.rope_attention_scaling,
+            freqs_cos,
+            freqs_sin,
             cache_k[i + 1],
             cache_v[i + 1],
             start_pos,

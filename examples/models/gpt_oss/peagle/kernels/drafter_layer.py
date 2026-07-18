@@ -17,7 +17,7 @@ import numpy as np
 from nkipy.core import tensor_apis
 
 from .rmsnorm import rmsnorm_kernel
-from .rope import apply_rotary_emb_kernel, compute_cos_sin_cache
+from .rope import apply_rotary_emb_kernel
 from .softmax import softmax_kernel
 
 
@@ -47,8 +47,8 @@ def _attention_cached(
     n_heads,
     n_kv_heads,
     head_dim,
-    rope_inv_freq,
-    rope_attention_scaling,
+    freqs_cos,
+    freqs_sin,
     cache_k,
     cache_v,
     start_pos,
@@ -58,40 +58,24 @@ def _attention_cached(
     Mirrors the base gpt-oss attention decode path (kernels/attention.py) but for
     the drafter: no sinks, no bias, no GQA all-reduce (the drafter is replicated).
 
-    When ``start_pos`` is None: prefill mode — process the full ``S`` positions and
-    write them to cache slots ``0..S-1``. Otherwise: append ``S`` new positions at
-    absolute offsets ``start_pos + [0..S-1]``, scatter their K/V into the cache, and
-    attend to the whole cache under a causal mask over absolute positions.
+    ``freqs_cos``/``freqs_sin`` are the RoPE tables already gathered to the ``S``
+    query positions (computed once per forward and shared across layers, since all
+    layers use identical RoPE params). New positions are appended at absolute
+    offsets ``start_pos + [0..S-1]``, their K/V scattered into the cache, and the
+    query attends to the whole cache under a causal mask over absolute positions.
     """
-    is_prefill = start_pos is None
     B, S, _ = attn_input.shape
 
     xq = np.matmul(attn_input, q_proj).reshape(B, S, n_heads, head_dim)
     xk = np.matmul(attn_input, k_proj).reshape(B, S, n_kv_heads, head_dim)
     xv = np.matmul(attn_input, v_proj).reshape(B, S, n_kv_heads, head_dim)
 
-    max_seq_len = cache_k.shape[1]
-    freqs_cos, freqs_sin = compute_cos_sin_cache(
-        rope_inv_freq, max_seq_len, rope_attention_scaling, dtype=nl.bfloat16
-    )
-    if is_prefill:
-        freqs_cos = freqs_cos[0:S]
-        freqs_sin = freqs_sin[0:S]
-    else:
-        query_pos = start_pos + np.arange(S, dtype=np.int32)
-        freqs_cos = tensor_apis.constant(freqs_cos)
-        freqs_sin = tensor_apis.constant(freqs_sin)
-        freqs_cos = freqs_cos[query_pos]
-        freqs_sin = freqs_sin[query_pos]
+    query_pos = start_pos + np.arange(S, dtype=np.int32)
     xq, xk = apply_rotary_emb_kernel(xq, xk, freqs_cos, freqs_sin)
 
     # KV cache update.
-    if is_prefill:
-        cache_k[:, :S] = xk
-        cache_v[:, :S] = xv
-    else:
-        cache_k[:, query_pos] = xk
-        cache_v[:, query_pos] = xv
+    cache_k[:, query_pos] = xk
+    cache_v[:, query_pos] = xv
 
     n_rep = n_heads // n_kv_heads
     keys = _repeat_kv(cache_k, n_rep)
@@ -106,16 +90,13 @@ def _attention_cached(
     scores = (xq @ keys.transpose(0, 1, 3, 2)) / np.float32(np.sqrt(head_dim))
     scores = scores.astype(nl.bfloat16)
 
-    # Causal mask over absolute positions (compile-time constant).
+    # Causal mask over absolute positions (compile-time constant). One mask row
+    # per query token: the query at start_pos+i attends to keys <= start_pos+i
+    # (block-causal for the S committed+ptd positions; start_pos=0 for prefill).
     NEG = -100000.0
     full_mask = np.triu(np.ones((k_seq_len, k_seq_len)) * NEG, k=1).astype(scores.dtype)
     causal_mask = tensor_apis.constant(full_mask)
-    if is_prefill:
-        scores = scores + np.expand_dims(causal_mask[:S, :k_seq_len], axis=[0, 1])
-    else:
-        # One mask row per query token: query at start_pos+i attends to keys
-        # <= start_pos+i (block-causal for the S committed+ptd positions).
-        scores = scores + np.expand_dims(causal_mask[query_pos, :k_seq_len], axis=[0, 1])
+    scores = scores + np.expand_dims(causal_mask[query_pos, :k_seq_len], axis=[0, 1])
 
     weights = softmax_kernel(scores)
     out = weights @ values  # BHSD
@@ -130,8 +111,8 @@ def drafter_layer_cached(
     n_heads,
     n_kv_heads,
     head_dim,
-    rope_inv_freq,
-    rope_attention_scaling,
+    freqs_cos,
+    freqs_sin,
     cache_k,
     cache_v,
     start_pos,
@@ -141,8 +122,9 @@ def drafter_layer_cached(
 
     Same layer math, but attention reads/writes a persistent per-layer KV cache
     and attends over absolute positions (``start_pos`` runtime offset), so the new
-    positions see the full prompt + accepted-token context. ``start_pos=None``
-    runs prefill (writes cache slots ``0..S-1``).
+    positions see the full prompt + accepted-token context. ``freqs_cos``/
+    ``freqs_sin`` are the RoPE tables pre-gathered to the query positions, shared
+    across all layers.
     """
     if is_fusion:
         hidden_size = x.shape[-1] // 2
@@ -165,8 +147,8 @@ def drafter_layer_cached(
         n_heads,
         n_kv_heads,
         head_dim,
-        rope_inv_freq,
-        rope_attention_scaling,
+        freqs_cos,
+        freqs_sin,
         cache_k,
         cache_v,
         start_pos,

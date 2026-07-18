@@ -247,6 +247,18 @@ class DrafterModel:
         -- carrying their real target hidden states (``commit_aux3``, which only
         exist after verify) -- and then drafts the next K tokens, all in one pass.
 
+        Why re-feed all C accepted tokens, not just the single newest one? The
+        *previous* step wrote KV for these positions from placeholders
+        (``ptd_token_id`` embeddings + ``mask_hidden``), since at draft time it did
+        not yet know which of its K-1 MTP slots the target would accept. Now that
+        the target has confirmed C of them, this step overwrites those stale
+        mask-derived rows -- at their true absolute positions -- with the real
+        token embeds + target hidden, so later positions (this step's MTP slots and
+        every future step) attend to correct context. A "1 real + K-1 mask" layout
+        would only be right if C were always 1 (i.e. the target accepted exactly
+        one token per step, defeating speculation); the C-1 other accepted rows
+        would keep their placeholder KV forever.
+
         Runs ONE fused forward of width W = C + K - 1 over
         ``[commit_0 .. commit_{C-1} | ptd_0 .. ptd_{K-2}]`` at consecutive absolute
         positions ``base_pos + [0..W-1]``, all attending to the full cache. The
