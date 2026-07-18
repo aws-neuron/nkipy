@@ -258,7 +258,9 @@ def main():
 
     os.environ["TOKENIZERS_PARALLELISM"] = "true"
     os.environ["OMP_NUM_THREADS"] = "1"
-    os.environ["NEURON_RT_ROOT_COMM_ID"] = "localhost:61239"
+    # Overridable so concurrent runs on one host don't collide on the comm port
+    # (export NEURON_RT_ROOT_COMM_ID=localhost:<other_port> for a second instance).
+    os.environ.setdefault("NEURON_RT_ROOT_COMM_ID", "localhost:61239")
     dist.init_process_group()
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
