@@ -7,8 +7,10 @@ over the full context (prompt + accepted tokens); each draft step runs
 W = C + K - 1 positions that attend causally to the whole cache.
 
 Only the token-embedding gather stays on host (dynamic ids); everything else is
-on device. Kernels are compiled once per sequence width (prefill = prompt_len-1,
-draft W = K..2K) at load time. Rollback of rejected speculative rows is implicit:
+on device. The draft kernels (one per width W = K..2K) are compiled up front at
+load time; the single prefill kernel is compiled lazily on the first prefill()
+since prompt_len isn't known until then (it runs once, outside the decode loop).
+Rollback of rejected speculative rows is implicit:
 committed rows are re-written at their absolute positions and the causal mask
 prevents any query from attending past its own position (same trick as the
 target's verify).
@@ -24,8 +26,6 @@ from nkipy.runtime import DeviceKernel, DeviceTensor
 from .config import EagleConfig
 from .kernels.drafter import drafter_fused_kernel
 
-BUILD_DIR = None  # set by the caller (absolute path)
-
 
 class DrafterModel:
     def __init__(self, weights, config: EagleConfig, build_dir):
@@ -35,33 +35,32 @@ class DrafterModel:
         self.K = config.num_draft_tokens
         self.n_layers = config.num_layers
         assert self.n_layers == 4, "fused kernel is wired for 4 layers (1 fusion + 3)"
-        self.cache_len = 0
         self._prepare_tensors(weights)
         self._prepare_kernels()
 
-    def _dt(self, t, name):
-        return DeviceTensor.from_torch(t, name)
+    def _to_device(self, tensor, name):
+        return DeviceTensor.from_torch(tensor, name)
 
-    def _prepare_tensors(self, w):
+    def _prepare_tensors(self, weights):
         cfg = self.config
         H = cfg.hidden_size
 
         # Host: token embeddings (dynamic gather each step) + d2t remap.
-        self.embed_tokens = w["embed_tokens"]  # (vocab, H) host
+        self.embed_tokens = weights["embed_tokens"]  # (vocab, H) host
         self.ptd_emb_host = self.embed_tokens[cfg.ptd_token_id].reshape(1, H)
-        self.d2t = w["d2t"].to(torch.int64)
+        self.d2t = weights["d2t"].to(torch.int64)
 
         # Device: fc weight + mask hidden (fc-fuse now runs on device).
-        self.fc_weight = self._dt(w["fc_weight"], "d_fc_weight")  # (3*tH, H)
-        self.mask_hidden = self._dt(
-            w["mask_hidden"].reshape(1, -1), "d_mask_hidden"
+        self.fc_weight = self._to_device(weights["fc_weight"], "d_fc_weight")  # (3*tH, H)
+        self.mask_hidden = self._to_device(
+            weights["mask_hidden"].reshape(1, -1), "d_mask_hidden"
         )  # (1, 3*tH)
-        self.norm_weight = self._dt(w["norm_weight"], "d_norm_weight")
-        self.lm_head_weight = self._dt(w["lm_head_weight"], "d_lm_head_weight")
+        self.norm_weight = self._to_device(weights["norm_weight"], "d_norm_weight")
+        self.lm_head_weight = self._to_device(weights["lm_head_weight"], "d_lm_head_weight")
 
         # Fusion midlayer weights (layer 0).
-        self.m = {
-            k: self._dt(w[f"midlayer.{k}"], f"d_m_{k}")
+        self.fusion_weights = {
+            k: self._to_device(weights[f"midlayer.{k}"], f"d_m_{k}")
             for k in [
                 "q_proj", "k_proj", "v_proj", "o_proj",
                 "input_weight", "hidden_norm_weight", "post_attention_weight",
@@ -75,12 +74,12 @@ class DrafterModel:
             "input_weight", "post_attention_weight",
             "gate_proj", "up_proj", "down_proj",
         ]
-        self.p = {}
+        self.plain_weights = {}
         for k in plain_keys:
             stacked = torch.stack(
-                [w[f"layers.{i}.{k}"] for i in range(1, cfg.num_layers)]
+                [weights[f"layers.{i}.{k}"] for i in range(1, cfg.num_layers)]
             )
-            self.p[k] = self._dt(stacked, f"d_p_{k}")
+            self.plain_weights[k] = self._to_device(stacked, f"d_p_{k}")
 
         # Per-layer KV caches (separate named device tensors, aliased in+out).
         cache_shape = (
@@ -102,25 +101,25 @@ class DrafterModel:
             "mask_hidden": self.mask_hidden,
             "norm_weight": self.norm_weight,
             "lm_head_weight": self.lm_head_weight,
-            "m_q_proj": self.m["q_proj"],
-            "m_k_proj": self.m["k_proj"],
-            "m_v_proj": self.m["v_proj"],
-            "m_o_proj": self.m["o_proj"],
-            "m_input_weight": self.m["input_weight"],
-            "m_hidden_norm_weight": self.m["hidden_norm_weight"],
-            "m_post_attention_weight": self.m["post_attention_weight"],
-            "m_gate_proj": self.m["gate_proj"],
-            "m_up_proj": self.m["up_proj"],
-            "m_down_proj": self.m["down_proj"],
-            "p_q_proj": self.p["q_proj"],
-            "p_k_proj": self.p["k_proj"],
-            "p_v_proj": self.p["v_proj"],
-            "p_o_proj": self.p["o_proj"],
-            "p_input_weight": self.p["input_weight"],
-            "p_post_attention_weight": self.p["post_attention_weight"],
-            "p_gate_proj": self.p["gate_proj"],
-            "p_up_proj": self.p["up_proj"],
-            "p_down_proj": self.p["down_proj"],
+            "m_q_proj": self.fusion_weights["q_proj"],
+            "m_k_proj": self.fusion_weights["k_proj"],
+            "m_v_proj": self.fusion_weights["v_proj"],
+            "m_o_proj": self.fusion_weights["o_proj"],
+            "m_input_weight": self.fusion_weights["input_weight"],
+            "m_hidden_norm_weight": self.fusion_weights["hidden_norm_weight"],
+            "m_post_attention_weight": self.fusion_weights["post_attention_weight"],
+            "m_gate_proj": self.fusion_weights["gate_proj"],
+            "m_up_proj": self.fusion_weights["up_proj"],
+            "m_down_proj": self.fusion_weights["down_proj"],
+            "p_q_proj": self.plain_weights["q_proj"],
+            "p_k_proj": self.plain_weights["k_proj"],
+            "p_v_proj": self.plain_weights["v_proj"],
+            "p_o_proj": self.plain_weights["o_proj"],
+            "p_input_weight": self.plain_weights["input_weight"],
+            "p_post_attention_weight": self.plain_weights["post_attention_weight"],
+            "p_gate_proj": self.plain_weights["gate_proj"],
+            "p_up_proj": self.plain_weights["up_proj"],
+            "p_down_proj": self.plain_weights["down_proj"],
         }
         for i in range(self.n_layers):
             d[f"cache_k{i}.must_alias_input"] = self.cache_k[i]
@@ -188,14 +187,16 @@ class DrafterModel:
     # ── helpers ──────────────────────────────────────────────────────────────
 
     def _embed(self, token_ids):
+        # torch side hardcoded to bf16 to match cfg.dtype (an NKI/numpy dtype, not
+        # a torch dtype, so it can't be substituted directly here).
         ids = torch.as_tensor(token_ids)
         return self.embed_tokens[ids].reshape(1, len(ids), self.H).to(torch.bfloat16)
 
     def _run_fused(self, kernel, logits_buf, embeds, target_hidden3, start_pos):
         """Invoke the fused kernel: upload inputs, run, return host logits (W,vocab)."""
         inputs = {
-            "embeds": self._dt(embeds, "embeds_in"),
-            "target_hidden3": self._dt(target_hidden3.to(torch.bfloat16), "th3_in"),
+            "embeds": self._to_device(embeds, "embeds_in"),
+            "target_hidden3": self._to_device(target_hidden3.to(torch.bfloat16), "th3_in"),
             "start_pos": DeviceTensor.from_numpy(
                 np.array([start_pos], dtype=np.int32), "sp_in"
             ),
@@ -208,17 +209,17 @@ class DrafterModel:
 
     # ── public API ─────────────────────────────────────────────────────────────
 
-    def reset(self):
-        self.cache_len = 0
-
     @torch.no_grad()
     def prefill(self, token_ids, aux_hidden_states):
         """Fill the drafter KV cache with prompt context (single fused pass).
 
         token_ids: (S,) prompt tokens (EAGLE-shifted by the caller).
         aux_hidden_states: (1, S, 3*target_H) target tap hiddens.
+
+        The KV cache needs no explicit clearing between sequences: every row is
+        re-written at its absolute position and the causal mask blocks any query
+        from attending past its own position, so stale rows are never read.
         """
-        self.reset()
         S = len(token_ids)
         embeds = self._embed(token_ids)  # (1, S, H)
         th3 = aux_hidden_states  # all S rows are "committed" (C == S, no MTP slots)
@@ -234,7 +235,6 @@ class DrafterModel:
             )
             self._prefill_width = S
         self._run_fused(self._prefill_kernel, self._prefill_logits, embeds, th3, 0)
-        self.cache_len = S
 
     @torch.no_grad()
     def draft(self, commit_token_ids, commit_aux3, base_pos):
@@ -259,6 +259,10 @@ class DrafterModel:
         H, K = self.H, self.K
         C = len(commit_token_ids)  # tokens accepted by the target last step
         assert C >= 1, "draft() needs at least the NTP (last committed) token"
+        assert C <= K + 1, (
+            f"C={C} exceeds max acceptance length K+1={K + 1}; only widths "
+            f"W in [{K}, {2 * K}] have compiled kernels"
+        )
         W = C + K - 1
 
         _prof = os.environ.get("SPEC_PROFILE") == "1"
@@ -281,8 +285,6 @@ class DrafterModel:
         )
         # Committed rows land at their true absolute positions; the K-1 ptd rows are
         # speculative and get overwritten when the next step commits accepted tokens.
-        self.cache_len = base_pos + C
-
         logits = logits[C - 1 :]  # (K, vocab_local)
         self.last_logits = logits  # stashed for numerical cross-checks
         draft_local = logits.argmax(dim=-1)  # (K,)
