@@ -13,12 +13,18 @@ from typing import Dict
 
 import numpy as np
 import pytest
+from nkipy.core.trace import NKIPyKernel
 from utils import (
     NEURON_AVAILABLE,
     baremetal_assert_allclose,
     on_device_test,
     trace_and_compile,
 )
+
+
+def _assert_traced_shape(kernel, trace_mode, expected_shape, *args):
+    traced = NKIPyKernel.trace(kernel, backend=trace_mode).specialize(*args)
+    assert traced.outputs[0].shape == expected_shape
 
 
 class TestIndexingSlicingCore:
@@ -354,6 +360,7 @@ class TestIndexingSlicingAdvanced:
         """Create sample tensors for advanced testing"""
 
         return {
+            "small_1d": np.random.randn(32).astype(np.float32),
             "small_2d": np.random.randn(8, 16).astype(np.float32),
             "small_3d": np.random.randn(4, 8, 12).astype(np.float32),
             "batch_seq": np.random.randn(4, 32, 64).astype(np.float32),
@@ -636,6 +643,63 @@ class TestIndexingSlicingAdvanced:
 
         a = sample_tensors["small_2d"]
         expected = kernel(a)
+
+        if NEURON_AVAILABLE:
+            out_baremetal = on_device_test(kernel, trace_mode, a)
+            baremetal_assert_allclose(expected, out_baremetal)
+        else:
+            trace_and_compile(kernel, trace_mode, a)
+
+    def test_reverse_slice(self, trace_mode, sample_tensors):
+        def kernel(a):
+            return a[::-1]
+
+        a = sample_tensors["small_1d"]
+        expected = kernel(a)
+        _assert_traced_shape(kernel, trace_mode, expected.shape, a)
+
+        if NEURON_AVAILABLE:
+            out_baremetal = on_device_test(kernel, trace_mode, a)
+            baremetal_assert_allclose(expected, out_baremetal)
+        else:
+            trace_and_compile(kernel, trace_mode, a)
+
+    def test_reverse_slice_with_step(self, trace_mode, sample_tensors):
+        def kernel(a):
+            return a[40:3:-4]
+
+        a = sample_tensors["small_1d"]
+        expected = kernel(a)
+        _assert_traced_shape(kernel, trace_mode, expected.shape, a)
+
+        if NEURON_AVAILABLE:
+            out_baremetal = on_device_test(kernel, trace_mode, a)
+            baremetal_assert_allclose(expected, out_baremetal)
+        else:
+            trace_and_compile(kernel, trace_mode, a)
+
+    @pytest.mark.parametrize("index", [slice(40, 50), slice(5, 3), slice(3, 5, -1)])
+    def test_empty_slice(self, trace_mode, sample_tensors, index):
+        def kernel(a):
+            return a[index]
+
+        a = sample_tensors["small_1d"]
+        expected = kernel(a)
+        _assert_traced_shape(kernel, trace_mode, expected.shape, a)
+
+        if NEURON_AVAILABLE:
+            out_baremetal = on_device_test(kernel, trace_mode, a)
+            baremetal_assert_allclose(expected, out_baremetal)
+        else:
+            trace_and_compile(kernel, trace_mode, a)
+
+    def test_multidimensional_reverse_slice(self, trace_mode, sample_tensors):
+        def kernel(a):
+            return a[::-1, 14:2:-3]
+
+        a = sample_tensors["small_2d"]
+        expected = kernel(a)
+        _assert_traced_shape(kernel, trace_mode, expected.shape, a)
 
         if NEURON_AVAILABLE:
             out_baremetal = on_device_test(kernel, trace_mode, a)

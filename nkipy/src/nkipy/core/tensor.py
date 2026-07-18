@@ -689,18 +689,21 @@ class NKIPyTensorRef(TensorArithmeticMixin, TensorOperationMixin):
         limit_indices = []
         strides = []
         squeeze_dims = []  # Dimensions to squeeze (from integer indexing)
+        reverse_dims = []
 
         for dim, idx in enumerate(indices):
             if isinstance(idx, slice):
-                start = idx.start if idx.start is not None else 0
-                stop = idx.stop if idx.stop is not None else self.shape[dim]
-                step = idx.step if idx.step is not None else 1
+                dim_size = self.shape[dim]
+                start, stop, step = idx.indices(dim_size)
 
-                # Normalize negative indices
-                if start < 0:
-                    start = self.shape[dim] + start
-                if stop < 0:
-                    stop = self.shape[dim] + stop
+                if (step > 0 and start >= stop) or (step < 0 and start <= stop):
+                    start, stop, step = 0, 0, 1
+                elif step < 0:
+                    # HLO slices require positive strides; reverse and remap bounds.
+                    reverse_dims.append(dim)
+                    start = dim_size - 1 - start
+                    stop = dim_size - 1 - stop
+                    step = -step
 
                 start_indices.append(start)
                 limit_indices.append(stop)
@@ -718,8 +721,13 @@ class NKIPyTensorRef(TensorArithmeticMixin, TensorOperationMixin):
                     f"Unsupported index type in static slicing: {type(idx)}"
                 )
 
+        result = self
+        for dim in reverse_dims:
+            reversed_indices = np.arange(self.shape[dim] - 1, -1, -1, dtype=np.int32)
+            result = nkipy_ops.take(result, reversed_indices, axis=dim)
+
         return nkipy_ops.static_slice(
-            self, start_indices, limit_indices, strides, squeeze_dims
+            result, start_indices, limit_indices, strides, squeeze_dims
         )
 
     def _do_scatter_indexing(self, indices, value):
