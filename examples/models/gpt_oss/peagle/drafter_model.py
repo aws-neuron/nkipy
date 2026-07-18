@@ -7,10 +7,11 @@ over the full context (prompt + accepted tokens); each draft step runs
 W = C + K - 1 positions that attend causally to the whole cache.
 
 Only the token-embedding gather stays on host (dynamic ids); everything else is
-on device. The draft kernels (one per width W = K..2K) are compiled up front at
-load time; the single prefill kernel is compiled lazily on the first prefill()
-since prompt_len isn't known until then (it runs once, outside the decode loop).
-Rollback of rejected speculative rows is implicit:
+on device. A single max-width draft kernel (W = 2K) is compiled up front at load
+time and every step pads up to it (the acceptance count C, hence the natural
+width, varies per step); the prefill kernel is compiled lazily on the first
+prefill() since prompt_len isn't known until then (it runs once, outside the
+decode loop). Rollback of rejected speculative rows is implicit:
 committed rows are re-written at their absolute positions and the causal mask
 prevents any query from attending past its own position (same trick as the
 target's verify).
@@ -52,9 +53,12 @@ class DrafterModel:
 
         # Device: fc weight + mask hidden (fc-fuse now runs on device).
         self.fc_weight = self._to_device(weights["fc_weight"], "d_fc_weight")  # (3*tH, H)
-        self.mask_hidden = self._to_device(
-            weights["mask_hidden"].reshape(1, -1), "d_mask_hidden"
-        )  # (1, 3*tH)
+        mask_hidden = weights["mask_hidden"].reshape(1, -1)  # (1, 3*tH)
+        self.mask_hidden = self._to_device(mask_hidden, "d_mask_hidden")
+        # Host copy of the raw mask hidden: pads target_hidden3 up to the fixed
+        # committed-count C=K+1 so the single max-width kernel sees the same
+        # fc(mask_hidden) MTP rows the variable-width kernels used to build.
+        self.mask_hidden_host = mask_hidden.to(torch.bfloat16)
         self.norm_weight = self._to_device(weights["norm_weight"], "d_norm_weight")
         self.lm_head_weight = self._to_device(weights["lm_head_weight"], "d_lm_head_weight")
 
@@ -165,21 +169,26 @@ class DrafterModel:
 
     def _prepare_kernels(self):
         t = time.time()
-        # Draft step: width W = C + K - 1, C in 1..K+1, so W in K..2K. For each W
-        # the committed count is C = W - K + 1. Compile all upfront (a lazy compile
-        # inside the decode loop would stall a step by tens of seconds).
-        self.kernel_draft = {}  # W -> kernel
-        self.draft_logits = {}  # W -> (B, W, vocab) buffer
-        for W in range(self.K, 2 * self.K + 1):
-            C = W - self.K + 1
-            self.kernel_draft[W] = self._compile_fused(W, C, f"drafter_fused_W{W}")
-            self.draft_logits[W] = DeviceTensor.from_numpy(
-                np.empty(
-                    (self.config.max_batch_size, W, self.lm_head_weight.shape[1]),
-                    dtype=self.config.dtype,
-                ),
-                f"d_logits_W{W}",
-            )
+        # Draft step: the acceptance count C is in 1..K+1, so the natural width
+        # W = C + K - 1 varies over K..2K. Rather than compile one shape-static
+        # kernel per width, compile ONE kernel at the max width (W = 2K, C = K+1)
+        # and pad every call up to it (see draft()). Padding is safe: the extra
+        # rows sit at absolute positions past the draft window, so the causal mask
+        # hides them from every real row and their cache writes get overwritten by
+        # a later commit -- the same invariant that already lets speculative MTP
+        # rows be rewritten. Cuts cold compile from K+1 kernels to 1.
+        self.draft_W = 2 * self.K
+        self.draft_C = self.K + 1
+        self.kernel_draft = self._compile_fused(
+            self.draft_W, self.draft_C, "drafter_fused"
+        )
+        self.draft_logits = DeviceTensor.from_numpy(
+            np.empty(
+                (self.config.max_batch_size, self.draft_W, self.lm_head_weight.shape[1]),
+                dtype=self.config.dtype,
+            ),
+            "d_logits",
+        )
         self._prefill_kernel = None
         self._prefill_width = None
         self._compile_time = time.time() - t
@@ -259,45 +268,63 @@ class DrafterModel:
         one token per step, defeating speculation); the C-1 other accepted rows
         would keep their placeholder KV forever.
 
-        Runs ONE fused forward of width W = C + K - 1 over
+        The natural width is W = C + K - 1 over
         ``[commit_0 .. commit_{C-1} | ptd_0 .. ptd_{K-2}]`` at consecutive absolute
         positions ``base_pos + [0..W-1]``, all attending to the full cache. The
         width is C + K - 1 (not C + K) because the NTP draft is read from the last
         committed row itself, so only K-1 extra placeholder (ptd/MTP) slots are
-        appended. The K draft logits are rows ``[C-1 .. W-1]`` (last committed slot
-        + K-1 MTP). Rejected speculative rows from the previous step are
+        appended. The K draft logits are rows ``[C-1 .. C+K-2]`` (last committed
+        slot + K-1 MTP). Rejected speculative rows from the previous step are
         overwritten in place.
+
+        A single kernel of the max width ``draft_W = 2K`` (fixed ``draft_C = K+1``)
+        handles every C: we pad the ids with extra ptd placeholders and pad
+        ``target_hidden3`` with the raw ``mask_hidden`` (so the padded rows fc-fuse
+        to exactly the MTP hidden the kernel would build anyway). The padding rows
+        land at absolute positions >= base_pos + W, past this step's draft window,
+        so no real row attends to them and their cache writes are overwritten later.
         """
         H, K = self.H, self.K
         C = len(commit_token_ids)  # tokens accepted by the target last step
         assert C >= 1, "draft() needs at least the NTP (last committed) token"
-        assert C <= K + 1, (
-            f"C={C} exceeds max acceptance length K+1={K + 1}; only widths "
-            f"W in [{K}, {2 * K}] have compiled kernels"
+        assert C <= self.draft_C, (
+            f"C={C} exceeds max acceptance length K+1={self.draft_C}"
         )
-        W = C + K - 1
 
         _prof = os.environ.get("SPEC_PROFILE") == "1"
         if _prof:
             _td = time.time()
 
-        # Embedding half: committed token embeds + K-1 ptd embeds. The hidden half
-        # (fc-fuse of target_hidden3 / mask_hidden) is built inside the kernel.
+        # Embedding half: C committed token embeds, then ptd embeds padding out to
+        # the fixed draft width. The hidden half (fc-fuse of target_hidden3 /
+        # mask_hidden) is built inside the kernel.
         commit_emb = self._embed(commit_token_ids)  # (1, C, H)
-        if K > 1:
-            mtp_emb = self.ptd_emb_host.reshape(1, 1, H).expand(1, K - 1, H).to(
+        n_pad_emb = self.draft_W - C
+        if n_pad_emb > 0:
+            ptd_emb = self.ptd_emb_host.reshape(1, 1, H).expand(1, n_pad_emb, H).to(
                 torch.bfloat16
             )
-            embeds = torch.cat([commit_emb, mtp_emb], dim=1)  # (1, W, H)
+            embeds = torch.cat([commit_emb, ptd_emb], dim=1)  # (1, draft_W, H)
         else:
             embeds = commit_emb
 
+        # Hidden half: C real target hiddens, padded to draft_C with raw mask_hidden
+        # (which fc-fuses to the MTP hidden, matching the kernel's own MTP rows).
+        n_pad_h = self.draft_C - C
+        if n_pad_h > 0:
+            mask_pad = self.mask_hidden_host.reshape(1, 1, -1).expand(
+                1, n_pad_h, -1
+            )
+            target_hidden3 = torch.cat([commit_aux3.to(torch.bfloat16), mask_pad], dim=1)
+        else:
+            target_hidden3 = commit_aux3
+
         logits = self._run_fused(
-            self.kernel_draft[W], self.draft_logits[W], embeds, commit_aux3, base_pos
+            self.kernel_draft, self.draft_logits, embeds, target_hidden3, base_pos
         )
-        # Committed rows land at their true absolute positions; the K-1 ptd rows are
+        # Committed rows land at their true absolute positions; the ptd rows are
         # speculative and get overwritten when the next step commits accepted tokens.
-        logits = logits[C - 1 :]  # (K, vocab_local)
+        logits = logits[C - 1 : C - 1 + K]  # (K, vocab_local)
         self.last_logits = logits  # stashed for numerical cross-checks
         draft_local = logits.argmax(dim=-1)  # (K,)
         draft_global = draft_local + self.d2t[draft_local]
