@@ -294,8 +294,11 @@ decode tok/s on trn2 (TP=4).
 Each draft step runs a **single fused forward** of width `W = C + K - 1` over
 `[commit_0 .. commit_{C-1} | ptd_0 .. ptd_{K-2}]` (accepted tokens + MTP slots), so
 committing accepted tokens and drafting the next K happen in one kernel — no
-separate per-token commit or per-layer launches. One kernel is compiled per width
-(`W` ranges `K..2K`) at load time.
+separate per-token commit or per-layer launches. Because `C` (hence `W`) varies
+per step, a single kernel is compiled at the **max width** (`W = 2K`, `C = K+1`)
+and every step pads up to it (extra `ptd`/`mask_hidden` rows land past the draft
+window, so the causal mask hides them and their cache writes are overwritten by a
+later commit). This compiles one kernel instead of `K+1` at load time.
 
 Remaining work (profile with `SPEC_PROFILE=1`):
 
