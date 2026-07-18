@@ -237,13 +237,17 @@ draft-token match). Three issues were found and fixed:
    the prompt, so they produced generic tokens. The drafter must keep a KV cache
    over the whole context and have every new position attend to it (plain causal
    over absolute positions). The drafter now keeps a KV cache: it prefills on the
-   prompt and, each step, rolls the cache back to the last accepted position and
-   runs `[newly-accepted tokens | K-1 ptd slots]`.
+   prompt and, each step, re-commits the newly-accepted tokens at their absolute
+   positions before drafting the next `K-1` ptd slots.
 
-2. **`rollback()` truncated the wrong axis.** The cache tensors are
-   `(B, n_kv, seq, head_dim)`; `rollback()` sliced dim 1 (`n_kv`) instead of dim 2
-   (`seq`), so rejected speculative KV entries were never discarded and corrupted
-   every later step. Fixed to slice the sequence axis.
+2. **Discarding rejected speculative KV.** Rejected speculative rows from the
+   previous step must not corrupt later steps. This is now handled *implicitly*
+   (no explicit rollback): each step rewrites the accepted tokens' KV at their
+   true absolute positions, and the causal mask prevents any query from attending
+   past its own position, so stale speculative rows are never read (the same trick
+   the target's verify uses). An earlier explicit-truncation design had a bug
+   here — it sliced the KV heads axis instead of the sequence axis — which the
+   absolute-position rewrite scheme removes entirely.
 
 3. **Aux tap off-by-one.** vLLM's EAGLE-3 default `(2, n//2, n-3)` captures the
    residual stream *entering* those layers (`layer_idx=i+1` after layer `i`), i.e.
@@ -265,11 +269,12 @@ applies the chat template by default (`--raw-prompt` to opt out).
    `target_hidden@p`.
 3. **Drafter prefill** over the prompt builds a KV cache (positions 0..P-2), plain
    causal.
-4. **Each draft step:** roll the cache back to the last accepted position; append
-   `[newly-accepted tokens (real target hidden) | K-1 ptd slots (fc(mask_hidden),
-   ptd_token_id embedding)]` at consecutive absolute positions, attending to the
-   full cache; the K draft logits are the last committed slot (NTP) + the K-1 ptd
-   slots (MTP).
+4. **Each draft step:** run `[newly-accepted tokens (real target hidden) | K-1 ptd
+   slots (fc(mask_hidden), ptd_token_id embedding)]` at consecutive absolute
+   positions, attending to the full cache. Committing the accepted tokens rewrites
+   their KV in place, and the causal mask hides any stale speculative rows from
+   the previous step (no explicit rollback). The K draft logits are the last
+   committed slot (NTP) + the K-1 ptd slots (MTP).
 
 ### vLLM reference (parallel_drafting)
 
