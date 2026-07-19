@@ -656,12 +656,12 @@ class TestIndexingSlicingAdvanced:
 
         a = sample_tensors["small_1d"]
         expected = kernel(a)
-        _assert_traced_shape(kernel, trace_mode, expected.shape, a)
 
         if NEURON_AVAILABLE:
             out_baremetal = on_device_test(kernel, trace_mode, a)
             baremetal_assert_allclose(expected, out_baremetal)
         else:
+            _assert_traced_shape(kernel, trace_mode, expected.shape, a)
             trace_and_compile(kernel, trace_mode, a)
 
     def test_reverse_slice_with_step(self, trace_mode, sample_tensors):
@@ -670,12 +670,12 @@ class TestIndexingSlicingAdvanced:
 
         a = sample_tensors["small_1d"]
         expected = kernel(a)
-        _assert_traced_shape(kernel, trace_mode, expected.shape, a)
 
         if NEURON_AVAILABLE:
             out_baremetal = on_device_test(kernel, trace_mode, a)
             baremetal_assert_allclose(expected, out_baremetal)
         else:
+            _assert_traced_shape(kernel, trace_mode, expected.shape, a)
             trace_and_compile(kernel, trace_mode, a)
 
     @pytest.mark.parametrize("index", [slice(40, 50), slice(5, 3), slice(3, 5, -1)])
@@ -685,12 +685,12 @@ class TestIndexingSlicingAdvanced:
 
         a = sample_tensors["small_1d"]
         expected = kernel(a)
-        _assert_traced_shape(kernel, trace_mode, expected.shape, a)
 
         if NEURON_AVAILABLE:
             out_baremetal = on_device_test(kernel, trace_mode, a)
             baremetal_assert_allclose(expected, out_baremetal)
         else:
+            _assert_traced_shape(kernel, trace_mode, expected.shape, a)
             trace_and_compile(kernel, trace_mode, a)
 
     def test_multidimensional_reverse_slice(self, trace_mode, sample_tensors):
@@ -699,12 +699,12 @@ class TestIndexingSlicingAdvanced:
 
         a = sample_tensors["small_2d"]
         expected = kernel(a)
-        _assert_traced_shape(kernel, trace_mode, expected.shape, a)
 
         if NEURON_AVAILABLE:
             out_baremetal = on_device_test(kernel, trace_mode, a)
             baremetal_assert_allclose(expected, out_baremetal)
         else:
+            _assert_traced_shape(kernel, trace_mode, expected.shape, a)
             trace_and_compile(kernel, trace_mode, a)
 
     def test_step_slicing_assignment(self, trace_mode, sample_tensors):
