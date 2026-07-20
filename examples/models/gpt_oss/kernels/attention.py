@@ -1,6 +1,6 @@
 from typing import Optional
 
-import neuronxcc.nki.language as nl
+import nki.language as nl
 import nkipy.core.typing as nt
 import nkipy.distributed.collectives as cc
 import numpy as np
