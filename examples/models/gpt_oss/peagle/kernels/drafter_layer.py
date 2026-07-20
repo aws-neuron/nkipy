@@ -12,7 +12,7 @@ Two layer shapes share most of the math:
 Both use rotate-halves llama3 RoPE and plain SwiGLU.
 """
 
-import neuronxcc.nki.language as nl
+import nki.language as nl
 import numpy as np
 from nkipy.core import tensor_apis
 
