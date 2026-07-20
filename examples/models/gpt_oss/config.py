@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch.distributed as dist
-from neuronxcc.nki.language import bfloat16
+from nki.language import bfloat16
 from transformers import AutoConfig
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 

@@ -12,7 +12,7 @@ Weights are passed as a flat, static signature (fusion-midlayer weights prefixed
 exactly as produced by ``peagle/tensor_preparation.py``.
 """
 
-import neuronxcc.nki.language as nl
+import nki.language as nl
 import numpy as np
 from nkipy.core import tensor_apis
 
