@@ -50,7 +50,7 @@ Output includes acceptance metrics:
 ```
 Time to first token: 0.6s
 Generated 256 tokens in N verify steps
-Mean acceptance length: X.XX (K=7)
+Mean acceptance length: X.XX (K=3)
 Decode tokens/sec: XX.XX
 ```
 
@@ -179,11 +179,11 @@ The P-EAGLE drafter (`GPT-OSS-20B-P-EAGLE`, ~3.6 GB bf16):
 
 | Component | Description |
 |-----------|-------------|
-| `fc` (8640→2880) | Fuses 3 target hidden states (layers 2, 12, 21 of 24-layer target) |
+| `fc` (8640→2880) | Fuses 3 target hidden states (outputs of layers 1, 11, 20 of 24-layer target) |
 | `midlayer` | EAGLE-3 fusion decoder layer: attention takes 2×hidden (embed⊕hidden), has `hidden_norm` |
 | `layers.1/2/3` | Plain Llama decoder layers (SiLU MLP, llama3 RoPE) |
 | `mask_hidden` (1,1,8640) | Learnable shared hidden state for MTP positions |
-| `ptd_token_id` = 201020 | Placeholder token whose embedding fills MTP positions |
+| `ptd_token_id` (≈201020, from checkpoint) | Placeholder token whose embedding fills MTP positions |
 | `d2t` / `t2d` | Draft↔target vocab mapping (identity for this checkpoint) |
 | `lm_head` (2880→201088) | Full target vocab, replicated on every rank |
 
@@ -198,125 +198,3 @@ The target verifies K+1 candidate tokens in a single multi-token forward pass:
 **Greedy acceptance makes KV rollback implicit**: rejected speculative entries are
 overwritten by the next verify pass, and the causal mask prevents any query from
 attending past its own position.
-
-## Files
-
-| File | Purpose |
-|------|---------|
-| `speculate.py` | Main entry: speculation loop orchestrating target + drafter |
-| `config.py` | `EagleConfig` for the P-EAGLE drafter (llama3 RoPE, fc, mask_hidden, K) |
-| `tensor_preparation.py` | Convert P-EAGLE checkpoint to x@W form (replicated, no TP) |
-| `drafter_model.py` | Device-side drafter: loads weights, compiles kernel, runs draft |
-| `kernels/drafter.py` | Parallel-drafting forward kernel (K tokens in one pass) |
-| `kernels/drafter_layer.py` | EAGLE-3 fusion midlayer + plain Llama layers |
-| `kernels/verify.py` | Multi-position greedy argmax for verification |
-| `kernels/rope.py` | llama3 RoPE (different from target's YaRN RoPE) |
-| `kernels/rmsnorm.py`, `softmax.py` | Leaf kernels (copied from base) |
-
-## Validation
-
-| What | Result |
-|------|--------|
-| Drafter layer math | ✅ cos 0.9999 vs vLLM on prefill (85/86 tokens) |
-| KV-cached decode steps | ✅ cos 0.9999, 100% draft-token match vs vLLM |
-| `draft()` public API | ✅ 7/7 draft tokens match vLLM on multiple decode steps |
-| Aux tap layers (1, 11, 20) | ✅ fc chunks equal target layer outputs at cos 1.0 |
-| Rollback / context-attention | ✅ device drafter attends the full context KV cache |
-
-## Acceptance length: root cause & fix
-
-Earlier acceptance was ~1.4 tokens/step (vs the model card's 3.30–3.80 at K=7).
-This was root-caused on GPU by running the **identical checkpoint** through vLLM's
-`eagle3` parallel-drafting path and capturing its exact drafter I/O, then
-reproducing it with a standalone PyTorch reference (cosine **0.9999**, 100%
-draft-token match). Three issues were found and fixed:
-
-1. **Context-blind drafting (dominant).** `speculate.py` drove `DrafterModel`
-   (`kernels/drafter.py`), which runs only the K draft positions under a (K,K)
-   cross-depth mask with **no prefill and no KV cache** — the MTP slots never saw
-   the prompt, so they produced generic tokens. The drafter must keep a KV cache
-   over the whole context and have every new position attend to it (plain causal
-   over absolute positions). The drafter now keeps a KV cache: it prefills on the
-   prompt and, each step, re-commits the newly-accepted tokens at their absolute
-   positions before drafting the next `K-1` ptd slots.
-
-2. **Discarding rejected speculative KV.** Rejected speculative rows from the
-   previous step must not corrupt later steps. This is now handled *implicitly*
-   (no explicit rollback): each step rewrites the accepted tokens' KV at their
-   true absolute positions, and the causal mask prevents any query from attending
-   past its own position, so stale speculative rows are never read (the same trick
-   the target's verify uses). An earlier explicit-truncation design had a bug
-   here — it sliced the KV heads axis instead of the sequence axis — which the
-   absolute-position rewrite scheme removes entirely.
-
-3. **Aux tap off-by-one.** vLLM's EAGLE-3 default `(2, n//2, n-3)` captures the
-   residual stream *entering* those layers (`layer_idx=i+1` after layer `i`), i.e.
-   the **outputs of layers (1, 11, 20)** for the 24-layer target. Our prefill loop
-   captures *after* layer `i`, so `default_aux_layers` now returns `(1, 11, 20)`.
-   Verified on GPU: the drafter's 3 fc chunks equal target layer outputs (1,11,20)
-   at cosine 1.0.
-
-**Prompt formatting matters too.** The drafter is trained on chat data; raw
-completion prompts are out-of-distribution and roughly halve acceptance (GPU,
-identical checkpoint, K=7: **3.65** chat vs **1.99** raw). `speculate.py` now
-applies the chat template by default (`--raw-prompt` to opt out).
-
-### Validated algorithm (matches vLLM)
-
-1. Target taps the residual stream (`x+residual`) at the **outputs of layers
-   (1, 11, 20)**; concat the 3 → `fc` → H.
-2. **EAGLE shift:** drafter slot `p` pairs `embed(token@p+1)` with
-   `target_hidden@p`.
-3. **Drafter prefill** over the prompt builds a KV cache (positions 0..P-2), plain
-   causal.
-4. **Each draft step:** run `[newly-accepted tokens (real target hidden) | K-1 ptd
-   slots (fc(mask_hidden), ptd_token_id embedding)]` at consecutive absolute
-   positions, attending to the full cache. Committing the accepted tokens rewrites
-   their KV in place, and the causal mask hides any stale speculative rows from
-   the previous step (no explicit rollback). The K draft logits are the last
-   committed slot (NTP) + the K-1 ptd slots (MTP).
-
-### vLLM reference (parallel_drafting)
-
-vLLM produces all K tokens in **one forward pass**: the expanded input is
-`[shifted context tokens | bonus (next_token) | K-1 ptd_token positions]`, all run
-together. `parallel_drafting_hidden_state_tensor = fc(mask_hidden)` fills the MTP
-positions; the `copy_and_expand_eagle_inputs_kernel` lays out sequential positions
-(`start_pos + j`) and tags parallel-draft slots with `ptd_token_id`. Only the
-midlayer concatenates embeds with hidden to 2H; later layers are standard.
-
-### Status / remaining work
-
-The drafter math and the `speculate.py` loop bookkeeping are GPU-validated
-against vLLM (a PyTorch reference reproduced vLLM's drafter I/O at logit cosine
-0.9999). The **on-device drafter keeps a KV cache and runs as a single fused
-kernel** (`drafter_model.py` + `drafter_fused_kernel` in `kernels/drafter.py`):
-fc-fusion + (embed, hidden) assembly + all 4 layers + final norm + lm_head in one
-device call, each layer aliasing its own cache. It prefills over the prompt and
-drafts K context-attending positions per step, reaching acceptance ~4.3 at ~50
-decode tok/s on trn2 (TP=4).
-
-Each draft step runs a **single fused forward** of width `W = C + K - 1` over
-`[commit_0 .. commit_{C-1} | ptd_0 .. ptd_{K-2}]` (accepted tokens + MTP slots), so
-committing accepted tokens and drafting the next K happen in one kernel — no
-separate per-token commit or per-layer launches. Because `C` (hence `W`) varies
-per step, a single kernel is compiled at the **max width** (`W = 2K`, `C = K+1`)
-and every step pads up to it (extra `ptd`/`mask_hidden` rows land past the draft
-window, so the causal mask hides them and their cache writes are overwritten by a
-later commit). This compiles one kernel instead of `K+1` at load time.
-
-Remaining work (profile with `SPEC_PROFILE=1`):
-
-- **Verify is the dominant per-step cost** (~70–78% depending on K). Profiling
-  shows it scales as **~19 ms fixed + ~6.3 ms/candidate token**, and it is genuine
-  device layer compute (argmax/head and aux copies are <3 ms/step combined), not
-  host overhead. The fixed ~19 ms is a single-token forward — dominated by
-  streaming the 24 layers' weights from HBM — so it is amortized across the batch.
-  Tuning **K to the acceptance plateau** (K=3 here) is the highest-leverage lever;
-  a stronger drafter (higher plateau) would let larger K pay off. Further gains
-  would come from the shared target MoE `feedforward` kernel (e.g. gathering each
-  routed expert's weights once per step instead of per token).
-- **Time-to-first-token.** `prefill()` compiles a full-prompt-width fused kernel
-  on the first call (inside the timed region), which dominates TTFT on a cold
-  build cache; a warm cache amortizes it. Pre-compiling a bucketed set of prompt
-  widths (like the base model's context buckets) would hide it.
