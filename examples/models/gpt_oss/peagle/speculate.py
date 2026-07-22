@@ -302,6 +302,19 @@ def main():
         args.draft_model, args.draft_checkpoint, config.hidden_size, K
     )
 
+    # Warm up the prefill path once (compile the prompt-width drafter kernel +
+    # first kernel dispatch) before timing, so time-to-first-token reflects
+    # steady-state prefill rather than one-time build/first-exec cost. Mirrors the
+    # warm-up in gpt_oss.py's load_model, keeping TTFT comparable to the base
+    # model. The KV cache is self-cleaning (rows are rewritten at their absolute
+    # positions under a causal mask), so this scratch pass leaves no stale state.
+    print_log("Warming up prefill")
+    _warm_aux = _stack_aux(target.run_prefill(input_ids, capture_aux=True)[1])
+    drafter.prefill(
+        torch.as_tensor(input_ids).reshape(-1)[1:prompt_len],
+        _warm_aux[:, : prompt_len - 1, :],
+    )
+
     # ── Prefill the target on the prompt ──
     dist.barrier()
     t0 = time.time()
