@@ -60,32 +60,33 @@ The drafter forward runs **on the Neuron device** (`kernels/drafter.py` +
 `drafter_model.py`). It keeps a full per-layer KV cache on device — prefill over
 the prompt, then each step commits the accepted tokens and drafts K positions
 attending to the whole context — as a single fused kernel with no per-step
-host↔device sync (~4.3 acceptance, ~50 decode tok/s on trn2 at TP=4, K=7, chat
+host↔device sync (~4.1 acceptance, ~42 decode tok/s on trn2 at TP=4, K=7, chat
 prompt). Set `SPEC_PROFILE=1` to print a per-step draft/verify time breakdown.
-Note: the first `prefill()` compiles a full-prompt-width fused kernel, which
-inflates time-to-first-token on a cold build cache.
+Note: the first `prefill()` compiles a full-prompt-width fused kernel; `main()`
+runs one warm-up prefill before timing so time-to-first-token (~0.5s) reflects
+steady-state prefill, not that one-time build cost.
 
 ### Choosing K (draft tokens per step)
 
-Verify runs `K+1` candidate tokens through the target in one pass. Profiling on
-trn2 (TP=4) shows its cost is **~19 ms fixed + ~6.3 ms per candidate token** — the
-fixed part (a single-token forward, ~19 ms, dominated by loading the 24 layers'
-weights from HBM) is amortized across all `K+1` tokens, so verify is efficient
-*per token*. But acceptance saturates: this drafter plateaus around ~3.3 accepted
-tokens/step, so beyond K≈3 each extra draft slot adds verify time for no extra
-accepted tokens. Sweep (n=96, chat prompt):
+Verify runs `K+1` candidate tokens through the target in one pass. Its cost is
+dominated by loading the 24 layers' weights from HBM (a fixed per-step cost) plus
+a smaller per-candidate-token term, so verify is efficient *per token* and the
+fixed part is amortized across all `K+1` tokens. Acceptance keeps rising with K
+but with diminishing returns, while per-step verify cost grows, so throughput
+peaks in the middle. Sweep (n=200, chat prompt, `reference` MoE, trn2 TP=4):
 
 | K | Mean acceptance | Decode tok/s |
 |---|-----------------|--------------|
-| 1 | 1.94 | 50.0 |
-| 2 | 2.67 | 52.6 |
-| **3 (default)** | **3.31** | **~60** |
-| 4 | 3.31 | 49.5 |
-| 7 | 4.33 | 50.4 |
+| 1 | 1.90 | 40.7 |
+| 2 | 2.68 | 46.7 |
+| **3 (default)** | **3.17** | **48.2** |
+| 4 | 3.62 | 48.5 |
+| 7 | 4.08 | 42.5 |
 
-**K=3 is the throughput optimum (~60–62 tok/s), beating both the base model
-(~52 tok/s) and larger K.** Higher K only helps if a stronger drafter raises the
-acceptance plateau. Set `-k` to override.
+**K=3–4 is the throughput optimum (~48 tok/s), beating both the base model
+(~31 tok/s) and larger K.** K=4 edges K=3 by a hair here; K=3 is kept as the
+default for its lower verify latency. Beyond K≈4, added verify time outpaces the
+extra acceptance. Set `-k` to override.
 
 ### Speedup over the base model
 
@@ -93,26 +94,28 @@ Speedup = speculative tok/s ÷ base (non-speculative) tok/s of the same target,
 **with the same MoE kernel on both sides** (the base model also honors
 `GPT_OSS_MOE_KERNEL`, so comparing spec-batched against base-reference would
 overstate the win). Measured on trn2 (TP=4, K=3, binary-search chat prompt,
-acceptance ~3.2, n=200 base / n=256 spec):
+acceptance ~3.2, n=200 each, both warm):
 
 | MoE kernel | Base tok/s | P-EAGLE K=3 tok/s | Speedup |
 |---|---|---|---|
-| `reference` (default) | 52.0 | 61.6 | **1.18×** |
-| `batched` | 54.9 | 66.2 | **1.21×** |
+| `reference` (default) | 31.5 | 48.2 | **1.53×** |
+| `batched` | 34.7 | 50.8 | **1.47×** |
 
-The speedup is well below the ~3.2 acceptance length because verify is not free:
-each step runs `K+1` tokens through the full target (~36–39 ms) plus ~13 ms of
-drafting. Decode is dispatch/overhead-bound, so verifying 4 tokens costs roughly
-2× a single-token step while producing ~3.2 tokens of output — hence ~1.2×. The
-`batched` MoE speeds up base decode (52.0→54.9) and verify alike, so it lifts
-both columns and only slightly improves the *ratio* (1.18×→1.21×).
+The speedup is below the ~3.2 acceptance length because verify is not free. At
+K=3 (`SPEC_PROFILE=1`), each step spends ~52 ms in verify (running `K+1`=4 tokens
+through the full 24-layer target, dominated by weight loads) and ~15 ms drafting.
+Verifying 4 tokens costs well under 4× a single-token decode while producing ~3.2
+tokens of output — hence a solid but sub-acceptance speedup. The `batched` MoE
+lifts base and spec decode alike (31.5→34.7 base), so it barely moves the *ratio*
+(1.53×→1.47×) even as it raises absolute tok/s.
 
 **Speedup scales ~linearly with acceptance length, which is prompt-dependent.**
-Chat-formatted, in-distribution prompts accept ~3.2 (→ ~1.2×); an
-out-of-distribution / hard prompt can accept ~2.3 (→ ~1.0×, i.e. no win).
-Always benchmark tok/s with a fixed, representative prompt. The biggest lever on
-speedup is a stronger drafter (raises the acceptance plateau); a cheaper verify
-(LNC2, or the `batched`/`dense` MoE kernels below) is the secondary lever.
+Chat-formatted, in-distribution prompts accept ~3.2 (→ ~1.5×); the same prompt
+tokenized raw (`--raw-prompt`, out of the drafter's training distribution)
+accepts only ~2.2 (→ ~1.05×, i.e. essentially no win). Always benchmark tok/s
+with a fixed, representative prompt. The biggest lever on speedup is a stronger
+drafter (raises acceptance); a cheaper verify (LNC2, or the `batched`/`dense`
+MoE kernels below) is the secondary lever.
 
 ### MoE kernel selection
 
@@ -125,19 +128,19 @@ The target's MoE feed-forward has several implementations, selected via the
 | `batched` | gather top-k experts, batched GEMV | decode / verify with K ≤ 4 |
 | `dense` | all experts as one dense GEMM, router-masked | verify with K ≥ 5 |
 
-All are numerically equivalent. End-to-end P-EAGLE tok/s (TP=4, n=160):
+All are numerically equivalent. End-to-end P-EAGLE tok/s (TP=4, n=200,
+binary-search chat prompt):
 
 | K | `reference` | `batched` | `dense` |
 |---|-----------|-----------|---------|
-| 1 | 45.4 | **49.5** | 32.7 |
-| 3 | 44.9 | **47.8** | 42.1 |
-| 5 | 36.9 | 39.2 | **42.3** |
-| 7 | 33.1 | 35.3 | **40.0** |
+| 1 | 40.7 | **41.4** | 29.7 |
+| 3 | 48.2 | **50.8** | 45.3 |
+| 5 | 47.9 | 52.0 | **53.3** |
+| 7 | 42.5 | 44.1 | **48.6** |
 
 `batched` wins at the default K=3 (verify processes N=K+1 tokens); `dense` is
-weight-load-bound (~flat in N) and overtakes at K≥5. (This table uses a harder
-prompt than the K-sweep above, so absolute tok/s is lower; the per-K kernel
-ranking is what's robust.)
+weight-load-bound (~flat in N) and overtakes at K≥5, where it also lifts the
+optimum to ~53 tok/s. The per-K kernel ranking is the robust takeaway.
 
 ## How it works
 
