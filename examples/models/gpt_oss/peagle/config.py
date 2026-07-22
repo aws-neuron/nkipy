@@ -18,7 +18,6 @@ arXiv 2602.01469). Its structure, from the checkpoint:
 from dataclasses import dataclass
 
 import numpy as np
-import torch.distributed as dist
 from nki.language import bfloat16
 from transformers import AutoConfig
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
@@ -71,13 +70,13 @@ def get_eagle_config(
         head_dim=hf.head_dim,
         num_kv_heads=hf.num_key_value_heads,
         num_layers=hf.num_hidden_layers,
-        intermediate_size=hf.intermediate_size // dist.get_world_size(),
+        intermediate_size=hf.intermediate_size,
         rope_inv_freq=np.asarray(inv_freq, dtype=np.float32),
         rope_attention_scaling=float(attention_scaling),
         target_hidden_size=target_hidden_size,
         draft_vocab_size=hf.draft_vocab_size,
         target_vocab_size=hf.vocab_size,
-        ptd_token_id=getattr(hf, "ptd_token_id"),
+        ptd_token_id=hf.ptd_token_id,
         num_draft_tokens=num_draft_tokens,
         norm_eps=hf.rms_norm_eps,
         max_seq_len=max_seq_len,
