@@ -49,10 +49,10 @@ if _BASE not in sys.path:
     sys.path.insert(0, _BASE)
 
 from config import Config, get_config  # noqa: E402  (base config; _BASE wins)
-from peagle.config import get_eagle_config  # noqa: E402
-from peagle.drafter_model import DrafterModel  # noqa: E402
 from kernels.transformer_layer import transformer_layer  # noqa: E402  (base)
 from nkipy.runtime import DeviceKernel, DeviceTensor  # noqa: E402
+from peagle.config import get_eagle_config  # noqa: E402
+from peagle.drafter_model import DrafterModel  # noqa: E402
 from safetensors.torch import load_file  # noqa: E402
 from transformers import AutoTokenizer  # noqa: E402
 from utils import print_log  # noqa: E402
@@ -356,16 +356,20 @@ def main():
         #    of the first pending token.
         base_pos = cur_pos - len(pending_tokens)
         if profile:
-            dist.barrier(); _t = time.time()
+            dist.barrier()
+            _t = time.time()
         drafts = drafter.draft(pending_tokens, pending_aux3, base_pos)
         if profile:
-            dist.barrier(); prof["draft"] += time.time() - _t; _t = time.time()
+            dist.barrier()
+            prof["draft"] += time.time() - _t
+            _t = time.time()
 
         # 2) Verify: feed [last_token, drafts...] at absolute cur_pos.
         cand = [generated[-1]] + drafts  # length K+1
         target_ids, aux = target.verify(cand, cur_pos)
         if profile:
-            dist.barrier(); prof["verify"] += time.time() - _t
+            dist.barrier()
+            prof["verify"] += time.time() - _t
 
         # 3) Accept the longest matching prefix (greedy).
         accepted = []

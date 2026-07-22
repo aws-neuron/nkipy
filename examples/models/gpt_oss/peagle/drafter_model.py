@@ -52,7 +52,8 @@ class DrafterModel:
         self.d2t = weights["d2t"].to(torch.int64)
 
         # Device: fc weight + mask hidden (fc-fuse now runs on device).
-        self.fc_weight = self._to_device(weights["fc_weight"], "d_fc_weight")  # (3*tH, H)
+        # fc_weight: (3*tH, H)
+        self.fc_weight = self._to_device(weights["fc_weight"], "d_fc_weight")
         mask_hidden = weights["mask_hidden"].reshape(1, -1)  # (1, 3*tH)
         self.mask_hidden = self._to_device(mask_hidden, "d_mask_hidden")
         # Host copy of the raw mask hidden: pads target_hidden3 up to the fixed
@@ -60,7 +61,9 @@ class DrafterModel:
         # fc(mask_hidden) MTP rows the variable-width kernels used to build.
         self.mask_hidden_host = mask_hidden.to(torch.bfloat16)
         self.norm_weight = self._to_device(weights["norm_weight"], "d_norm_weight")
-        self.lm_head_weight = self._to_device(weights["lm_head_weight"], "d_lm_head_weight")
+        self.lm_head_weight = self._to_device(
+            weights["lm_head_weight"], "d_lm_head_weight"
+        )
 
         # Fusion midlayer weights (layer 0).
         self.fusion_weights = {
@@ -148,7 +151,9 @@ class DrafterModel:
             np.empty((B, C, 3 * cfg.target_hidden_size), dtype=cfg.dtype),
             f"d_th3_{name}",
         )
-        start_pos = DeviceTensor.from_numpy(np.empty((1,), dtype=np.int32), f"d_sp_{name}")
+        start_pos = DeviceTensor.from_numpy(
+            np.empty((1,), dtype=np.int32), f"d_sp_{name}"
+        )
         kw = {
             "embeds": embeds,
             "target_hidden3": th3,
@@ -184,7 +189,11 @@ class DrafterModel:
         )
         self.draft_logits = DeviceTensor.from_numpy(
             np.empty(
-                (self.config.max_batch_size, self.draft_W, self.lm_head_weight.shape[1]),
+                (
+                    self.config.max_batch_size,
+                    self.draft_W,
+                    self.lm_head_weight.shape[1],
+                ),
                 dtype=self.config.dtype,
             ),
             "d_logits",
@@ -205,7 +214,9 @@ class DrafterModel:
         """Invoke the fused kernel: upload inputs, run, return host logits (W,vocab)."""
         inputs = {
             "embeds": self._to_device(embeds, "embeds_in"),
-            "target_hidden3": self._to_device(target_hidden3.to(torch.bfloat16), "th3_in"),
+            "target_hidden3": self._to_device(
+                target_hidden3.to(torch.bfloat16), "th3_in"
+            ),
             "start_pos": DeviceTensor.from_numpy(
                 np.array([start_pos], dtype=np.int32), "sp_in"
             ),
@@ -315,7 +326,9 @@ class DrafterModel:
             mask_pad = self.mask_hidden_host.reshape(1, 1, -1).expand(
                 1, n_pad_h, -1
             )
-            target_hidden3 = torch.cat([commit_aux3.to(torch.bfloat16), mask_pad], dim=1)
+            target_hidden3 = torch.cat(
+                [commit_aux3.to(torch.bfloat16), mask_pad], dim=1
+            )
         else:
             target_hidden3 = commit_aux3
 

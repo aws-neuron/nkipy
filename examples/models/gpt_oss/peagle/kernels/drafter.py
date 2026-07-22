@@ -1,15 +1,14 @@
 """P-EAGLE parallel drafter forward, fused into one KV-cached device kernel.
 
 ``drafter_fused_kernel`` runs the whole drafter forward for one speculation step
-in a single Neuron kernel: on-device fc-fusion, ``[embed | hidden]`` assembly,
-all layers (fusion midlayer + plain layers, each aliasing its own KV cache), a
-final RMSNorm, and the draft ``lm_head``. It produces the per-position draft
-logits; the caller argmaxes rows ``[C-1 .. W-1]`` (NTP + K-1 MTP) and applies the
-``d2t`` remap.
+in a single Neuron kernel (fc-fusion, input assembly, all layers, final norm, and
+the draft ``lm_head``); see its docstring for the input layout and return value.
 
-Weights are passed as a flat, static signature (fusion-midlayer weights prefixed
-``m_``, plain-layer weights stacked on a leading axis and prefixed ``p_``), keyed
-exactly as produced by ``peagle/tensor_preparation.py``.
+Weights are passed as a flat, static signature: fusion-midlayer weights are
+prefixed ``m_``, and the plain layers' weights are stacked on a leading axis
+(size ``num_plain``) and prefixed ``p_``. The keys match exactly what
+``peagle/tensor_preparation.py`` produces. This checkpoint has 4 layers (1 fusion
+midlayer + 3 plain), hence the 4 named KV-cache pairs in the signature.
 """
 
 import nki.language as nl
@@ -62,16 +61,23 @@ def drafter_fused_kernel(
     cache_v3,
     cfg,
 ):
-    """Whole KV-cached drafter forward in ONE kernel: fc-fuse + input assembly +
-    all layers + final norm + lm_head.
+    """Whole KV-cached drafter forward in ONE device call: fc-fuse + input
+    assembly + all layers + final norm + lm_head (no per-layer host round trips).
 
-    Replaces the host-driven per-layer loop (4 launches + separate head + host
-    fc-fuse/concat) with a single device call. The W-position input stream is
-    ``[commit_0..commit_{C-1} | ptd_0..ptd_{K-2}]``:
-      * committed rows: hidden = fc(target_hidden3)
-      * MTP (ptd) rows: hidden = fc(mask_hidden), broadcast across depths
-    ``embeds`` (host-gathered token embeddings) supplies the embedding half for all
-    rows. Returns ``(logits, cache_k, cache_v)`` with the per-layer caches updated.
+    Processes ``W`` positions laid out as ``[commit_0..commit_{C-1} | ptd_0..]``:
+    the first ``C`` committed rows (NTP), the rest MTP (ptd) slots. Each row's
+    layer-0 input is ``cat(embed, hidden)`` of width ``2H``:
+      * embed: ``embeds[row]`` -- accepted token for committed rows, ``ptd_token_id``
+        for MTP rows.
+      * hidden: ``fc(target_hidden3)`` per committed row; shared ``fc(mask_hidden)``
+        broadcast across MTP rows.
+    Row ``i`` sits at absolute position ``start_pos + i`` and attends causally over
+    the full KV cache (not just these ``W`` rows); RoPE tables are gathered once and
+    shared across layers.
+
+    Returns ``(logits (B, W, draft_vocab), cache_k0, cache_v0, ..)``. The caller
+    argmaxes rows ``[C-1 .. W-1]`` (NTP + K-1 MTP) and applies the ``d2t`` remap;
+    caches are returned so the runtime aliases them back into HBM.
     """
     B, W, H = embeds.shape
     C = target_hidden3.shape[1]
