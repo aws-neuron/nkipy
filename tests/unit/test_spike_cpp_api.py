@@ -430,6 +430,82 @@ def test_complex_workflow(
 
 
 @pytest.mark.order(4)
+def test_execute_async_single(shared_spike_instance, add_neff_model, model_tracker):
+    """A single async execution matches the synchronous result after wait()."""
+    spike = shared_spike_instance
+
+    model = spike.load_model(add_neff_model)
+    model_tracker.mark_loaded(model)
+
+    x = spike.allocate_tensor(size=4, name="x")
+    y = spike.allocate_tensor(size=4, name="y")
+    output = spike.allocate_tensor(size=4, name="output0")
+    spike.tensor_write(x, np.array([3.0], dtype=np.float32).tobytes(), 0)
+    spike.tensor_write(y, np.array([4.0], dtype=np.float32).tobytes(), 0)
+
+    handle = spike.execute_async(model, {"x": x, "y": y}, {"output0": output})
+    handle.wait()
+
+    result = np.frombuffer(spike.tensor_read(output, 0, 4), dtype=np.float32)[0]
+    assert result == 7.0, f"Expected 7.0, got {result}"
+
+    # Completed after wait(), and wait() is idempotent.
+    assert handle.is_completed()
+    handle.wait()
+
+    spike.unload_model(model)
+    model_tracker.mark_unloaded(model)
+    spike.free_tensor(x)
+    spike.free_tensor(y)
+    spike.free_tensor(output)
+
+
+@pytest.mark.order(4)
+def test_execute_async_chain(
+    shared_spike_instance, add_neff_model, mul_neff_model, model_tracker
+):
+    """Chained async executions run in submission order; waiting on the last
+    handle is enough to see all results. (2 + 3) * 4 = 20."""
+    spike = shared_spike_instance
+
+    add_model = spike.load_model(add_neff_model)
+    model_tracker.mark_loaded(add_model)
+    mul_model = spike.load_model(mul_neff_model)
+    model_tracker.mark_loaded(mul_model)
+
+    x = spike.allocate_tensor(size=4, name="x")
+    y = spike.allocate_tensor(size=4, name="y")
+    add_out = spike.allocate_tensor(size=4, name="add_out")
+    z = spike.allocate_tensor(size=4, name="z")
+    mul_out = spike.allocate_tensor(size=4, name="mul_out")
+    spike.tensor_write(x, np.array([2.0], dtype=np.float32).tobytes(), 0)
+    spike.tensor_write(y, np.array([3.0], dtype=np.float32).tobytes(), 0)
+    spike.tensor_write(z, np.array([4.0], dtype=np.float32).tobytes(), 0)
+
+    # mul consumes add's output; only wait on the final handle. Both handles are
+    # kept alive until then so NRT's in-flight tensor sets stay valid.
+    h_add = spike.execute_async(add_model, {"x": x, "y": y}, {"output0": add_out})
+    h_mul = spike.execute_async(
+        mul_model, {"x": add_out, "y": z}, {"output0": mul_out}
+    )
+    h_mul.wait()
+
+    result = np.frombuffer(spike.tensor_read(mul_out, 0, 4), dtype=np.float32)[0]
+    assert result == 20.0, f"Expected 20.0, got {result}"
+    del h_add
+
+    spike.unload_model(add_model)
+    model_tracker.mark_unloaded(add_model)
+    spike.unload_model(mul_model)
+    model_tracker.mark_unloaded(mul_model)
+    spike.free_tensor(x)
+    spike.free_tensor(y)
+    spike.free_tensor(add_out)
+    spike.free_tensor(z)
+    spike.free_tensor(mul_out)
+
+
+@pytest.mark.order(4)
 def test_get_tensor_info(shared_spike_instance, add_neff_model, model_tracker):
     """Test get_tensor_info API using the shared Spike instance"""
     spike = shared_spike_instance

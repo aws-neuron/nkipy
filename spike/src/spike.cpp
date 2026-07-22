@@ -89,7 +89,9 @@ void Spike::tensor_write_from_pybuffer(NrtTensor &tensor, const void *data,
 
 NrtTensorSet Spike::create_tensor_sets(
     const std::unordered_map<std::string, NrtTensor &> &tensor_map) {
-  NrtTensorSet tensor_set;
+  // Pass the runtime-closed token so tensor sets that outlive the runtime (held
+  // by an in-flight AsyncExecution) skip nrt_destroy_tensor_set after close.
+  NrtTensorSet tensor_set(runtime_closed_);
 
   for (const auto &[name, tensor] : tensor_map) {
     // FIXME: consider time-of-check-time-of-use (TOCTOU) race condition
@@ -114,6 +116,18 @@ void Spike::execute(NrtModel &model,
 
   // Execute
   model.execute(input_set, output_set, ntff_name, save_trace);
+}
+
+AsyncExecution Spike::execute_async(
+    NrtModel &model,
+    const std::unordered_map<std::string, NrtTensor &> &inputs,
+    const std::unordered_map<std::string, NrtTensor &> &outputs) {
+  // The tensor sets are moved into the AsyncExecution so the NRT-referenced
+  // containers stay alive while the request is in flight.
+  NrtTensorSet input_set = create_tensor_sets(inputs);
+  NrtTensorSet output_set = create_tensor_sets(outputs);
+
+  return model.execute_schedule(std::move(input_set), std::move(output_set));
 }
 
 std::string Spike::dtype_to_string(nrt_dtype_t dtype) {

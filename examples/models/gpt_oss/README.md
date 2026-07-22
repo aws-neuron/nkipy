@@ -65,6 +65,18 @@ gpt-oss differs from the Qwen3 MoE example in several ways, all handled here:
 | YaRN RoPE | `inv_freq` + attention-scaling precomputed from HF config (`config.py`) and baked into the cos/sin cache |
 | Router | top-k on raw logits (+bias), then softmax over the selected logits |
 
+## Decode performance
+
+Each decode step runs ~25 kernels (one per transformer layer plus sampling)
+that form a linear dependency chain. Rather than block on a host round-trip
+after every kernel, the decode loop schedules them through NRT's explicit
+asynchronous execution queue (`DeviceKernel.execute_async` → `spike`), keeping a
+bounded window of requests in flight (`TKG_MAX_INFLIGHT` in `gpt_oss.py`) and
+blocking only once per token. This overlaps host-side dispatch with device
+compute — the throughput that the removed implicit async-exec mode
+(`NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS`) used to provide. The window is
+capped below NRT's schedule-queue depth; going over it raises `NRT_QUEUE_FULL`.
+
 ## Files
 
 | File | Purpose |

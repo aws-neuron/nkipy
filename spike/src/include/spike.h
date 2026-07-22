@@ -76,6 +76,14 @@ public:
                std::optional<std::string> ntff_name = std::nullopt,
                bool save_trace = false);
 
+  // Schedules an asynchronous model execution and returns a handle that owns
+  // the in-flight tensor sets. Call wait() on the handle before reading the
+  // outputs back to host.
+  AsyncExecution
+  execute_async(NrtModel &model,
+                const std::unordered_map<std::string, NrtTensor &> &inputs,
+                const std::unordered_map<std::string, NrtTensor &> &outputs);
+
   // Model introspection
   ModelTensorInfo get_tensor_info(NrtModel &model);
 

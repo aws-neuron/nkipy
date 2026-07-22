@@ -87,6 +87,20 @@ NB_MODULE(_spike, m) {
       .def_prop_ro("va", &NrtTensor::get_va,
                    "CPU-accessible virtual address of device HBM memory");
 
+  // AsyncExecution class — handle for an in-flight async model execution.
+  nb::class_<AsyncExecution>(m, "AsyncExecution")
+      .def_prop_ro(
+          "sequence",
+          [](const AsyncExecution &self) {
+            return static_cast<uint64_t>(self.sequence());
+          },
+          "NRT sequence id of the scheduled request")
+      .def("is_completed", &AsyncExecution::is_completed,
+           "Return True if the scheduled request has completed (non-blocking)")
+      .def("wait", &AsyncExecution::wait,
+           nb::call_guard<nb::gil_scoped_release>(),
+           "Block until the scheduled request completes, raising on failure");
+
   // NrtModel class
   nb::class_<NrtModel>(m, "NrtModel")
       .def_prop_ro("neff_path", &NrtModel::get_neff_path, "NEFF file path")
@@ -123,6 +137,11 @@ NB_MODULE(_spike, m) {
                                                      // allow multiple cores
                                                      // to execute (enable CC)
            "Execute a model with given inputs and outputs")
+
+      .def("execute_async", &Spike::execute_async, "model"_a, "inputs"_a,
+           "outputs"_a, nb::call_guard<nb::gil_scoped_release>(),
+           "Schedule an asynchronous model execution, returning an "
+           "AsyncExecution handle. Call wait() before reading outputs.")
 
       .def("allocate_tensor", &Spike::allocate_tensor, "size"_a,
            "core_id"_a = 0, nb::arg("name") = nb::none(),

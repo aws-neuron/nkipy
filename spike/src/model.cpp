@@ -1,10 +1,74 @@
 #include "model.h"
 #include "spike.h"
 
+#include <cerrno>
+#include <cstdint>
 #include <fstream>
 #include <sstream>
+#include <sys/eventfd.h>
+#include <unistd.h>
 
 namespace spike {
+
+// AsyncExecution implementation
+AsyncExecution::AsyncExecution(NrtTensorSet &&inputs, NrtTensorSet &&outputs,
+                               nrta_seq_t sequence,
+                               std::unique_ptr<NRT_STATUS> ret)
+    : input_set_(std::move(inputs)), output_set_(std::move(outputs)),
+      sequence_(sequence), ret_(std::move(ret)), waited_(false) {}
+
+bool AsyncExecution::is_completed() const {
+  bool completed = false;
+  NRT_STATUS status = nrta_is_completed(sequence_, &completed);
+  // nrta_is_completed returns NRT_INVALID only when the sequence id itself is
+  // not valid; a valid-but-pending request reports completed=false. Treat an
+  // invalid sequence as an error rather than silently reporting "not done".
+  if (status == NRT_INVALID) {
+    throw NrtError(status, "Invalid sequence id while polling async completion");
+  }
+  return completed;
+}
+
+void AsyncExecution::wait() {
+  if (waited_) {
+    return;
+  }
+  waited_ = true;
+
+  // Block on an eventfd that NRT signals when the sequence completes. This
+  // avoids busy-polling a CPU core (each TP rank is its own process and needs
+  // its core for the host-side dispatch of the next token).
+  int efd = eventfd(0, 0);
+  if (efd < 0) {
+    throw SpikeError("Failed to create eventfd for async execution wait");
+  }
+
+  // Registering an already-completed sequence signals the fd immediately, so
+  // there is no lost-wakeup race between schedule and wait.
+  NRT_STATUS status = nrta_event_register_seq_id_completion(sequence_, efd);
+  if (status != NRT_SUCCESS) {
+    ::close(efd);
+    throw NrtError(status, "Failed to register async completion event");
+  }
+
+  uint64_t counter = 0;
+  ssize_t n = ::read(efd, &counter, sizeof(counter));
+  int read_errno = errno;
+
+  // Deregister before closing so NRT drops its reference to the fd.
+  nrta_event_register_seq_id_completion(sequence_, -1);
+  ::close(efd);
+
+  if (n != static_cast<ssize_t>(sizeof(counter))) {
+    throw SpikeError("Failed to wait on async completion eventfd (errno=" +
+                     std::to_string(read_errno) + ")");
+  }
+
+  // *ret_ holds the NRT_STATUS the execution reported on completion.
+  if (ret_ && *ret_ != NRT_SUCCESS) {
+    throw NrtError(*ret_, "Asynchronous model execution failed");
+  }
+}
 
 // NrtModel implementation
 NrtModel::NrtModel(const std::string &neff_path, uint32_t core_id,
@@ -107,6 +171,29 @@ void NrtModel::execute(const NrtTensorSet &inputs, NrtTensorSet &outputs,
   if (status) {
     throw NrtError(status, "Failed to execute model");
   }
+}
+
+AsyncExecution NrtModel::execute_schedule(NrtTensorSet &&inputs,
+                                          NrtTensorSet &&outputs) {
+  if (is_unloaded()) {
+    throw SpikeError("Unable to execute an unloaded model. Please check the "
+                     "lifetime of the model.");
+  }
+
+  // `ret` receives the execution's completion status asynchronously, so it must
+  // outlive the scheduled request; the returned AsyncExecution owns it. The
+  // queue is fixed at 0 per the nrt_async.h contract for nrta_execute_schedule.
+  auto ret = std::make_unique<NRT_STATUS>(NRT_SUCCESS);
+  nrta_seq_t sequence = 0;
+  NRT_STATUS status =
+      nrta_execute_schedule(ptr_, inputs.get_ptr(), outputs.get_ptr(),
+                            /*queue=*/0, ret.get(), &sequence);
+  if (status != NRT_SUCCESS) {
+    throw NrtError(status, "Failed to schedule asynchronous model execution");
+  }
+
+  return AsyncExecution(std::move(inputs), std::move(outputs), sequence,
+                        std::move(ret));
 }
 
 nrt_tensor_info_array_t *NrtModel::get_tensor_info() {

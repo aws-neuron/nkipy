@@ -287,6 +287,41 @@ class SpikeModel:
         if auto_allocated:
             return outputs
 
+    def execute_async(
+        self,
+        inputs: Dict[str, SpikeTensor],
+        outputs: Dict[str, SpikeTensor],
+    ):
+        """Schedule an asynchronous model execution.
+
+        Enqueues the execution on the NRT COMPUTE queue and returns immediately
+        with an ``AsyncExecution`` handle. NRT runs scheduled requests in
+        submission order, so a caller can chain many executions back-to-back and
+        only ``wait()`` on the final handle before reading results back to host.
+
+        The handle owns the in-flight tensor sets; the caller must keep the
+        ``SpikeTensor`` inputs/outputs (and the handle) alive until ``wait()``
+        returns. Unlike ``__call__`` this does not support tracing.
+
+        Args:
+            inputs: Dict[str, SpikeTensor]. Key needs to match neff input name.
+            outputs: Dict[str, SpikeTensor]. Key needs to match neff output name.
+
+        Returns:
+            AsyncExecution handle. Call ``.wait()`` before reading ``outputs``.
+        """
+        self._validate_io(inputs, outputs)
+
+        input_refs = {k: v.tensor_ref for k, v in inputs.items()}
+        output_refs = {k: v.tensor_ref for k, v in outputs.items()}
+
+        logger.info(f"Scheduling async model execution: {self.model_ref}")
+        return get_spike_singleton().execute_async(
+            self.model_ref,
+            inputs=input_refs,
+            outputs=output_refs,
+        )
+
     def benchmark(
         self,
         inputs: Dict[str, SpikeTensor],

@@ -2,6 +2,7 @@ import argparse
 import os
 import sys
 import time
+from collections import deque
 
 import numpy as np
 import torch
@@ -18,6 +19,11 @@ from utils import print_log
 # relative build dir would double up and the HLO module wouldn't be found.
 BUILD_DIR = os.path.abspath("./build")
 USE_NKI_RMSNORM = True
+
+# Max async model executions kept in flight on NRT's COMPUTE queue during
+# decode. Overlaps host-side dispatch with device execution; capped to stay
+# under the runtime's bounded schedule-queue depth (NRT_QUEUE_FULL otherwise).
+TKG_MAX_INFLIGHT = 4
 
 # weight names carried per layer (everything except the kv cache)
 _LAYER_WEIGHT_KEYS = [
@@ -171,7 +177,8 @@ class GptOssModel:
             f"--> Finished Kernel Compilation and Loading in {time.time() - t:.2f}s"
         )
 
-    def _run_layer(self, phase, i, hidden_states, start_pos):
+    def _layer_io(self, phase, i, hidden_states, start_pos):
+        """Build the (kernel, inputs, outputs) tuple for one transformer layer."""
         lt = self.layer_tensors[i]
         kernel = self.kernel_layer[(phase, self.config.is_sliding(i))]
         inputs = {key: lt[key] for key in _LAYER_WEIGHT_KEYS}
@@ -180,14 +187,21 @@ class GptOssModel:
         inputs["cache_v.must_alias_input"] = lt["cache_v"]
         if phase == "tkg":
             inputs["start_pos"] = start_pos
-        kernel(
-            inputs=inputs,
-            outputs={
-                "output0": hidden_states,
-                "cache_k": lt["cache_k"],
-                "cache_v": lt["cache_v"],
-            },
-        )
+        outputs = {
+            "output0": hidden_states,
+            "cache_k": lt["cache_k"],
+            "cache_v": lt["cache_v"],
+        }
+        return kernel, inputs, outputs
+
+    def _run_layer(self, phase, i, hidden_states, start_pos):
+        kernel, inputs, outputs = self._layer_io(phase, i, hidden_states, start_pos)
+        kernel(inputs=inputs, outputs=outputs)
+
+    def _schedule_layer(self, phase, i, hidden_states, start_pos):
+        """Schedule one layer asynchronously, returning its AsyncExecution handle."""
+        kernel, inputs, outputs = self._layer_io(phase, i, hidden_states, start_pos)
+        return kernel.execute_async(inputs=inputs, outputs=outputs)
 
     def run_prefill(self, input_ids, capture_aux=False):
         """Run the context-encoding (prefill) layer stack.
@@ -221,6 +235,48 @@ class GptOssModel:
         for i in range(self.config.num_layers):
             self._run_layer("tkg", i, hidden_states, start_pos)
 
+    def _run_tkg_token(self, hidden_states, start_pos, next_id):
+        """Run one decode step (all layers + sampling) via the async queue.
+
+        The per-token dependency chain (each layer's output aliases
+        ``hidden_states``, which feeds the next, and sampling reads the final
+        hidden state) runs in submission order on NRT's in-order COMPUTE queue,
+        so enqueuing kernels back-to-back overlaps host-side dispatch of the
+        next kernel with device execution of the previous one — the throughput
+        win that implicit async exec mode used to provide.
+
+        NRT's schedule queue has a bounded depth, so we keep at most
+        ``TKG_MAX_INFLIGHT`` requests in flight: before scheduling a new kernel
+        once the window is full, we block on the oldest. Each handle owns its
+        in-flight tensor sets, so it must stay alive (in ``inflight``) until its
+        ``wait()`` returns. Draining the final handle guarantees the whole step
+        completed before ``next_id`` is read back to host.
+        """
+        inflight = deque()
+
+        def schedule(handle):
+            if len(inflight) >= TKG_MAX_INFLIGHT:
+                inflight.popleft().wait()
+            inflight.append(handle)
+
+        for i in range(self.config.num_layers):
+            schedule(self._schedule_layer("tkg", i, hidden_states, start_pos))
+        schedule(
+            self.kernel_tkg_greedy_sampling.execute_async(
+                inputs={
+                    "h": hidden_states,
+                    "norm_weight": self.norm_weight,
+                    "lm_head_weight": self.lm_head_weight,
+                },
+                outputs={"output0": next_id},
+            )
+        )
+
+        # Drain the window; the last handle (sampling) finishing means next_id
+        # is ready to read back.
+        while inflight:
+            inflight.popleft().wait()
+
     def generate(self, input_ids):
         """Run inference and generate tokens."""
         hidden_states, _ = self.run_prefill(input_ids, capture_aux=False)
@@ -252,16 +308,10 @@ class GptOssModel:
             t_start_pos.write_from_numpy(np.array([pos], dtype=np.int32))
             hidden_states.write_from_torch(self.tok_embedding[next_id_torch])
 
-            self._run_tkg_layers(hidden_states, t_start_pos)
-
-            self.kernel_tkg_greedy_sampling(
-                inputs={
-                    "h": hidden_states,
-                    "norm_weight": self.norm_weight,
-                    "lm_head_weight": self.lm_head_weight,
-                },
-                outputs={"output0": next_id},
-            )
+            # Drive the decode step through the async queue (bounded in-flight
+            # window) instead of a blocking host round-trip after each of the
+            # ~25 kernels.
+            self._run_tkg_token(hidden_states, t_start_pos, next_id)
 
             next_id_torch = next_id.torch().reshape(B, 1).to(dtype=torch.int)
             yield next_id_torch

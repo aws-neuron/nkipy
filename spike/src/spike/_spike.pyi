@@ -76,6 +76,17 @@ class NrtTensor:
     def va(self) -> int:
         """CPU-accessible virtual address of device HBM memory"""
 
+class AsyncExecution:
+    @property
+    def sequence(self) -> int:
+        """NRT sequence id of the scheduled request"""
+
+    def is_completed(self) -> bool:
+        """Return True if the scheduled request has completed (non-blocking)"""
+
+    def wait(self) -> None:
+        """Block until the scheduled request completes, raising on failure"""
+
 class NrtModel:
     @property
     def neff_path(self) -> str:
@@ -118,6 +129,11 @@ class Spike:
 
     def execute(self, model: NrtModel, inputs: Mapping[str, NrtTensor], outputs: Mapping[str, NrtTensor], ntff_name: str | None = None, save_trace: bool = False) -> None:
         """Execute a model with given inputs and outputs"""
+
+    def execute_async(self, model: NrtModel, inputs: Mapping[str, NrtTensor], outputs: Mapping[str, NrtTensor]) -> AsyncExecution:
+        """
+        Schedule an asynchronous model execution, returning an AsyncExecution handle. Call wait() before reading outputs.
+        """
 
     def allocate_tensor(self, size: int, core_id: int = 0, name: str | None = None) -> NrtTensor:
         """Allocate a tensor on device"""

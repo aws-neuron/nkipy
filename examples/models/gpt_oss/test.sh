@@ -35,8 +35,9 @@ echo ""
 echo "[3/3] Running gpt-oss inference..."
 echo "=========================================="
 
-# Enable async to improve performance
-export NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS=16
+# Decode drives NRT's explicit async execution queue directly (see the
+# TKG_MAX_INFLIGHT window in gpt_oss.py) to overlap host dispatch with device
+# compute, so no runtime async env var is needed.
 torchrun --nproc-per-node "$TP_DEGREE" gpt_oss.py -n 500 --checkpoint "$WEIGHTS_PATH" --model "$MODEL"
 
 echo ""
