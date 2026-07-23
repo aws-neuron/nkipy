@@ -20,7 +20,7 @@ position), and the causal mask never lets a query attend past its own position.
 Run (from the gpt_oss/ directory, with peagle/ on PYTHONPATH):
     torchrun --nproc-per-node $TP peagle/speculate.py \
         --target-checkpoint ./tmp_gpt-oss-20b \
-        --draft-checkpoint ./tmp_p-eagle \
+        --draft-checkpoint ./peagle/tmp_p-eagle \
         --model openai/gpt-oss-20b \
         --draft-model amazon/GPT-OSS-20B-P-EAGLE \
         -n 200 -k 7 "The capital of France is"
@@ -236,9 +236,9 @@ class _DeviceDrafterAdapter:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-n", "--max-new-tokens", type=int, default=128)
-    # K=3 is the measured throughput optimum on trn2: verify cost grows ~6.3
-    # ms/token but acceptance plateaus around 3.3 for this drafter, so larger K
-    # pays more verify time for no extra accepted tokens. See README.
+    # K=3-4 is the measured throughput optimum on trn2: acceptance keeps rising
+    # with K but per-step verify cost grows faster, so mid-range K wins. K=3 is
+    # the default for its lower per-step verify latency. See README.
     parser.add_argument("-k", "--num-draft-tokens", type=int, default=3)
     parser.add_argument("prompt", nargs="?", default="The capital of France is")
     parser.add_argument(
@@ -249,7 +249,7 @@ def main():
         "and yields higher acceptance).",
     )
     parser.add_argument("--target-checkpoint", default="./tmp_gpt-oss-20b")
-    parser.add_argument("--draft-checkpoint", default="./tmp_p-eagle")
+    parser.add_argument("--draft-checkpoint", default="./peagle/tmp_p-eagle")
     parser.add_argument("--model", default="openai/gpt-oss-20b")
     parser.add_argument(
         "--draft-model", default="amazon/GPT-OSS-20B-P-EAGLE"
@@ -269,8 +269,8 @@ def main():
     K = args.num_draft_tokens
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     # The drafter is trained on chat-formatted data; raw completion prompts are
-    # out-of-distribution and roughly halve acceptance length (≈2.0 vs ≈3.7 at
-    # K=7 on GPU). Apply the chat template unless --raw-prompt is set.
+    # out-of-distribution and substantially lower acceptance length. Apply the
+    # chat template unless --raw-prompt is set.
     if args.raw_prompt or tokenizer.chat_template is None:
         input_ids = tokenizer(args.prompt, return_tensors="np")["input_ids"]
     else:
@@ -302,6 +302,11 @@ def main():
         args.draft_model, args.draft_checkpoint, config.hidden_size, K
     )
 
+    # EAGLE shift: the drafter pairs embed(token_{p+1}) with target_hidden(token_p)
+    # at slot p, so it consumes the prompt shifted by +1 (t_1..t_{P-1}).
+    P = prompt_len
+    shifted_tokens = torch.as_tensor(input_ids).reshape(-1)[1:P]  # t_1..t_{P-1}
+
     # Warm up the prefill path once (compile the prompt-width drafter kernel +
     # first kernel dispatch) before timing, so time-to-first-token reflects
     # steady-state prefill rather than one-time build/first-exec cost. Mirrors the
@@ -310,10 +315,7 @@ def main():
     # positions under a causal mask), so this scratch pass leaves no stale state.
     print_log("Warming up prefill")
     _warm_aux = _stack_aux(target.run_prefill(input_ids, capture_aux=True)[1])
-    drafter.prefill(
-        torch.as_tensor(input_ids).reshape(-1)[1:prompt_len],
-        _warm_aux[:, : prompt_len - 1, :],
-    )
+    drafter.prefill(shifted_tokens, _warm_aux[:, : P - 1, :])
 
     # ── Prefill the target on the prompt ──
     dist.barrier()
@@ -336,12 +338,9 @@ def main():
 
     generated = [next_id]
 
-    # ── Prefill the DRAFTER over the prompt (EAGLE shift) ──
-    # The drafter pairs embed(token_{p+1}) with target_hidden(token_p) at slot p.
+    # ── Prefill the DRAFTER over the prompt (EAGLE shift, see above) ──
     # Prompt tokens t_0..t_{P-1} with prefill hiddens h_0..h_{P-1} fill drafter
-    # slots 0..P-2 as (embed(t_{p+1}), h_p). Tokens are the prompt shifted by +1.
-    P = prompt_len
-    shifted_tokens = torch.as_tensor(input_ids).reshape(-1)[1:P]  # t_1..t_{P-1}
+    # slots 0..P-2 as (embed(t_{p+1}), h_p).
     drafter.prefill(shifted_tokens, prompt_aux3[:, : P - 1, :])
 
     # The next committed slot is the first generated token `next_id` at abs pos
@@ -432,11 +431,18 @@ def main():
     decode_time = time.time() - t_decode
     if dist.get_rank() == 0:
         n_new = len(generated)
+        # Mean acceptance counts every accepted token (measured before the EOS/
+        # max-length emit truncation): it reports drafter<->target agreement,
+        # independent of when generation happened to stop.
         accept_len = n_accepted_total / max(n_steps, 1)
+        # generated[0] is the prefill (first) token, produced before t_decode; the
+        # decode-loop tokens are the rest. Rate them over the timed window only, so
+        # this matches the base model's decode-tok/s convention.
+        n_decoded = n_new - 1
         print(f"\n\nTime to first token: {ttft:.2f}s")
         print(f"Generated {n_new} tokens in {n_steps} verify steps")
         print(f"Mean acceptance length: {accept_len:.2f} (K={K})")
-        print(f"Decode tokens/sec: {n_new / max(decode_time, 1e-6):.2f}")
+        print(f"Decode tokens/sec: {n_decoded / max(decode_time, 1e-6):.2f}")
         if profile:
             other = decode_time - prof["draft"] - prof["verify"]
             print(
