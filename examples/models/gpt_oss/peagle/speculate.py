@@ -55,7 +55,7 @@ from peagle.config import get_eagle_config  # noqa: E402
 from peagle.drafter_model import DrafterModel  # noqa: E402
 from safetensors.torch import load_file  # noqa: E402
 from transformers import AutoTokenizer  # noqa: E402
-from utils import print_log  # noqa: E402
+from utils import encode_prompt, print_log  # noqa: E402
 
 import gpt_oss as base  # noqa: E402  (base model)
 
@@ -268,18 +268,7 @@ def main():
 
     K = args.num_draft_tokens
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    # The drafter is trained on chat-formatted data; raw completion prompts are
-    # out-of-distribution and substantially lower acceptance length. Apply the
-    # chat template unless --raw-prompt is set.
-    if args.raw_prompt or tokenizer.chat_template is None:
-        input_ids = tokenizer(args.prompt, return_tensors="np")["input_ids"]
-    else:
-        input_ids = tokenizer.apply_chat_template(
-            [{"role": "user", "content": args.prompt}],
-            add_generation_prompt=True,
-            return_tensors="np",
-            return_dict=True,
-        )["input_ids"]
+    input_ids = encode_prompt(tokenizer, args.prompt, raw=args.raw_prompt)
     prompt_len = input_ids.shape[1]
     eos_ids = _resolve_eos_ids(args.model, tokenizer)
 
