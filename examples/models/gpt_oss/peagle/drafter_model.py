@@ -338,7 +338,6 @@ class DrafterModel:
         # Committed rows land at their true absolute positions; the ptd rows are
         # speculative and get overwritten when the next step commits accepted tokens.
         logits = logits[C - 1 : C - 1 + K]  # (K, vocab_local)
-        self.last_logits = logits  # stashed for numerical cross-checks
         draft_local = logits.argmax(dim=-1)  # (K,)
         draft_global = draft_local + self.d2t[draft_local]
         if _prof:
