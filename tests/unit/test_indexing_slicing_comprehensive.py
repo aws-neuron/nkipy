@@ -622,6 +622,98 @@ class TestIndexingSlicingAdvanced:
         else:
             trace_and_compile(kernel, trace_mode, a)
 
+    def test_separated_advanced_indexing(self, trace_mode, sample_tensors):
+        def kernel(a):
+            indices = np.array([0, 2, 4], dtype=np.int32)
+            return a[1, :, indices]
+
+        a = sample_tensors["small_3d"]
+        expected = kernel(a)
+
+        if NEURON_AVAILABLE:
+            out_baremetal = on_device_test(kernel, trace_mode, a)
+            baremetal_assert_allclose(expected, out_baremetal)
+        else:
+            _assert_traced_shape(kernel, trace_mode, expected.shape, a)
+            trace_and_compile(kernel, trace_mode, a)
+
+    def test_separated_advanced_indexing_dynamic(self, trace_mode, sample_tensors):
+        def kernel(a, indices):
+            return a[1, ::-1, indices]
+
+        a = sample_tensors["small_3d"]
+        indices = np.array([0, 2, 4], dtype=np.int32)
+        expected = kernel(a, indices)
+
+        if NEURON_AVAILABLE:
+            out_baremetal = on_device_test(kernel, trace_mode, a, indices)
+            baremetal_assert_allclose(expected, out_baremetal)
+        else:
+            _assert_traced_shape(kernel, trace_mode, expected.shape, a, indices)
+            trace_and_compile(kernel, trace_mode, a, indices)
+
+    def test_multidimensional_advanced_indexing(self, trace_mode, sample_tensors):
+        def kernel(a, indices):
+            return a[1, :, indices]
+
+        a = sample_tensors["small_3d"]
+        indices = np.array([[0], [2]], dtype=np.int32)
+        expected = kernel(a, indices)
+
+        if NEURON_AVAILABLE:
+            out_baremetal = on_device_test(kernel, trace_mode, a, indices)
+            baremetal_assert_allclose(expected, out_baremetal)
+        else:
+            _assert_traced_shape(kernel, trace_mode, expected.shape, a, indices)
+            trace_and_compile(kernel, trace_mode, a, indices)
+
+    def test_separated_advanced_indexing_with_newaxis(self, trace_mode, sample_tensors):
+        def kernel(a, indices):
+            return a[1, None, :, indices]
+
+        a = sample_tensors["small_3d"]
+        indices = np.array([0, 2], dtype=np.int32)
+        expected = kernel(a, indices)
+
+        if NEURON_AVAILABLE:
+            out_baremetal = on_device_test(kernel, trace_mode, a, indices)
+            baremetal_assert_allclose(expected, out_baremetal)
+        else:
+            _assert_traced_shape(kernel, trace_mode, expected.shape, a, indices)
+            trace_and_compile(kernel, trace_mode, a, indices)
+
+    def test_separated_advanced_indexing_with_empty_ellipsis(
+        self, trace_mode, sample_tensors
+    ):
+        def kernel(a, indices):
+            return a[:, 1, ..., indices]
+
+        a = sample_tensors["small_3d"]
+        indices = np.array([0, 2], dtype=np.int32)
+        expected = kernel(a, indices)
+
+        if NEURON_AVAILABLE:
+            out_baremetal = on_device_test(kernel, trace_mode, a, indices)
+            baremetal_assert_allclose(expected, out_baremetal)
+        else:
+            _assert_traced_shape(kernel, trace_mode, expected.shape, a, indices)
+            trace_and_compile(kernel, trace_mode, a, indices)
+
+    def test_contiguous_advanced_indexing_axis_order(self, trace_mode, sample_tensors):
+        def kernel(a, indices):
+            return a[:, 1, indices]
+
+        a = sample_tensors["small_3d"]
+        indices = np.array([0, 2], dtype=np.int32)
+        expected = kernel(a, indices)
+
+        if NEURON_AVAILABLE:
+            out_baremetal = on_device_test(kernel, trace_mode, a, indices)
+            baremetal_assert_allclose(expected, out_baremetal)
+        else:
+            _assert_traced_shape(kernel, trace_mode, expected.shape, a, indices)
+            trace_and_compile(kernel, trace_mode, a, indices)
+
     def test_step_slicing_with_offset(self, trace_mode, sample_tensors):
         def kernel(a):
             view = a[1::2, 2::3]

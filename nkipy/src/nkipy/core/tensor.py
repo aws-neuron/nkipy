@@ -315,6 +315,65 @@ def _strip_newaxis(indices: tuple) -> tuple:
     return tuple(cleaned), newaxis_axes
 
 
+def _advanced_indices_are_separated(indices: tuple) -> bool:
+    """Whether basic indices separate scalar and array advanced indices."""
+    # NumPy treats integer scalars as part of the advanced block when an
+    # integer array index is also present.
+    advanced_positions = [
+        pos
+        for pos, idx in enumerate(indices)
+        if isinstance(idx, (int, NKIPyTensorRef, np.ndarray, list))
+    ]
+    if len(advanced_positions) < 2:
+        return False
+    return len(advanced_positions) != (
+        advanced_positions[-1] - advanced_positions[0] + 1
+    )
+
+
+def _advanced_index_output_layout(
+    indices: tuple,
+    dynamic_position: int,
+    index_ndim: int,
+    gather_axis: int,
+    result_ndim: int,
+    advanced_are_separated: bool,
+) -> tuple:
+    """Return the transpose order and newaxis positions for one advanced index."""
+    advanced_positions = {
+        pos
+        for pos, idx in enumerate(indices)
+        if pos == dynamic_position or isinstance(idx, int)
+    }
+
+    # Separated advanced dimensions move to the front; contiguous ones stay
+    # where the gather inserted them.
+    if advanced_are_separated:
+        permutation = (
+            list(range(gather_axis, gather_axis + index_ndim))
+            + list(range(gather_axis))
+            + list(range(gather_axis + index_ndim, result_ndim))
+        )
+        output_position = index_ndim
+    else:
+        permutation = list(range(result_ndim))
+        output_position = 0
+
+    newaxis_axes = []
+    advanced_inserted = False
+    for pos, idx in enumerate(indices):
+        if pos in advanced_positions:
+            if not advanced_are_separated and not advanced_inserted:
+                output_position += index_ndim
+                advanced_inserted = True
+            continue
+        if idx is None:
+            newaxis_axes.append(output_position)
+        output_position += 1
+
+    return permutation, newaxis_axes
+
+
 class NKIPyTensorRef(TensorArithmeticMixin, TensorOperationMixin):
     """
     NKIPy Tensor Reference
@@ -474,12 +533,15 @@ class NKIPyTensorRef(TensorArithmeticMixin, TensorOperationMixin):
             if not isinstance(indices, tuple):
                 indices = (indices,)
 
+            advanced_indices_are_separated = _advanced_indices_are_separated(indices)
             indices = _expand_ellipsis(indices, len(self.shape))
+            indices_with_newaxis = indices
             indices, newaxis_axes = _strip_newaxis(indices)
 
             # Pad with full slices if needed
             while len(indices) < len(self.shape):
                 indices = indices + (slice(None),)
+                indices_with_newaxis = indices_with_newaxis + (slice(None),)
 
             # Check if we have any tensor indices (dynamic indexing)
             # This includes NKIPyTensorRef, np.ndarray, and Python lists
@@ -548,29 +610,44 @@ class NKIPyTensorRef(TensorArithmeticMixin, TensorOperationMixin):
                     for i, idx in enumerate(static_indices)
                     if i != dynamic_index_dim
                 )
+                dims_removed_before = sum(
+                    1
+                    for idx in static_indices[:dynamic_index_dim]
+                    if isinstance(idx, int)
+                )
+                gather_axis = dynamic_index_dim - dims_removed_before
 
                 if has_static_slice:
                     # Apply static slicing first
                     sliced_tensor = self._do_static_slice(tuple(static_indices))
-                    # Now apply dynamic indexing on the sliced result
-                    # Need to adjust the dimension index after slicing
-                    # Count how many dimensions were removed before dynamic_index_dim
-                    dims_removed_before = sum(
-                        1
-                        for i, idx in enumerate(static_indices[:dynamic_index_dim])
-                        if isinstance(idx, int)
-                    )
-                    adjusted_dim = dynamic_index_dim - dims_removed_before
-
                     # Use np.take for dynamic indexing (dispatches to ops.take)
                     result = nkipy_ops.take(
-                        sliced_tensor, dynamic_index_value, axis=adjusted_dim
+                        sliced_tensor, dynamic_index_value, axis=gather_axis
                     )
                 else:
                     # No static slicing needed, just dynamic indexing
-                    result = nkipy_ops.take(
-                        self, dynamic_index_value, axis=dynamic_index_dim
-                    )
+                    result = nkipy_ops.take(self, dynamic_index_value, axis=gather_axis)
+
+                dynamic_position = next(
+                    pos
+                    for pos, idx in enumerate(indices_with_newaxis)
+                    if isinstance(idx, (NKIPyTensorRef, np.ndarray, list))
+                )
+                index_ndim = (
+                    dynamic_index_value.ndim
+                    if isinstance(dynamic_index_value, NKIPyTensorRef)
+                    else np.asarray(dynamic_index_value).ndim
+                )
+                permutation, newaxis_axes = _advanced_index_output_layout(
+                    indices_with_newaxis,
+                    dynamic_position,
+                    index_ndim,
+                    gather_axis,
+                    result.ndim,
+                    advanced_indices_are_separated,
+                )
+                if permutation != list(range(result.ndim)):
+                    result = nkipy_ops.transpose(result, axes=permutation)
             else:
                 # Pure static indexing
                 result = self._do_static_slice(indices)
