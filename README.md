@@ -42,6 +42,12 @@ runtime to support kernel execution.
 
 Spike provides a modern, efficient Python interface to AWS Neuron Runtime (NRT) through optimized C++ bindings. It enables direct execution of compiled NEFF models and tensor management on AWS Neuron devices with minimal overhead.
 
+### NKIPy Serving
+
+NKIPy Serving is a Python-first text-generation runtime for AWS Trainium. It
+uses NKIPy, NKI kernels, and Spike directly, without PyTorch or JAX in the
+runtime path. See the [serving package documentation](nkipy_serving/README.md).
+
 ## Installation
 
 ### Prerequisites
@@ -64,21 +70,25 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 git clone https://github.com/aws-neuron/nkipy.git
 cd nkipy
 
-# Install all packages in editable mode
+# Install the core NKIPy and Spike packages in editable mode
 uv sync
 
-# For additional features (examples, docs, testing):
+# Install NKIPy Serving (requires Python 3.12)
+uv sync --group serving
+
+# Install all optional groups, including serving, examples, docs, and tests
 uv sync --all-groups
 ```
 
-This will:
+The default sync will:
 - Create a `.venv` virtual environment
 - Install `nkipy`, `spike`, and all dependencies (including `neuronx-cc` from the Neuron repository)
 
-The `--all-groups` flag additionally installs:
+Additional dependency groups provide:
 - **test**: pytest, ruff, mypy for testing and linting
 - **examples**: torch, transformers, ipython for running examples
 - **docs**: sphinx and related tools for building documentation
+- **serving**: the `nkipy-serving` package and its runtime dependencies
 
 ### Running Commands
 

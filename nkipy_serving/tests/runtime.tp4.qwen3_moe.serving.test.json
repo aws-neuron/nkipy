@@ -1,0 +1,14 @@
+{
+  "execution_backend": "nkipy",
+  "attention_backend": "NKIBlockSparseFlashAttention",
+  "paged_attn_impl": "nki_blocksparse_flash_attention",
+  "model_id": "Qwen/Qwen3-30B-A3B-Thinking-2507",
+  "max_context_len": 4096,
+  "tokenizer_model_id": "Qwen/Qwen3-30B-A3B-Thinking-2507",
+  "tokenizer_local_files_only": true,
+  "hf_local_files_only": true,
+  "tp_degree": 4,
+  "kv_cache_block_size": 32,
+  "request_buckets": [128],
+  "token_buckets": [128]
+}

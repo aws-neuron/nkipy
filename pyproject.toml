@@ -8,7 +8,7 @@ requires-python = ">=3.10"
 dependencies = ["nkipy"]
 
 [tool.uv.workspace]
-members = ["nkipy", "spike", "nkigen"]
+members = ["nkipy", "spike", "nkigen", "nkipy_serving"]
 
 [[tool.uv.index]]
 name = "neuron"
@@ -19,6 +19,7 @@ explicit = true
 spike = { workspace = true }
 nkipy = { workspace = true }
 nkigen = { workspace = true }
+nkipy-serving = { workspace = true }
 
 [dependency-groups]
 dev = [
@@ -26,13 +27,15 @@ dev = [
     "spike",
 ]
 test = [
+    "boto3>=1.34",
     "pytest>=7.0",
     "pytest-cov>=4.0",
     "pytest-order>=1.0",
     "pytest-xdist>=3.0",
-    "ruff",
+    "ruff==0.14.10",
     "mypy",
 ]
+serving = ["nkipy-serving"]
 examples = [
     "torch",
     "ipython",
@@ -40,7 +43,6 @@ examples = [
     "argparse",
     "safetensors",
     "accelerate",
-    "boto3>=1.34",
 ]
 docs = [
     "sphinx",

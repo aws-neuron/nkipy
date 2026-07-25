@@ -1,0 +1,12 @@
+{
+  "execution_backend": "nkipy",
+  "attention_backend": "NKIBlockSparseFlashAttention",
+  "paged_attn_impl": "nki_blocksparse_flash_attention",
+  "model_id": "Qwen/Qwen3-0.6B",
+  "max_context_len": 4096,
+  "model_dtype": "bf16",
+  "tp_degree": 1,
+  "kv_cache_block_size": 32,
+  "request_buckets": [1, 2, 4, 8],
+  "token_buckets": [128, 256, 512]
+}

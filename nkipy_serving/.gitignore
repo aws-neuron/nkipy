@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual envs
+.venv/
+venv/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+uv.lock
+
+# Build cache
+.cache/
+
+# Profiling artifacts
+profiles/
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/

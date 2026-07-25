@@ -1,0 +1,17 @@
+{
+  "execution_backend": "nkipy",
+  "attention_backend": "NKIBlockSparseFlashAttention",
+  "paged_attn_impl": "nki_blocksparse_flash_attention",
+  "model_id": "unsloth/gpt-oss-120b-BF16",
+  "max_context_len": 4096,
+  "tokenizer_model_id": "unsloth/gpt-oss-120b-BF16",
+  "tokenizer_local_files_only": true,
+  "hf_local_files_only": true,
+  "tp_degree": 8,
+  "ep_degree": 16,
+  "kv_cache_block_size": 32,
+  "request_buckets": [32],
+  "token_buckets": [128, 512, 1024, 2048, 4096],
+  "decode_graph_scope": "embed_layers",
+  "nkipy_build_dir": "/tmp/build_gpt_oss_bench"
+}
