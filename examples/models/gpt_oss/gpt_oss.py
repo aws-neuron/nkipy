@@ -12,7 +12,7 @@ from kernels.transformer_layer import transformer_layer
 from nkipy.runtime import DeviceKernel, DeviceTensor
 from safetensors.torch import load_file
 from transformers import AutoTokenizer
-from utils import print_log
+from utils import encode_prompt, print_log
 
 # Absolute path: the compiler chdir's into the per-kernel build dir, so a
 # relative build dir would double up and the HLO module wouldn't be found.
@@ -293,8 +293,7 @@ def load_model(args):
     os.environ["NEURON_RT_VISIBLE_CORES"] = str(dist.get_rank())
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    model_inputs = tokenizer(args.prompt, return_tensors="np")
-    input_ids = model_inputs["input_ids"]
+    input_ids = encode_prompt(tokenizer, args.prompt, raw=args.raw_prompt)
     config = get_config(args.model, input_ids.shape[1], args.max_new_tokens)
     args.eos_ids = _resolve_eos_ids(args.model, tokenizer)
 
@@ -320,6 +319,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-n", "--max-new-tokens", type=int, default=16)
     parser.add_argument("prompt", nargs="?", default="The capital of France is")
+    parser.add_argument(
+        "--raw-prompt",
+        action="store_true",
+        help="Tokenize the prompt as raw text instead of applying the chat "
+        "template (gpt-oss is an instruct model, so the chat template is the "
+        "in-distribution format and is applied by default).",
+    )
     parser.add_argument("--checkpoint", default="./tmp_gpt-oss-20b")
     parser.add_argument("--model", default="openai/gpt-oss-20b")
     args = parser.parse_args()
