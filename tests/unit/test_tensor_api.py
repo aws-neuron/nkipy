@@ -18,6 +18,7 @@ except ImportError:
     TORCH_AVAILABLE = False
 
 from nkipy.core import tensor_apis
+from nkipy.core.trace import NKIPyKernel
 from utils import (
     NEURON_AVAILABLE,
     baremetal_assert_allclose,
@@ -3369,6 +3370,74 @@ def test_diff_n2(trace_mode):
     shape = (32, 64)
     in0 = np.random.uniform(0.0, 1.0, size=shape).astype(np.float32)
     expected = kernel(in0)
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_diff_with_scalar_prepend_and_append(trace_mode):
+    def kernel(a):
+        return np.diff(
+            a,
+            axis=-1,
+            prepend=np.float32(0.0),
+            append=np.float32(25.0),
+        )
+
+    in0 = np.array([[1.0, 4.0, 9.0, 16.0]], dtype=np.float16)
+    expected = kernel(in0)
+
+    traced = NKIPyKernel.trace(kernel, backend=trace_mode).specialize(in0)
+    assert traced.outputs[0].shape == expected.shape
+    assert traced.outputs[0].dtype == expected.dtype
+    assert any(op.op_name == "concatenate" for op in traced.operations)
+
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_diff_with_tensor_prepend_and_append(trace_mode):
+    def kernel(a, prepend, append):
+        return np.diff(a, axis=0, prepend=prepend, append=append)
+
+    in0 = np.array([[1.0, 4.0], [9.0, 16.0]], dtype=np.float32)
+    prepend = np.array([[0.0, 1.0]], dtype=np.float32)
+    append = np.array([[25.0, 36.0], [49.0, 64.0]], dtype=np.float32)
+    expected = kernel(in0, prepend, append)
+
+    traced = NKIPyKernel.trace(kernel, backend=trace_mode).specialize(
+        in0, prepend, append
+    )
+    assert traced.outputs[0].shape == expected.shape
+
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0, prepend, append)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0, prepend, append)
+
+
+def test_diff_n2_applies_boundaries_once(trace_mode):
+    def kernel(a):
+        return np.diff(
+            a,
+            n=2,
+            prepend=np.float32(0.0),
+            append=np.float32(25.0),
+        )
+
+    in0 = np.array([1.0, 4.0, 9.0, 16.0], dtype=np.float32)
+    expected = kernel(in0)
+
+    traced = NKIPyKernel.trace(kernel, backend=trace_mode).specialize(in0)
+    assert traced.outputs[0].shape == expected.shape
+    assert sum(op.op_name == "concatenate" for op in traced.operations) == 1
+
     if NEURON_AVAILABLE:
         out_device = on_device_test(kernel, trace_mode, in0)
         baremetal_assert_allclose(expected, out_device)

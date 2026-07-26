@@ -1602,16 +1602,118 @@ def pad(x, pad_width, mode="constant", constant_values=0, **kwargs):
         )
 
 
+def _prepare_diff_boundary(ctx, value, input_shape, axis, dtype):
+    if isinstance(value, NKIPyTensorRef):
+        boundary = value.backend_tensor
+    else:
+        if not np.isscalar(value) and not isinstance(value, np.ndarray):
+            value = np.asarray(value)
+        boundary = as_hlo_tensor(ctx, value, dtype)
+
+    if boundary.dtype != dtype:
+        boundary = ctx.build_op("convert", [boundary], boundary.shape, dtype)
+
+    if len(boundary.shape) == 0:
+        boundary_shape = list(input_shape)
+        boundary_shape[axis] = 1
+        return ctx.build_op(
+            "broadcast",
+            [boundary],
+            tuple(boundary_shape),
+            dtype,
+            {"broadcast_dimensions": []},
+        )
+
+    if len(boundary.shape) != len(input_shape):
+        raise ValueError(
+            "prepend and append must be scalars or have the same rank as the input"
+        )
+
+    for dim, (boundary_size, input_size) in enumerate(
+        zip(boundary.shape, input_shape)
+    ):
+        if dim != axis and boundary_size != input_size:
+            raise ValueError(
+                "prepend and append must match the input shape on every "
+                "dimension except the differencing axis"
+            )
+
+    return boundary
+
+
 def diff(a, n=1, axis=-1, prepend=None, append=None):
     from nkipy.core.ops.binary import subtract as sub_op
 
     ctx = get_hlo_context()
 
+    if n < 0:
+        raise ValueError(f"order must be non-negative but got {n}")
+
     ndim = len(a.shape)
     if axis < 0:
         axis += ndim
+    if axis < 0 or axis >= ndim:
+        raise ValueError(f"axis {axis} is out of bounds for array of dimension {ndim}")
 
-    result = a
+    if n == 0:
+        return a
+
+    boundaries = []
+    if prepend is not None:
+        if not np.isscalar(prepend) and not isinstance(
+            prepend, (NKIPyTensorRef, np.ndarray)
+        ):
+            prepend = np.asarray(prepend)
+        boundaries.append(prepend)
+    if append is not None:
+        if not np.isscalar(append) and not isinstance(
+            append, (NKIPyTensorRef, np.ndarray)
+        ):
+            append = np.asarray(append)
+        boundaries.append(append)
+
+    result_dtype = a.dtype
+    dtype_probe = a
+    for boundary in boundaries:
+        result_dtype = find_common_type_hlo(dtype_probe, boundary)
+        dtype_probe = np.empty((), dtype=result_dtype)
+
+    a_tensor = a.backend_tensor if isinstance(a, NKIPyTensorRef) else a
+    if a_tensor.dtype != result_dtype:
+        a_tensor = ctx.build_op(
+            "convert", [a_tensor], a_tensor.shape, result_dtype
+        )
+
+    parts = []
+    if prepend is not None:
+        parts.append(
+            _prepare_diff_boundary(
+                ctx, prepend, a_tensor.shape, axis, result_dtype
+            )
+        )
+    parts.append(a_tensor)
+    if append is not None:
+        parts.append(
+            _prepare_diff_boundary(
+                ctx, append, a_tensor.shape, axis, result_dtype
+            )
+        )
+
+    if len(parts) > 1:
+        concatenated_shape = list(a_tensor.shape)
+        concatenated_shape[axis] = builtins.sum(part.shape[axis] for part in parts)
+        result = NKIPyTensorRef(
+            ctx.build_op(
+                "concatenate",
+                parts,
+                tuple(concatenated_shape),
+                result_dtype,
+                {"dimension": axis},
+            )
+        )
+    else:
+        result = NKIPyTensorRef(a_tensor)
+
     for _ in range(n):
         if isinstance(result, NKIPyTensorRef):
             r_bt = result.backend_tensor
