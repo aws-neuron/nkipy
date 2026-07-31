@@ -22,6 +22,11 @@ Supports three NKI frontends:
 - Legacy frontend (neuronxcc.nki): Default, supports CPU execution
 - Beta 2 frontend (nki with GenericKernel): Hardware-only (no CPU execution support)
 - Beta 3 frontend (nki with Kernel): Hardware-only, new compilation API
+
+Beta 3 kernels compile through ``nki.framework.compiled.CompileKernel`` (see
+``_NKIPyCompileKernel``), which is where the allocation/scheduling split between
+NKI and the neuronx-cc backend is decided; ``BETA3_COMPILE_MODES`` documents the
+available modes.
 """
 
 import dataclasses
@@ -61,17 +66,15 @@ except ImportError:
     Beta2UnifiedKernel = None
     BETA2_NKI_AVAILABLE = False
 
-# Beta 3 frontend (nki with Kernel + compile_kernel_to_nir)
+# Beta 3 frontend (nki with Kernel + CompileKernel)
 try:
     from nki.framework.kernel import Kernel as Beta3Kernel
-    from nki.framework.compiled import compile_kernel_to_nir as _beta3_compile_kernel_to_nir
-    from nki.compiler.ncc_driver import CompileOptions as Beta3CompileOptions
+    from nki.framework.compiled import CompileKernel as Beta3CompileKernel
 
     BETA3_NKI_AVAILABLE = True
 except ImportError:
     Beta3Kernel = None
-    _beta3_compile_kernel_to_nir = None
-    Beta3CompileOptions = None
+    Beta3CompileKernel = None
     BETA3_NKI_AVAILABLE = False
 
 
@@ -104,6 +107,139 @@ def _get_beta3_artifacts_dir() -> str:
     subdir = os.path.join(_beta3_base_artifacts_dir, str(_beta3_artifacts_counter))
     os.makedirs(subdir, exist_ok=True)
     return subdir
+
+
+# ---------------------------------------------------------------------------
+# Beta 3 compilation modes
+# ---------------------------------------------------------------------------
+
+# How the NKI beta 3 MLIR pipeline and the neuronx-cc backend split
+# responsibility for memory allocation and instruction scheduling:
+#
+#   "standard"          neuronx-cc owns allocation + scheduling. NKI's
+#                       LinearScanAllocation and InstructionScheduling passes are
+#                       off, so the BIR carries unallocated memory locations and
+#                       neuronx-cc runs its coloring allocator and PSUM address
+#                       rotation. This is the production path -- the same one
+#                       nki.framework's own torch/JAX integrations use.
+#
+#   "integration-alloc" NKI owns allocation (LinearScanAllocation on), neuronx-cc
+#                       still owns scheduling. The BIR is stamped
+#                       ``sb_allocated``/``psum_allocated``, so neuronx-cc skips its
+#                       allocator.
+BETA3_COMPILE_MODES = ("standard", "integration-alloc")
+BETA3_ALLOCATION_MODES = ("fast", "ring", "max-reuse")
+
+
+def _beta3_supports_allocation_mode() -> bool:
+    """Whether the installed nki exposes the ``nisa-allocation-mode`` option."""
+    import glob
+    import os
+
+    try:
+        from nki.compiler import _internal
+    except ImportError:
+        return False
+
+    pattern = os.path.join(os.path.dirname(_internal.__file__), "_mlir_libs", "_nki*.so")
+    for lib in glob.glob(pattern):
+        try:
+            with open(lib, "rb") as handle:
+                if b"nisa-allocation-mode" in handle.read():
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def _beta3_pipeline_options(compile_opts, compile_mode, allocation_mode):
+    """Apply the beta 3 compile-mode pipeline options to ``compile_opts``."""
+    if compile_mode not in BETA3_COMPILE_MODES:
+        raise ValueError(
+            f"nki_compile_mode={compile_mode!r} is invalid; expected one of: "
+            f"{', '.join(BETA3_COMPILE_MODES)}"
+        )
+    if allocation_mode is not None and allocation_mode not in BETA3_ALLOCATION_MODES:
+        raise ValueError(
+            f"nisa_allocation_mode={allocation_mode!r} is invalid; expected one "
+            f"of: {', '.join(BETA3_ALLOCATION_MODES)}"
+        )
+    if allocation_mode is not None and not _beta3_supports_allocation_mode():
+        raise ValueError(
+            "nisa_allocation_mode is not supported by the installed nki: it has "
+            "no 'nisa-allocation-mode' pipeline option. Leave it as None to use "
+            "NKI's built-in default."
+        )
+
+    if compile_mode == "standard":
+        if allocation_mode is not None:
+            raise ValueError(
+                "nisa_allocation_mode is only meaningful with "
+                'nki_compile_mode="integration-alloc"; under "standard" the '
+                "neuronx-cc backend owns allocation."
+            )
+        # Turns off NKI's LinearScanAllocation + InstructionScheduling and sets
+        # emit_reg_compute_as_affine_expr, matching the production integrations.
+        return compile_opts.disable_backend_optimizations()
+
+    options = [
+        "enable-linear-scan-allocation=true",
+        "enable-instruction-scheduling=false",
+    ]
+    if allocation_mode is not None:
+        options.append(f"nisa-allocation-mode={allocation_mode}")
+    return compile_opts.set_pipeline_options(*options)
+
+
+if BETA3_NKI_AVAILABLE:
+
+    @dataclasses.dataclass(frozen=True)
+    class _NKIPyCompileKernel(Beta3CompileKernel):
+        """``CompileKernel`` subclass carrying NKIPy's compilation policy.
+
+        Using ``CompileKernel`` (rather than calling ``compile_kernel_to_nir``
+        with a hand-built ``CompileOptions``) is what nki.framework expects of a
+        framework integration: it is the layer that resolves the compile-mode
+        pipeline options, so a bare ``CompileOptions`` silently inherits NKI's
+        experimental defaults instead of the production ones.
+
+        NKIPy deliberately keeps compile caching and artifact lifetime as the
+        caller's concern, so NKI's caches are disabled here: ``__post_init__``
+        skips creating the in-memory compile cache, and ``_make_trace_cache``
+        suppresses the persistent trace cache on nki versions that have one.
+        """
+
+        nki_compile_mode: str = "standard"
+        """Allocation/scheduling split; see ``BETA3_COMPILE_MODES``."""
+
+        nisa_allocation_mode: Optional[str] = None
+        """NKI address-assignment strategy; ``"integration-alloc"`` only."""
+
+        def __post_init__(self):
+            # Skip CompileKernel.__post_init__, which installs an in-memory
+            # compile cache on the wrapped function. Cache management is left to
+            # the caller, so go straight to Kernel.__post_init__.
+            Beta3Kernel.__post_init__(self)
+
+        def _make_trace_cache(self, inputs, compile_opts):
+            """Disable NKI's cross-process trace cache (see class docstring).
+
+            Only present on newer nki; harmless to define unconditionally.
+            """
+            return None
+
+        def _compile_opts(self):
+            # CompileKernel._compile_opts() applies
+            # disable_backend_optimizations() whenever _enable_backend_opt is
+            # False, which is right for "standard" but would contradict
+            # "integration-alloc". Let it build the base options with that step
+            # suppressed, then apply exactly one mode's options.
+            base = dataclasses.replace(self, _enable_backend_opt=True)
+            return _beta3_pipeline_options(
+                Beta3CompileKernel._compile_opts(base),
+                self.nki_compile_mode,
+                self.nisa_allocation_mode,
+            )
 
 
 def _patch_nkipy_methods(kernel):
@@ -346,27 +482,53 @@ def _generate_nki_custom_call(kernel, *args, **kwargs):
     return _build_hlo_custom_call(config, operands)
 
 
-def _beta3_compile_and_get_config(kernel, numpy_inputs, platform_target=None, lnc=None):
+def _beta3_compile_and_get_config(
+    kernel,
+    numpy_inputs,
+    platform_target=None,
+    lnc=None,
+    nki_compile_mode="standard",
+    nisa_allocation_mode=None,
+):
     """Compile a beta 3 kernel and return (framework_config, is_tuple_return).
 
     The artifacts directory is managed by the caller via _get_beta3_artifacts_dir().
     """
-    import os
-
     if platform_target is None:
         platform_target = _get_platform_target_default()
-    if lnc is None:
-        lnc = getattr(kernel, "lnc", 1) or 1
 
-    artifacts_dir = _get_beta3_artifacts_dir()
-    compile_opts = Beta3CompileOptions(
+    # Carry the user's @nki.jit settings (lnc, schedule, address_rotation, ...)
+    # over to the CompileKernel rather than re-deriving them, so kernel options
+    # keep working and new Kernel fields are picked up automatically.
+    kernel_fields = {
+        field.name: getattr(kernel, field.name)
+        for field in dataclasses.fields(kernel)
+        if field.name != "func"
+    }
+    if lnc is not None:
+        kernel_fields["lnc"] = lnc
+    kernel_fields.setdefault("lnc", 1)
+
+    compile_kernel = _NKIPyCompileKernel(
+        getattr(kernel, "func", kernel),
+        **kernel_fields,
         target=platform_target,
-        lnc=lnc,
-        artifacts_dir=artifacts_dir,
-        output_path=os.path.join(artifacts_dir, "kernel.neff"),
+        artifacts_dir=_get_beta3_artifacts_dir(),
+        nki_compile_mode=nki_compile_mode,
+        nisa_allocation_mode=nisa_allocation_mode,
     )
-    nir = _beta3_compile_kernel_to_nir(
-        kernel, inputs=numpy_inputs, compile_opts=compile_opts, enable_cache=False
+
+    # CompileKernel.compile() returns only (config, cache_hash); go through
+    # _cached_compile_to_bir (as nki.framework's JAX integration does) to keep
+    # the NirResult, which carries is_tuple_return. Inputs are already numpy
+    # arrays, which NKI's frontends consume directly -- no per-framework tensor
+    # conversion step is needed.
+    nir = compile_kernel._cached_compile_to_bir(
+        frontend=compile_kernel._frontend_cls(
+            enable_backend_opt=compile_kernel._enable_backend_opt
+        ),
+        inputs=numpy_inputs,
+        compile_opts=compile_kernel._compile_opts(),
     )
     return nir.build_config(), nir.is_tuple_return
 
@@ -455,6 +617,8 @@ class NKICustomOp:
         is_nki_beta_2_version: bool = False,
         is_nki_beta_3_version: bool = False,
         platform_target: Optional[str] = None,
+        nki_compile_mode: str = "standard",
+        nisa_allocation_mode: Optional[str] = None,
     ):
         operands = list(operands)
         self._is_beta3 = is_nki_beta_3_version
@@ -468,7 +632,13 @@ class NKICustomOp:
                     "Beta 3 NKI frontend (nki.framework.kernel.Kernel) is not "
                     "available. Please install nki >= 0.4."
                 )
-            self._compile_beta3(kernel, operands, platform_target)
+            self._compile_beta3(
+                kernel,
+                operands,
+                platform_target,
+                nki_compile_mode,
+                nisa_allocation_mode,
+            )
         elif is_nki_beta_2_version:
             if not BETA2_NKI_AVAILABLE:
                 raise ImportError(
@@ -513,7 +683,14 @@ class NKICustomOp:
         )
         self.config = traced_kernel.dump_config(*operands)
 
-    def _compile_beta3(self, kernel, operands, platform_target):
+    def _compile_beta3(
+        self,
+        kernel,
+        operands,
+        platform_target,
+        nki_compile_mode="standard",
+        nisa_allocation_mode=None,
+    ):
         # Build inputs dict from operands matching kernel parameter names
         func = getattr(kernel, "func", kernel)
         sig = inspect.signature(func)
@@ -529,7 +706,13 @@ class NKICustomOp:
                 break
 
         self._beta3_framework_config, self._beta3_is_tuple_return = (
-            _beta3_compile_and_get_config(kernel, numpy_inputs, platform_target)
+            _beta3_compile_and_get_config(
+                kernel,
+                numpy_inputs,
+                platform_target,
+                nki_compile_mode=nki_compile_mode,
+                nisa_allocation_mode=nisa_allocation_mode,
+            )
         )
 
     def __call__(self, *operands):
@@ -551,6 +734,8 @@ def wrap_nki_kernel(
     is_nki_beta_2_version: bool = False,
     is_nki_beta_3_version: bool = False,
     platform_target: Optional[str] = None,
+    nki_compile_mode: str = "standard",
+    nisa_allocation_mode: Optional[str] = None,
 ):
     """Wrap an NKI kernel for use in NKIPy's HLO tracing flow.
 
@@ -563,8 +748,16 @@ def wrap_nki_kernel(
         is_nki_beta_2_version: If True, use the Beta 2 NKI frontend (nki package
                                with GenericKernel). Note: does not support CPU execution.
         is_nki_beta_3_version: If True, use the Beta 3 NKI frontend (nki >= 0.4 with
-                               compile_kernel_to_nir). Note: does not support CPU execution.
+                               CompileKernel). Note: does not support CPU execution.
         platform_target: Target platform (e.g., "trn1", "trn2"). If None, auto-detected.
+        nki_compile_mode: Beta 3 only. ``"standard"`` (default) leaves memory
+            allocation and instruction scheduling to the neuronx-cc backend.
+            ``"integration-alloc"`` has NKI allocate instead; it is experimental.
+        nisa_allocation_mode: Beta 3 ``"integration-alloc"`` only. NKI's
+            address-assignment strategy: ``"fast"``, ``"ring"``, or
+            ``"max-reuse"``. ``None`` (default) uses NKI's own default
+            (``"fast"``). Raises ValueError if the installed nki has no
+            ``nisa-allocation-mode`` pipeline option.
 
     Returns:
         NKICustomOp that can be called during HLO tracing
@@ -576,6 +769,8 @@ def wrap_nki_kernel(
         is_nki_beta_2_version=is_nki_beta_2_version,
         is_nki_beta_3_version=is_nki_beta_3_version,
         platform_target=platform_target,
+        nki_compile_mode=nki_compile_mode,
+        nisa_allocation_mode=nisa_allocation_mode,
     )
 
 
