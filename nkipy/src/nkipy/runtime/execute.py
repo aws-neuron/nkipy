@@ -96,9 +96,17 @@ def _execute_neff(neff, name, ir: ComputationIR, original_inputs, save_trace=Fal
     }
 
     device_outputs = {}
+    # Zero-element outputs (e.g. from an empty slice) are dropped by the
+    # compiler and are absent from the NEFF; nrt also rejects 0-byte tensor
+    # allocations. Materialize them directly on the host instead.
+    empty_outputs = {}
     for i, outtensor in enumerate(ir.outputs):
         if i in alias_input_names:
             device_outputs[outtensor.name] = device_inputs[alias_input_names[i]]
+        elif int(np.prod(outtensor.shape)) == 0:
+            empty_outputs[outtensor.name] = np.zeros(
+                outtensor.shape, dtype=outtensor.dtype
+            )
         else:
             np_output = np.zeros(outtensor.shape, dtype=outtensor.dtype)
             device_outputs[outtensor.name] = DeviceTensor.from_numpy(np_output)
@@ -108,7 +116,10 @@ def _execute_neff(neff, name, ir: ComputationIR, original_inputs, save_trace=Fal
     output_arrays = {}
     alias_by_output = {a.output_index: a for a in ir.aliases}
     for i, outtensor in enumerate(ir.outputs):
-        result = device_outputs[outtensor.name].numpy()
+        if outtensor.name in empty_outputs:
+            result = empty_outputs[outtensor.name]
+        else:
+            result = device_outputs[outtensor.name].numpy()
         if i in alias_by_output:
             alias = alias_by_output[i]
             np.copyto(dst=original_inputs[alias.param_name], src=result)
