@@ -599,6 +599,48 @@ def test_transpose(trace_mode, shape, axes):
 
 
 @pytest.mark.parametrize(
+    "shape,axes",
+    [
+        ((2, 3), (-1, -2)),
+        ((2, 3, 4), (1, -1, 0)),
+    ],
+)
+def test_transpose_negative_axes(trace_mode, shape, axes):
+    def kernel(a):
+        return np.transpose(a, axes=axes)
+
+    in0 = np.random.random_sample(shape).astype(np.float32)
+    expected = kernel(in0)
+
+    traced = NKIPyKernel.trace(kernel, backend=trace_mode).specialize(in0)
+    assert traced.outputs[0].shape == expected.shape
+    assert traced.outputs[0].dtype == expected.dtype
+
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+@pytest.mark.parametrize(
+    "axes,error_type,error_match",
+    [
+        ((0,), ValueError, "axes don't match array"),
+        ((0, 0), ValueError, "repeated axis in transpose"),
+        ((0, 2), np.exceptions.AxisError, "axis 2 is out of bounds"),
+    ],
+)
+def test_transpose_invalid_axes(trace_mode, axes, error_type, error_match):
+    def kernel(a):
+        return np.transpose(a, axes=axes)
+
+    in0 = np.ones((2, 3), dtype=np.float32)
+    with pytest.raises(error_type, match=error_match):
+        NKIPyKernel.trace(kernel, backend=trace_mode).specialize(in0)
+
+
+@pytest.mark.parametrize(
     "shape,repeats,axis",
     [
         ((2, 3), 2, 0),

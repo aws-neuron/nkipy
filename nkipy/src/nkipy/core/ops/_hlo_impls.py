@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import builtins
 import itertools
+import operator
 from typing import List, Tuple
 
 import numpy as np
@@ -1214,8 +1215,24 @@ def transpose(x, axes=None, out=None, dtype=None):
     if isinstance(x, NKIPyTensorRef):
         x = x.backend_tensor
 
+    ndim = len(x.shape)
     if axes is None:
-        axes = list(range(len(x.shape)))[::-1]
+        axes = tuple(range(ndim - 1, -1, -1))
+    else:
+        axes = tuple(axes)
+        if len(axes) != ndim:
+            raise ValueError("axes don't match array")
+
+        normalized_axes = []
+        for axis in axes:
+            axis = operator.index(axis)
+            if axis < -ndim or axis >= ndim:
+                raise np.exceptions.AxisError(axis, ndim)
+            normalized_axes.append(axis % ndim)
+        axes = tuple(normalized_axes)
+
+        if len(set(axes)) != ndim:
+            raise ValueError("repeated axis in transpose")
 
     result_shape = tuple(x.shape[i] for i in axes)
 
