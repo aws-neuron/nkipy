@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import builtins
 import itertools
+import operator
 from typing import List, Tuple
 
 import numpy as np
@@ -1824,20 +1825,34 @@ def roll(x, shift, axis=None):
     if axis is None:
         total = int(np.prod(x_shape))
         flat = reshape_op(x, (total,))
-        rolled = _roll_single_axis(flat, shift, 0)
+        rolled = roll(flat, shift, 0)
         return reshape_op(rolled, x_shape)
 
-    if isinstance(shift, (list, tuple)):
-        if not isinstance(axis, (list, tuple)):
-            raise ValueError("If shift is a tuple, axis must also be a tuple")
-        result = x
-        for s, a in zip(shift, axis):
-            result = _roll_single_axis(result, s, a if a >= 0 else a + ndim)
-        return result
+    if isinstance(axis, (int, np.integer)):
+        axes = (operator.index(axis),)
+    else:
+        axes = tuple(axis)
 
-    if axis < 0:
-        axis += ndim
-    return _roll_single_axis(x, shift, axis)
+    normalized_axes = []
+    for ax in axes:
+        ax = operator.index(ax)
+        if ax < -ndim or ax >= ndim:
+            raise np.exceptions.AxisError(ax, ndim)
+        normalized_axes.append(ax % ndim)
+
+    broadcasted = np.broadcast(shift, tuple(normalized_axes))
+    if broadcasted.ndim > 1:
+        raise ValueError("'shift' and 'axis' should be scalars or 1D sequences")
+
+    shifts = dict.fromkeys(range(ndim), 0)
+    for amount, ax in broadcasted:
+        shifts[ax] += int(amount)
+
+    result = x
+    for ax, amount in shifts.items():
+        if amount:
+            result = _roll_single_axis(result, amount, ax)
+    return result
 
 
 def _roll_single_axis(x, shift, axis):
