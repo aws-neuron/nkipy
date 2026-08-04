@@ -3613,6 +3613,47 @@ def test_roll_axis0(trace_mode):
         trace_and_compile(kernel, trace_mode, in0)
 
 
+@pytest.mark.parametrize(
+    "shift,axis,expected_concatenate_axes",
+    [
+        ((1,), (0, 1), [0, 1]),
+        (1, (0, 1), [0, 1]),
+        ((1, 2), 0, [0]),
+        ((1, 2), None, [0]),
+    ],
+)
+def test_roll_broadcasts_shift_and_axis(
+    trace_mode, shift, axis, expected_concatenate_axes
+):
+    def kernel(a):
+        return np.roll(a, shift, axis=axis)
+
+    in0 = np.arange(32 * 64, dtype=np.float32).reshape(32, 64)
+    expected = kernel(in0)
+    traced = NKIPyKernel.trace(kernel, backend=trace_mode).specialize(in0)
+    concatenate_axes = [
+        op.attributes["dimension"]
+        for op in traced.operations
+        if op.op_name == "concatenate"
+    ]
+    assert concatenate_axes == expected_concatenate_axes
+
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+def test_roll_rejects_non_broadcastable_shift_and_axis(trace_mode):
+    def kernel(a):
+        return np.roll(a, (1, 2, 3), axis=(0, 1))
+
+    in0 = np.ones((32, 64), dtype=np.float32)
+    with pytest.raises(ValueError, match="shape mismatch"):
+        NKIPyKernel.trace(kernel, backend=trace_mode).specialize(in0)
+
+
 def test_isnan(trace_mode):
     def kernel(a):
         # Return as float since bool output is tricky
