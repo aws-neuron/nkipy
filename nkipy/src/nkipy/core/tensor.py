@@ -298,6 +298,16 @@ def _expand_ellipsis(indices: tuple, ndim: int) -> tuple:
     return new_indices
 
 
+def _normalize_scalar_indices(indices: tuple) -> tuple:
+    """Convert NumPy integer scalars while rejecting boolean scalar indexing."""
+    normalized = []
+    for idx in indices:
+        if isinstance(idx, (bool, np.bool_)):
+            raise NotImplementedError("Boolean scalar indexing is not supported.")
+        normalized.append(int(idx) if isinstance(idx, np.integer) else idx)
+    return tuple(normalized)
+
+
 def _strip_newaxis(indices: tuple) -> tuple:
     """Remove None (np.newaxis) from indices; return cleaned indices and expand axes."""
     cleaned = []
@@ -532,6 +542,7 @@ class NKIPyTensorRef(TensorArithmeticMixin, TensorOperationMixin):
             # Normalize indices to a tuple
             if not isinstance(indices, tuple):
                 indices = (indices,)
+            indices = _normalize_scalar_indices(indices)
 
             advanced_indices_are_separated = _advanced_indices_are_separated(indices)
             indices = _expand_ellipsis(indices, len(self.shape))
@@ -724,6 +735,7 @@ class NKIPyTensorRef(TensorArithmeticMixin, TensorOperationMixin):
             # Normalize indices to a tuple
             if not isinstance(indices, tuple):
                 indices = (indices,)
+            indices = _normalize_scalar_indices(indices)
 
             if any(idx is None for idx in indices):
                 raise IndexError(

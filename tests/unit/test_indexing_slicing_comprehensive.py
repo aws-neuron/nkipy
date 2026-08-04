@@ -380,6 +380,41 @@ class TestIndexingSlicingAdvanced:
             out_baremetal = on_device_test(kernel, trace_mode, a)
             baremetal_assert_allclose(expected, out_baremetal)
 
+    @pytest.mark.parametrize("scalar_type", [np.int32, np.int64])
+    @pytest.mark.parametrize("index", [1, -1])
+    def test_numpy_integer_scalar_index(
+        self, trace_mode, sample_tensors, scalar_type, index
+    ):
+        numpy_index = scalar_type(index)
+
+        def kernel(a):
+            return a[:, numpy_index, :]
+
+        a = sample_tensors["small_3d"]
+        expected = kernel(a)
+
+        if NEURON_AVAILABLE:
+            out_baremetal = on_device_test(kernel, trace_mode, a)
+            baremetal_assert_allclose(expected, out_baremetal)
+        else:
+            _assert_traced_shape(kernel, trace_mode, expected.shape, a)
+            trace_and_compile(kernel, trace_mode, a)
+
+    def test_numpy_integer_scalar_assignment(self, trace_mode, sample_tensors):
+        def kernel(a, b):
+            a[:, np.int64(1)] = b
+            return a
+
+        a = sample_tensors["small_2d"]
+        b = np.ones(a[:, 1].shape, dtype=np.float32)
+        expected = kernel(a.copy(), b)
+
+        if NEURON_AVAILABLE:
+            out_baremetal = on_device_test(kernel, trace_mode, a.copy(), b)
+            baremetal_assert_allclose(expected, out_baremetal)
+        else:
+            trace_and_compile(kernel, trace_mode, a.copy(), b)
+
     def test_negative_slice_indexing(self, trace_mode, sample_tensors):
         def kernel(a):
             view = a[:-2, 1:-1]
@@ -872,6 +907,35 @@ class TestIndexingSlicingErrorHandling:
                 on_device_test(kernel, trace_mode, a)
             else:
                 trace_and_compile(kernel, trace_mode, a)
+
+    @pytest.mark.parametrize(
+        "boolean_index", [True, False, np.bool_(True), np.bool_(False)]
+    )
+    def test_boolean_scalar_index_unsupported(
+        self, trace_mode, sample_tensors, boolean_index
+    ):
+        def kernel(a):
+            return a[boolean_index]
+
+        a = sample_tensors["small_2d"]
+
+        with pytest.raises(NotImplementedError, match="Boolean scalar indexing"):
+            NKIPyKernel.trace(kernel, backend=trace_mode).specialize(a)
+
+    @pytest.mark.parametrize(
+        "boolean_index", [True, False, np.bool_(True), np.bool_(False)]
+    )
+    def test_boolean_scalar_assignment_unsupported(
+        self, trace_mode, sample_tensors, boolean_index
+    ):
+        def kernel(a):
+            a[boolean_index] = 0.0
+            return a
+
+        a = sample_tensors["small_2d"]
+
+        with pytest.raises(NotImplementedError, match="Boolean scalar indexing"):
+            NKIPyKernel.trace(kernel, backend=trace_mode).specialize(a)
 
     def test_newaxis_in_setitem_error(self, trace_mode, sample_tensors):
         def kernel(a):
