@@ -1333,6 +1333,11 @@ def concatenate(tensors, axis=0):
     for t in hlo_tensors[1:]:
         dtype = np.result_type(dtype, t.dtype)
 
+    hlo_tensors = [
+        (ctx.build_op("convert", [t], t.shape, dtype) if t.dtype != dtype else t)
+        for t in hlo_tensors
+    ]
+
     result_tensor = ctx.build_op(
         "concatenate", hlo_tensors, output_shape, dtype, {"dimension": axis}
     )

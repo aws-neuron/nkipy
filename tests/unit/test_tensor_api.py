@@ -1756,6 +1756,48 @@ def test_concatenate(trace_mode):
         trace_and_compile(kernel, trace_mode, in0, in1)
 
 
+def test_concatenate_promotes_mixed_tensor_dtypes(trace_mode):
+    """Concatenate converts tensor operands to the promoted result dtype."""
+
+    def kernel(a, b):
+        return np.concatenate([a, b], axis=0)
+
+    in0 = np.random.random_sample((32, 64)).astype(np.float16)
+    in1 = np.random.random_sample((16, 64)).astype(np.float32)
+    expected = kernel(in0, in1)
+
+    traced = NKIPyKernel.trace(kernel, backend=trace_mode).specialize(in0, in1)
+    assert traced.outputs[0].shape == expected.shape
+    assert traced.outputs[0].dtype == expected.dtype
+
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0, in1)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0, in1)
+
+
+def test_concatenate_promotes_tensor_and_numpy_constant(trace_mode):
+    """Concatenate promotes a tensor parameter and NumPy constant."""
+    constant = np.ones((16, 64), dtype=np.float32)
+
+    def kernel(a):
+        return np.concatenate([a, constant], axis=0)
+
+    in0 = np.random.random_sample((32, 64)).astype(np.float16)
+    expected = kernel(in0)
+
+    traced = NKIPyKernel.trace(kernel, backend=trace_mode).specialize(in0)
+    assert traced.outputs[0].shape == expected.shape
+    assert traced.outputs[0].dtype == expected.dtype
+
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
 def test_concatenate_single_tensor(trace_mode):
     """Test np.concatenate with a single tensor."""
 
