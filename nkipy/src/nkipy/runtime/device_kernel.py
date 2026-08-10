@@ -172,6 +172,23 @@ class DeviceKernel(SpikeModel):
                 "and torch.distributed is not available for auto-detection"
             )
 
+        # MPMD-with-collectives is the one case where nkipy's default of disabling
+        # the NRT execution barrier (see nkipy/runtime/__init__.py) is unsafe: with
+        # per-rank-independent graphs, that barrier is the runtime's only mid-run
+        # detector of mismatched graphs across ranks. Warn so the user can re-enable.
+        if (
+            not is_spmd
+            and resolved_cc
+            and os.environ.get("NEURON_RT_DISABLE_EXECUTION_BARRIER") == "1"
+        ):
+            logger.warning(
+                "MPMD execution (is_spmd=False) with collectives while "
+                "NEURON_RT_DISABLE_EXECUTION_BARRIER=1: the NRT per-execution "
+                "barrier that detects mismatched graphs across ranks is disabled. "
+                "Set NEURON_RT_DISABLE_EXECUTION_BARRIER=0 before importing nkipy "
+                "to restore it."
+            )
+
         # Barrier only needed in SPMD mode (rank 0 compiled for everyone)
         if is_spmd and distributed:
             dist.barrier()
