@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Any, Callable, Coroutine, Optional, Sequence
 from ._spike import (
-    NonBlockResult,
     NonBlockExecResult,
     NonBlockTensorReadResult,
     NonBlockTensorWriteResult,
@@ -17,6 +16,8 @@ from ._spike import (
 import asyncio
 import numpy as np
 
+# Type alias for convenience
+NonBlockResult = NonBlockTensorReadResult | NonBlockTensorWriteResult | NonBlockExecResult
 
 class SpikeAsyncSelector:
     """Event selector for async operations."""
