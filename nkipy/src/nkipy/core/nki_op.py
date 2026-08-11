@@ -836,11 +836,7 @@ def wrap_nki_kernel(
     Args:
         kernel: The NKI kernel function (or @nki.jit decorated kernel)
         operands: Example operands for tracing. Tensors contribute their shape
-            and dtype. For beta 3, non-tensor values (scalars, tuples, dtypes,
-            ...) may be included positionally: they are trace-time constants
-            that NKI specializes into the compiled kernel, and they are not
-            passed as operands to the resulting op. See ``kernel_kwargs`` for
-            supplying them by name.
+            and dtype.
         grid: SPMD grid configuration (ignored if kernel is already @nki.jit with grid)
         is_nki_beta_2_version: If True, use the Beta 2 NKI frontend (nki package
                                with GenericKernel). Note: does not support CPU execution.
@@ -857,9 +853,7 @@ def wrap_nki_kernel(
             ``nisa-allocation-mode`` pipeline option.
         kernel_kwargs: Beta 3 only. Extra kernel arguments bound BY NAME at
             trace time, e.g. ``kernel_kwargs={"scale": 0.088}`` for a kernel
-            whose ``scale`` parameter is consumed while tracing. Use this rather
-            than a module-level global or ``functools.partial`` to specialize a
-            non-tensor parameter.
+            whose ``scale`` parameter is consumed while tracing.
 
     Returns:
         NKICustomOp that can be called during HLO tracing
