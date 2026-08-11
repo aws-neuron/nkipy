@@ -26,7 +26,7 @@ public:
   NrtTensorSet &operator=(NrtTensorSet &&other) noexcept;
 
   bool is_freed() const;
-  bool is_owner() const { return spike_ != nullptr; }
+  bool is_owner() const { return runtime_closed_ != nullptr; }
 
   void add_tensor(const std::string &name,
                   std::shared_ptr<const NrtTensor> tensor);
@@ -36,8 +36,8 @@ public:
 
 private:
   nrt_tensor_set_t *ptr_;
-  const Spike *spike_;
   std::vector<std::shared_ptr<const NrtTensor>> tensors_;
+  std::shared_ptr<std::atomic_bool> runtime_closed_;
 };
 
 } // namespace spike

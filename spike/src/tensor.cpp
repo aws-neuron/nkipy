@@ -22,7 +22,7 @@ NrtTensor::NrtTensor(nrt_tensor_placement_t placement, uint32_t core_id,
 NrtTensor::NrtTensor(nrt_tensor_t *ptr, uint32_t core_id, uint64_t size,
                      const std::string &name, const Spike *spike)
     : ptr_(nullptr), core_id_(core_id), size_(size), name_(name),
-      spike_(spike) {
+      runtime_closed_(spike->get_runtime_closed_state()) {
   // Wrap an existing tensor by creating a slice
   NRT_STATUS status =
       nrt_tensor_allocate_slice(ptr, 0, size, name.c_str(), &ptr_);
