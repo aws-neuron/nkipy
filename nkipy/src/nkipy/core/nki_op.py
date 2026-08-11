@@ -421,15 +421,32 @@ def _build_hlo_custom_call(config, operands):
     )
 
 
+def _beta3_is_device_input(value):
+    """Whether a beta 3 kernel argument becomes a device (HBM) input tensor.
+
+    Mirrors ``nki.compiler.frontend._classify_kernel_args``: only ndarray-like
+    values become BIR input tensors. Everything else (python/numpy scalars,
+    tuples, dtypes, enums, ...) is a trace-time constant that NKI specializes
+    into the compiled kernel and that must NOT be passed as a custom-call
+    operand.
+    """
+    return isinstance(value, (np.ndarray, NKIPyTensorRef))
+
+
 def _build_hlo_custom_call_beta3(framework_config, is_tuple_return, operands):
-    """Build HLO custom-call operation from a beta 3 FrameworkConfig."""
+    """Build HLO custom-call operation from a beta 3 FrameworkConfig.
+
+    Non-tensor values in ``operands`` are trace-time constants that NKI already
+    specialized into ``framework_config``; they are not device inputs, so they
+    are dropped here rather than forwarded to the custom-call. Passing them
+    through would shift every later operand and make the kernel read the wrong
+    buffers.
+    """
     if get_backend() != "hlo":
         raise NotImplementedError("Modes other than HLO are not implemented yet")
 
-    # Collect tensor operands (preserving order) for alias resolution
-    tensor_operands = [op for op in operands if isinstance(op, NKIPyTensorRef)]
-
-    # Build HLO operands (beta 3 handles constants internally)
+    # Device inputs, in kernel-parameter order, for alias resolution.
+    tensor_operands = [op for op in operands if _beta3_is_device_input(op)]
     hlo_operands = [op.backend_tensor for op in tensor_operands]
 
     output_shapes = [tuple(spec.shape) for spec in framework_config.output_specs]
@@ -548,12 +565,10 @@ def _generate_nki_custom_call_beta3(kernel, *args, **kwargs):
 
     framework_config, is_tuple_return = _beta3_compile_and_get_config(kernel, numpy_inputs)
 
-    # Collect tensor operands in parameter order
-    operands = [
-        v
-        for v in bound.arguments.values()
-        if isinstance(v, (NKIPyTensorRef, np.ndarray))
-    ]
+    # Device inputs in parameter order. Non-tensor arguments are trace-time
+    # constants that NKI specialized into the compiled kernel above, so they are
+    # deliberately not operands of the custom-call.
+    operands = [v for v in bound.arguments.values() if _beta3_is_device_input(v)]
     if get_backend() == "cpu":
         raise NotImplementedError("CPU execution is not supported for NKI custom ops")
     return _build_hlo_custom_call_beta3(
@@ -619,12 +634,19 @@ class NKICustomOp:
         platform_target: Optional[str] = None,
         nki_compile_mode: str = "standard",
         nisa_allocation_mode: Optional[str] = None,
+        kernel_kwargs: Optional[dict] = None,
     ):
         operands = list(operands)
         self._is_beta3 = is_nki_beta_3_version
 
         if platform_target is None:
             platform_target = _get_platform_target_default()
+
+        if kernel_kwargs and not is_nki_beta_3_version:
+            raise ValueError(
+                "kernel_kwargs is only supported by the beta 3 frontend "
+                "(is_nki_beta_3_version=True)."
+            )
 
         if is_nki_beta_3_version:
             if not BETA3_NKI_AVAILABLE:
@@ -638,6 +660,7 @@ class NKICustomOp:
                 platform_target,
                 nki_compile_mode,
                 nisa_allocation_mode,
+                kernel_kwargs=kernel_kwargs,
             )
         elif is_nki_beta_2_version:
             if not BETA2_NKI_AVAILABLE:
@@ -690,20 +713,56 @@ class NKICustomOp:
         platform_target,
         nki_compile_mode="standard",
         nisa_allocation_mode=None,
+        kernel_kwargs=None,
     ):
-        # Build inputs dict from operands matching kernel parameter names
+        # Bind the example operands to the kernel signature BY NAME, so that
+        # non-tensor arguments -- which NKI specializes into the compiled kernel
+        # at trace time -- land on the right parameter whether they are given
+        # positionally or via kernel_kwargs. Mirrors torch-neuronx's
+        # merge_tensor_constant_args: parameters named in kernel_kwargs are
+        # filled from there, and the positional operands fill the rest in order.
+        # This is what lets a kernel with a non-tensor parameter in the MIDDLE of
+        # its signature be wrapped with just its tensors.
         func = getattr(kernel, "func", kernel)
         sig = inspect.signature(func)
-        params = list(sig.parameters.keys())
+        kernel_kwargs = dict(kernel_kwargs or {})
+        unknown = set(kernel_kwargs) - set(sig.parameters)
+        if unknown:
+            raise ValueError(
+                f"kernel_kwargs names {sorted(unknown)}, which are not "
+                f"parameters of {getattr(func, '__name__', func)!r}: "
+                f"{list(sig.parameters)}"
+            )
+        positional = [p for p in sig.parameters if p not in kernel_kwargs]
+        if len(operands) > len(positional):
+            raise ValueError(
+                f"{getattr(func, '__name__', func)!r} takes {len(positional)} "
+                f"operand(s) {positional} after kernel_kwargs "
+                f"{sorted(kernel_kwargs)}, got {len(operands)}."
+            )
+        bound = sig.bind_partial(
+            **kernel_kwargs, **dict(zip(positional, operands))
+        )
+        bound.apply_defaults()
+        numpy_inputs = {
+            name: bound.arguments[name]
+            for name in sig.parameters
+            if name in bound.arguments
+        }
 
-        numpy_inputs = {}
-        op_idx = 0
-        for p in params:
-            if op_idx < len(operands):
-                numpy_inputs[p] = operands[op_idx]
-                op_idx += 1
-            else:
-                break
+        # Split the bound arguments the same way NKI's frontend does: the device
+        # inputs are the HBM operands the compiled kernel expects at call time,
+        # everything else is a constant NKI specialized into the kernel.
+        self._beta3_device_input_names = [
+            name
+            for name, value in numpy_inputs.items()
+            if _beta3_is_device_input(value)
+        ]
+        self._beta3_constant_names = [
+            name
+            for name, value in numpy_inputs.items()
+            if not _beta3_is_device_input(value)
+        ]
 
         self._beta3_framework_config, self._beta3_is_tuple_return = (
             _beta3_compile_and_get_config(
@@ -721,10 +780,42 @@ class NKICustomOp:
                 "CPU execution is not supported for NKI custom ops"
             )
         if self._is_beta3:
+            self._check_beta3_operands(operands)
             return _build_hlo_custom_call_beta3(
                 self._beta3_framework_config, self._beta3_is_tuple_return, operands
             )
         return _build_hlo_custom_call(self.config, operands)
+
+    def _check_beta3_operands(self, operands):
+        """Fail loudly on a call-time/wrap-time operand mismatch (beta 3).
+
+        The kernel is specialized at wrap time, so a call must supply exactly the
+        device inputs it was compiled for. A count mismatch otherwise reaches the
+        backend as an opaque "Unrecognized DRAM input location", and a non-tensor
+        passed at call time is silently ignored in favour of the value that was
+        compiled in.
+        """
+        expected = self._beta3_device_input_names
+        got = [op for op in operands if _beta3_is_device_input(op)]
+        if len(got) != len(expected):
+            raise ValueError(
+                f"NKI beta 3 kernel expects {len(expected)} tensor operand(s) "
+                f"{expected}, got {len(got)}."
+            )
+        extra = len(operands) - len(got)
+        if extra:
+            raise ValueError(
+                f"NKI beta 3 kernel got {extra} non-tensor operand(s) at call "
+                f"time. Non-tensor values are trace-time constants that NKI "
+                f"specializes into the kernel when it is compiled, so a value "
+                f"passed here has no effect"
+                + (
+                    f" -- {self._beta3_constant_names} were already compiled in. "
+                    if self._beta3_constant_names
+                    else ". "
+                )
+                + "Pass them to wrap_nki_kernel via kernel_kwargs instead."
+            )
 
 
 def wrap_nki_kernel(
@@ -736,6 +827,7 @@ def wrap_nki_kernel(
     platform_target: Optional[str] = None,
     nki_compile_mode: str = "standard",
     nisa_allocation_mode: Optional[str] = None,
+    kernel_kwargs: Optional[dict] = None,
 ):
     """Wrap an NKI kernel for use in NKIPy's HLO tracing flow.
 
@@ -743,7 +835,8 @@ def wrap_nki_kernel(
 
     Args:
         kernel: The NKI kernel function (or @nki.jit decorated kernel)
-        operands: Example operands (numpy arrays) for tracing (shape and dtype)
+        operands: Example operands for tracing. Tensors contribute their shape
+            and dtype.
         grid: SPMD grid configuration (ignored if kernel is already @nki.jit with grid)
         is_nki_beta_2_version: If True, use the Beta 2 NKI frontend (nki package
                                with GenericKernel). Note: does not support CPU execution.
@@ -758,6 +851,9 @@ def wrap_nki_kernel(
             ``"max-reuse"``. ``None`` (default) uses NKI's own default
             (``"fast"``). Raises ValueError if the installed nki has no
             ``nisa-allocation-mode`` pipeline option.
+        kernel_kwargs: Beta 3 only. Extra kernel arguments bound BY NAME at
+            trace time, e.g. ``kernel_kwargs={"scale": 0.088}`` for a kernel
+            whose ``scale`` parameter is consumed while tracing.
 
     Returns:
         NKICustomOp that can be called during HLO tracing
@@ -771,6 +867,7 @@ def wrap_nki_kernel(
         platform_target=platform_target,
         nki_compile_mode=nki_compile_mode,
         nisa_allocation_mode=nisa_allocation_mode,
+        kernel_kwargs=kernel_kwargs,
     )
 
 
