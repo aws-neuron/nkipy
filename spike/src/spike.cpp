@@ -466,6 +466,8 @@ uint64_t Spike::tensor_write_nonblock_batched_start(uint64_t batch_id) {
         e.tensor->get_ptr(), e.data, e.offset, e.size, static_cast<int>(lnc),
         /*queue=*/0, &p.rets[i], &seq);
     if (status != NRT_SUCCESS) {
+      // TODO: Should cancel the successful ones to avoid them being orphaned
+      // But nrta currently does not have such API
       throw NrtError(status,
                      "Failed to schedule nonblocking batched tensor write");
     }

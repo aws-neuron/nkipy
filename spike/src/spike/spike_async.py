@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Coroutine, Optional, Sequence
 from ._spike import (
+    NonBlockResult,
     NonBlockExecResult,
     NonBlockTensorReadResult,
     NonBlockTensorWriteResult,
