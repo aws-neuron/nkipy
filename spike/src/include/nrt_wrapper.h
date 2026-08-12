@@ -4,6 +4,7 @@
 #include "error.h"
 
 #include <nrt/nrt.h>
+#include <nrt/nrt_async.h>
 #include <nrt/nrt_experimental.h>
 #include <nrt/nrt_profile.h>
 
@@ -26,6 +27,10 @@ public:
   NrtRuntime &operator=(NrtRuntime &&) = default;
 
   static uint32_t get_visible_nc_count();
+  static uint32_t get_total_nc_count();
+  static uint32_t get_tensor_lnc(const nrt_tensor_t *tensor);
+  static uint32_t get_model_lnc(const nrt_model_t *model);
+  static size_t get_tensor_size(const nrt_tensor_t *tensor);
 
 private:
   bool initialized_;
