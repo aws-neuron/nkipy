@@ -183,15 +183,15 @@ class Spike:
         """Read data from tensor into the provided destination nonblockingly"""
 
     @overload
-    def tensor_write_nonblock(self, tensor: NrtTensor, data: bytes, offset: int = 0) -> int:
+    def tensor_write_nonblock(self, tensor: NrtTensor, data: bytes, offset: int = 0, size: int = 0) -> int:
         """Write bytes data to tensor nonblockingly"""
 
     @overload
-    def tensor_write_nonblock(self, tensor: NrtTensor, data: NDArray, offset: int = 0) -> int:
+    def tensor_write_nonblock(self, tensor: NrtTensor, data: NDArray, offset: int = 0, size: int = 0) -> int:
         """Write ndarray data to tensor nonblockingly"""
 
     @overload
-    def tensor_write_nonblock(self, tensor: NrtTensor, data: int, size: int, offset: int = 0) -> int:
+    def tensor_write_nonblock(self, tensor: NrtTensor, data: int, offset: int, size: int) -> int:
         """Write raw pointer data to tensor nonblockingly"""
 
     def tensor_write_nonblock_batched_prepare(self, tensors: Sequence[NrtTensor], data_objs: Sequence[NDArray], offsets: Sequence[int] | None = None) -> int:

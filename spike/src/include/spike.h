@@ -186,13 +186,14 @@ public:
 
   // Nonblocking operations
   uint64_t tensor_write_nonblock(std::shared_ptr<NrtTensor> tensor,
-                                  nb::bytes data_obj, size_t offset = 0);
+                                  nb::bytes data_obj, size_t offset = 0,
+                                  size_t size = 0);
   uint64_t tensor_write_nonblock(std::shared_ptr<NrtTensor> tensor,
                                   nb::ndarray<> data_obj,
-                                  size_t offset = 0);
+                                  size_t offset = 0, size_t size = 0);
   uint64_t tensor_write_nonblock(std::shared_ptr<NrtTensor> tensor,
-                                  const void *data, size_t size,
-                                  size_t offset);
+                                  const void *data, size_t offset,
+                                  size_t size);
 
   uint64_t tensor_read_nonblock(std::shared_ptr<const NrtTensor> tensor,
                                  size_t offset = 0, size_t size = 0);

@@ -230,10 +230,7 @@ class SpikeAsync:
 
         def internal() -> SpikeAsyncFuture:
             fut = self._loop.create_future()
-            if size > 0:
-                req_id = self.spike.tensor_write_nonblock(tensor, data, size, offset)
-            else:
-                req_id = self.spike.tensor_write_nonblock(tensor, data, offset)
+            req_id = self.spike.tensor_write_nonblock(tensor, data, offset, size)
             self._loop.register_tensor_op(req_id, fut)
             return fut
 

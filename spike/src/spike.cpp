@@ -243,10 +243,12 @@ void Spike::execute(NrtModel &model,
 }
 
 uint64_t Spike::tensor_write_nonblock(std::shared_ptr<NrtTensor> tensor,
-                                       nb::bytes data_obj,
-                                       size_t offset) {
+                                       nb::bytes data_obj, size_t offset,
+                                       size_t size) {
   const void *data = data_obj.data();
-  size_t size = data_obj.size();
+  if (size == 0) {
+    size = data_obj.size();
+  }
 
   uint64_t cmd_id = next_non_block_id_++;
   uint32_t lnc = tensor->get_core_id();
@@ -274,10 +276,12 @@ uint64_t Spike::tensor_write_nonblock(std::shared_ptr<NrtTensor> tensor,
 }
 
 uint64_t Spike::tensor_write_nonblock(std::shared_ptr<NrtTensor> tensor,
-                                       nb::ndarray<> data_obj,
-                                       size_t offset) {
+                                       nb::ndarray<> data_obj, size_t offset,
+                                       size_t size) {
   const void *data = data_obj.data();
-  size_t size = data_obj.nbytes();
+  if (size == 0) {
+    size = data_obj.nbytes();
+  }
 
   uint64_t cmd_id = next_non_block_id_++;
   uint32_t lnc = tensor->get_core_id();
@@ -303,8 +307,8 @@ uint64_t Spike::tensor_write_nonblock(std::shared_ptr<NrtTensor> tensor,
 }
 
 uint64_t Spike::tensor_write_nonblock(std::shared_ptr<NrtTensor> tensor,
-                                       const void *data, size_t size,
-                                       size_t offset) {
+                                       const void *data, size_t offset,
+                                       size_t size) {
   uint64_t cmd_id = next_non_block_id_++;
   uint32_t lnc = tensor->get_core_id();
 

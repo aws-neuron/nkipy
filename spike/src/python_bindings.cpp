@@ -257,32 +257,32 @@ NB_MODULE(_spike, m) {
       .def(
           "tensor_write_nonblock",
           [](Spike &self, std::shared_ptr<NrtTensor> tensor, nb::bytes data_obj,
-             size_t offset) {
-            return self.tensor_write_nonblock(std::move(tensor),
-                                              std::move(data_obj), offset);
+             size_t offset, size_t size) {
+            return self.tensor_write_nonblock(
+                std::move(tensor), std::move(data_obj), offset, size);
           },
-          "tensor"_a, "data"_a, "offset"_a = 0,
+          "tensor"_a, "data"_a, "offset"_a = 0, "size"_a = 0,
           "Write bytes data to tensor nonblockingly")
 
       .def(
           "tensor_write_nonblock",
           [](Spike &self, std::shared_ptr<NrtTensor> tensor,
-             nb::ndarray<> data_obj, size_t offset) {
-            return self.tensor_write_nonblock(std::move(tensor),
-                                              std::move(data_obj), offset);
+             nb::ndarray<> data_obj, size_t offset, size_t size) {
+            return self.tensor_write_nonblock(
+                std::move(tensor), std::move(data_obj), offset, size);
           },
-          "tensor"_a, "data"_a, "offset"_a = 0,
+          "tensor"_a, "data"_a, "offset"_a = 0, "size"_a = 0,
           "Write ndarray data to tensor nonblockingly")
 
       .def(
           "tensor_write_nonblock",
           [](Spike &self, std::shared_ptr<NrtTensor> tensor, int64_t data,
-             size_t size, size_t offset) {
+             size_t offset, size_t size) {
             return self.tensor_write_nonblock(
-                std::move(tensor), reinterpret_cast<const void *>(data), size,
-                offset);
+                std::move(tensor), reinterpret_cast<const void *>(data), offset,
+                size);
           },
-          "tensor"_a, "data"_a, "size"_a, "offset"_a = 0,
+          "tensor"_a, "data"_a, "offset"_a, "size"_a,
           "Write raw pointer data to tensor nonblockingly")
 
       .def("tensor_write_nonblock_batched_prepare",
