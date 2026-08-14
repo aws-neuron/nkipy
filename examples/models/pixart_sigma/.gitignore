@@ -1,0 +1,13 @@
+# prepared weights (downloaded/converted via tensor_preparation.py)
+tmp_pixart_sigma/
+*.safetensors
+
+# compiled kernels
+build/
+
+# generated images
+*.png
+
+# python caches
+__pycache__/
+*.pyc
