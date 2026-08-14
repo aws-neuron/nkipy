@@ -25,6 +25,14 @@ or host. Validated on trn2 (bf16 device vs fp32 baseline unless noted):
 | Tokenizer + token-embedding lookup | host | — | — |
 
 Notes:
+- **Self-attention backend** (`--attention-backend {naive,cte}`, default
+  `naive`): `naive` is the portable hand-rolled softmax (CPU-testable, no nkilib
+  dependency); `cte` uses nki-library's tuned `attention_cte` context kernel.
+  Both validate identically (rel_l2 0.83%). On trn2 the `cte` backend cuts
+  `denoise_step` from **927.0 → 495.8 ms/step (1.87×**; 20-step generation
+  18.6s → 10.0s), lifting MFU from ~17% to ~32% of the 83.4 TFLOP/s per-core
+  bf16 peak. The attention op is pre-traced once and shared across all 28 blocks
+  (per-call specialization made whole-graph compile time explode).
 - The **fused sampling step** keeps the latent resident on device across all
   steps: `denoise_step` runs the DiT, applies classifier-free guidance, and
   performs the DPM-Solver++ update on device. The host only supplies per-step
