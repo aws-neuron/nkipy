@@ -22,7 +22,7 @@ from .modulation import block_modulation, modulate
 
 
 def dit_block(x, context, w, timestep, n_heads, head_dim, hidden_size, eps,
-              cross_mask_bias=None):
+              cross_mask_bias=None, attention_backend="naive"):
     """Run one DiT block.
 
     Args:
@@ -31,6 +31,7 @@ def dit_block(x, context, w, timestep, n_heads, head_dim, hidden_size, eps,
         w: dict of this block's weights (short canonical keys).
         timestep: (B, 6*hidden) shared adaLN projection.
         cross_mask_bias: (B, 1, 1, Ltext) additive mask for T5 padding tokens.
+        attention_backend: self-attention core, "naive" or "cte".
     Returns:
         (B, L, hidden)
     """
@@ -48,6 +49,7 @@ def dit_block(x, context, w, timestep, n_heads, head_dim, hidden_size, eps,
         w["v_w"], w.get("v_b"),
         w["o_w"], w.get("o_b"),
         n_heads, head_dim,
+        backend=attention_backend,
     )
     x = x + gate_msa * attn
 

@@ -71,6 +71,8 @@ def main():
     parser.add_argument("--sample-size", type=int, default=128)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--tol", type=float, default=0.05)
+    parser.add_argument("--attention-backend", choices=["naive", "cte"],
+                        default="naive", help="self-attention core (cte = nki-library)")
     args = parser.parse_args()
 
     if args.validate:

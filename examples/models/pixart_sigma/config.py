@@ -63,6 +63,10 @@ class Config:
     dtype: np.dtype = DTYPE
     additional_compiler_args_nkipy: str = "--lnc 1"
 
+    # self-attention backend: "naive" (hand-rolled softmax) or "cte"
+    # (nki-library attention_cte, ~3.7x faster at seq=4096, device-only)
+    attention_backend: str = "naive"
+
     @property
     def head_dim(self) -> int:
         return self.hidden_size // self.num_heads

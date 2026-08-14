@@ -4,6 +4,7 @@ tmp_pixart_sigma/
 
 # compiled kernels
 build/
+build_*/
 
 # generated images
 *.png

@@ -397,7 +397,8 @@ def decode_latents_device(latents, config, checkpoint):
 def load_model(args):
     config = get_config(args.model, args.steps, args.sample_size)
     config.model_name = args.model
-    print("[pixart] loading weights")
+    config.attention_backend = getattr(args, "attention_backend", "naive")
+    print(f"[pixart] loading weights (attention backend: {config.attention_backend})")
     weights = load_file(os.path.join(args.checkpoint, "weights.safetensors"))
     model = PixArtModel(weights, config)
     return model, config
@@ -419,6 +420,8 @@ def main():
                         help="Run the T5 encoder on Trainium (needs prepared t5_weights)")
     parser.add_argument("--vae-on-device", action="store_true",
                         help="Run the VAE decoder on Trainium (<=512px; needs vae_weights)")
+    parser.add_argument("--attention-backend", choices=["naive", "cte"],
+                        default="naive", help="self-attention core (cte = nki-library)")
     args = parser.parse_args()
 
     model, config = load_model(args)

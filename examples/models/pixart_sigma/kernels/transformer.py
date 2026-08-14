@@ -75,9 +75,10 @@ def _dit_core(latent, timestep, caption, caption_mask, shared, blocks, configs):
     cross_mask_bias = np.expand_dims(cross_mask_bias, axis=[1, 2])
 
     # ── transformer blocks ──
+    attn_backend = getattr(configs, "attention_backend", "naive")
     for w in blocks:
         x = dit_block(x, context, w, timestep_proj, n_heads, head_dim, hidden, eps,
-                      cross_mask_bias=cross_mask_bias)
+                      cross_mask_bias=cross_mask_bias, attention_backend=attn_backend)
 
     # ── final layer + unpatchify ──
     x = final_layer(x, embedded_timestep, shared, hidden, eps)
