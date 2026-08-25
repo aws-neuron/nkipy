@@ -26,6 +26,17 @@ logger = get_logger()
 
 trace = NKIPyKernel.trace(backend="hlo")
 
+# When set, the decode step submits its kernel chain (embedding -> fused
+# decode blocks -> sampling) non-blocking on the runtime FIFO channel, so host
+# dispatch of the next kernel overlaps device compute of the current one.
+# Default off keeps the blocking path as the reference.
+_ASYNC_DECODE = os.environ.get("GPT_OSS_120B_ASYNC", "0") == "1"
+# Max non-blocking submissions kept in flight. The hardware compute queue has
+# finite depth (submitting a whole ~11-kernel step at once overflows it with
+# NRT_QUEUE_FULL), so we wait on the oldest in-flight future before submitting
+# past the window. Small windows already capture the host-dispatch overlap.
+_ASYNC_WINDOW = int(os.environ.get("GPT_OSS_120B_ASYNC_WINDOW", "4"))
+
 @dataclass
 class LayerTensors:
     qkv_weight: DeviceTensor
@@ -608,20 +619,37 @@ class GPTOSSModel:
             "h0/res1",
         )
 
-        self.kernel_tkg_token_embedding(
+        # In async mode, submit each kernel non-blocking on the runtime's FIFO
+        # compute channel via DeviceKernel.submit (ordering + data deps preserved
+        # by the channel), keeping at most _ASYNC_WINDOW submissions in flight so
+        # we don't overflow the finite-depth hardware queue -- wait on the oldest
+        # future when the window is full. In sync mode, __call__ blocks per op.
+        # (save_trace is a debug capture only honored on the blocking path.)
+        futs = []
+
+        def submit(kernel, *, inputs, outputs, save_trace=False):
+            if not _ASYNC_DECODE:
+                return kernel(inputs=inputs, outputs=outputs, save_trace=save_trace)
+            if len(futs) >= _ASYNC_WINDOW:
+                futs.pop(0).wait()
+            futs.append(kernel.submit(inputs, outputs))
+
+        submit(
+            self.kernel_tkg_token_embedding,
             inputs={
                 "tok_embedding": self.tok_embedding_device,
                 "token_ids": input_ids,  # Use DeviceTensor directly
             },
             outputs={
                 "output0": hidden_states,
-            }
+            },
         )
 
         t_res1 = hidden_states  # Output becomes next layer's input
 
         for i in range(0, self.config.n_layers, 4):
-            self.kernel_tkg_fuse4(
+            submit(
+                self.kernel_tkg_fuse4,
                 inputs={
                     "hidden_states": hidden_states,
                     "start_pos": t_start_pos,
@@ -709,7 +737,8 @@ class GPTOSSModel:
             )
 
         # Run greedy sampling to get next token
-        self.kernel_tkg_greedy_sampling(
+        submit(
+            self.kernel_tkg_greedy_sampling,
             inputs={
                 "hidden_states_shard": t_res1,
                 "norm_weight": self.norm_weight,
@@ -717,6 +746,15 @@ class GPTOSSModel:
             },
             outputs={"output0": next_id},
         )
+
+        # In async mode the chain above was submitted non-blocking. Wait on every
+        # outstanding future in submission (FIFO) order before returning next_id:
+        # each .wait() retrieves that op's result/exception, so a failed submission
+        # raises from its own .wait() instead of stalling FIFO behind it and
+        # hanging, and no completed-with-exception future is left unretrieved. The
+        # last completing implies the whole step is done.
+        for fut in futs:
+            fut.wait()
 
         # Return DeviceTensor without .numpy() - caller will handle conversion
         return next_id

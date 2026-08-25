@@ -123,8 +123,17 @@ def main():
         required=True,
     )
     args = parser.parse_args()
-    args.checkpoint = f"{args.checkpoint}-TP{args.tp_size}"
-    assert os.path.exists(args.checkpoint)
+    # Accept either the base path or a path that already carries the suffix, and
+    # tolerate a trailing slash, so a correct-looking directory just works.
+    ckpt = args.checkpoint.rstrip("/")
+    suffix = f"-TP{args.tp_size}"
+    if not ckpt.endswith(suffix):
+        ckpt = f"{ckpt}{suffix}"
+    args.checkpoint = ckpt
+    assert os.path.exists(args.checkpoint), (
+        f"checkpoint not found: {args.checkpoint} "
+        f"(pass --checkpoint as the base path without '{suffix}')"
+    )
     logger.info(str(args))
 
     # model_name = args.model

@@ -67,41 +67,51 @@ python scripts/openai_tensor_preparation.py \
 ## Quickstart
 
 `chat.sh` launches `torchrun` across all `TP_SIZE * DP_SIZE` ranks and runs
-generation end-to-end. It builds the C++ blockwise-index extension on rank 0
-before compiling kernels.
+generation end-to-end. It activates the project `.venv` (for both `python` and
+the `neuronx-cc` compiler), builds the C++ blockwise-index extension on rank 0,
+then compiles kernels.
+
+The defaults are the layout verified on a single `trn2.48xlarge` (16 devices /
+64 logical NeuronCores under LNC2): 64 ranks, `dp8`/`ep8`, one rank per logical
+core, so each rank holds only `128/8 + 128/8 = 32` expert copies (~7 GB), well
+under the 24 GB per-core HBM budget.
 
 ``` sh
-# Defaults: TP_SIZE=8, DP_SIZE=16, PREFILL_EP_SIZE=4
+# Defaults: TP_SIZE=8 DP_SIZE=8 PREFILL_EP_SIZE=8
 CHECKPOINT=./gpt-oss-120b-bf16 ./chat.sh "The capital of France is"
 ```
 
-Override the parallelism layout via env vars:
+`chat.sh` activates the repo `.venv` (set `VENV=` to use the active environment
+instead) and reads `TP_SIZE`, `DP_SIZE`, `PREFILL_EP_SIZE`, and `CHECKPOINT` from
+the environment. Override the parallelism layout via env vars:
 
 ``` sh
 TP_SIZE=8 DP_SIZE=2 PREFILL_EP_SIZE=2 ./chat.sh "The capital of France is"
 ```
 
-Or invoke the entrypoint directly. This is the layout verified on a single
-`trn2.48xlarge` (16 devices / 64 logical NeuronCores under LNC2). It spreads one
-rank per logical core (`GPT_OSS_CORE_STRIDE=1`) and uses `dp8`/`ep8` so each
-rank holds only `128/8 + 128/8 = 32` expert copies (~7 GB), well under the 24 GB
-per-core HBM budget:
+The heavier **128-rank** layout (`DP16`) needs 128 logical cores
+(`NEURON_LOGICAL_NC_CONFIG=1`) **and** `PREFILL_EP_SIZE>=8`. The `ep4` variant
+runs out of HBM during warmup: under LNC1 two ranks share one device's 24 GB, and
+`ep4` leaves ~11 GB of expert tensors per rank. `ep8` halves that (~5.4 GB) and
+fits:
 
 ``` sh
-GPT_OSS_CORE_STRIDE=1 torchrun --nproc-per-node 64 chat.py \
-    --tp_size 8 --prefill_ep_size 8 \
-    --checkpoint ./gpt-oss-120b-bf16 \
-    --max_batch_size_per_dp 1 --max_model_len 512 --max_tokens 16 \
-    "The capital of France is"
+NEURON_LOGICAL_NC_CONFIG=1 DP_SIZE=16 PREFILL_EP_SIZE=8 \
+    CHECKPOINT=./gpt-oss-120b-bf16 ./chat.sh "The capital of China is"
 ```
 
 ### Sizing notes (single-node TRN2)
 
 - **HBM per rank.** gpt-oss-120b is memory-heavy: after TP sharding each rank
   still holds separate prefill and decode expert copies. If several ranks land
-  on one device you get `NRT_RESOURCE: Failed to allocate tensor`. Spread ranks
-  across devices (`GPT_OSS_CORE_STRIDE`) and raise expert-parallelism (`dp`,
-  `prefill_ep`) so `num_experts/ep` shrinks.
+  on one device you get `NRT_RESOURCE: Failed to allocate tensor` at load, or an
+  `ENC:__devmem_res_checkout ... failed to allocate dev mem` / `NRT_FAILURE`
+  when building collective resources during warmup. Spread ranks across devices
+  (`GPT_OSS_CORE_STRIDE`) and raise expert-parallelism (`DP_SIZE`,
+  `PREFILL_EP_SIZE`) so `num_experts/ep` shrinks. Note `NEURON_LOGICAL_NC_CONFIG=1`
+  gives more cores but **not** more memory — it splits each physical core's 24 GB
+  HBM between two logical cores, so packing 2 ranks per device needs a smaller
+  per-rank footprint (higher EP).
 - **`max_model_len`** must satisfy `(max_model_len // tp_size) % 32 == 0` and be
   `>= 512` (the NKI flash-attention KV tile is 512).
 

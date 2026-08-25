@@ -12,17 +12,26 @@ set -e
 export OMP_NUM_THREADS=1
 
 # ---- Parallelism config (override via env) ----
+# Defaults are the layout verified on a single trn2.48xlarge (64 ranks, dp8/ep8).
 export TP_SIZE="${TP_SIZE:-8}"
-export DP_SIZE="${DP_SIZE:-16}"
-export PREFILL_EP_SIZE="${PREFILL_EP_SIZE:-4}"
+export DP_SIZE="${DP_SIZE:-8}"
+export PREFILL_EP_SIZE="${PREFILL_EP_SIZE:-8}"
 
 # Base checkpoint path; the runner appends "-TP${TP_SIZE}".
 CHECKPOINT="${CHECKPOINT:-./gpt-oss-120b-bf16}"
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 
+# Activate the repo venv so python, neuronx-cc, and torchrun all resolve there
+# (a bare invocation would use the system python, which reads a stale ~/.local
+# user-site). Set VENV to override, or VENV= to use the active environment.
+VENV="${VENV-$( git -C "$SCRIPT_DIR" rev-parse --show-toplevel )/.venv}"
+if [ -f "$VENV/bin/activate" ]; then
+    source "$VENV/bin/activate"
+fi
+
 # Kill any stale run holding the rendezvous port.
-lsof -ti:29501 | xargs -r kill -9
+lsof -ti:29501 | xargs -r kill -9 || true
 
 torchrun \
     --nproc-per-node=$((TP_SIZE * DP_SIZE)) \

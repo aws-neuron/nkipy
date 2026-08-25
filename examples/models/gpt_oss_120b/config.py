@@ -47,7 +47,6 @@ def set_env():
 
     os.environ["TOKENIZERS_PARALLELISM"] = "true"  # disable warning
     os.environ["NEURON_RT_ROOT_COMM_ID"] = "localhost:61239"
-    os.environ["NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS"] = "16"
 
     # cache dma ring for static dma, need to be n_layers because unique number of io tensor sets
     # FIXME: nkipy uses dge by default, but some neff still uses static dma
