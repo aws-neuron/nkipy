@@ -12,7 +12,7 @@ from nkipy.core.logger import get_logger
 from nkipy.core.trace import NKIPyKernel
 from nkipy.runtime import device_tensor
 from nkipy.runtime.device_tensor import DeviceTensor
-from spike import SpikeModel
+from spike import SpikeModel, get_spike_async_singleton
 
 if device_tensor._TORCH_ENABLED:
     import torch.distributed as dist
@@ -47,6 +47,37 @@ class DeviceKernel(SpikeModel):
 
     def __init__(self, model_ref, name, neff_path):
         super().__init__(model_ref, name, neff_path)
+
+    def submit(self, inputs, outputs):
+        """Submit this kernel without blocking; return a future.
+
+        Unlike :meth:`__call__` (which blocks), this enqueues the kernel on the
+        runtime's FIFO compute channel via ``SpikeAsync`` and returns immediately,
+        so the host can submit the next kernel while this one runs. FIFO ordering
+        preserves data dependencies between successive submissions.
+
+        Call ``.wait()`` on the returned future before reading outputs back;
+        ``inputs``/``outputs`` must stay alive until then. The compute queue has
+        finite depth, so cap in-flight submissions by waiting on older futures.
+
+        Args:
+            inputs: Dict[str, DeviceTensor] keyed by NEFF input name.
+            outputs: Dict[str, DeviceTensor] keyed by NEFF output name.
+
+        Returns:
+            spike.SpikeAsyncFuture: resolves when this submission completes.
+        """
+        # Validate up front (as __call__ does) so name/shape/dtype/core mismatches
+        # fail here, not later as an opaque NRT error out of .wait().
+        self._validate_io(inputs, outputs)
+
+        sa = get_spike_async_singleton()
+        in_set = sa.create_tensor_set({k: v.tensor_ref for k, v in inputs.items()})
+        out_set = sa.create_tensor_set({k: v.tensor_ref for k, v in outputs.items()})
+        # Dep-free fast path: FIFO channel already orders successive submissions,
+        # so no stream/deps (those would serialize submission on completion and
+        # defeat host/device overlap).
+        return sa.execute(self.model_ref, in_set, out_set)
 
     @classmethod
     def compile_and_load(

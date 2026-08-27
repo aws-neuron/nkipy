@@ -124,8 +124,11 @@ class SpikeAsyncEventLoop(asyncio.BaseEventLoop):
 class SpikeAsync:
     """Async interface for Spike runtime."""
 
-    def __init__(self, verbose_level: int = 0) -> None:
-        self.spike: Spike = Spike(verbose_level=verbose_level)
+    def __init__(self, verbose_level: int = 0, spike: Spike | None = None) -> None:
+        # Wrap an existing Spike when given (e.g. the process singleton) so models
+        # loaded on it run here without a second NRT runtime; else build a fresh
+        # one (standalone use).
+        self.spike: Spike = spike if spike is not None else Spike(verbose_level=verbose_level)
 
         self._selector: SpikeAsyncSelector = SpikeAsyncSelector(self.spike)
         self._loop: SpikeAsyncEventLoop = SpikeAsyncEventLoop(self._selector)

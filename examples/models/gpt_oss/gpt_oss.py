@@ -19,6 +19,15 @@ from utils import encode_prompt, print_log
 BUILD_DIR = os.path.abspath("./build")
 USE_NKI_RMSNORM = True
 
+# Decode is host-dispatch-bound at batch=1: the blocking DeviceKernel.__call__
+# stalls the host on every one of the ~25 kernels per token, so dispatch of
+# kernel N+1 can't overlap device execution of kernel N. GPT_OSS_ASYNC=1 submits
+# the tkg layer stack + sampling non-blocking (submit/wait) to reclaim that
+# overlap. GPT_OSS_ASYNC_WINDOW caps in-flight ops so the finite-depth compute
+# queue doesn't overflow (NRT_QUEUE_FULL).
+ASYNC_DECODE = os.environ.get("GPT_OSS_ASYNC", "0") == "1"
+ASYNC_WINDOW = int(os.environ.get("GPT_OSS_ASYNC_WINDOW", "4"))
+
 # weight names carried per layer (everything except the kv cache)
 _LAYER_WEIGHT_KEYS = [
     "qkv_weight",
@@ -171,7 +180,8 @@ class GptOssModel:
             f"--> Finished Kernel Compilation and Loading in {time.time() - t:.2f}s"
         )
 
-    def _run_layer(self, phase, i, hidden_states, start_pos):
+    def _layer_io(self, phase, i, hidden_states, start_pos):
+        """Build (kernel, inputs, outputs) for one transformer layer."""
         lt = self.layer_tensors[i]
         kernel = self.kernel_layer[(phase, self.config.is_sliding(i))]
         inputs = {key: lt[key] for key in _LAYER_WEIGHT_KEYS}
@@ -180,14 +190,16 @@ class GptOssModel:
         inputs["cache_v.must_alias_input"] = lt["cache_v"]
         if phase == "tkg":
             inputs["start_pos"] = start_pos
-        kernel(
-            inputs=inputs,
-            outputs={
-                "output0": hidden_states,
-                "cache_k": lt["cache_k"],
-                "cache_v": lt["cache_v"],
-            },
-        )
+        outputs = {
+            "output0": hidden_states,
+            "cache_k": lt["cache_k"],
+            "cache_v": lt["cache_v"],
+        }
+        return kernel, inputs, outputs
+
+    def _run_layer(self, phase, i, hidden_states, start_pos):
+        kernel, inputs, outputs = self._layer_io(phase, i, hidden_states, start_pos)
+        kernel(inputs=inputs, outputs=outputs)
 
     def run_prefill(self, input_ids, capture_aux=False):
         """Run the context-encoding (prefill) layer stack.
@@ -221,6 +233,41 @@ class GptOssModel:
         for i in range(self.config.num_layers):
             self._run_layer("tkg", i, hidden_states, start_pos)
 
+    def _sampling_io(self, kernel, hidden_states, next_id):
+        """Build (kernel, inputs, outputs) for a greedy-sampling head."""
+        inputs = {
+            "h": hidden_states,
+            "norm_weight": self.norm_weight,
+            "lm_head_weight": self.lm_head_weight,
+        }
+        return kernel, inputs, {"output0": next_id}
+
+    def _decode_step_async(self, hidden_states, start_pos, next_id):
+        """Run one tkg step (layers + sampling) via non-blocking submit/wait.
+
+        Layers write hidden_states in place and share the runtime's FIFO compute
+        channel, so submitting without waiting preserves ordering/data deps while
+        overlapping host dispatch with device execution. The window bounds in-flight
+        ops (finite queue depth). Draining every future in FIFO order -- not just
+        the last -- surfaces a failed submission from its own ``.wait()`` instead
+        of hanging behind it, and leaves no exception unretrieved.
+        """
+        futs = []
+
+        def _submit(kernel, inputs, outputs):
+            if len(futs) >= ASYNC_WINDOW:
+                futs.pop(0).wait()
+            futs.append(kernel.submit(inputs, outputs))
+
+        for i in range(self.config.num_layers):
+            _submit(*self._layer_io("tkg", i, hidden_states, start_pos))
+        _submit(*self._sampling_io(self.kernel_tkg_greedy_sampling,
+                                   hidden_states, next_id))
+        # Wait in submission (FIFO) order: each .wait() retrieves that op's
+        # result/exception; the last completing implies the whole step is done.
+        for fut in futs:
+            fut.wait()
+
     def generate(self, input_ids):
         """Run inference and generate tokens."""
         hidden_states, _ = self.run_prefill(input_ids, capture_aux=False)
@@ -252,16 +299,14 @@ class GptOssModel:
             t_start_pos.write_from_numpy(np.array([pos], dtype=np.int32))
             hidden_states.write_from_torch(self.tok_embedding[next_id_torch])
 
-            self._run_tkg_layers(hidden_states, t_start_pos)
-
-            self.kernel_tkg_greedy_sampling(
-                inputs={
-                    "h": hidden_states,
-                    "norm_weight": self.norm_weight,
-                    "lm_head_weight": self.lm_head_weight,
-                },
-                outputs={"output0": next_id},
-            )
+            if ASYNC_DECODE:
+                self._decode_step_async(hidden_states, t_start_pos, next_id)
+            else:
+                self._run_tkg_layers(hidden_states, t_start_pos)
+                kernel, inputs, outputs = self._sampling_io(
+                    self.kernel_tkg_greedy_sampling, hidden_states, next_id
+                )
+                kernel(inputs=inputs, outputs=outputs)
 
             next_id_torch = next_id.torch().reshape(B, 1).to(dtype=torch.int)
             yield next_id_torch
