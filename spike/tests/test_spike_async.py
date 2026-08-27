@@ -51,9 +51,14 @@ def neff_path(request):
 
 @pytest.fixture(scope="module")
 def spike_async():
-    """Initialize SpikeAsync for testing."""
+    """Initialize a standalone SpikeAsync for testing."""
     from spike import SpikeAsync
 
+    # NRT allows one Spike per process, and the runtime singleton (a Spike, with
+    # a lazily-created SpikeAsync view over it) may already be up; tear it down
+    # first so this standalone instance can init cleanly even if a prior test in
+    # the same process brought the singleton up.
+    spike_reset()
     spike_async = SpikeAsync()
     yield spike_async
     spike_async.spike.close()

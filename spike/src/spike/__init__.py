@@ -13,9 +13,14 @@ from ._spike import (
     TensorMetadata,
 )
 from .profiler_adapter import SpikeProfiler
-from .spike_async import SpikeAsync, SpikeStream, NonBlockResult
+from .spike_async import NonBlockResult, SpikeAsync, SpikeStream
 from .spike_model import BenchmarkResult, SpikeModel
-from .spike_singleton import configure, get_spike_singleton, reset
+from .spike_singleton import (
+    configure,
+    get_spike_async_singleton,
+    get_spike_singleton,
+    reset,
+)
 from .spike_tensor import SpikeTensor
 
 __all__ = [
@@ -24,6 +29,7 @@ __all__ = [
     "SpikeProfiler",
     "SpikeAsync",
     "SpikeStream",
+    "get_spike_async_singleton",
     "Spike",
     "configure",
     "reset",

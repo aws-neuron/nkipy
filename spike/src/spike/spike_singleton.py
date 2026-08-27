@@ -4,7 +4,8 @@ This module provides the singleton pattern for the Spike runtime, ensuring
 only one NRT runtime instance exists at a time.
 
 Thread Safety:
-    - `get_spike_singleton()` and `reset()` are thread-safe (protected by lock)
+    - `get_spike_singleton()`, `get_spike_async_singleton()`, and `reset()` are
+      thread-safe (protected by lock)
     - `configure()` checks runtime state under lock, but env var setting is not locked
       (if multiple threads race to configure, last one wins - user's responsibility)
 """
@@ -21,6 +22,9 @@ from .logger import get_logger
 logger = get_logger()
 
 _runtime: Optional[_Spike] = None
+# Non-blocking view of the singleton: a SpikeAsync wrapping the _runtime Spike.
+# Lazily created on first async use; only async callers pay for the event loop.
+_async_runtime = None
 _lock = threading.Lock()
 
 
@@ -105,7 +109,7 @@ def reset() -> None:
         >>> spike.configure(visible_cores=[2, 3])  # Optional: change cores
         >>> tensor2 = SpikeTensor(...)  # Uses cores 2, 3
     """
-    global _runtime
+    global _runtime, _async_runtime
 
     with _lock:
         if _runtime is not None:
@@ -117,6 +121,8 @@ def reset() -> None:
             )
             _runtime.close()
             _runtime = None
+            # Drop the async view too; it wraps the Spike we just closed.
+            _async_runtime = None
             logger.info("Spike Runtime closed")
 
 
@@ -147,12 +153,42 @@ def get_spike_singleton() -> _Spike:
         return _runtime
 
 
+def get_spike_async_singleton():
+    """Get the SpikeAsync view of the runtime singleton, created lazily.
+
+    Wraps the one process ``Spike`` (from :func:`get_spike_singleton`) so
+    models/tensors loaded blockingly can be submitted non-blockingly without a
+    second NRT runtime. Only async callers construct it (and its event loop);
+    reset by :func:`reset` along with the Spike it wraps. Thread-safe.
+
+    Returns:
+        spike.SpikeAsync: the process-wide async view.
+    """
+    global _async_runtime
+
+    if _async_runtime is not None:
+        return _async_runtime
+
+    # Resolve (and lazily build) the Spike singleton BEFORE taking _lock:
+    # get_spike_singleton() re-acquires _lock on its init path, and _lock is
+    # non-reentrant, so calling it while holding _lock self-deadlocks.
+    spike = get_spike_singleton()
+
+    with _lock:
+        if _async_runtime is None:
+            from .spike_async import SpikeAsync
+
+            _async_runtime = SpikeAsync(spike=spike)
+        return _async_runtime
+
+
 def _cleanup() -> None:
     """Cleanup function called at program exit."""
-    global _runtime
+    global _runtime, _async_runtime
     with _lock:
         runtime = _runtime
         _runtime = None
+        _async_runtime = None
     if runtime is not None:
         # Close NRT before Python starts tearing down nanobind module state.
         # Models and tensors retain a shared closed-state token and skip NRT
