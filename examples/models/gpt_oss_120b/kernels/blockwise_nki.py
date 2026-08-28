@@ -80,13 +80,25 @@ def output_initialization(output, dims=None):
 
 
 def load_token_indices(buffer_idx, token_indices, token_position_to_id, block_idx):
-    """Load the [TILE_SIZE] token id map for a (static) block onto the partition dim."""
+    """Load the [TILE_SIZE] token id map for a block onto the partition dim.
+
+    ``block_idx`` is a Python int for the statically-unrolled path, or a runtime
+    ``nisa.VirtualRegister`` under ``nl.dynamic_range``. In the dynamic case the
+    block is selected with a DMA ``scalar_offset`` (which scales by the per_block
+    stride of the leading dim) instead of a static element ``offset``.
+    """
     n_blocks, per_block = token_position_to_id.shape
+    if isinstance(block_idx, nisa.VirtualRegister):
+        src = token_position_to_id.reshape((n_blocks, per_block)).ap(
+            pattern=[[1, TILE_SIZE], [1, 1]], scalar_offset=block_idx
+        )
+    else:
+        src = token_position_to_id.reshape((n_blocks * per_block, 1)).ap(
+            pattern=[[1, TILE_SIZE], [1, 1]], offset=block_idx * per_block
+        )
     nisa.dma_copy(
         dst=token_indices[0:TILE_SIZE, buffer_idx : buffer_idx + 1],
-        src=token_position_to_id.reshape((n_blocks * per_block, 1)).ap(
-            pattern=[[1, TILE_SIZE], [1, 1]], offset=block_idx * per_block
-        ),
+        src=src,
     )
 
 
@@ -505,13 +517,20 @@ def compute_block_output_in_place(
 
 
 def _load_block_expert(dst, buffer_idx, block_to_expert, block_idx):
-    """Load block_to_expert[block_idx] (a static int index) into dst[0,buf,0] as int32."""
+    """Load block_to_expert[block_idx] into dst[0,buf,0] as int32.
+
+    ``block_idx`` is a Python int for the statically-unrolled path, or a runtime
+    ``nisa.VirtualRegister`` under ``nl.dynamic_range``; the latter selects the
+    element with a DMA ``scalar_offset`` instead of a static ``offset``.
+    """
     n_blocks = block_to_expert.shape[0]
     raw = nl.ndarray((1, 1), dtype=block_to_expert.dtype, buffer=nl.sbuf)
-    nisa.dma_copy(
-        dst=raw,
-        src=block_to_expert.reshape((n_blocks, 1)).ap(pattern=[[1, 1], [1, 1]], offset=block_idx),
-    )
+    view = block_to_expert.reshape((n_blocks, 1))
+    if isinstance(block_idx, nisa.VirtualRegister):
+        src = view.ap(pattern=[[1, 1], [1, 1]], scalar_offset=block_idx)
+    else:
+        src = view.ap(pattern=[[1, 1], [1, 1]], offset=block_idx)
+    nisa.dma_copy(dst=raw, src=src)
     nisa.tensor_copy(dst=dst[0:1, buffer_idx, 0:1], src=raw)  # cast to int32
 
 
@@ -630,10 +649,31 @@ def blockwise_nki_static(
     # predicate scratch for expert skip handling
     pred = nl.ndarray((1, 1), dtype=nl.uint8, buffer=nl.sbuf)
 
-    for block_idx in range(num_static_blocks):
+    # When BUFFER_DEGREE == 1 there is no cross-block buffer rotation to unroll
+    # for, so iterate the blocks with a real device loop (nl.dynamic_range) instead
+    # of a Python range that the tracer fully unrolls num_static_blocks times.
+    # dynamic_range emits one on-device loop body rather than N compiled copies --
+    # a large compile-time win -- with no change to the single-buffer schedule.
+    # block_idx is then a runtime nisa.VirtualRegister, so the two block-indexed
+    # gathers below read it as a DMA scalar_offset (see load_token_indices /
+    # _load_block_expert). BUFFER_DEGREE > 1 still needs static unrolling so the
+    # compiler can rotate through the buffer_idx = block_idx % BUFFER_DEGREE tiles
+    # and software-pipeline the weight DMA against the previous block's compute.
+    block_iter = (
+        nl.dynamic_range(num_static_blocks)
+        if BUFFER_DEGREE == 1
+        else range(num_static_blocks)
+    )
+    for block_idx in block_iter:
         # A
-        buffer_idx_prev = (block_idx - 1) % BUFFER_DEGREE
-        buffer_idx_now = block_idx % BUFFER_DEGREE
+        if BUFFER_DEGREE == 1:
+            # block_idx is a dynamic loop index here; both buffer slots collapse to
+            # 0, so keep them Python ints for the static SBUF slicing below.
+            buffer_idx_prev = 0
+            buffer_idx_now = 0
+        else:
+            buffer_idx_prev = (block_idx - 1) % BUFFER_DEGREE
+            buffer_idx_now = block_idx % BUFFER_DEGREE
 
         load_token_indices(buffer_idx_now, token_indices, token_position_to_id, block_idx)
 
