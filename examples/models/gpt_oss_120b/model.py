@@ -26,11 +26,12 @@ logger = get_logger()
 
 trace = NKIPyKernel.trace(backend="hlo")
 
-# When set, the decode step submits its kernel chain (embedding -> fused
-# decode blocks -> sampling) non-blocking on the runtime FIFO channel, so host
-# dispatch of the next kernel overlaps device compute of the current one.
-# Default off keeps the blocking path as the reference.
-_ASYNC_DECODE = os.environ.get("GPT_OSS_120B_ASYNC", "0") == "1"
+# The decode step submits its kernel chain (embedding -> fused decode blocks ->
+# sampling) non-blocking on the runtime FIFO channel, so host dispatch of the
+# next kernel overlaps device compute of the current one (~1.3x decode at
+# batch=1). This is the default; set GPT_OSS_120B_ASYNC=0 to fall back to the
+# blocking path (useful as a reference / for debugging).
+_ASYNC_DECODE = os.environ.get("GPT_OSS_120B_ASYNC", "1") == "1"
 # Max non-blocking submissions kept in flight. The hardware compute queue has
 # finite depth (submitting a whole ~11-kernel step at once overflows it with
 # NRT_QUEUE_FULL), so we wait on the oldest in-flight future before submitting
