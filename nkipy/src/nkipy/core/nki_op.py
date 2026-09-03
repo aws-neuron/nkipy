@@ -764,10 +764,23 @@ class NKICustomOp:
             if not _beta3_is_device_input(value)
         ]
 
+        # Convert NKIPyTensorRef operands to empty numpy arrays before
+        # specialization. When wrap_nki_kernel is called during an NKIPy trace
+        # the operands are NKIPyTensorRefs; NKI's beta 3 frontend only
+        # understands numpy arrays and otherwise fails to specialize. Shapes and
+        # dtypes are all the frontend needs. (Classification above already ran on
+        # the refs, which _beta3_is_device_input recognizes as device inputs.)
+        specialize_inputs = {
+            name: np.empty(value.shape, dtype=value.dtype)
+            if isinstance(value, NKIPyTensorRef)
+            else value
+            for name, value in numpy_inputs.items()
+        }
+
         self._beta3_framework_config, self._beta3_is_tuple_return = (
             _beta3_compile_and_get_config(
                 kernel,
-                numpy_inputs,
+                specialize_inputs,
                 platform_target,
                 nki_compile_mode=nki_compile_mode,
                 nisa_allocation_mode=nisa_allocation_mode,

@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+build/
+profile/
+chat.log
+*.pftrace
+*.npy
+# Presharded checkpoints and downloaded weights
+gpt-oss-120b-bf16*/
+*.safetensors
