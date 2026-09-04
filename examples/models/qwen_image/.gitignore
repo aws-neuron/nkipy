@@ -1,0 +1,14 @@
+# prepared weights (downloaded/converted via tensor_preparation.py)
+tmp_qwen_image/
+*.safetensors
+
+# compiled kernels
+build/
+build_*/
+
+# generated images
+*.png
+
+# python caches
+__pycache__/
+*.pyc
