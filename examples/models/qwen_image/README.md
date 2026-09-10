@@ -8,6 +8,13 @@ encoder, a 16-channel video-style VAE, and rectified-flow sampling.
 The port is **device-only** end-to-end: the denoiser, text encoder, and VAE all
 run on trn2 (TP=4, fused on-device sampling), producing correct 512px images.
 
+## Sample output
+
+![Qwen-Image sample: a coffee shop entrance with a chalkboard sign](assets/sample.png)
+
+*512px, TP=4, 50 steps, guidance 4.0 — prompt: "a coffee shop entrance with a
+chalkboard sign".*
+
 ## Run
 
 ```bash
