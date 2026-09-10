@@ -28,7 +28,36 @@ torchrun --nproc-per-node 4 qwen_image.py "your prompt" \
 **Tensor parallelism is required** — 20B bf16 (~40 GB) doesn't fit on one 24 GB
 core. TP=4 fits (20.4 GB/core) and is the max: the text encoder caps TP at
 `num_kv_heads = 4`. The model is downloaded once by the diffusers pipeline (HF
-cache); the driver extracts + shards all weights in-memory (no repack step).
+cache).
+
+### Startup caching & resident mode
+
+A cold launch is dominated by one-time host-side weight prep, not compile or
+generation, so two mechanisms amortize it:
+
+- **Shard cache** (on by default, `--weight-cache-dir`, default `./weight_cache`):
+  the per-rank sharded weights are extracted + written once, then reloaded on
+  every later launch — turning the ~350 s extract/shard into a memory-mapped
+  read (and dropping peak RAM from ~200 GB to ~45 GB). `--no-weight-cache`
+  disables it.
+- **Resident mode** (`--prompts-file FILE` or `--interactive`): keep the process
+  alive and generate an image per prompt. The weight upload (~25 s) and NEFF
+  load (~17 s) — which no on-disk cache can remove — are then paid once; each
+  additional image costs only `generate()` (e.g. ~2.8 s at 8 steps, ~17 s at 50).
+- **Text-length bucketing** (`--text-bucket N`, default 64): the text-encoder
+  sequence and the denoiser text length are rounded up to a multiple of `N`, so
+  varying prompts reuse one compiled kernel per bucket instead of recompiling
+  per exact length (a different-length prompt in a resident session then costs
+  ~2.8 s instead of a ~90 s recompile). Padding is exact — the encoder is causal
+  (real tokens never attend to the pad tail) and the denoiser masks the pad text
+  tokens — but because the kernel *shapes* change, the bf16 GEMM reduction order
+  differs, so a given prompt's pixels differ slightly (same scene) from the
+  `--text-bucket 0` (per-exact-length, bitwise-stable) result.
+
+```bash
+# one image per line, process stays resident
+torchrun --nproc-per-node 4 qwen_image.py --prompts-file prompts.txt --steps 50
+```
 
 CPU correctness tests: `uv run pytest tests/`. The on-device TP check needs
 hardware and is opt-in: `QWEN_IMAGE_TP_DEVICE_TEST=1 uv run pytest

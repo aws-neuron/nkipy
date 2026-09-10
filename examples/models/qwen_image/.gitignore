@@ -2,6 +2,9 @@
 tmp_qwen_image/
 *.safetensors
 
+# per-rank sharded weight cache (qwen_image.py --weight-cache-dir)
+weight_cache/
+
 # compiled kernels
 build/
 build_*/

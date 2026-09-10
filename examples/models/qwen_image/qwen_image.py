@@ -72,8 +72,16 @@ class _DeviceModule:
 
     def _select_weight_keys(self):
         """Weights to feed the kernel, before tracer pruning. Default: all of
-        them; the denoiser / text encoder narrow this to their key scheme."""
-        return list(self.device_weights)
+        them in a deterministic (sorted) order; the denoiser / text encoder
+        narrow this to their own canonical key scheme.
+
+        The order matters: it becomes the kernel's HLO parameter order, which
+        feeds the compile cache's content hash. Sorting keeps that order
+        independent of the weight-dict's source order (extraction preserves
+        insertion order; the shard cache round-trips through safetensors, which
+        re-sorts keys) so a cached and a freshly-extracted run hit the same
+        compiled NEFF."""
+        return sorted(self.device_weights)
 
     def _compile(self, key, kernel_fn, name, placeholders, build_dir):
         """Compile once (cached by ``key``) and return ``(kernel, wkeys)``, where
@@ -245,16 +253,32 @@ class DeviceTextEncoder(_DeviceModule):
         return out.torch().to(torch.float32)
 
 
-def encode_prompt_device(pipe, device_encoder, prompt):
+def _round_up(n, bucket):
+    """Round ``n`` up to the next multiple of ``bucket`` (``bucket <= 0`` -> no
+    change). Used to snap prompt/text lengths onto a small set of buckets so
+    varying prompts reuse a few compiled kernels instead of recompiling per
+    exact length."""
+    if bucket <= 0:
+        return int(n)
+    return ((int(n) + bucket - 1) // bucket) * bucket
+
+
+def encode_prompt_device(pipe, device_encoder, prompt, text_bucket=0):
     """Replicate ``QwenImagePipeline._get_qwen_prompt_embeds`` with the encoder
     forward on device.
 
     The host does everything data-dependent (chat-template wrapping, tokenize,
     embedding lookup, masked-hidden extraction, ``drop_idx`` prefix slice); the
     device runs only the transformer. Batch=1 (cond and neg are encoded
-    separately), so the tokenizer emits no padding and the encoder's causal-only
-    mask matches diffusers exactly. Returns ``(prompt_embeds, prompt_embeds_mask)``
-    in the same layout as ``encode_prompt``.
+    separately). Returns ``(prompt_embeds, prompt_embeds_mask)`` in the same
+    layout as ``encode_prompt``.
+
+    With ``text_bucket > 0`` the encoder input is right-padded to the next
+    bucket multiple so different-length prompts hit one compiled kernel per
+    bucket. This is exact: the encoder is causal, so a real token at position
+    ``i < L`` never attends to a later pad position — its hidden state is
+    identical with or without the padding — and we slice the pad tail back off
+    before the masked-hidden extraction.
     """
     template = pipe.prompt_template_encode
     drop_idx = pipe.prompt_template_encode_start_idx
@@ -268,8 +292,14 @@ def encode_prompt_device(pipe, device_encoder, prompt):
     # host embedding lookup (the table stays on host)
     with torch.no_grad():
         embeds = pipe.text_encoder.get_input_embeddings()(input_ids)
-    # device transformer -> last hidden state
-    hidden = device_encoder.encode(embeds.to(torch.float32))
+    # right-pad the encoder input to a bucket length (causal-safe, see docstring)
+    L = embeds.shape[1]
+    s_fixed = _round_up(L, text_bucket)
+    if s_fixed > L:
+        embeds = torch.cat(
+            [embeds, embeds.new_zeros(embeds.shape[0], s_fixed - L, embeds.shape[2])], dim=1)
+    # device transformer -> last hidden state, then drop the padded tail
+    hidden = device_encoder.encode(embeds.to(torch.float32))[:, :L]
 
     # masked-hidden extraction + drop template prefix (matches diffusers)
     bool_mask = attn_mask.bool()
@@ -364,10 +394,11 @@ def generate(pipe, denoiser, prompt, negative_prompt, config, height, width,
         raise ValueError("qwen-image requires true-CFG (guidance_scale > 1.0)")
     device = "cpu"
     vae_scale = pipe.vae_scale_factor
+    text_bucket = getattr(config, "text_bucket", 0)
 
     # text encode on device
-    prompt_embeds, prompt_mask = encode_prompt_device(pipe, text_encoder, prompt)
-    neg_embeds, neg_mask = encode_prompt_device(pipe, text_encoder, negative_prompt)
+    prompt_embeds, prompt_mask = encode_prompt_device(pipe, text_encoder, prompt, text_bucket)
+    neg_embeds, neg_mask = encode_prompt_device(pipe, text_encoder, negative_prompt, text_bucket)
 
     # init latents (packed) + flow-match schedule
     num_ch = pipe.transformer.config.in_channels // 4
@@ -393,8 +424,10 @@ def generate(pipe, denoiser, prompt, negative_prompt, config, height, width,
 
     # device-resident loop: CFG + FlowMatchEuler run on device in denoise_step.
     # cond/neg share a text length (pad + mask); dt comes from the scheduler
-    # sigmas (prev = sample + dt * model_output).
-    tlen = max(prompt_embeds.shape[1], neg_embeds.shape[1])
+    # sigmas (prev = sample + dt * model_output). Bucketing the shared length
+    # lets varying prompts reuse one compiled denoise_step (the padded text
+    # tokens are masked out via cond_mask/neg_mask, so the result is exact).
+    tlen = _round_up(max(prompt_embeds.shape[1], neg_embeds.shape[1]), text_bucket)
     c_emb, c_mask = _pad_text(prompt_embeds, prompt_mask, tlen)
     n_emb, n_mask = _pad_text(neg_embeds, neg_mask, tlen)
     sched_sigmas = pipe.scheduler.sigmas  # (num_steps+1,)
@@ -419,10 +452,65 @@ def generate(pipe, denoiser, prompt, negative_prompt, config, height, width,
     return (image.permute(0, 2, 3, 1).cpu().float().numpy() * 255).round().astype(np.uint8)
 
 
+# Bump when the extraction/sharding layout changes so stale shard caches are
+# not silently reused (the content the cache stores must match what the kernels
+# expect). Part of the cache path.
+_SHARD_CACHE_VERSION = 1
+
+
+def _shard_cache_path(cache_dir, model_name, tag, tp_size, rank):
+    """Per-(model, component, tp, rank) shard-cache file. Model name is slugged so
+    it is safe as a directory component."""
+    slug = model_name.replace("/", "__")
+    return os.path.join(
+        cache_dir, f"v{_SHARD_CACHE_VERSION}", slug,
+        f"{tag}_tp{tp_size}_rank{rank}.safetensors")
+
+
+def _cached_weights(cache_path, build_fn, store_dtype, log, label, enabled):
+    """Load a rank's sharded weights from ``cache_path`` if present, else build
+    them with ``build_fn`` (extract + shard from the host pipeline) and write the
+    cache. Floating tensors are stored as ``store_dtype`` (bf16 for the
+    denoiser/text-encoder — exactly what gets uploaded — fp32 for the VAE), which
+    both halves the cache/load size and skips the fp32 extraction blow-up on
+    cached runs. Returns a ``{key: torch.Tensor}`` dict ready to upload.
+
+    Extraction is the whole cost of weight prep (~330 s at TP=4: transpose +
+    copy + fp32 cast over 20B params, ranks contending for memory bandwidth); a
+    cache hit replaces it with a memory-mapped read of a few GB.
+    """
+    import safetensors.torch as st
+
+    if enabled and os.path.exists(cache_path):
+        t = time.time()
+        weights = st.load_file(cache_path)
+        log(f"[qwen-image] {label}: loaded shard cache "
+            f"({len(weights)} tensors) in {time.time() - t:.2f}s")
+        return weights
+
+    t = time.time()
+    weights = build_fn()
+    log(f"[qwen-image] {label}: extracted+sharded in {time.time() - t:.2f}s")
+    if store_dtype is not None:
+        weights = {
+            k: (v.to(store_dtype) if v.is_floating_point() else v).contiguous()
+            for k, v in weights.items()
+        }
+    if enabled:
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        # Per-rank filename (each rank writes its own shard), so writes never
+        # collide; the temp+rename keeps a concurrent reader from seeing a
+        # half-written file.
+        tmp = f"{cache_path}.tmp.{os.getpid()}"
+        st.save_file(weights, tmp)
+        os.replace(tmp, cache_path)
+        log(f"[qwen-image] {label}: wrote shard cache {cache_path}")
+    return weights
+
+
 def _build_device_denoiser_weights(pipe, config, tp_size, rank):
     """Extract the denoiser's flat weights from the host pipeline's transformer
-    and slice this rank's tensor-parallel shard (mirrors the text-encoder / VAE
-    paths — no on-disk pre-bake step)."""
+    and slice this rank's tensor-parallel shard."""
     from weight_extract import extract_flat_weights, shard_flat_weights
 
     flat = extract_flat_weights(pipe.transformer, config.num_layers, dtype=np.float32)
@@ -431,13 +519,11 @@ def _build_device_denoiser_weights(pipe, config, tp_size, rank):
     return {k: torch.from_numpy(np.ascontiguousarray(v)) for k, v in shard.items()}
 
 
-def _build_device_text_encoder(pipe, tp_size, rank, log):
-    """Extract the Qwen2.5 encoder weights from the host pipeline, shard for this
-    rank, and build a ``DeviceTextEncoder``. The host pipeline's encoder stays
-    resident for the embedding-table lookup (the transformer layers now run on
-    device, but the embedding gather remains on host)."""
+def _make_text_encoder_config(pipe, tp_size):
+    """Build the ``TextEncoderConfig`` from the host pipeline (cheap; needed on
+    every run to construct ``DeviceTextEncoder``, cached or not)."""
     from config import TextEncoderConfig
-    from weight_extract import extract_text_encoder_weights, shard_text_encoder_weights
+    from kernels.tp import make_all_reduce
 
     te_hf = pipe.text_encoder.config.text_config
     # rope_theta is top-level on older transformers, nested under
@@ -456,31 +542,108 @@ def _build_device_text_encoder(pipe, tp_size, rank, log):
         rms_norm_eps=te_hf.rms_norm_eps,
         rope_theta=rope_theta,
     )
-    from kernels.tp import make_all_reduce
     te_cfg.tp_size = tp_size
     te_cfg.all_reduce_fn = make_all_reduce(tp_size)
+    return te_cfg
 
-    log(f"[qwen-image] extracting text-encoder weights ({te_cfg.num_layers} layers)")
+
+def _build_text_encoder_weights(pipe, te_cfg, tp_size, rank):
+    """Extract the Qwen2.5 encoder weights from the host pipeline and slice this
+    rank's TP shard. The host pipeline's encoder stays resident for the
+    embedding-table lookup (only the transformer layers run on device)."""
+    from weight_extract import extract_text_encoder_weights, shard_text_encoder_weights
+
     lm = pipe.text_encoder.model.language_model
     flat = extract_text_encoder_weights(lm, te_cfg.num_layers, dtype=np.float32)
     flat = shard_text_encoder_weights(
         flat, rank, tp_size, te_cfg.num_layers,
         te_cfg.num_heads, te_cfg.num_kv_heads, te_cfg.head_dim)
-    weights = {k: torch.from_numpy(np.ascontiguousarray(v)) for k, v in flat.items()}
-    return DeviceTextEncoder(weights, te_cfg)
+    return {k: torch.from_numpy(np.ascontiguousarray(v)) for k, v in flat.items()}
 
 
-def _build_device_vae(pipe, model_name, log):
-    """Extract the VAE decoder weights from the host pipeline and build a
-    ``DeviceVAEDecoder`` (T=1 2D-collapsed decoder, fp32, replicated per rank)."""
-    from config import get_vae_config
+def _build_vae_weights(pipe):
+    """Extract the VAE decoder weights (T=1 2D-collapsed decoder, replicated per
+    rank) from the host pipeline."""
     from weight_extract import extract_vae_decoder_weights
 
-    vae_cfg = get_vae_config(model_name)
-    log(f"[qwen-image] extracting VAE decoder weights (z_dim {vae_cfg.z_dim})")
     flat = extract_vae_decoder_weights(pipe.vae, dtype=np.float32)
-    weights = {k: torch.from_numpy(np.ascontiguousarray(v)) for k, v in flat.items()}
-    return DeviceVAEDecoder(weights, vae_cfg)
+    return {k: torch.from_numpy(np.ascontiguousarray(v)) for k, v in flat.items()}
+
+
+def _indexed_output(template, idx):
+    """``output.png`` -> ``output_000.png`` for the idx-th resident image."""
+    base, ext = os.path.splitext(template)
+    return f"{base}_{idx:03d}{ext}"
+
+
+def _generate_and_save(pipe, denoiser, text_encoder, vae_decoder, config, args,
+                       prompt, seed, out_path, rank):
+    """Run one image end-to-end and (rank 0) save it. Returns wall time (s).
+
+    Within a resident process the kernels are already loaded, so repeated calls
+    reuse them (the denoiser / text-encoder / VAE cache compiled kernels in
+    ``self._kernels`` and the runtime caches the loaded NEFF), i.e. no re-upload
+    and no NEFF reload — only a new text length triggers a one-time recompile.
+    """
+    t = time.time()
+    images = generate(pipe, denoiser, prompt, args.negative_prompt, config,
+                      args.height, args.width, args.guidance_scale, args.steps,
+                      text_encoder, vae_decoder, seed=seed)
+    dt = time.time() - t
+    if rank == 0:
+        from PIL import Image
+        Image.fromarray(images[0]).save(out_path)
+    return dt
+
+
+def _resident_loop(pipe, denoiser, text_encoder, vae_decoder, config, args,
+                   rank, log):
+    """Keep the process (and all TP ranks) resident, generating one image per
+    prompt so the one-time setup — weight upload (~25s) + NEFF load (~17s) that
+    no on-disk cache can remove — is paid once and amortized across every image.
+
+    Rank 0 is the source of prompts (``--prompts-file``, else interactive
+    stdin); each ``(prompt, seed)`` is broadcast to all ranks so they run
+    ``generate`` together — the kernels use collectives, so every rank must
+    participate on every image. A ``None`` prompt ends the loop on all ranks.
+    """
+    import torch.distributed as dist
+
+    src = None
+    if rank == 0 and args.prompts_file:
+        with open(args.prompts_file) as f:
+            prompts = [ln.strip() for ln in f if ln.strip()]
+        log(f"[qwen-image] resident mode: {len(prompts)} prompt(s) from {args.prompts_file}")
+        src = iter(prompts)
+    elif rank == 0:
+        log("[qwen-image] resident mode: interactive (blank line / Ctrl-D to quit)")
+
+    idx = 0
+    while True:
+        # Rank 0 picks the next prompt; all ranks agree via broadcast so they
+        # step through generate() in lockstep.
+        if rank == 0:
+            if src is not None:
+                prompt = next(src, None)
+            else:
+                try:
+                    prompt = input("prompt> ").strip() or None
+                except EOFError:
+                    prompt = None
+            payload = [prompt, int(args.seed) + idx]
+        else:
+            payload = [None, None]
+        dist.broadcast_object_list(payload, src=0)
+        prompt, seed = payload
+        if prompt is None:
+            break
+        out_path = _indexed_output(args.output, idx)
+        dt = _generate_and_save(pipe, denoiser, text_encoder, vae_decoder,
+                                config, args, prompt, seed, out_path, rank)
+        log(f"[qwen-image] image {idx} ({args.steps} steps) in {dt:.2f}s "
+            f"-> {out_path}  |  {prompt[:50]!r}")
+        idx += 1
+    log(f"[qwen-image] resident mode: generated {idx} image(s)")
 
 
 def main():
@@ -496,6 +659,28 @@ def main():
     parser.add_argument("--guidance-scale", type=float, default=4.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", default="output.png")
+    parser.add_argument(
+        "--weight-cache-dir", default="./weight_cache",
+        help="directory for the per-rank sharded weight cache; a cache hit skips "
+             "the ~330s host-side extract/shard on every launch")
+    parser.add_argument(
+        "--no-weight-cache", action="store_true",
+        help="disable the shard cache (always extract+shard from the pipeline)")
+    parser.add_argument(
+        "--prompts-file", default=None,
+        help="resident batch mode: generate one image per non-empty line of this "
+             "file, keeping the process alive so the one-time weight upload + NEFF "
+             "load are paid once and amortized across every image")
+    parser.add_argument(
+        "--interactive", action="store_true",
+        help="resident REPL mode: read prompts from stdin (rank 0) until a blank "
+             "line or EOF; same amortization as --prompts-file")
+    parser.add_argument(
+        "--text-bucket", type=int, default=64,
+        help="round prompt text length up to this multiple so varying prompts "
+             "reuse one compiled text-encoder + denoise kernel per bucket instead "
+             "of recompiling per exact length (padded tokens are masked; exact). "
+             "0 disables (compile per exact length)")
     args = parser.parse_args()
 
     # ── tensor-parallel setup (torchrun) ──────────────────────────────────────
@@ -526,32 +711,60 @@ def main():
     config.model_name = args.model
     config.tp_size = tp_size
     config.all_reduce_fn = make_all_reduce(tp_size)
+    config.text_bucket = args.text_bucket
 
+    from config import get_vae_config
+
+    cache_enabled = not args.no_weight_cache
+    cache_dir = args.weight_cache_dir
+
+    def cpath(tag):
+        return _shard_cache_path(cache_dir, args.model, tag, tp_size, rank)
+
+    setup_start = time.time()
     log(f"[qwen-image] loading host pipeline {args.model} (TP={tp_size})")
     pipe = load_host_pipeline(args.model)
     vae_scale = pipe.vae_scale_factor
     gh, gw = args.height // vae_scale // 2, args.width // vae_scale // 2
 
-    log("[qwen-image] extracting denoiser weights from host transformer")
-    weights = _build_device_denoiser_weights(pipe, config, tp_size, rank)
-    denoiser = QwenImageDenoiser(weights, config, (1, gh, gw), batch_size=1)
+    # Weight prep goes through a per-rank shard cache (bf16 for the
+    # denoiser/text-encoder, fp32 for the VAE). A cache hit skips the dominant
+    # cost of a cold launch — the host-side extract/shard (~330s at TP=4).
+    denoiser_weights = _cached_weights(
+        cpath("denoiser"),
+        lambda: _build_device_denoiser_weights(pipe, config, tp_size, rank),
+        torch.bfloat16, log, "denoiser weights", cache_enabled)
+    denoiser = QwenImageDenoiser(denoiser_weights, config, (1, gh, gw), batch_size=1)
 
-    text_encoder = _build_device_text_encoder(pipe, tp_size, rank, log)
-    vae_decoder = _build_device_vae(pipe, args.model, log)
+    te_cfg = _make_text_encoder_config(pipe, tp_size)
+    te_weights = _cached_weights(
+        cpath("text_encoder"),
+        lambda: _build_text_encoder_weights(pipe, te_cfg, tp_size, rank),
+        torch.bfloat16, log, "text-encoder weights", cache_enabled)
+    text_encoder = DeviceTextEncoder(te_weights, te_cfg)
+
+    vae_cfg = get_vae_config(args.model)
+    vae_weights = _cached_weights(
+        cpath("vae"), lambda: _build_vae_weights(pipe),
+        torch.float32, log, "VAE weights", cache_enabled)
+    vae_decoder = DeviceVAEDecoder(vae_weights, vae_cfg)
 
     dist.barrier()
-    log("[qwen-image] generating")
-    start = time.time()
-    images = generate(pipe, denoiser, args.prompt, args.negative_prompt, config,
-                      args.height, args.width, args.guidance_scale, args.steps,
-                      text_encoder, vae_decoder, seed=args.seed)
-    log(f"[qwen-image] --> {args.steps} steps in {time.time() - start:.2f}s")
+    setup_done = time.time()
 
-    if rank == 0:
-        from PIL import Image
-        Image.fromarray(images[0]).save(args.output)
-        print(f"[qwen-image] saved {args.output}")
+    if args.prompts_file or args.interactive:
+        # Resident mode: setup is paid once; each image costs only generate().
+        _resident_loop(pipe, denoiser, text_encoder, vae_decoder, config, args,
+                       rank, log)
+    else:
+        log("[qwen-image] generating")
+        dt = _generate_and_save(pipe, denoiser, text_encoder, vae_decoder, config,
+                                args, args.prompt, args.seed, args.output, rank)
+        log(f"[qwen-image] --> {args.steps} steps in {dt:.2f}s")
+        if rank == 0:
+            print(f"[qwen-image] saved {args.output}")
 
+    log(f"[qwen-image] (setup {setup_done - setup_start:.1f}s done before generation)")
     dist.destroy_process_group()
 
 
