@@ -390,6 +390,11 @@ def _build_reduction_hlo(
     if isinstance(x, NKIPyTensorRef):
         x = x.backend_tensor
 
+    if dtype is not None:
+        reduction_dtype = np.dtype(dtype)
+        if x.dtype != reduction_dtype:
+            x = ctx.build_op("convert", [x], x.shape, reduction_dtype)
+
     reduce_op_map = {
         np.sum: "add",
         np.max: "maximum",
@@ -426,9 +431,18 @@ def _build_reduction_hlo(
         "minimum": float("inf"),
         "multiply": 1.0,
     }
-    init_value = init_values[hlo_op]
+    init_value = init_values[hlo_op] if initial is None else initial
 
-    init_tensor = as_hlo_tensor(ctx, init_value, x.dtype)
+    if isinstance(init_value, NKIPyTensorRef):
+        init_tensor = init_value.backend_tensor
+        if init_tensor.shape != ():
+            raise ValueError("initial must be a scalar")
+        if init_tensor.dtype != x.dtype:
+            init_tensor = ctx.build_op("convert", [init_tensor], (), x.dtype)
+    else:
+        if isinstance(init_value, np.ndarray) and init_value.shape != ():
+            raise ValueError("initial must be a scalar")
+        init_tensor = as_hlo_tensor(ctx, init_value, x.dtype)
 
     result_tensor = ctx.build_op(
         "reduce",
