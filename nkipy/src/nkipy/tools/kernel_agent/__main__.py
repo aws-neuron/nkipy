@@ -7,7 +7,7 @@ import json
 import sys
 from typing import List, Optional
 
-from nkipy.tools.kernel_agent.generator import DEFAULT_MODEL_ID, DEFAULT_REGION
+from nkipy.tools.kernel_agent.generator import DEFAULT_REGION, MODEL_ID_ENV
 
 
 def _add_bedrock_args(parser: argparse.ArgumentParser) -> None:
@@ -15,8 +15,8 @@ def _add_bedrock_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "-m",
         "--model",
-        default=DEFAULT_MODEL_ID,
-        help=f"Bedrock model ID (default: {DEFAULT_MODEL_ID})",
+        default=None,
+        help=f"Bedrock model ID (default: ${MODEL_ID_ENV} environment variable)",
     )
     parser.add_argument(
         "-r",

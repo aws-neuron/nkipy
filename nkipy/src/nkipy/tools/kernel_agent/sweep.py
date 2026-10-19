@@ -13,9 +13,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from nkipy.tools.kernel_agent.generator import (
-    DEFAULT_MODEL_ID,
     DEFAULT_REGION,
     load_prompt,
+    resolve_model_id,
 )
 
 
@@ -225,7 +225,7 @@ def _print_summary(
 
 
 def run_sweep(
-    model_id: str = DEFAULT_MODEL_ID,
+    model_id: Optional[str] = None,
     region: str = DEFAULT_REGION,
     run_hardware: bool = True,
     max_iterations: Optional[int] = None,
@@ -242,6 +242,7 @@ def run_sweep(
 
     from nkipy.tools.kernel_agent.generator import compile_code, generate_kernel
 
+    model_id = resolve_model_id(model_id)
     prompts = get_kernel_prompts()
 
     out_path = Path(output_dir)

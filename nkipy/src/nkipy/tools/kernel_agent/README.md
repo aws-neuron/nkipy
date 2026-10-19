@@ -2,6 +2,16 @@
 
 Test NumPy operations against the NKIPy hardware pipeline and generate kernels with an LLM.
 
+## Setup
+
+The `generate` and `sweep` commands call AWS Bedrock. Set the model ID via the
+`NKIPY_KERNEL_AGENT_MODEL` environment variable (or pass `--model` explicitly);
+there is no built-in default.
+
+```bash
+export NKIPY_KERNEL_AGENT_MODEL=<your Bedrock model ID>
+```
+
 ## Commands
 
 ```bash

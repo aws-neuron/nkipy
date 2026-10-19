@@ -7,9 +7,39 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 from nkipy.tools.kernel_agent.generator import (
+    MODEL_ID_ENV,
     build_inputs,
     generate_kernel,
+    resolve_model_id,
 )
+
+
+@pytest.fixture(autouse=True)
+def _model_env(monkeypatch):
+    monkeypatch.setenv(MODEL_ID_ENV, "env-model")
+
+
+# ---------------------------------------------------------------------------
+# resolve_model_id
+# ---------------------------------------------------------------------------
+
+
+class TestResolveModelId:
+    def test_explicit_wins_over_env(self):
+        assert resolve_model_id("explicit-model") == "explicit-model"
+
+    def test_falls_back_to_env(self):
+        assert resolve_model_id(None) == "env-model"
+
+    def test_raises_when_unset(self, monkeypatch):
+        monkeypatch.delenv(MODEL_ID_ENV)
+        with pytest.raises(ValueError, match=MODEL_ID_ENV):
+            resolve_model_id(None)
+
+    def test_raises_when_blank(self, monkeypatch):
+        monkeypatch.setenv(MODEL_ID_ENV, "  ")
+        with pytest.raises(ValueError, match=MODEL_ID_ENV):
+            resolve_model_id("")
 
 # ---------------------------------------------------------------------------
 # build_inputs
@@ -111,8 +141,9 @@ class TestGenerateKernelToolUse:
         assert "a" in inputs and "b" in inputs
         assert inputs["a"].shape == (4,)
 
-        # Verify toolConfig was passed
+        # Verify toolConfig and the env-resolved model ID were passed
         call_kwargs = mock_client.converse.call_args.kwargs
+        assert call_kwargs["modelId"] == "env-model"
         assert "toolConfig" in call_kwargs
         assert (
             call_kwargs["toolConfig"]["tools"][0]["toolSpec"]["name"] == "submit_kernel"

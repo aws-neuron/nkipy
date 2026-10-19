@@ -3,6 +3,7 @@
 """LLM-based kernel generation using AWS Bedrock."""
 
 import functools
+import os
 from importlib.resources import files as _resource_files
 from typing import Dict, List, Optional, Tuple
 
@@ -10,8 +11,25 @@ import boto3
 import ml_dtypes  # noqa: F401 — registers bfloat16 etc. with numpy
 import numpy as np
 
-DEFAULT_MODEL_ID = "global.anthropic.claude-sonnet-4-6"
+MODEL_ID_ENV = "NKIPY_KERNEL_AGENT_MODEL"
 DEFAULT_REGION = "us-west-2"
+
+
+def resolve_model_id(model_id: Optional[str] = None) -> str:
+    """Return the Bedrock model ID to use.
+
+    An explicit ``model_id`` wins; otherwise the ``NKIPY_KERNEL_AGENT_MODEL``
+    environment variable is consulted. There is no built-in default.
+    """
+    if model_id:
+        return model_id
+    env_value = os.environ.get(MODEL_ID_ENV, "").strip()
+    if env_value:
+        return env_value
+    raise ValueError(
+        "No Bedrock model ID configured. Pass --model / model_id or set the "
+        f"{MODEL_ID_ENV} environment variable."
+    )
 
 _KERNEL_TOOL = {
     "toolSpec": {
@@ -92,7 +110,7 @@ def build_inputs(input_specs: Dict) -> Dict[str, np.ndarray]:
 
 def generate_kernel(
     prompt: str,
-    model_id: str = DEFAULT_MODEL_ID,
+    model_id: Optional[str] = None,
     region: str = DEFAULT_REGION,
     *,
     constrained: bool = False,
@@ -102,7 +120,8 @@ def generate_kernel(
 
     Args:
         prompt: Natural language description of the kernel.
-        model_id: Bedrock model identifier.
+        model_id: Bedrock model identifier. Defaults to the
+            NKIPY_KERNEL_AGENT_MODEL environment variable.
         region: AWS region for the Bedrock client.
         constrained: If True, restrict generation to allowed_ops and use
             the constrained system prompt.
@@ -112,6 +131,7 @@ def generate_kernel(
     Returns:
         (name, code, inputs) tuple.
     """
+    model_id = resolve_model_id(model_id)
     if constrained:
         from nkipy.tools.kernel_agent.ops import get_all_ops
 
