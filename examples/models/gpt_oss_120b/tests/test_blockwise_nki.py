@@ -34,7 +34,7 @@ def get_blockwise_expert_and_token_mapping(num_blocks, n_experts, seq_len, test_
     [
         (4096, 2880, 360, True),  # prefill: TP8
         (512, 2880, 360, False),  # tokengen: TP8
-        # partial to leverage walrus detecting bugs like uninitialized read/write
+        # partial to leverage backend compiler detecting bugs like uninitialized read/write
         # TODO: fix test below
         (16, 512, 128, True),
         (512, 80, 128, True),

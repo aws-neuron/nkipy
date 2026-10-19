@@ -8,9 +8,15 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 from botocore.exceptions import ClientError, NoCredentialsError
-
 from nkipy.tools.kernel_agent.executor import ExecutionResult, StageResult
+from nkipy.tools.kernel_agent.generator import MODEL_ID_ENV
 from nkipy.tools.kernel_agent.sweep import SweepRecord, run_rerun, run_sweep
+
+
+@pytest.fixture(autouse=True)
+def _model_env(monkeypatch):
+    monkeypatch.setenv(MODEL_ID_ENV, "env-model")
+
 
 # Patch targets: lazy imports in _run_and_record / run_sweep / run_rerun resolve from source modules
 _GEN = "nkipy.tools.kernel_agent.generator.generate_kernel"
