@@ -371,6 +371,56 @@ def test_reduction(trace_mode, np_fn, shape, dtype, axis):
         trace_and_compile(kernel, trace_mode, in0)
 
 
+@pytest.mark.parametrize(
+    "np_fn,initial",
+    [
+        (np.sum, np.float32(10.0)),
+        (np.prod, np.float32(2.0)),
+        (np.max, np.float32(20.0)),
+        (np.min, np.float32(-5.0)),
+    ],
+)
+def test_reduction_initial(trace_mode, np_fn, initial):
+    def kernel(a):
+        return np_fn(a, axis=1, initial=initial)
+
+    in0 = np.array([[1.0, 4.0], [9.0, 16.0]], dtype=np.float32)
+    expected = kernel(in0)
+
+    traced = NKIPyKernel.trace(kernel, backend=trace_mode).specialize(in0)
+    reduce_op = next(op for op in traced.operations if op.op_name == "reduce")
+    init_op = reduce_op.operands[1].source_op
+    assert init_op.op_name == "constant"
+    assert init_op.attributes["value"] == pytest.approx(float(initial))
+
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
+@pytest.mark.parametrize("np_fn", [np.sum, np.prod])
+def test_reduction_dtype(trace_mode, np_fn):
+    def kernel(a):
+        return np_fn(a, axis=1, dtype=np.float16)
+
+    in0 = np.array([[1.0, 4.0], [9.0, 16.0]], dtype=np.float32)
+    expected = kernel(in0)
+
+    traced = NKIPyKernel.trace(kernel, backend=trace_mode).specialize(in0)
+    reduce_op = next(op for op in traced.operations if op.op_name == "reduce")
+    assert traced.outputs[0].dtype == expected.dtype
+    assert reduce_op.operands[0].dtype == expected.dtype
+    assert reduce_op.operands[1].dtype == expected.dtype
+
+    if NEURON_AVAILABLE:
+        out_device = on_device_test(kernel, trace_mode, in0)
+        baremetal_assert_allclose(expected, out_device)
+    else:
+        trace_and_compile(kernel, trace_mode, in0)
+
+
 def test_multiple_sum_different_dtypes(trace_mode):
     """Test multiple np.sum calls with different dtypes.
 
